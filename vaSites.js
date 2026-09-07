@@ -120,10 +120,12 @@ const builder = require('./vaSiteBuilder');
  * page, an about page, a stylesheet — not an application. A VA that needs more
  * than this needs a host, and crew-feed.js already works on one.
  *
- * Images are NOT stored here on purpose. A VA's logo and banner already live in
- * our uploads, event banners already have their own endpoint, and everything
- * else can be an https URL. Accepting binaries would turn a 2 MB text quota
- * into an image host with none of an image host's answers about takedowns.
+ * Pictures do not count against any of this, and are not stored in a file at
+ * all. They go to S3 through the same pipeline as a VA's logo and banner, and
+ * what this document keeps is a row of metadata each — so the numbers below
+ * stay a budget for TEXT, which is the only thing they are a sensible budget
+ * for. See PICTURES below for the caps that do apply to them, and for why
+ * hosting them at all is a change of position rather than a feature.
  * ======================================================================== */
 const MAX_FILES = 60;
 const MAX_FILE_BYTES = 256 * 1024;        // 256 KB — a very large page
@@ -131,6 +133,50 @@ const MAX_TOTAL_BYTES = 2 * 1024 * 1024;  // 2 MB across the whole site
 const MAX_PATH_LEN = 120;
 const MAX_VERSIONS = 10;                  // published snapshots kept for revert
 const PREVIEW_TTL_MS = 30 * 60 * 1000;    // a preview token lasts half an hour
+
+/* ---------------------------------------------------------------------------
+ * PICTURES
+ *
+ * WHY THESE ARE NOT FILES
+ *
+ * Everything above counts against a 2 MB budget for the site's TEXT, and a
+ * single photograph would eat it. Pictures are therefore not stored here at
+ * all: they go to S3 through the same sharp pipeline that has always handled a
+ * VA's logo and banner (vaAds.js), and what this document keeps is a row of
+ * metadata per picture — a URL, a size, a name. So the two budgets are
+ * separate, and a VA who uploads twenty photographs has not spent a byte of
+ * their page budget.
+ *
+ * WHY THIS IS A CHANGE OF POSITION, STATED OUT LOUD
+ *
+ * Hosting only text was a deliberate refusal, and the reason was takedowns: a
+ * picture on somebody else's host is not ours to remove, and a page carrying it
+ * is. Hosting the picture moves that liability here. That is a decision the
+ * platform has now taken, and the honest thing is to make the takedown answer
+ * exist rather than pretend the problem went away:
+ *
+ *   - every picture is one row on one airline's site document, so "everything
+ *     this VA put on their website" is one lookup, not a search;
+ *   - the S3 keys sit under their own `va-sites/` prefix for the same reason;
+ *   - deleting a row deletes the object, so removal is real rather than a
+ *     broken link;
+ *   - and the staff endpoint lists the count, so a site under review shows how
+ *     much there is to look at before anybody opens it.
+ *
+ * THE NUMBERS
+ *
+ * 60 pictures is a large website — a homepage, a fleet page and a gallery is
+ * perhaps twenty. 60 MB is what those weigh AFTER sharp has capped them at
+ * 2000px and re-encoded to WebP, which is where a phone photograph lands at
+ * roughly 300 KB. Both are per site.
+ * ------------------------------------------------------------------------ */
+const MAX_MEDIA = 60;
+const MAX_MEDIA_BYTES = 60 * 1024 * 1024;
+// The types sharp will take and we are willing to re-encode. Everything is
+// stored as WebP whatever it arrived as, so this is about what we can DECODE.
+const MEDIA_MIME = /^image\/(jpeg|png|webp|gif|avif|tiff|svg\+xml)$/i;
+const MAX_ALT_LEN = 160;
+const MAX_MEDIA_NAME = 80;
 
 // What a VA may write. Text formats only, and every one of them is something a
 // browser renders as itself rather than sniffs into something else.
@@ -307,6 +353,34 @@ const CrewSiteSchema = new mongoose.Schema({
         // on its design's own choices instead of on a pattern nobody picked.
         pattern: { type: String, default: '' },
         radius: { type: Number, default: null },
+    },
+
+    /* THE PICTURES ON THIS SITE.
+     *
+     * Metadata only — the bytes are on S3. See PICTURES at the top of this file
+     * for why they are not counted against the text budget, and for the
+     * takedown answer this list is half of.
+     *
+     * `alt` is stored beside the picture rather than beside each USE of it,
+     * because a photograph of an aircraft is the same photograph on the
+     * homepage and on the fleet page, and asking somebody to describe it twice
+     * gets it described once and left blank the second time.
+     */
+    media: {
+        type: [{
+            _id: false,
+            id: String,            // ours, stable, what a block stores
+            url: String,           // the S3 address, https
+            name: String,          // what the VA called it
+            alt: String,           // what a screen reader is told
+            bytes: Number,         // AFTER sharp — what it actually costs us
+            width: Number,
+            height: Number,
+            animated: Boolean,
+            uploadedAt: Date,
+            uploadedBy: String,
+        }],
+        default: [],
     },
 
     // Short-lived preview credential. The site host has no session — that is
@@ -923,6 +997,25 @@ function publicSite(site, va) {
             by: (site.published && site.published.by) || '',
             version: (site.published && site.published.version) || 0,
         },
+        /* THE PICTURE LIBRARY.
+         *
+         * Sent whole on every read, because it is small (a row is ~120 bytes)
+         * and because every image field in the editor is a picker onto it — a
+         * separate fetch would mean the first click on "choose a picture"
+         * spinning while the rest of the editor was already usable.
+         *
+         * Newest first: the picture a VA wants is almost always the one they
+         * just uploaded.
+         */
+        media: (site.media || [])
+            .map(m => ({
+                id: m.id, url: m.url, name: m.name || '', alt: m.alt || '',
+                bytes: m.bytes || 0, width: m.width || 0, height: m.height || 0,
+                animated: !!m.animated,
+                uploadedAt: m.uploadedAt || null, uploadedBy: m.uploadedBy || '',
+            }))
+            .reverse(),
+
         // The one thing the editor's Publish button needs to know.
         hasUnpublishedChanges: !same,
         versions: (site.versions || []).map(v => ({ version: v.version, at: v.at, by: v.by, files: (v.files || []).length })),
@@ -932,12 +1025,28 @@ function publicSite(site, va) {
             totalBytes: MAX_TOTAL_BYTES,
             types: Object.keys(TYPES),
             versions: MAX_VERSIONS,
+            media: MAX_MEDIA,
+            mediaBytes: MAX_MEDIA_BYTES,
         },
-        usage: { files: draft.length, bytes: draft.reduce((n, f) => n + (f.bytes || 0), 0) },
+        usage: {
+            files: draft.length,
+            bytes: draft.reduce((n, f) => n + (f.bytes || 0), 0),
+            // Reported separately because it IS separate: a photograph is not
+            // spending the page budget, and an editor that showed one number
+            // would have a VA deleting paragraphs to make room for a picture.
+            media: (site.media || []).length,
+            mediaBytes: (site.media || []).reduce((n, m) => n + (m.bytes || 0), 0),
+        },
     };
 }
 
-function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePortalOwner, requireAuth, requireCap, logActivity }) {
+function registerVaSiteRoutes(app, {
+    VirtualAirlineAd, requirePortal, requirePortalOwner, requireAuth, requireCap, logActivity,
+    // The picture pipeline, handed in rather than required here: this file has
+    // no opinion about S3 and no way to test one. Same split as the rest of the
+    // module — it makes decisions and strings, the caller does the I/O.
+    upload, s3Client, uploadVaImageMeta, deleteVaImage,
+}) {
 
     /* -----------------------------------------------------------------------
      * TWO DOORS, ONE IMPLEMENTATION
@@ -1366,6 +1475,187 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
         }
     });
 
+    /* =====================================================================
+     * PICTURES
+     *
+     * Three routes and a rule: a picture is a row on this document and an
+     * object on S3, and the two are never allowed to disagree. Every path here
+     * does the S3 work FIRST and writes the row only if it succeeded, so the
+     * failure mode is an orphaned object in a bucket rather than a library full
+     * of rows pointing at nothing — untidy, and invisible to the VA, which is
+     * the right way round for a failure nobody can act on.
+     *
+     * Delete is the exception and goes the other way: the row is removed even
+     * if S3 refuses, because a picture a VA has asked to remove must stop being
+     * on their website whatever the bucket says. The object is then a leak we
+     * can sweep; a picture that will not go away is a complaint.
+     * =================================================================== */
+
+    /** Somewhere between "a file" and "an upload the browser sent". Multer puts
+     *  a single file on req.file; a few clients send it as an array. */
+    const uploaded = (req) => req.file
+        || (req.files && (Array.isArray(req.files) ? req.files[0] : (req.files.file || [])[0]))
+        || null;
+
+    const mediaId = () => 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+    const cleanAlt = (v) => String(v == null ? '' : v)
+        .replace(/[\x00-\x1F\x7F]/g, ' ').trim().slice(0, MAX_ALT_LEN);
+    const cleanName = (v) => String(v == null ? '' : v)
+        .replace(/[\x00-\x1F\x7F]/g, ' ').trim().slice(0, MAX_MEDIA_NAME);
+
+    // Multer's own limit rejects with an error rather than a JSON body, and a
+    // VA who picked a 40 MB photograph should be told that in words.
+    const withUpload = (req, res, next) => {
+        if (typeof upload !== 'function' && !(upload && upload.single)) {
+            return res.status(501).json({ error: 'Picture uploads are not configured on this deployment.' });
+        }
+        upload.single('file')(req, res, (err) => {
+            if (!err) return next();
+            const tooBig = err.code === 'LIMIT_FILE_SIZE';
+            res.status(tooBig ? 413 : 400).json({
+                error: tooBig
+                    ? 'That picture is too large to upload. Try one under 15 MB — a photograph straight off a phone is usually fine.'
+                    : 'That upload did not arrive properly. Try again.',
+            });
+        });
+    };
+
+    app.post('/api/va-portal/site/media', siteOwner, withUpload, async (req, res) => {
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            if (site.blocked) {
+                return res.status(423).json({ error: 'This site is on hold. Ask Inflight.' });
+            }
+
+            const file = uploaded(req);
+            if (!file) return res.status(400).json({ error: 'No picture arrived. Choose a file and try again.' });
+            if (!MEDIA_MIME.test(String(file.mimetype || ''))) {
+                return res.status(415).json({
+                    error: 'That is not a picture we can use. JPEG, PNG, WebP, GIF or AVIF.',
+                });
+            }
+
+            const library = Array.isArray(site.media) ? site.media : (site.media = []);
+            if (library.length >= MAX_MEDIA) {
+                return res.status(413).json({
+                    error: `That would be ${library.length + 1} pictures. A site holds up to ${MAX_MEDIA} — delete one you are not using.`,
+                });
+            }
+            const used = library.reduce((n, m) => n + (m.bytes || 0), 0);
+            // Checked again after the upload, when the real size is known. This
+            // first check is only to refuse the obviously hopeless before
+            // spending a sharp pipeline and an S3 round-trip on it.
+            if (used >= MAX_MEDIA_BYTES) {
+                return res.status(413).json({
+                    error: `Your pictures already fill the ${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)} MB this site has. Delete one to make room.`,
+                });
+            }
+
+            let stored;
+            try {
+                stored = await uploadVaImageMeta(s3Client, file, String(r.va._id), 'site');
+            } catch (err) {
+                const status = err && err.status === 413 ? 413 : 502;
+                return res.status(status).json({
+                    error: err && err.status === 413
+                        ? err.message
+                        : 'That picture could not be processed. If it is an unusual format, try saving it as a JPEG or PNG first.',
+                });
+            }
+
+            // The real cost, now that sharp has had it. Over the line, the
+            // object is removed again rather than left paid for and unusable.
+            if (used + stored.bytes > MAX_MEDIA_BYTES) {
+                deleteVaImage(s3Client, stored.url).catch(() => {});
+                return res.status(413).json({
+                    error: `That picture would take you over the ${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)} MB this site has for pictures. Delete one to make room.`,
+                });
+            }
+
+            const row = {
+                id: mediaId(),
+                url: stored.url,
+                name: cleanName(req.body && req.body.name) || cleanName(file.originalname) || 'Picture',
+                alt: cleanAlt(req.body && req.body.alt),
+                bytes: stored.bytes,
+                width: stored.width,
+                height: stored.height,
+                animated: !!stored.animated,
+                uploadedAt: new Date(),
+                uploadedBy: actorName(req),
+            };
+            library.push(row);
+            site.markModified('media');
+            await site.save();
+            if (logActivity) {
+                logActivity(req, 'site.media.add', { name: row.name, bytes: row.bytes }).catch(() => {});
+            }
+            res.json(publicSite(site, r.va));
+        } catch (err) {
+            console.error('VA site media upload error:', err);
+            res.status(500).json({ error: 'Could not add that picture.' });
+        }
+    });
+
+    /** What a picture is called, and what a screen reader is told about it. */
+    app.post('/api/va-portal/site/media/describe', siteOwner, async (req, res) => {
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            const body = req.body || {};
+            const row = (site.media || []).find(m => m.id === String(body.id || ''));
+            if (!row) return res.status(404).json({ error: 'That picture is not in your library.' });
+            if (body.alt !== undefined) row.alt = cleanAlt(body.alt);
+            if (body.name !== undefined) row.name = cleanName(body.name) || row.name;
+            site.markModified('media');
+            await site.save();
+            res.json(publicSite(site, r.va));
+        } catch (err) {
+            console.error('VA site media describe error:', err);
+            res.status(500).json({ error: 'Could not save that.' });
+        }
+    });
+
+    app.delete('/api/va-portal/site/media', siteOwner, async (req, res) => {
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            const id = String((req.body && req.body.id) || (req.query && req.query.id) || '');
+            const library = Array.isArray(site.media) ? site.media : [];
+            const at = library.findIndex(m => m.id === id);
+            if (at < 0) return res.status(404).json({ error: 'That picture is not in your library.' });
+
+            const [row] = library.splice(at, 1);
+            site.media = library;
+            site.markModified('media');
+            await site.save();
+
+            /* The row is gone before S3 is asked, and the object's removal is
+             * not awaited. A picture a VA has asked to remove must stop being on
+             * their website whatever the bucket says — a leaked object is a
+             * sweep, and a picture that will not go away is a complaint. */
+            deleteVaImage(s3Client, row.url).catch((err) => {
+                console.error('VA site media: object left behind', row.url, err && err.message);
+            });
+            if (logActivity) logActivity(req, 'site.media.remove', { name: row.name }).catch(() => {});
+
+            /* A block still pointing at it is NOT hunted down and rewritten.
+             * The builder stores the URL, the page keeps rendering it, and the
+             * <img> 404s — which is visible, which is the point. Silently
+             * emptying somebody's hero because they tidied their library is a
+             * worse surprise than a missing picture they can see and replace. */
+            res.json(publicSite(site, r.va));
+        } catch (err) {
+            console.error('VA site media delete error:', err);
+            res.status(500).json({ error: 'Could not remove that picture.' });
+        }
+    });
+
     /* --- The theme ---------------------------------------------------------
      * Rewrites theme.css and nothing else. That is the whole reason the
      * templates keep every colour and family in one small file of custom
@@ -1572,7 +1862,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     app.get('/api/crew-admin/sites', requireAuth, async (req, res) => {
         try {
             const rows = await CrewSite.find({})
-                .select('vaAdId slug enabled blocked blockedReason published.at published.version draft.updatedAt')
+                .select('vaAdId slug enabled blocked blockedReason published.at published.version draft.updatedAt media')
                 .sort({ 'published.at': -1 }).limit(500).lean();
             const ads = await VirtualAirlineAd.find({ _id: { $in: rows.map(r => r.vaAdId) } })
                 .select('name callsign').lean();
@@ -1620,12 +1910,74 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
                         publishedAt: (r.published && r.published.at) || null,
                         version: (r.published && r.published.version) || 0,
                         draftUpdatedAt: (r.draft && r.draft.updatedAt) || null,
+                        // How many pictures this airline has put on OUR storage,
+                        // and what they weigh. The count is here rather than a
+                        // click away because it is the number that decides
+                        // whether a copyright report is a page to look at or an
+                        // afternoon — and because a site with forty photographs
+                        // on it is a different kind of listing from one with
+                        // none, before anybody opens either.
+                        media: (r.media || []).length,
+                        mediaBytes: (r.media || []).reduce((n, m) => n + (m.bytes || 0), 0),
                     };
                 }),
             });
         } catch (err) {
             console.error('VA sites list error:', err);
             res.status(500).json({ error: 'Could not list the websites.' });
+        }
+    });
+
+    /* WHAT A TAKEDOWN ACTUALLY NEEDS.
+     *
+     * Blocking a site takes the whole thing down, which is right for a site
+     * that is a problem and wrong for a site with one problem picture on it.
+     * This is the smaller instrument: every picture one airline has put on our
+     * storage, and the ability to remove one of them.
+     *
+     * The VA is not asked first and is not consulted — that is what makes it a
+     * takedown. What they get is the same thing anybody gets when a picture
+     * they linked to goes away: a missing image on their page, which they can
+     * see and replace.
+     */
+    app.get('/api/crew-admin/sites/:id/media', requireAuth, async (req, res) => {
+        try {
+            const site = await CrewSite.findById(req.params.id).select('slug media').lean();
+            if (!site) return res.status(404).json({ error: 'No such website.' });
+            res.json({
+                slug: site.slug,
+                media: (site.media || []).map(m => ({
+                    id: m.id, url: m.url, name: m.name || '', alt: m.alt || '',
+                    bytes: m.bytes || 0, width: m.width || 0, height: m.height || 0,
+                    uploadedAt: m.uploadedAt || null, uploadedBy: m.uploadedBy || '',
+                })).reverse(),
+            });
+        } catch (err) {
+            console.error('VA site media list error:', err);
+            res.status(500).json({ error: 'Could not list the pictures.' });
+        }
+    });
+
+    app.delete('/api/crew-admin/sites/:id/media/:mediaId', requireAuth, async (req, res) => {
+        try {
+            const site = await CrewSite.findById(req.params.id);
+            if (!site) return res.status(404).json({ error: 'No such website.' });
+            const library = Array.isArray(site.media) ? site.media : [];
+            const at = library.findIndex(m => m.id === String(req.params.mediaId));
+            if (at < 0) return res.status(404).json({ error: 'No such picture.' });
+            const [row] = library.splice(at, 1);
+            site.media = library;
+            site.markModified('media');
+            await site.save();
+            if (typeof deleteVaImage === 'function') {
+                deleteVaImage(s3Client, row.url).catch((err) => {
+                    console.error('VA site media: object left behind', row.url, err && err.message);
+                });
+            }
+            res.json({ ok: true, removed: { id: row.id, name: row.name || '', url: row.url } });
+        } catch (err) {
+            console.error('VA site media takedown error:', err);
+            res.status(500).json({ error: 'Could not remove that picture.' });
         }
     });
 
@@ -1650,6 +2002,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 module.exports = {
     CrewSite,
     MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_VERSIONS, PREVIEW_TTL_MS,
+    MAX_MEDIA, MAX_MEDIA_BYTES, MEDIA_MIME,
     TYPES, PREVIEW_PREFIX, DOMAIN,
     cleanPath, extOf, bytesOf, layOutTemplate,
     parseSiteHost, siteUrlFor, pickFile, registrableGuess,

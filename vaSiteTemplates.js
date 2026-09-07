@@ -580,6 +580,47 @@ ${navLinks(c)}
     </ul>
   </section>`,
 
+    /* WORDS BESIDE A PICTURE. The layout every airline wants for "who we are"
+     * and the one a stack of full-width sections cannot produce. Two columns on
+     * a screen, one on a phone — and the picture goes first on a phone whichever
+     * side it was on, so two of these stacked do not alternate. */
+    split: () => `
+  <section class="block">
+    <div class="split">
+      <div>
+        <div class="block__head"><h2>Who we are</h2></div>
+        <p class="prose">Two or three sentences about the airline, next to a
+           picture of one of your aircraft. Anybody who wants the detail will
+           read your operations manual — this is the part they read first.</p>
+      </div>
+      <!-- Put your own picture here. Any https:// address works; the ones you
+           upload in the Website tab are already https. -->
+      <div class="split__media">
+        <img src="" alt="" loading="lazy" decoding="async">
+      </div>
+    </div>
+  </section>`,
+
+    /* A GRID OF PHOTOGRAPHS.
+     *
+     * A tile is a <button> when it opens the picture larger and an <a> when it
+     * goes somewhere, because those are two different things to a keyboard and
+     * to a screen reader. site.js turns [data-shot] into a lightbox; drop the
+     * attribute and the tile is just a picture. */
+    gallery: () => `
+  <section class="block">
+    <div class="block__head">
+      <h2>The airline, photographed</h2>
+      <p>Swap these for your own. Each tile opens larger when it is clicked.</p>
+    </div>
+    <div class="shots">
+      <button class="shot" type="button" data-shot="" data-caption="On the line" aria-label="Open this picture larger">
+        <img src="" alt="On the line" loading="lazy" decoding="async">
+        <figcaption>On the line</figcaption>
+      </button>
+    </div>
+  </section>`,
+
     cta: (c) => `
   <section class="band" data-motif>
     <h2>There is a seat for you.</h2>
@@ -627,6 +668,8 @@ const INSERTABLE = [
     { id: 'joining', label: 'What happens when you apply', note: 'Four numbered steps. The question every applicant has.' },
     { id: 'quote', label: 'A quote', note: 'One line, set large. Worth having once and nothing twice.' },
     { id: 'contact', label: 'Talk to us', note: 'Discord, the crew centre and the application, in three tiles.' },
+    { id: 'split', label: 'Words beside a picture', note: 'Two columns on a screen, one on a phone.' },
+    { id: 'gallery', label: 'Pictures', note: 'A grid of photographs, each opening larger when it is clicked.' },
     { id: 'text', label: 'Your own words', note: 'A heading and paragraphs. Nothing in it is fed from anywhere.' },
     { id: 'cta', label: 'Apply band', note: 'A full-width band with the apply button.' },
 ];
@@ -1140,6 +1183,123 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
 .faq .prose { padding-bottom: 1.1rem; margin-top: 0; }
 
 /* ---------------------------------------------------------------------------
+   A PICTURE BEHIND A SECTION
+
+   The thing every page builder has and the reason people reach for one: put a
+   photograph behind the words.
+
+   IT IS AN <img>, NOT A background-image. Three reasons, and the third is the
+   one that decided it:
+
+     · loading="lazy" and decoding="async" work on an element and not on a CSS
+       background, so a page with four of these does not fetch four photographs
+       before it paints;
+     · the address goes through the same attribute escaping as every other URL
+       on the page, rather than into a style attribute where a stray quote or
+       bracket would end the declaration and start something else;
+     · and object-position is a property of the picture, so a VA can say which
+       part of a wide photograph survives on a phone.
+
+   THE SCRIM IS NOT OPTIONAL. White text over an unknown photograph is
+   unreadable often enough to be a rule rather than a taste — the VA chose the
+   image, and nobody checked it against the words that would sit on it. --dim
+   is how hard it is, and 0 is not offered as a value: the floor is applied
+   here, not trusted from the editor.
+   ------------------------------------------------------------------------ */
+.has-bg { position: relative; isolation: isolate; color: var(--on-shot, #fff); }
+.has-bg__layer { position: absolute; inset: 0; z-index: -1; overflow: hidden; }
+.has-bg__layer img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+  object-position: var(--bg-pos, 50% 50%);
+}
+.has-bg__layer::after {
+  content: ''; position: absolute; inset: 0;
+  background: rgba(8, 10, 14, var(--dim, .55));
+}
+/* Everything inside inherits the light ink, including the parts that normally
+   take a muted or accent colour — those are tuned for the page background and
+   are unreadable on a photograph. */
+.has-bg h1, .has-bg h2, .has-bg h3, .has-bg p, .has-bg li, .has-bg b, .has-bg span,
+.has-bg .lede, .has-bg .prose, .has-bg .eyebrow, .has-bg .more a { color: inherit; }
+.has-bg .lede, .has-bg .prose, .has-bg .block__head p { opacity: .88; }
+.has-bg .rows li, .has-bg .steps li { border-color: rgba(255, 255, 255, .22); }
+.has-bg .tile, .has-bg .card, .has-bg .pill {
+  background: rgba(255, 255, 255, .1); border-color: rgba(255, 255, 255, .2);
+}
+.has-bg .cta--ghost { color: inherit; border-color: rgba(255, 255, 255, .5); }
+.has-bg .cta--ghost:hover { background: rgba(255, 255, 255, .12); color: inherit; }
+/* A section with a picture behind it needs room the flat one does not. */
+.has-bg { padding-block: clamp(3rem, 8vw, 5.5rem); }
+
+/* EDGE TO EDGE.
+   Full bleed by pulling each side out to the viewport from whatever box the
+   section happens to sit in, so it works the same in a centred main and in
+   Livery's full-width one. The inner padding grows to fill the gutter so the
+   text stays on the same left edge as everything above it. */
+.bleed {
+  margin-inline: calc(50% - 50vw);
+  padding-inline: max(var(--pad), calc((100vw - var(--measure)) / 2 + var(--pad)));
+  border-radius: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   THE PICTURE GRID
+
+   Used by the gallery. A tile is a <button> when it opens in the lightbox and
+   an <a> when it links somewhere, because those are two different things to a
+   keyboard and to a screen reader — and never a div with a click handler.
+   ------------------------------------------------------------------------ */
+.shots {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr));
+}
+.shots--tight { grid-template-columns: repeat(auto-fill, minmax(min(10rem, 100%), 1fr)); gap: .6rem; }
+/* A COLUMN, NOT A BLOCK.
+   A grid stretches every tile to the tallest in its row, and a gallery where
+   some pictures have captions and some do not has two heights in every row. As
+   a block that leaves the odd one out with a taller picture; as a flex column
+   with the caption pushed to the bottom, every picture is the same size and the
+   captions line up. */
+.shot {
+  margin: 0; padding: 0; overflow: hidden; text-align: left;
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); color: inherit; font: inherit;
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
+.shot:hover { border-color: var(--accent-line); box-shadow: var(--shadow-1); transform: translateY(-1px); }
+/* flex: none, or the image is the thing that stretches instead of the caption. */
+.shot img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; flex: none; }
+.shot figcaption, .shot > span {
+  display: block; margin-top: auto; padding: .6rem .75rem; font-size: .84rem; color: var(--muted);
+}
+
+/* THE LIGHTBOX.
+
+   A <dialog>, so the browser supplies the modal behaviour that is tedious and
+   easy to get wrong: the top layer, the backdrop, Escape, and returning focus
+   to whatever opened it. site.js only opens and closes it.
+
+   It is written in the markup by site.js rather than shipped in every page,
+   because a site with no gallery should not carry a dialog it never opens. */
+.lightbox {
+  border: 0; padding: 0; background: none; max-width: 96vw; max-height: 96vh;
+  color: #fff;
+}
+.lightbox::backdrop { background: rgba(6, 8, 12, .88); }
+.lightbox img { max-width: 96vw; max-height: 84vh; width: auto; height: auto; display: block; border-radius: var(--radius); }
+.lightbox figcaption { padding: .75rem .25rem 0; font-size: .9rem; text-align: center; opacity: .85; }
+.lightbox__shut {
+  position: absolute; top: -.25rem; right: -.25rem;
+  width: 2.4rem; height: 2.4rem; border-radius: var(--radius-pill);
+  border: 0; background: rgba(255, 255, 255, .16); color: #fff;
+  font-size: 1.2rem; line-height: 1; cursor: pointer;
+}
+.lightbox__shut:hover { background: rgba(255, 255, 255, .3); }
+
+/* ---------------------------------------------------------------------------
    THE APPLY BAND
    ------------------------------------------------------------------------ */
 .band {
@@ -1266,9 +1426,10 @@ const SITE_JS = `/* Your site's own script.
      2. the header         a shadow once the page has moved under it
      3. the current page   marked in the nav, worked out from the address
      4. arrival            sections fade up the first time they are reached
-     5. the Instagram wall and clearing away a section that came back empty
+     5. the lightbox       a gallery picture, opened larger
+     6. the Instagram wall and clearing away a section that came back empty
 
-   Jobs 1 to 4 are pure DOM. Only 5 needs the feed. */
+   Jobs 1 to 5 are pure DOM. Only 6 needs the feed. */
 (function () {
   'use strict';
 
@@ -1423,7 +1584,83 @@ const SITE_JS = `/* Your site's own script.
   })();
 
   /* -------------------------------------------------------------------------
-     5. THE FEED'S TWO LEFTOVERS
+     5. THE LIGHTBOX
+
+        A gallery tile that opens its picture larger. The tile is already a
+        <button> in the markup — the builder decided that, because a thing you
+        click to open something is a control — so all this does is open the
+        dialog and put the right picture in it.
+
+        A <dialog>, so the browser supplies the modal behaviour that is tedious
+        and easy to get wrong: the top layer, the backdrop, Escape, and giving
+        focus back to the tile that opened it. Nothing here reimplements any of
+        that.
+
+        The dialog is BUILT ON FIRST USE rather than shipped in every page. A
+        site with no gallery never makes one, and a site with one makes it the
+        first time somebody clicks a picture — by which point they have told us
+        they want it.
+     --------------------------------------------------------------------- */
+  (function lightbox() {
+    var tiles = document.querySelectorAll('[data-shot]');
+    if (!tiles.length) return;
+    // A browser without <dialog> leaves the tiles as buttons that do nothing,
+    // which is worse than a tile that is not a button at all — so in that case
+    // each one is turned into a plain link to the picture instead.
+    if (typeof HTMLDialogElement === 'undefined') {
+      Array.prototype.forEach.call(tiles, function (t) {
+        var a = document.createElement('a');
+        a.className = t.className;
+        a.href = t.getAttribute('data-shot');
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.innerHTML = t.innerHTML;
+        t.parentNode.replaceChild(a, t);
+      });
+      return;
+    }
+
+    var box = null, pic = null, cap = null;
+
+    function build() {
+      box = document.createElement('dialog');
+      box.className = 'lightbox';
+      var fig = document.createElement('figure');
+      fig.style.margin = '0';
+      fig.style.position = 'relative';
+      pic = document.createElement('img');
+      cap = document.createElement('figcaption');
+      var shut = document.createElement('button');
+      shut.type = 'button';
+      shut.className = 'lightbox__shut';
+      shut.setAttribute('aria-label', 'Close');
+      shut.innerHTML = '&times;';
+      shut.addEventListener('click', function () { box.close(); });
+      fig.appendChild(pic);
+      fig.appendChild(cap);
+      fig.appendChild(shut);
+      box.appendChild(fig);
+      // Clicking the backdrop shuts it. The dialog's own box is the figure, so
+      // a click that landed on the dialog itself landed outside the picture.
+      box.addEventListener('click', function (e) { if (e.target === box) box.close(); });
+      document.body.appendChild(box);
+    }
+
+    document.addEventListener('click', function (e) {
+      var tile = e.target.closest ? e.target.closest('[data-shot]') : null;
+      if (!tile) return;
+      if (!box) build();
+      pic.src = tile.getAttribute('data-shot');
+      var text = tile.getAttribute('data-caption') || '';
+      cap.textContent = text;
+      cap.hidden = !text;
+      pic.alt = text;
+      box.showModal();
+    });
+  })();
+
+  /* -------------------------------------------------------------------------
+     6. THE FEED'S TWO LEFTOVERS
 
         crew-feed.js fills in figures and lists by itself. It deliberately does
         NOT remove a list that came back empty, because on most pages an empty
@@ -2334,6 +2571,24 @@ The lists that read from your crew centre: \`routes\`, \`events\`,
 anywhere — the airports you fly most out of, and the airlines you codeshare
 with. Publish a sector and they follow.
 
+### Putting a picture behind a section
+
+Any section can carry one. In the builder it is under **Picture behind this
+section**; by hand it is a class and a layer:
+
+\`\`\`html
+<section class="block has-bg" style="--dim:.55;--bg-pos:50% 50%">
+  <span class="has-bg__layer" aria-hidden="true">
+    <img src="https://…" alt="" loading="lazy" decoding="async">
+  </span>
+  …
+</section>
+\`\`\`
+
+Add \`bleed\` beside \`has-bg\` to run it edge to edge. \`--dim\` is how dark the
+scrim over it is, and there is always one: white words over a photograph nobody
+checked them against are unreadable often enough to be a rule.
+
 ### Your fleet always has a picture
 
 Every aircraft in the fleet list gets an image. Yours if you uploaded a livery
@@ -2387,8 +2642,14 @@ design uses the same class names, so a block from one looks right in another.
 ## What you can put here
 
 Text files only: \`.html .css .js .json .svg .txt .md .xml .webmanifest\`.
-Images are not stored here — put them on an \`https://\` address and link to
-them. Your logo and banner already have addresses; the VA Profile tab shows them.
+
+**Pictures are separate and do not count against your page budget.** Upload them
+under **Pictures** in the Website tab and they get an \`https://\` address you
+can use anywhere on the site — in a block's picture field, behind a section, or
+by hand in a page you wrote yourself. Everything is resized and re-encoded on the
+way in, so a photograph straight off a phone lands at about a tenth of what it
+arrived as. Your logo and banner already have addresses too; the VA Profile tab
+shows them.
 
 ## Your site's address
 

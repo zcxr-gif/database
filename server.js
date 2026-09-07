@@ -24,7 +24,7 @@ const {
 } = require('./airports');
 
 // VA Advertisement image helpers (banner + logo -> S3 as WebP)
-const { uploadVaImage, deleteVaImage } = require('./vaAds');
+const { uploadVaImage, uploadVaImageMeta, deleteVaImage } = require('./vaAds');
 
 // Staff portal authentication (per-user accounts, JWT cookie).
 const {
@@ -2892,6 +2892,14 @@ vaSites.registerVaSiteRoutes(app, {
     requirePortal: requireVaPortalSession,
     requirePortalOwner: requireVaPortalOwner,
     requireAuth,
+    // The picture library. Same sharp-to-WebP pipeline and same bucket as a VA's
+    // logo and banner — a website photograph is not a new kind of media, it is
+    // the existing kind with a different size profile ('site') and its own key
+    // prefix so a takedown can find every picture one airline uploaded.
+    upload,
+    s3Client,
+    uploadVaImageMeta,
+    deleteVaImage,
     // The crew centre's own door onto the same handlers: a crew token holding
     // site.manage reaches them at /api/crew/:slug/site/*. Hoisted — requireCap
     // is declared further down this file.

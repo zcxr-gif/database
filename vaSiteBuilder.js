@@ -164,6 +164,86 @@ function prose(body, cls) {
  * one, and the answer — it is your crew centre, change it there and it changes
  * here — is the entire point of the feature.
  * ======================================================================== */
+/* ---------------------------------------------------------------------------
+ * A PICTURE BEHIND ANY SECTION
+ *
+ * The one thing a page builder is judged on. Every block gets it, and no block
+ * implements it: the three fields are appended to every definition below, and
+ * the markup is wrapped around whatever the block rendered.
+ *
+ * WHY WRAPPING RATHER THAN TWENTY EDITS. There are twenty-odd blocks and there
+ * will be more. Teaching each one about backgrounds means twenty places for the
+ * scrim to be forgotten, and the scrim is the part that decides whether the
+ * words can be read. One transform is one place to be right.
+ *
+ * It is a controlled transform over markup THIS FILE authors — every block
+ * returns a section element as its first tag — and it no-ops rather than
+ * guesses when it does not recognise what it is given, so a block that returns
+ * an empty string (as several do when they have nothing to show) is untouched.
+ * ------------------------------------------------------------------------ */
+const BG_FIELDS = [
+    { key: 'bgImage', label: 'Picture behind this section', type: 'image', group: 'background' },
+    {
+        key: 'bgDim', label: 'How dark over it', type: 'number', min: 25, max: 85, group: 'background',
+        help: 'White words over an unknown photograph are unreadable often enough that some shade is always applied.',
+    },
+    {
+        key: 'bgFocus', label: 'Keep this part in frame', type: 'select', group: 'background',
+        options: [
+            { value: 'center', label: 'The middle' },
+            { value: 'top', label: 'The top' },
+            { value: 'bottom', label: 'The bottom' },
+            { value: 'left', label: 'The left' },
+            { value: 'right', label: 'The right' },
+        ],
+        help: 'Which part survives when the section is narrower than the picture.',
+    },
+    { key: 'bgFull', label: 'Run it edge to edge', type: 'bool', group: 'background' },
+];
+
+const BG_DEFAULTS = { bgImage: '', bgDim: 55, bgFocus: 'center', bgFull: false };
+
+const FOCUS_POS = {
+    center: '50% 50%', top: '50% 0%', bottom: '50% 100%', left: '0% 50%', right: '100% 50%',
+};
+
+/**
+ * The section, with the picture behind it.
+ *
+ * Nothing is written into a style attribute except two numbers this file
+ * produced: the dim as a decimal and a position from a fixed table. The URL
+ * goes in an `src`, which is the same escaping every other address on the page
+ * goes through — a background-image would put it in CSS, where a stray quote
+ * ends the declaration and starts whatever the author fancies.
+ */
+function withBackground(html, p) {
+    const url = imageUrl(p && p.bgImage);
+    if (!url || !html) return html;
+
+    // The opening tag of the section this block rendered. Matched rather than
+    // assumed: a block that returned '' or something with no section is handed
+    // back untouched.
+    const open = /^(\s*)<section\b([^>]*)>/.exec(html);
+    if (!open) return html;
+
+    const attrs = open[2];
+    const dim = Math.min(85, Math.max(25, Number(p.bgDim) || 55)) / 100;
+    const pos = FOCUS_POS[p.bgFocus] || FOCUS_POS.center;
+    const extra = `has-bg${p.bgFull ? ' bleed' : ''}`;
+
+    // Fold the classes into the existing attribute rather than adding a second
+    // class attribute, which is invalid and silently ignored by every parser.
+    const withClass = /class="([^"]*)"/.test(attrs)
+        ? attrs.replace(/class="([^"]*)"/, (_, c) => `class="${c} ${extra}"`)
+        : `${attrs} class="${extra}"`;
+
+    const style = `--dim:${dim};--bg-pos:${pos}`;
+    const layer = `\n    <span class="has-bg__layer" aria-hidden="true">`
+        + `<img src="${esc(url)}" alt="" loading="lazy" decoding="async"></span>`;
+
+    return open[1] + `<section${withClass} style="${style}">` + layer + html.slice(open[0].length);
+}
+
 const BLOCKS = {
 
     hero: {
@@ -176,7 +256,13 @@ const BLOCKS = {
             { key: 'lede', label: 'One sentence', type: 'text', help: 'What your airline is for, in your own words.' },
             { key: 'ctaLabel', label: 'Button', type: 'line', placeholder: 'Apply to fly' },
             { key: 'ctaHref', label: 'Button goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
-            { key: 'banner', label: 'Use your banner as the background', type: 'bool' },
+            { key: 'ctaLabel2', label: 'Second button', type: 'line', help: 'Optional. A quieter one beside the first.' },
+            { key: 'ctaHref2', label: 'That one goes to', type: 'url', help: 'Left empty, it goes to your crew centre.' },
+            {
+                key: 'image', label: 'Picture behind the hero', type: 'image',
+                help: 'Choose one of your pictures. Left empty, your Inflight banner is used if you have one.',
+            },
+            { key: 'banner', label: 'Fall back to your Inflight banner', type: 'bool' },
         ],
         defaults: (c) => ({
             eyebrow: `${c.callsign || 'Virtual airline'} · Infinite Flight`,
@@ -184,20 +270,43 @@ const BLOCKS = {
             lede: 'One sentence about what your airline is for. The numbers underneath look after themselves.',
             ctaLabel: 'Apply to fly',
             ctaHref: '',
+            ctaLabel2: '',
+            ctaHref2: '',
+            image: '',
             banner: true,
         }),
-        render: (p, c) => `
-  <section class="hero">${p.banner ? `
-    <div class="hero__bg" data-crew-figure hidden>
-      <img data-crew-brand="banner" alt="" loading="eager" decoding="async">
-    </div>` : ''}
+        /* TWO SOURCES FOR ONE PICTURE, and only ever one of them on the page.
+         *
+         * A picture chosen here wins, because it was chosen for this hero. The
+         * Inflight banner is the fallback and is [data-crew-figure], so a VA
+         * who has neither gets a hero with no photograph — a design — rather
+         * than a gap where one should be, which is a fault.
+         *
+         * Rendering both and hiding one would mean fetching two photographs to
+         * show one, on the element the page paints first. */
+        render: (p, c) => {
+            const bg = p.image
+                ? `\n    <div class="hero__bg">`
+                    + `\n      <img src="${esc(p.image)}" alt="" loading="eager" decoding="async" fetchpriority="high">`
+                    + `\n    </div>`
+                : (p.banner ? `\n    <div class="hero__bg" data-crew-figure hidden>`
+                    + `\n      <img data-crew-brand="banner" alt="" loading="eager" decoding="async" fetchpriority="high">`
+                    + `\n    </div>` : '');
+            const buttons = [
+                p.ctaLabel ? `<a class="cta" href="${esc(linkUrl(p.ctaHref, c.join))}">${esc(p.ctaLabel)}</a>` : '',
+                p.ctaLabel2 ? `<a class="cta cta--ghost" href="${esc(linkUrl(p.ctaHref2, c.crew))}">${esc(p.ctaLabel2)}</a>` : '',
+            ].filter(Boolean);
+            return `
+  <section class="hero" data-motif>${bg}
     <div class="hero__in">${p.eyebrow ? `
       <p class="eyebrow">${esc(p.eyebrow)}</p>` : ''}
       <h1>${esc(p.headline)}</h1>${p.lede ? `
-${prose(p.lede, 'lede')}` : ''}${p.ctaLabel ? `
-      <a class="cta" href="${esc(linkUrl(p.ctaHref, c.join))}">${esc(p.ctaLabel)}</a>` : ''}
+${prose(p.lede, 'lede')}` : ''}${buttons.length ? `
+      <div class="actions">${buttons.map(b => `\n        ${b}`).join('')}
+      </div>` : ''}
     </div>
-  </section>`,
+  </section>`;
+        },
     },
 
     figures: {
@@ -642,34 +751,127 @@ ${prose(p.body)}
   </section>`,
     },
 
+    /* WORDS BESIDE A PICTURE.
+     *
+     * The layout every airline wants for "who we are" and the one a stack of
+     * full-width sections cannot produce. Two columns on a wide screen, one on
+     * a phone — and on a phone the PICTURE goes first whichever side it was on,
+     * because a column that reads picture-then-words on one section and
+     * words-then-picture on the next reads as a mistake.
+     */
+    split: {
+        label: 'Words beside a picture',
+        note: 'Two columns on a screen, one on a phone. The layout every airline wants for "who we are".',
+        icon: 'columns-2',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'body', label: 'Words', type: 'text', help: 'Leave a blank line between paragraphs.' },
+            { key: 'image', label: 'Picture', type: 'image' },
+            { key: 'caption', label: 'Under the picture', type: 'line' },
+            { key: 'flip', label: 'Picture on the left', type: 'bool' },
+            { key: 'ctaLabel', label: 'Button', type: 'line' },
+            { key: 'ctaHref', label: 'Button goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
+        ],
+        defaults: () => ({
+            heading: 'Who we are',
+            body: 'Two or three sentences about the airline, next to a picture of one of your aircraft.'
+                + '\n\nAnybody who wants the detail will read your operations manual — this is the part they read first.',
+            image: '', caption: '', flip: false, ctaLabel: '', ctaHref: '',
+        }),
+        render: (p, ctx) => {
+            // A split with no picture is a heading and two paragraphs, which is
+            // the `text` block — so it renders as one rather than as a grid with
+            // an empty column in it.
+            const media = p.image
+                ? `\n      <div class="split__media">`
+                    + `<img src="${esc(p.image)}" alt="${esc(p.caption)}" loading="lazy" decoding="async">`
+                    + `</div>`
+                : '';
+            const cta = p.ctaLabel
+                ? `\n        <a class="cta" href="${esc(linkUrl(p.ctaHref, ctx.join))}">${esc(p.ctaLabel)}</a>`
+                : '';
+            const words = `\n      <div>`
+                + `\n        <div class="block__head"><h2>${esc(p.heading)}</h2></div>`
+                + `\n${prose(p.body, 'prose')}${cta}`
+                + `\n      </div>`;
+            if (!media) {
+                return `
+  <section class="block">
+    <div class="block__head"><h2>${esc(p.heading)}</h2></div>
+${prose(p.body, 'prose')}${cta}
+  </section>`;
+            }
+            return `
+  <section class="block">
+    <div class="split${p.flip ? ' split--reverse' : ''}">${words}${media}
+    </div>
+  </section>`;
+        },
+    },
+
+    /* THE GALLERY.
+     *
+     * Three shapes for a tile, and which one it gets is not a style choice —
+     * it is what the tile DOES:
+     *
+     *   <a>       it goes somewhere. A link.
+     *   <button>  it opens the picture larger. A control.
+     *   <figure>  it does neither. Not focusable, because there is nothing to
+     *             focus — a div with a click handler is the thing this avoids.
+     *
+     * The lightbox is opt-in per gallery rather than always on: a strip of
+     * partner logos is not something anybody wants to see at 1600px.
+     */
     gallery: {
         label: 'Pictures',
-        note: 'Screenshots, on a grid. Paste the address of each one.',
+        note: 'A grid of photographs. Choose them from your pictures, or paste an address.',
         icon: 'image',
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
             {
-                key: 'items', label: 'Pictures', type: 'list', max: 12, of: [
-                    { key: 'url', label: 'Image address', type: 'image', placeholder: 'https://…' },
+                key: 'size', label: 'Tile size', type: 'select',
+                options: [
+                    { value: 'normal', label: 'Normal' },
+                    { value: 'tight', label: 'Small' },
+                ],
+            },
+            {
+                key: 'lightbox', label: 'Open a picture larger when it is clicked', type: 'bool',
+                help: 'Off for a strip of logos; on for photographs.',
+            },
+            {
+                key: 'items', label: 'Pictures', type: 'list', max: 24, of: [
+                    { key: 'url', label: 'Picture', type: 'image', placeholder: 'https://…' },
                     { key: 'caption', label: 'Caption', type: 'line' },
-                    { key: 'href', label: 'Links to', type: 'url' },
+                    { key: 'href', label: 'Links to', type: 'url', help: 'Left empty, it opens larger instead.' },
                 ],
             },
         ],
-        defaults: () => ({ heading: 'On the line', items: [] }),
+        defaults: () => ({ heading: 'The airline, photographed', note: '', size: 'normal', lightbox: true, items: [] }),
         render: (p) => {
             const tiles = (p.items || []).filter(i => i.url).map((i) => {
+                // alt falls back to the caption and is empty when there is
+                // neither — an empty alt on a decorative tile is correct, and a
+                // filename read aloud is worse than silence.
                 const img = `<img src="${esc(i.url)}" alt="${esc(i.caption)}" loading="lazy" decoding="async">`;
-                const inner = i.caption ? `${img}<span>${esc(i.caption)}</span>` : img;
-                return i.href
-                    ? `      <a class="shot" href="${esc(linkUrl(i.href, ''))}" target="_blank" rel="noopener">${inner}</a>`
-                    : `      <figure class="shot">${inner}</figure>`;
+                const cap = i.caption ? `<figcaption>${esc(i.caption)}</figcaption>` : '';
+                if (i.href) {
+                    return `      <a class="shot" href="${esc(linkUrl(i.href, ''))}" target="_blank" rel="noopener">${img}${cap}</a>`;
+                }
+                if (p.lightbox) {
+                    return `      <button class="shot" type="button" data-shot="${esc(i.url)}"`
+                        + ` data-caption="${esc(i.caption)}" aria-label="${esc(i.caption || 'Open this picture larger')}">${img}${cap}</button>`;
+                }
+                return `      <figure class="shot">${img}${cap}</figure>`;
             }).join('\n');
             if (!tiles) return '';
             return `
   <section class="block">
-    <h2>${esc(p.heading)}</h2>
-    <div class="shots">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="shots${p.size === 'tight' ? ' shots--tight' : ''}">
 ${tiles}
     </div>
   </section>`;
@@ -806,13 +1008,12 @@ const BLOCK_IDS = Object.keys(BLOCKS);
  * it, and written in the same custom properties so it inherits the theme.
  * ------------------------------------------------------------------------ */
 const BUILDER_CSS = `
-/* ---- Blocks added by the builder ------------------------------------- */
-.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .8rem; }
-.shot { margin: 0; display: block; border-radius: var(--radius); overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
-.shot img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; }
-.shot span { display: block; padding: .55rem .7rem; font-size: .82rem; color: var(--muted); }
-a.shot { text-decoration: none; }
-a.shot:hover { border-color: var(--accent); }
+/* ---- Blocks added by the builder -------------------------------------
+
+   The picture grid, the lightbox and the section background are NOT here: they
+   are in the base stylesheet, because a hand-written site can use all three and
+   a design has to be able to restyle them. What is left is the one thing only a
+   builder block produces. */
 .frame { position: relative; width: 100%; border-radius: var(--radius); overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
 .frame--wide { aspect-ratio: 16 / 9; }
 .frame--square { aspect-ratio: 1 / 1; }
@@ -862,14 +1063,19 @@ function cleanBlock(raw, ctx) {
     const type = raw && String(raw.type || '');
     const def = BLOCKS[type];
     if (!def) return null;
-    const defaults = def.defaults(ctx);
+    const defaults = { ...BG_DEFAULTS, ...def.defaults(ctx) };
     const props = {};
-    def.fields.forEach((f) => {
+    // The background fields belong to every block and are declared on none of
+    // them — see A PICTURE BEHIND ANY SECTION above.
+    fieldsOf(def).forEach((f) => {
         const given = raw.props ? raw.props[f.key] : undefined;
         props[f.key] = given === undefined ? defaults[f.key] : cleanValue(f, given);
     });
     return { id: line(raw.id, 40) || newId(), type, props };
 }
+
+/** A block's own fields, plus the ones every block has. */
+const fieldsOf = (def) => (def.fields || []).concat(BG_FIELDS);
 
 /**
  * A whole document, cleaned.
@@ -995,7 +1201,8 @@ function pageHtml(doc, page, ctx) {
     const title = page.title ? `${page.title} — ${ctx.name}` : ctx.name;
     const body = page.blocks.map((b) => {
         const def = BLOCKS[b.type];
-        return def ? def.render(b.props, ctx) : '';
+        if (!def) return '';
+        return withBackground(def.render(b.props, ctx), b.props);
     }).filter(Boolean).join('\n');
 
     return `<!DOCTYPE html>
@@ -1094,7 +1301,10 @@ function blankDoc(va, { crewBase } = {}) {
 function newBlock(type, va, { crewBase } = {}) {
     const def = BLOCKS[type];
     if (!def) return null;
-    return { id: newId(), type, props: def.defaults(contextFor(va, { crewBase })) };
+    // BG_DEFAULTS first, so a freshly inserted section has the background
+    // fields the editor is about to draw a form for — without them the picture
+    // controls open empty and the first change writes an incomplete block.
+    return { id: newId(), type, props: { ...BG_DEFAULTS, ...def.defaults(contextFor(va, { crewBase })) } };
 }
 
 /** What the editor draws its palette and its forms from. Content-free. */
@@ -1106,7 +1316,10 @@ function catalogue() {
             note: BLOCKS[id].note,
             icon: BLOCKS[id].icon || 'square',
             live: !!BLOCKS[id].live,
-            fields: BLOCKS[id].fields,
+            // The block's own fields AND the ones every block has. The editor
+            // draws whatever is in this list, so a background arrives on every
+            // section without the editor knowing what a background is.
+            fields: fieldsOf(BLOCKS[id]),
         })),
         limits: { pages: MAX_PAGES, blocks: MAX_BLOCKS, items: MAX_ITEMS },
     };

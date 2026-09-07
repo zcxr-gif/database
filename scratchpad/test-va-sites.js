@@ -451,5 +451,146 @@ console.log('\nthe fleet — a picture for every aircraft, and whose it is');
     T('a drawn outline is contained, not cropped', /data-fit="\{\{fit\}\}"/.test(fleetPage), true);
 }
 
+
+/* ===========================================================================
+ * PICTURES
+ *
+ * A hosted site can now carry photographs, which is a change of position and
+ * not only a feature — see PICTURES in vaSites.js. What is worth testing here
+ * is the part that is easy to get wrong twice: an address a person typed,
+ * ending up somewhere it is not escaped.
+ * ======================================================================== */
+const B = require(path.join('..', 'vaSiteBuilder.js'));
+const bva = { name: 'Ocean Virtual', slug: 'ocean', callsign: 'OCN' };
+const blockOf = (type, props) => {
+    const b = B.newBlock(type, bva, {});
+    Object.assign(b.props, props || {});
+    return b;
+};
+const renderOne = (block) => {
+    const doc = { version: 1, pages: [{ path: 'index.html', title: '', nav: true, navLabel: 'Home', blocks: [block] }] };
+    const html = B.renderSite(doc, { va: bva, templateId: 'horizon' }).find(f => f.path === 'index.html').content;
+    return html.split('<main>')[1].split('</main>')[0];
+};
+
+console.log('\na picture behind any section');
+{
+    const out = renderOne(blockOf('about', { bgImage: 'https://cdn.test/hangar.jpg', bgDim: 70, bgFocus: 'bottom', bgFull: true }));
+    T('the section says it has one', /<section class="block has-bg bleed"/.test(out), true);
+    T('the picture is an <img>, so it can be lazy-loaded',
+        /<span class="has-bg__layer" aria-hidden="true"><img src="https:\/\/cdn\.test\/hangar\.jpg" alt="" loading="lazy"/.test(out), true);
+    // The address goes in an src, never in a style — a stray quote or bracket
+    // in CSS ends the declaration and starts whatever the author fancies.
+    T('…and never in a style attribute', /style="[^"]*url\(/.test(out), false);
+    T('the scrim and the framing are the only things in the style',
+        /style="--dim:0\.7;--bg-pos:50% 100%"/.test(out), true);
+
+    const bare = renderOne(blockOf('about', {}));
+    T('a section with no picture is untouched', /has-bg/.test(bare), false);
+}
+{
+    // The dim is the thing that decides whether the words can be read, so the
+    // floor is applied here rather than trusted from the editor.
+    const dark = renderOne(blockOf('about', { bgImage: 'https://cdn.test/a.jpg', bgDim: 0 }));
+    T('a scrim of nothing is not offered', /--dim:0\.25/.test(dark), true);
+    const blown = renderOne(blockOf('about', { bgImage: 'https://cdn.test/a.jpg', bgDim: 999 }));
+    T('…nor a scrim that is a solid block', /--dim:0\.85/.test(blown), true);
+    const odd = renderOne(blockOf('about', { bgImage: 'https://cdn.test/a.jpg', bgFocus: 'nowhere' }));
+    T('a framing nobody offered falls back to the middle', /--bg-pos:50% 50%/.test(odd), true);
+}
+{
+    // The one that matters. imageUrl() is the same guard every other address
+    // on the page goes through, and a background is not an exception to it.
+    const nasty = renderOne(blockOf('about', { bgImage: 'javascript:alert(1)' }));
+    T('a javascript: address never becomes a background',
+        /javascript:/.test(nasty) || /has-bg/.test(nasty), false);
+    const quoted = renderOne(blockOf('about', { bgImage: 'https://cdn.test/a.jpg"><script>x</script>' }));
+    T('an address with markup in it cannot close the tag', /<script>x<\/script>/.test(quoted), false);
+}
+{
+    // Every block, not a list of blessed ones — the whole point of doing this
+    // once is that a block added next year gets it without being told.
+    const withBg = B.catalogue().blocks.filter(b => b.fields.some(f => f.key === 'bgImage'));
+    T('every section can take a picture behind it', withBg.length, B.catalogue().blocks.length);
+    T('…and the fields are grouped, so a form does not end in four of them',
+        B.catalogue().blocks[0].fields.filter(f => f.key === 'bgImage')[0].group, 'background');
+}
+
+console.log('\nwords beside a picture');
+{
+    const out = renderOne(blockOf('split', { image: 'https://cdn.test/crew.jpg', caption: 'Our crew' }));
+    T('it is two columns', /<div class="split">/.test(out), true);
+    T('the caption is what a screen reader is told', /alt="Our crew"/.test(out), true);
+    T('the picture can go on the other side',
+        /split--reverse/.test(renderOne(blockOf('split', { image: 'https://cdn.test/c.jpg', flip: true }))), true);
+    // A grid with an empty column in it is not a layout.
+    const noPic = renderOne(blockOf('split', { image: '' }));
+    T('with no picture it is a heading and paragraphs, not an empty column',
+        /class="split"/.test(noPic), false);
+    T('…and the words are still there', /class="prose"/.test(noPic), true);
+}
+
+console.log('\na tile is what it does');
+{
+    const g = blockOf('gallery', {
+        lightbox: true,
+        items: [
+            { url: 'https://cdn.test/1.jpg', caption: 'On the line', href: '' },
+            { url: 'https://cdn.test/2.jpg', caption: '', href: 'https://example.com' },
+        ],
+    });
+    const out = renderOne(g);
+    // Three shapes, and which one a tile gets is not a style choice.
+    T('a tile that opens larger is a button', /<button class="shot" type="button" data-shot=/.test(out), true);
+    T('a tile that goes somewhere is a link', /<a class="shot" href="https:\/\/example\.com/.test(out), true);
+    T('…and it opens safely', /rel="noopener"/.test(out), true);
+
+    const plain = renderOne(blockOf('gallery', {
+        lightbox: false, items: [{ url: 'https://cdn.test/1.jpg', caption: 'Logo', href: '' }],
+    }));
+    // Not focusable, because there is nothing to focus. A div with a click
+    // handler is the thing this avoids.
+    T('a tile that does neither is neither', /<figure class="shot">/.test(plain), true);
+    T('an empty gallery renders nothing at all', renderOne(blockOf('gallery', { items: [] })).trim(), '');
+}
+
+console.log('\nthe hero takes a picture');
+{
+    const chosen = renderOne(blockOf('hero', { image: 'https://cdn.test/hero.jpg', banner: true }));
+    T('a chosen picture is used', /<img src="https:\/\/cdn\.test\/hero\.jpg"/.test(chosen), true);
+    // Two photographs fetched to show one, on the element the page paints first.
+    T('…and the crew-centre banner is NOT also fetched', /data-crew-brand="banner"/.test(chosen), false);
+    const fallback = renderOne(blockOf('hero', { image: '', banner: true }));
+    T('with none chosen the Inflight banner is the fallback', /data-crew-brand="banner"/.test(fallback), true);
+    T('…and it is removed rather than left as a gap', /data-crew-figure hidden/.test(fallback), true);
+    const neither = renderOne(blockOf('hero', { image: '', banner: false }));
+    T('a hero with no photograph is a design, not a hole', /hero__bg/.test(neither), false);
+}
+
+console.log('\nthe lightbox');
+{
+    const js = TPL.SITE_JS;
+    T('it is a <dialog>, so the browser supplies the modal behaviour',
+        /createElement\('dialog'\)/.test(js), true);
+    T('…and it is built on first use, not shipped in every page',
+        /if \(!box\) build\(\);/.test(js), true);
+    // A button that does nothing is worse than a tile that was never a button.
+    T('a browser without <dialog> gets links instead of dead buttons',
+        /typeof HTMLDialogElement === 'undefined'/.test(js), true);
+    T('the styles are in the base sheet, so a design can restyle them',
+        /\.lightbox::backdrop/.test(TPL.BASE_CSS), true);
+}
+
+console.log('\nthe picture library');
+{
+    T('a site holds a sensible number of them', S.MAX_MEDIA >= 20 && S.MAX_MEDIA <= 200, true);
+    T('…and a sensible weight', S.MAX_MEDIA_BYTES >= 10 * 1024 * 1024, true);
+    // Whatever it arrives as it is stored as WebP, so this is about what sharp
+    // can DECODE — and about what it must not be handed.
+    T('a picture is a picture', S.MEDIA_MIME.test('image/jpeg') && S.MEDIA_MIME.test('image/png'), true);
+    T('…and a script is not', S.MEDIA_MIME.test('text/html') || S.MEDIA_MIME.test('application/javascript'), false);
+    T('…nor a video', S.MEDIA_MIME.test('video/mp4'), false);
+}
+
 console.log(failures ? `\n${failures} failing\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);
