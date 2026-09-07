@@ -378,6 +378,17 @@ console.log('\nthe header — a menu on a phone, and links without JavaScript');
     const terminalNav = paths(TPL.renderTemplate('terminal', VA, ctx).find(f => f.path === 'index.html').content);
     T('…and links no page it does not', terminalNav.includes('join.html'), false);
 
+    /* The one button in the header is the one that says "Apply".
+     *
+     * Every link in the bar is coloured --muted, and ".bar__nav a" is more
+     * specific than the ".cta" that says --on-accent — so the button renders in
+     * body-copy grey on a block of the accent unless the bar restates it. Both
+     * states, because the hover rule has the same reach. */
+    T('the header\'s apply button is not left in body-copy grey',
+        /\.bar \.cta \{[^}]*color: var\(--on-accent\)/.test(TPL.BASE_CSS), true);
+    T('…on hover either',
+        /\.bar \.cta:hover \{[^}]*color: var\(--on-accent\)/.test(TPL.BASE_CSS), true);
+
     const js = TPL.SITE_JS;
     T('the script marks the document so CSS knows JavaScript ran',
         /setAttribute\('data-js'/.test(js), true);

@@ -780,8 +780,13 @@ h3 { font-size: 1.02rem; margin: 0 0 .4rem; }
 /* The page you are on, marked. site.js sets it from the address, so it is
    right on both of a site's two addresses without anything being hard-coded. */
 .bar__nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
-.bar .cta { margin: 0; padding: .5rem 1rem; font-size: .85rem; }
-.bar .cta:hover { background: var(--accent); }
+/* The Apply button, restated.
+   The rule above colours every link in the bar --muted, and ".bar__nav a" is
+   more specific than the ".cta" that says --on-accent — so without this the
+   one button in the header renders in body-copy grey on a block of the accent.
+   Both states, because the hover rule above has the same reach. */
+.bar .cta { margin: 0; padding: .5rem 1rem; font-size: .85rem; color: var(--on-accent); }
+.bar .cta:hover { background: var(--accent); color: var(--on-accent); }
 
 /* THE BURGER.
 
