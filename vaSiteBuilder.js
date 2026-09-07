@@ -216,7 +216,8 @@ const FOCUS_POS = {
  * goes through — a background-image would put it in CSS, where a stray quote
  * ends the declaration and starts whatever the author fancies.
  */
-function withBackground(html, p) {
+function withBackground(html, p, def) {
+    if (def && def.ownBackground) return html;
     const url = imageUrl(p && p.bgImage);
     if (!url || !html) return html;
 
@@ -250,6 +251,9 @@ const BLOCKS = {
         label: 'Hero',
         note: 'The top of the page: a headline, one sentence, and the apply button.',
         icon: 'panel-top',
+        // It has a picture field of its own, a scrim each design tunes, and a
+        // fallback to the airline's Inflight banner. See fieldsOf.
+        ownBackground: true,
         fields: [
             { key: 'eyebrow', label: 'Small line above', type: 'line', placeholder: 'BAW · Infinite Flight' },
             { key: 'headline', label: 'Headline', type: 'line', placeholder: 'Fly with us.' },
@@ -1074,8 +1078,14 @@ function cleanBlock(raw, ctx) {
     return { id: line(raw.id, 40) || newId(), type, props };
 }
 
-/** A block's own fields, plus the ones every block has. */
-const fieldsOf = (def) => (def.fields || []).concat(BG_FIELDS);
+/** A block's own fields, plus the ones every block has.
+ *
+ *  A block marked `ownBackground` is left alone. The hero already has a picture
+ *  field, its own scrim tuned per design, and a fallback to the airline's
+ *  Inflight banner — offering it a SECOND picture underneath all that is two
+ *  photographs fetched to show one, stacked, with no way to tell from the form
+ *  which is on top. */
+const fieldsOf = (def) => (def.fields || []).concat(def.ownBackground ? [] : BG_FIELDS);
 
 /**
  * A whole document, cleaned.
@@ -1202,7 +1212,7 @@ function pageHtml(doc, page, ctx) {
     const body = page.blocks.map((b) => {
         const def = BLOCKS[b.type];
         if (!def) return '';
-        return withBackground(def.render(b.props, ctx), b.props);
+        return withBackground(def.render(b.props, ctx), b.props, def);
     }).filter(Boolean).join('\n');
 
     return `<!DOCTYPE html>

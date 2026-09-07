@@ -2666,7 +2666,9 @@ startDiscordBot(
       // Full VA teardown: wipes portal accounts, submissions, events, embeds,
       // S3 images and the flight-events webhook for a VA. The bot handles the
       // Discord channel/role + the ad doc itself.
-      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl }) }
+      // CrewSite so a purge also takes the VA's website and every picture they
+      // uploaded onto our storage with it — see purgeVaData.
+      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, CrewSite: vaSites.CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl }) }
 );
 // ---------------------
 

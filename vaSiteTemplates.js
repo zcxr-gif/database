@@ -1383,6 +1383,12 @@ footer p { margin: .3rem 0; max-width: 62ch; }
   /* A section waiting to be scrolled to has never been scrolled to on paper.
      Printing must never hand somebody a page of blanks. */
   [data-reveal] { opacity: 1 !important; transform: none !important; }
+  /* A photographic section is white text on a dark scrim. On paper that is
+     white text on white, because the scrim is a background nobody prints. The
+     picture goes and the words come back in ink. */
+  .has-bg { color: #000 !important; padding-block: 1rem !important; }
+  .has-bg__layer { display: none !important; }
+  .has-bg .tile, .has-bg .card, .has-bg .pill { background: none !important; border-color: #ccc !important; }
   body { background: #fff; color: #000; }
   .card, .tile { break-inside: avoid; border-color: #ccc; }
 }

@@ -508,12 +508,17 @@ console.log('\na picture behind any section');
     T('an address with markup in it cannot close the tag', /<script>x<\/script>/.test(quoted), false);
 }
 {
-    // Every block, not a list of blessed ones — the whole point of doing this
-    // once is that a block added next year gets it without being told.
-    const withBg = B.catalogue().blocks.filter(b => b.fields.some(f => f.key === 'bgImage'));
-    T('every section can take a picture behind it', withBg.length, B.catalogue().blocks.length);
+    /* Every block, not a list of blessed ones — the whole point of doing this
+     * once is that a block added next year gets it without being told. The one
+     * exception opts OUT by declaring that it handles its own picture, which is
+     * a property of that block rather than a list kept somewhere else. */
+    const all = B.catalogue().blocks;
+    const without = all.filter(b => !b.fields.some(f => f.key === 'bgImage')).map(b => b.type);
+    T('every section can take a picture behind it, bar the ones that own theirs',
+        without, ['hero']);
+    const anyBg = all.find(b => b.fields.some(f => f.key === 'bgImage'));
     T('…and the fields are grouped, so a form does not end in four of them',
-        B.catalogue().blocks[0].fields.filter(f => f.key === 'bgImage')[0].group, 'background');
+        anyBg.fields.filter(f => f.key === 'bgImage')[0].group, 'background');
 }
 
 console.log('\nwords beside a picture');
@@ -590,6 +595,49 @@ console.log('\nthe picture library');
     T('a picture is a picture', S.MEDIA_MIME.test('image/jpeg') && S.MEDIA_MIME.test('image/png'), true);
     T('…and a script is not', S.MEDIA_MIME.test('text/html') || S.MEDIA_MIME.test('application/javascript'), false);
     T('…nor a video', S.MEDIA_MIME.test('video/mp4'), false);
+    /* SVG is rasterised by librsvg, which resolves external references — that
+     * is a parser being handed a document a stranger uploaded. The output would
+     * be a safe raster either way; the risk is in the decode, and a vector logo
+     * is not worth it when the same logo as a PNG is. */
+    T('…and an SVG is not decoded at all', S.MEDIA_MIME.test('image/svg+xml'), false);
+    // The list and the sentence that refuses on it are the same list, so they
+    // cannot drift the way they already had once.
+    T('every type we accept is one we say we accept',
+        S.MEDIA_KINDS.filter(k => !S.MEDIA_MIME.test('image/' + k)), []);
+}
+
+
+console.log('\na section that handles its own picture is not given a second');
+{
+    /* The hero has a picture field, a scrim each design tunes, and a fallback to
+     * the airline's Inflight banner. A section background underneath all that is
+     * two photographs fetched to show one, stacked, with no way to tell from the
+     * form which is on top. */
+    const cat = B.catalogue();
+    const hero = cat.blocks.find(b => b.type === 'hero');
+    T('the hero is not offered one', hero.fields.some(f => f.key === 'bgImage'), false);
+    T('every other section still is',
+        cat.blocks.filter(b => b.type !== 'hero' && !b.fields.some(f => f.key === 'bgImage')).map(b => b.type), []);
+
+    // Belt and braces: even a stored document that still carries bgImage on a
+    // hero — written before this, or by hand — must not grow a second layer.
+    const h = B.newBlock('hero', bva, {});
+    h.props.image = 'https://cdn.test/own.jpg';
+    h.props.bgImage = 'https://cdn.test/second.jpg';
+    const out = renderOne(h);
+    T('…and a stored one is ignored rather than rendered underneath',
+        /has-bg__layer/.test(out), false);
+    T('…while the hero keeps its own', /cdn\.test\/own\.jpg/.test(out), true);
+}
+
+console.log('\na photograph is not a background on paper');
+{
+    // White text on a dark scrim is white text on white once the scrim is a
+    // background nobody prints.
+    T('the picture is taken away when printing',
+        /@media print[\s\S]*\.has-bg__layer \{ display: none !important/.test(TPL.BASE_CSS), true);
+    T('…and the words come back in ink',
+        /@media print[\s\S]*\.has-bg \{ color: #000 !important/.test(TPL.BASE_CSS), true);
 }
 
 console.log(failures ? `\n${failures} failing\n` : '\nAll good.\n');

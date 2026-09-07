@@ -172,9 +172,25 @@ const PREVIEW_TTL_MS = 30 * 60 * 1000;    // a preview token lasts half an hour
  * ------------------------------------------------------------------------ */
 const MAX_MEDIA = 60;
 const MAX_MEDIA_BYTES = 60 * 1024 * 1024;
-// The types sharp will take and we are willing to re-encode. Everything is
-// stored as WebP whatever it arrived as, so this is about what we can DECODE.
-const MEDIA_MIME = /^image\/(jpeg|png|webp|gif|avif|tiff|svg\+xml)$/i;
+/* WHAT WE WILL DECODE.
+ *
+ * Everything is stored as WebP whatever it arrived as, so this is only about
+ * what sharp is asked to read — and the list is deliberately shorter than what
+ * sharp can manage.
+ *
+ * SVG IS NOT ON IT. sharp rasterises SVG through librsvg, which means handing a
+ * parser that resolves external references a document a stranger uploaded. The
+ * output would be a safe raster either way; the risk is in the decode, and a
+ * vector logo is not worth it when the same logo as a PNG is.
+ *
+ * TIFF is off for a duller reason: nobody uploads one from a phone or a
+ * screenshot, and every format on this list is one more decoder exposed.
+ *
+ * The names are written once and the refusal message is built from them, so the
+ * two can never drift — which they already had. */
+const MEDIA_KINDS = ['jpeg', 'png', 'webp', 'gif', 'avif'];
+const MEDIA_MIME = new RegExp('^image/(' + MEDIA_KINDS.join('|') + ')$', 'i');
+const MEDIA_KINDS_SAID = 'JPEG, PNG, WebP, GIF or AVIF';
 const MAX_ALT_LEN = 160;
 const MAX_MEDIA_NAME = 80;
 
@@ -1499,15 +1515,60 @@ function registerVaSiteRoutes(app, {
 
     const mediaId = () => 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+    /* Let an object go, and never let that be the reason a request fails.
+     *
+     * Not awaited anywhere it is called: the row is already the truth by then,
+     * and a bucket that is slow to answer must not hold up telling the VA their
+     * picture is gone. A failure is logged with the key, because that log line
+     * is the only trace of an object nothing points at any more. */
+    const dropObject = (url) => {
+        if (!url || typeof deleteVaImage !== 'function') return;
+        Promise.resolve()
+            .then(() => deleteVaImage(s3Client, url))
+            .catch((err) => console.error('VA site media: object left behind', url, err && err.message));
+    };
+
+    /* logActivity takes ONE object and returns nothing — it is fire-and-forget
+     * onto a Discord channel. Wrapped here because calling it with the wrong
+     * shape is silent, and chaining .catch() onto its undefined return is not:
+     * it throws inside the route that just succeeded, and the VA is told their
+     * upload failed after it worked. */
+    const note = (req, va, action, detail) => {
+        if (typeof logActivity !== 'function') return;
+        try {
+            logActivity({
+                vaAdId: va && va._id, vaName: (va && va.name) || '',
+                actorName: actorName(req), actorRole: actorOf(req).role,
+                action, detail: detail || '',
+            });
+        } catch (err) {
+            console.error('VA site activity log error:', err && err.message);
+        }
+    };
+
     const cleanAlt = (v) => String(v == null ? '' : v)
         .replace(/[\x00-\x1F\x7F]/g, ' ').trim().slice(0, MAX_ALT_LEN);
     const cleanName = (v) => String(v == null ? '' : v)
         .replace(/[\x00-\x1F\x7F]/g, ' ').trim().slice(0, MAX_MEDIA_NAME);
 
+    /* IS THERE ANYWHERE TO PUT A PICTURE.
+     *
+     * Three things have to be present, and on a deployment without S3 none of
+     * them is: the multer middleware, the upload helper, and a bucket name.
+     * Without the bucket in particular the helper would happily build
+     * `https://undefined.s3.undefined.amazonaws.com/...` and we would store that
+     * as if it were an address — a library full of rows pointing at nothing,
+     * discovered by a VA whose pictures are all broken.
+     *
+     * Better to say so at the door. */
+    const canStorePictures = () => !!(upload && upload.single)
+        && typeof uploadVaImageMeta === 'function'
+        && !!process.env.AWS_S3_BUCKET_NAME;
+
     // Multer's own limit rejects with an error rather than a JSON body, and a
     // VA who picked a 40 MB photograph should be told that in words.
     const withUpload = (req, res, next) => {
-        if (typeof upload !== 'function' && !(upload && upload.single)) {
+        if (!canStorePictures()) {
             return res.status(501).json({ error: 'Picture uploads are not configured on this deployment.' });
         }
         upload.single('file')(req, res, (err) => {
@@ -1534,7 +1595,7 @@ function registerVaSiteRoutes(app, {
             if (!file) return res.status(400).json({ error: 'No picture arrived. Choose a file and try again.' });
             if (!MEDIA_MIME.test(String(file.mimetype || ''))) {
                 return res.status(415).json({
-                    error: 'That is not a picture we can use. JPEG, PNG, WebP, GIF or AVIF.',
+                    error: `That is not a picture we can use. ${MEDIA_KINDS_SAID}.`,
                 });
             }
 
@@ -1569,7 +1630,7 @@ function registerVaSiteRoutes(app, {
             // The real cost, now that sharp has had it. Over the line, the
             // object is removed again rather than left paid for and unusable.
             if (used + stored.bytes > MAX_MEDIA_BYTES) {
-                deleteVaImage(s3Client, stored.url).catch(() => {});
+                dropObject(stored.url);
                 return res.status(413).json({
                     error: `That picture would take you over the ${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)} MB this site has for pictures. Delete one to make room.`,
                 });
@@ -1589,10 +1650,25 @@ function registerVaSiteRoutes(app, {
             };
             library.push(row);
             site.markModified('media');
-            await site.save();
-            if (logActivity) {
-                logActivity(req, 'site.media.add', { name: row.name, bytes: row.bytes }).catch(() => {});
+
+            /* THE SAVE IS WHERE AN ORPHAN COMES FROM.
+             *
+             * The object is on S3 by now. If writing the row fails — a
+             * VersionError from a concurrent save, a dropped connection — the
+             * picture exists in the bucket and nothing points at it, and nobody
+             * will ever know it is there. So the object is removed again and the
+             * VA is told the upload failed, which is true.
+             *
+             * This is why there is no orphan sweep: an orphan is created in
+             * exactly one place, and it is cleaned up in that place. */
+            try {
+                await site.save();
+            } catch (err) {
+                dropObject(stored.url);
+                throw err;
             }
+
+            note(req, r.va, 'Added a picture to their website', row.name);
             res.json(publicSite(site, r.va));
         } catch (err) {
             console.error('VA site media upload error:', err);
@@ -1639,10 +1715,8 @@ function registerVaSiteRoutes(app, {
              * not awaited. A picture a VA has asked to remove must stop being on
              * their website whatever the bucket says — a leaked object is a
              * sweep, and a picture that will not go away is a complaint. */
-            deleteVaImage(s3Client, row.url).catch((err) => {
-                console.error('VA site media: object left behind', row.url, err && err.message);
-            });
-            if (logActivity) logActivity(req, 'site.media.remove', { name: row.name }).catch(() => {});
+            dropObject(row.url);
+            note(req, r.va, 'Removed a picture from their website', row.name);
 
             /* A block still pointing at it is NOT hunted down and rewritten.
              * The builder stores the URL, the page keeps rendering it, and the
@@ -1969,11 +2043,7 @@ function registerVaSiteRoutes(app, {
             site.media = library;
             site.markModified('media');
             await site.save();
-            if (typeof deleteVaImage === 'function') {
-                deleteVaImage(s3Client, row.url).catch((err) => {
-                    console.error('VA site media: object left behind', row.url, err && err.message);
-                });
-            }
+            dropObject(row.url);
             res.json({ ok: true, removed: { id: row.id, name: row.name || '', url: row.url } });
         } catch (err) {
             console.error('VA site media takedown error:', err);
@@ -2002,7 +2072,7 @@ function registerVaSiteRoutes(app, {
 module.exports = {
     CrewSite,
     MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_VERSIONS, PREVIEW_TTL_MS,
-    MAX_MEDIA, MAX_MEDIA_BYTES, MEDIA_MIME,
+    MAX_MEDIA, MAX_MEDIA_BYTES, MEDIA_MIME, MEDIA_KINDS,
     TYPES, PREVIEW_PREFIX, DOMAIN,
     cleanPath, extOf, bytesOf, layOutTemplate,
     parseSiteHost, siteUrlFor, pickFile, registrableGuess,
