@@ -164,19 +164,109 @@ function prose(body, cls) {
  * one, and the answer — it is your crew centre, change it there and it changes
  * here — is the entire point of the feature.
  * ======================================================================== */
+/* ---------------------------------------------------------------------------
+ * A PICTURE BEHIND ANY SECTION
+ *
+ * The one thing a page builder is judged on. Every block gets it, and no block
+ * implements it: the three fields are appended to every definition below, and
+ * the markup is wrapped around whatever the block rendered.
+ *
+ * WHY WRAPPING RATHER THAN TWENTY EDITS. There are twenty-odd blocks and there
+ * will be more. Teaching each one about backgrounds means twenty places for the
+ * scrim to be forgotten, and the scrim is the part that decides whether the
+ * words can be read. One transform is one place to be right.
+ *
+ * It is a controlled transform over markup THIS FILE authors — every block
+ * returns a section element as its first tag — and it no-ops rather than
+ * guesses when it does not recognise what it is given, so a block that returns
+ * an empty string (as several do when they have nothing to show) is untouched.
+ * ------------------------------------------------------------------------ */
+const BG_FIELDS = [
+    { key: 'bgImage', label: 'Picture behind this section', type: 'image', group: 'background' },
+    {
+        key: 'bgDim', label: 'How dark over it', type: 'number', min: 25, max: 85, group: 'background',
+        help: 'White words over an unknown photograph are unreadable often enough that some shade is always applied.',
+    },
+    {
+        key: 'bgFocus', label: 'Keep this part in frame', type: 'select', group: 'background',
+        options: [
+            { value: 'center', label: 'The middle' },
+            { value: 'top', label: 'The top' },
+            { value: 'bottom', label: 'The bottom' },
+            { value: 'left', label: 'The left' },
+            { value: 'right', label: 'The right' },
+        ],
+        help: 'Which part survives when the section is narrower than the picture.',
+    },
+    { key: 'bgFull', label: 'Run it edge to edge', type: 'bool', group: 'background' },
+];
+
+const BG_DEFAULTS = { bgImage: '', bgDim: 55, bgFocus: 'center', bgFull: false };
+
+const FOCUS_POS = {
+    center: '50% 50%', top: '50% 0%', bottom: '50% 100%', left: '0% 50%', right: '100% 50%',
+};
+
+/**
+ * The section, with the picture behind it.
+ *
+ * Nothing is written into a style attribute except two numbers this file
+ * produced: the dim as a decimal and a position from a fixed table. The URL
+ * goes in an `src`, which is the same escaping every other address on the page
+ * goes through — a background-image would put it in CSS, where a stray quote
+ * ends the declaration and starts whatever the author fancies.
+ */
+function withBackground(html, p, def) {
+    if (def && def.ownBackground) return html;
+    const url = imageUrl(p && p.bgImage);
+    if (!url || !html) return html;
+
+    // The opening tag of the section this block rendered. Matched rather than
+    // assumed: a block that returned '' or something with no section is handed
+    // back untouched.
+    const open = /^(\s*)<section\b([^>]*)>/.exec(html);
+    if (!open) return html;
+
+    const attrs = open[2];
+    const dim = Math.min(85, Math.max(25, Number(p.bgDim) || 55)) / 100;
+    const pos = FOCUS_POS[p.bgFocus] || FOCUS_POS.center;
+    const extra = `has-bg${p.bgFull ? ' bleed' : ''}`;
+
+    // Fold the classes into the existing attribute rather than adding a second
+    // class attribute, which is invalid and silently ignored by every parser.
+    const withClass = /class="([^"]*)"/.test(attrs)
+        ? attrs.replace(/class="([^"]*)"/, (_, c) => `class="${c} ${extra}"`)
+        : `${attrs} class="${extra}"`;
+
+    const style = `--dim:${dim};--bg-pos:${pos}`;
+    const layer = `\n    <span class="has-bg__layer" aria-hidden="true">`
+        + `<img src="${esc(url)}" alt="" loading="lazy" decoding="async"></span>`;
+
+    return open[1] + `<section${withClass} style="${style}">` + layer + html.slice(open[0].length);
+}
+
 const BLOCKS = {
 
     hero: {
         label: 'Hero',
         note: 'The top of the page: a headline, one sentence, and the apply button.',
         icon: 'panel-top',
+        // It has a picture field of its own, a scrim each design tunes, and a
+        // fallback to the airline's Inflight banner. See fieldsOf.
+        ownBackground: true,
         fields: [
             { key: 'eyebrow', label: 'Small line above', type: 'line', placeholder: 'BAW · Infinite Flight' },
             { key: 'headline', label: 'Headline', type: 'line', placeholder: 'Fly with us.' },
             { key: 'lede', label: 'One sentence', type: 'text', help: 'What your airline is for, in your own words.' },
             { key: 'ctaLabel', label: 'Button', type: 'line', placeholder: 'Apply to fly' },
             { key: 'ctaHref', label: 'Button goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
-            { key: 'banner', label: 'Use your banner as the background', type: 'bool' },
+            { key: 'ctaLabel2', label: 'Second button', type: 'line', help: 'Optional. A quieter one beside the first.' },
+            { key: 'ctaHref2', label: 'That one goes to', type: 'url', help: 'Left empty, it goes to your crew centre.' },
+            {
+                key: 'image', label: 'Picture behind the hero', type: 'image',
+                help: 'Choose one of your pictures. Left empty, your Inflight banner is used if you have one.',
+            },
+            { key: 'banner', label: 'Fall back to your Inflight banner', type: 'bool' },
         ],
         defaults: (c) => ({
             eyebrow: `${c.callsign || 'Virtual airline'} · Infinite Flight`,
@@ -184,20 +274,43 @@ const BLOCKS = {
             lede: 'One sentence about what your airline is for. The numbers underneath look after themselves.',
             ctaLabel: 'Apply to fly',
             ctaHref: '',
+            ctaLabel2: '',
+            ctaHref2: '',
+            image: '',
             banner: true,
         }),
-        render: (p, c) => `
-  <section class="hero">${p.banner ? `
-    <div class="hero__bg" data-crew-figure hidden>
-      <img data-crew-brand="banner" alt="" loading="eager" decoding="async">
-    </div>` : ''}
+        /* TWO SOURCES FOR ONE PICTURE, and only ever one of them on the page.
+         *
+         * A picture chosen here wins, because it was chosen for this hero. The
+         * Inflight banner is the fallback and is [data-crew-figure], so a VA
+         * who has neither gets a hero with no photograph — a design — rather
+         * than a gap where one should be, which is a fault.
+         *
+         * Rendering both and hiding one would mean fetching two photographs to
+         * show one, on the element the page paints first. */
+        render: (p, c) => {
+            const bg = p.image
+                ? `\n    <div class="hero__bg">`
+                    + `\n      <img src="${esc(p.image)}" alt="" loading="eager" decoding="async" fetchpriority="high">`
+                    + `\n    </div>`
+                : (p.banner ? `\n    <div class="hero__bg" data-crew-figure hidden>`
+                    + `\n      <img data-crew-brand="banner" alt="" loading="eager" decoding="async" fetchpriority="high">`
+                    + `\n    </div>` : '');
+            const buttons = [
+                p.ctaLabel ? `<a class="cta" href="${esc(linkUrl(p.ctaHref, c.join))}">${esc(p.ctaLabel)}</a>` : '',
+                p.ctaLabel2 ? `<a class="cta cta--ghost" href="${esc(linkUrl(p.ctaHref2, c.crew))}">${esc(p.ctaLabel2)}</a>` : '',
+            ].filter(Boolean);
+            return `
+  <section class="hero" data-motif>${bg}
     <div class="hero__in">${p.eyebrow ? `
       <p class="eyebrow">${esc(p.eyebrow)}</p>` : ''}
       <h1>${esc(p.headline)}</h1>${p.lede ? `
-${prose(p.lede, 'lede')}` : ''}${p.ctaLabel ? `
-      <a class="cta" href="${esc(linkUrl(p.ctaHref, c.join))}">${esc(p.ctaLabel)}</a>` : ''}
+${prose(p.lede, 'lede')}` : ''}${buttons.length ? `
+      <div class="actions">${buttons.map(b => `\n        ${b}`).join('')}
+      </div>` : ''}
     </div>
-  </section>`,
+  </section>`;
+        },
     },
 
     figures: {
@@ -267,15 +380,243 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
         live: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'cards', label: 'Show each aircraft as a picture card', type: 'bool', help: 'Off, it is a compact list. Every card gets an image even where you have not uploaded one.' },
             { key: 'limit', label: 'How many', type: 'number', min: 1, max: 40 },
         ],
-        defaults: () => ({ heading: 'The fleet', limit: 16 }),
-        render: (p) => `
+        defaults: () => ({ heading: 'The fleet', note: '', limit: 16, cards: true }),
+        /* Two shapes, because a fleet of four and a fleet of forty want
+         * different pages. Cards give every airframe a picture — the VA's own
+         * livery shot, or the silhouette crew-feed.js draws for the type, so
+         * there is never a hole in the grid. Rows are the compact form for a
+         * long fleet, and both carry {{credit}}: where a picture is somebody
+         * else's it says whose and links back, and crew-feed.js removes the
+         * line when there is nothing to attribute. */
+        render: (p) => (p.cards ? `
   <section class="block">
-    <h2>${esc(p.heading)}</h2>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="cards" data-crew-list="fleet" data-crew-limit="${p.limit}">
+      <template>
+        <li class="card">
+          <span class="card__media"><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async"></span>
+          <span class="card__body">
+            <b>{{aircraft}}</b>
+            <span>{{livery}}</span>
+            <span class="card__credit">{{credit}}</span>
+          </span>
+        </li>
+      </template>
+      <li class="card"><span class="card__body"><b>Add your fleet in the crew centre</b><span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></span></li>
+    </ul>
+  </section>` : `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
     <ul class="rows" data-crew-list="fleet" data-crew-limit="${p.limit}">
       <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{aircraft}}</b> <span>{{livery}}</span></li></template>
       <li><b>Add your fleet in the crew centre</b> <span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></li>
+    </ul>
+  </section>`),
+    },
+
+    /* ---- The airline as an airline, not as a dataset --------------------
+     *
+     * The five blocks below are the ones a VA kept asking for and had to fake
+     * with a paragraph of prose: where we are based, what we are like, who runs
+     * it, who we fly with, and what actually happens when you apply.
+     *
+     * Two of them read from the crew centre and three are the VA's own words,
+     * and the split is deliberate. Hubs and codeshares are FACTS the crew
+     * centre already holds — a route map knows which airports carry the most
+     * sectors and which of them are flown with somebody else, so typing either
+     * by hand is typing something that will be wrong by next month. A culture
+     * is not a fact and there is no field for one, which is exactly why it is
+     * the thing missing from every VA website on the platform.
+     * ------------------------------------------------------------------ */
+
+    hubs: {
+        label: 'Hubs',
+        note: 'The airports you fly most out of, worked out from your route map.',
+        icon: 'building-2',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 12 },
+        ],
+        defaults: () => ({ heading: 'Where we are based', note: 'The airports we fly most of our sectors out of.', limit: 6 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles" data-crew-list="hubs" data-crew-limit="${p.limit}">
+      <template><li class="tile"><b class="code">{{icao}}</b><span>{{routes}} routes &middot; {{departures}} departures</span></li></template>
+    </ul>
+  </section>`,
+    },
+
+    values: {
+        label: 'How we fly',
+        note: 'The three or four things that make your airline itself. Nothing here is fed from anywhere.',
+        icon: 'heart',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'items', label: 'Things', type: 'list', max: 8, of: [
+                    { key: 'title', label: 'Called', type: 'line' },
+                    { key: 'body', label: 'One sentence', type: 'line' },
+                ],
+            },
+        ],
+        defaults: () => ({
+            heading: 'How we fly', note: '',
+            items: [
+                { title: 'We fly together', body: 'A group flight every week, on the same day, whoever turns up.' },
+                { title: 'Nobody is chased', body: 'Fly when you want to. There is no monthly minimum and no leaderboard.' },
+                { title: 'Realistic, not strict', body: 'Real routes and real liveries. Nobody is told off for a hard landing.' },
+            ],
+        }),
+        render: (p) => `
+  <section class="block" data-motif>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles">
+${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>${esc(i.body)}</span></li>`).join('\n')}
+    </ul>
+  </section>`,
+    },
+
+    /* Roles, never names. A staff list on a public page goes out of date the
+     * week somebody steps down, and it puts real people's handles somewhere
+     * anybody can scrape. The departments are the useful half and the half that
+     * stays true. */
+    staff: {
+        label: 'Who runs it',
+        note: 'Your crew centre roles, as a row of labels. Roles only — never who holds one.',
+        icon: 'users',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 20 },
+        ],
+        defaults: () => ({ heading: 'Who runs the airline', note: 'The teams behind the operation.', limit: 14 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="pills" data-crew-list="roles" data-crew-limit="${p.limit}">
+      <template><li class="pill"><span class="dot" style="background:{{color}}"></span>{{name}}</li></template>
+    </ul>
+  </section>`,
+    },
+
+    partners: {
+        label: 'Codeshares',
+        note: 'The airlines you share sectors with, read off your route map.',
+        icon: 'handshake',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 20 },
+        ],
+        defaults: () => ({ heading: 'We fly with', limit: 12 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head"><h2>${esc(p.heading)}</h2></div>
+    <ul class="pills" data-crew-list="partners" data-crew-limit="${p.limit}">
+      <template><li class="pill">{{name}}</li></template>
+    </ul>
+  </section>`,
+    },
+
+    /* The numbers are drawn by a CSS counter rather than typed, so reordering
+     * the steps in the editor cannot leave a 3 above a 2. */
+    joining: {
+        label: 'What happens when you apply',
+        note: 'Numbered steps. The question every applicant has and almost no VA answers.',
+        icon: 'list-ordered',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'items', label: 'Steps', type: 'list', max: 8, of: [
+                    { key: 'title', label: 'Called', type: 'line' },
+                    { key: 'body', label: 'One sentence', type: 'line' },
+                ],
+            },
+            { key: 'ctaLabel', label: 'Link under the steps', type: 'line' },
+            { key: 'ctaHref', label: 'That link goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
+        ],
+        defaults: () => ({
+            heading: 'What happens when you apply', note: '',
+            items: [
+                { title: 'You send the form', body: 'A few minutes, in the crew centre. No essay.' },
+                { title: 'A person reads it', body: 'Usually within a day or two. You get a real answer either way.' },
+                { title: 'You get your callsign', body: 'And the crew centre account that goes with it.' },
+                { title: 'You fly', body: 'Pick any sector on the schedule. Nobody minds where you start.' },
+            ],
+            ctaLabel: 'Start an application', ctaHref: '',
+        }),
+        render: (p, ctx) => `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles tiles--numbered">
+${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>${esc(i.body)}</span></li>`).join('\n')}
+    </ul>${p.ctaLabel ? `\n    <p class="more"><a href="${esc(linkUrl(p.ctaHref, ctx.join))}">${esc(p.ctaLabel)} &rarr;</a></p>` : ''}
+  </section>`,
+    },
+
+    quote: {
+        label: 'A quote',
+        note: 'One line, set large. Worth having once on a site and nothing twice.',
+        icon: 'quote',
+        fields: [
+            { key: 'body', label: 'What was said', type: 'text' },
+            { key: 'by', label: 'Who said it', type: 'line' },
+        ],
+        defaults: () => ({
+            body: 'A line from one of your pilots about their first week is worth more than a paragraph you wrote about yourselves.',
+            by: 'A pilot, somewhere over the Atlantic',
+        }),
+        render: (p) => `
+  <section class="block">
+    <figure class="quote">
+      <p>&ldquo;${esc(p.body)}&rdquo;</p>${p.by ? `\n      <figcaption class="by">${esc(p.by)}</figcaption>` : ''}
+    </figure>
+  </section>`,
+    },
+
+    /* The Discord invite comes from the crew centre rather than from a field
+     * here, so it cannot rot into a dead link the week the server is remade. */
+    contact: {
+        label: 'Talk to us',
+        note: 'Discord, the crew centre and the application, in three tiles.',
+        icon: 'message-circle',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'showDiscord', label: 'Show your Discord invite', type: 'bool', help: 'The one in your crew centre. The tile goes if you have not set one.' },
+        ],
+        defaults: () => ({ heading: 'Talk to us', note: 'Before you apply, or after. Either is fine.', showDiscord: true }),
+        render: (p, ctx) => `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles">${p.showDiscord ? `
+      <li class="tile" data-crew-figure><b>Discord</b><span>Where the airline actually lives. <a data-crew-brand="discord" href="#">Join the server</a></span></li>` : ''}
+      <li class="tile"><b>The crew centre</b><span>Schedules, reports and the noticeboard. <a href="${esc(ctx.crew)}">Open it</a></span></li>
+      <li class="tile"><b>Apply</b><span>A few minutes, and a human answer. <a href="${esc(ctx.join)}">Start</a></span></li>
     </ul>
   </section>`,
     },
@@ -414,34 +755,127 @@ ${prose(p.body)}
   </section>`,
     },
 
+    /* WORDS BESIDE A PICTURE.
+     *
+     * The layout every airline wants for "who we are" and the one a stack of
+     * full-width sections cannot produce. Two columns on a wide screen, one on
+     * a phone — and on a phone the PICTURE goes first whichever side it was on,
+     * because a column that reads picture-then-words on one section and
+     * words-then-picture on the next reads as a mistake.
+     */
+    split: {
+        label: 'Words beside a picture',
+        note: 'Two columns on a screen, one on a phone. The layout every airline wants for "who we are".',
+        icon: 'columns-2',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'body', label: 'Words', type: 'text', help: 'Leave a blank line between paragraphs.' },
+            { key: 'image', label: 'Picture', type: 'image' },
+            { key: 'caption', label: 'Under the picture', type: 'line' },
+            { key: 'flip', label: 'Picture on the left', type: 'bool' },
+            { key: 'ctaLabel', label: 'Button', type: 'line' },
+            { key: 'ctaHref', label: 'Button goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
+        ],
+        defaults: () => ({
+            heading: 'Who we are',
+            body: 'Two or three sentences about the airline, next to a picture of one of your aircraft.'
+                + '\n\nAnybody who wants the detail will read your operations manual — this is the part they read first.',
+            image: '', caption: '', flip: false, ctaLabel: '', ctaHref: '',
+        }),
+        render: (p, ctx) => {
+            // A split with no picture is a heading and two paragraphs, which is
+            // the `text` block — so it renders as one rather than as a grid with
+            // an empty column in it.
+            const media = p.image
+                ? `\n      <div class="split__media">`
+                    + `<img src="${esc(p.image)}" alt="${esc(p.caption)}" loading="lazy" decoding="async">`
+                    + `</div>`
+                : '';
+            const cta = p.ctaLabel
+                ? `\n        <a class="cta" href="${esc(linkUrl(p.ctaHref, ctx.join))}">${esc(p.ctaLabel)}</a>`
+                : '';
+            const words = `\n      <div>`
+                + `\n        <div class="block__head"><h2>${esc(p.heading)}</h2></div>`
+                + `\n${prose(p.body, 'prose')}${cta}`
+                + `\n      </div>`;
+            if (!media) {
+                return `
+  <section class="block">
+    <div class="block__head"><h2>${esc(p.heading)}</h2></div>
+${prose(p.body, 'prose')}${cta}
+  </section>`;
+            }
+            return `
+  <section class="block">
+    <div class="split${p.flip ? ' split--reverse' : ''}">${words}${media}
+    </div>
+  </section>`;
+        },
+    },
+
+    /* THE GALLERY.
+     *
+     * Three shapes for a tile, and which one it gets is not a style choice —
+     * it is what the tile DOES:
+     *
+     *   <a>       it goes somewhere. A link.
+     *   <button>  it opens the picture larger. A control.
+     *   <figure>  it does neither. Not focusable, because there is nothing to
+     *             focus — a div with a click handler is the thing this avoids.
+     *
+     * The lightbox is opt-in per gallery rather than always on: a strip of
+     * partner logos is not something anybody wants to see at 1600px.
+     */
     gallery: {
         label: 'Pictures',
-        note: 'Screenshots, on a grid. Paste the address of each one.',
+        note: 'A grid of photographs. Choose them from your pictures, or paste an address.',
         icon: 'image',
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
             {
-                key: 'items', label: 'Pictures', type: 'list', max: 12, of: [
-                    { key: 'url', label: 'Image address', type: 'image', placeholder: 'https://…' },
+                key: 'size', label: 'Tile size', type: 'select',
+                options: [
+                    { value: 'normal', label: 'Normal' },
+                    { value: 'tight', label: 'Small' },
+                ],
+            },
+            {
+                key: 'lightbox', label: 'Open a picture larger when it is clicked', type: 'bool',
+                help: 'Off for a strip of logos; on for photographs.',
+            },
+            {
+                key: 'items', label: 'Pictures', type: 'list', max: 24, of: [
+                    { key: 'url', label: 'Picture', type: 'image', placeholder: 'https://…' },
                     { key: 'caption', label: 'Caption', type: 'line' },
-                    { key: 'href', label: 'Links to', type: 'url' },
+                    { key: 'href', label: 'Links to', type: 'url', help: 'Left empty, it opens larger instead.' },
                 ],
             },
         ],
-        defaults: () => ({ heading: 'On the line', items: [] }),
+        defaults: () => ({ heading: 'The airline, photographed', note: '', size: 'normal', lightbox: true, items: [] }),
         render: (p) => {
             const tiles = (p.items || []).filter(i => i.url).map((i) => {
+                // alt falls back to the caption and is empty when there is
+                // neither — an empty alt on a decorative tile is correct, and a
+                // filename read aloud is worse than silence.
                 const img = `<img src="${esc(i.url)}" alt="${esc(i.caption)}" loading="lazy" decoding="async">`;
-                const inner = i.caption ? `${img}<span>${esc(i.caption)}</span>` : img;
-                return i.href
-                    ? `      <a class="shot" href="${esc(linkUrl(i.href, ''))}" target="_blank" rel="noopener">${inner}</a>`
-                    : `      <figure class="shot">${inner}</figure>`;
+                const cap = i.caption ? `<figcaption>${esc(i.caption)}</figcaption>` : '';
+                if (i.href) {
+                    return `      <a class="shot" href="${esc(linkUrl(i.href, ''))}" target="_blank" rel="noopener">${img}${cap}</a>`;
+                }
+                if (p.lightbox) {
+                    return `      <button class="shot" type="button" data-shot="${esc(i.url)}"`
+                        + ` data-caption="${esc(i.caption)}" aria-label="${esc(i.caption || 'Open this picture larger')}">${img}${cap}</button>`;
+                }
+                return `      <figure class="shot">${img}${cap}</figure>`;
             }).join('\n');
             if (!tiles) return '';
             return `
   <section class="block">
-    <h2>${esc(p.heading)}</h2>
-    <div class="shots">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="shots${p.size === 'tight' ? ' shots--tight' : ''}">
 ${tiles}
     </div>
   </section>`;
@@ -578,13 +1012,12 @@ const BLOCK_IDS = Object.keys(BLOCKS);
  * it, and written in the same custom properties so it inherits the theme.
  * ------------------------------------------------------------------------ */
 const BUILDER_CSS = `
-/* ---- Blocks added by the builder ------------------------------------- */
-.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .8rem; }
-.shot { margin: 0; display: block; border-radius: var(--radius); overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
-.shot img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; }
-.shot span { display: block; padding: .55rem .7rem; font-size: .82rem; color: var(--muted); }
-a.shot { text-decoration: none; }
-a.shot:hover { border-color: var(--accent); }
+/* ---- Blocks added by the builder -------------------------------------
+
+   The picture grid, the lightbox and the section background are NOT here: they
+   are in the base stylesheet, because a hand-written site can use all three and
+   a design has to be able to restyle them. What is left is the one thing only a
+   builder block produces. */
 .frame { position: relative; width: 100%; border-radius: var(--radius); overflow: hidden; background: var(--surface); border: 1px solid var(--line); }
 .frame--wide { aspect-ratio: 16 / 9; }
 .frame--square { aspect-ratio: 1 / 1; }
@@ -634,14 +1067,25 @@ function cleanBlock(raw, ctx) {
     const type = raw && String(raw.type || '');
     const def = BLOCKS[type];
     if (!def) return null;
-    const defaults = def.defaults(ctx);
+    const defaults = { ...BG_DEFAULTS, ...def.defaults(ctx) };
     const props = {};
-    def.fields.forEach((f) => {
+    // The background fields belong to every block and are declared on none of
+    // them — see A PICTURE BEHIND ANY SECTION above.
+    fieldsOf(def).forEach((f) => {
         const given = raw.props ? raw.props[f.key] : undefined;
         props[f.key] = given === undefined ? defaults[f.key] : cleanValue(f, given);
     });
     return { id: line(raw.id, 40) || newId(), type, props };
 }
+
+/** A block's own fields, plus the ones every block has.
+ *
+ *  A block marked `ownBackground` is left alone. The hero already has a picture
+ *  field, its own scrim tuned per design, and a fallback to the airline's
+ *  Inflight banner — offering it a SECOND picture underneath all that is two
+ *  photographs fetched to show one, stacked, with no way to tell from the form
+ *  which is on top. */
+const fieldsOf = (def) => (def.fields || []).concat(def.ownBackground ? [] : BG_FIELDS);
 
 /**
  * A whole document, cleaned.
@@ -716,25 +1160,46 @@ function navHtml(doc, ctx) {
     });
     if (doc.nav.showCrew) links.push(`      <a href="${esc(ctx.crew)}">${esc(doc.nav.crewLabel)}</a>`);
     const apply = doc.nav.showApply ? `\n      <a class="cta" href="${esc(ctx.join)}">${esc(doc.nav.applyLabel)}</a>` : '';
-    return `<header class="bar">
+    /* The same header a template renders, down to the attribute names — see
+     * BLOCKS.nav in vaSiteTemplates.js. The burger ships HIDDEN and site.js
+     * reveals it, so a builder page with no JavaScript is a plain wrapping row
+     * of links rather than a button that does nothing over a panel that never
+     * opens. The scrim is a <button> so that tapping outside the open panel is
+     * a real, announced way to close it. */
+    return `<header class="bar" data-bar>
   <div class="bar__in">
     <a class="mark" href="./">
       <span class="logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
       <span data-crew-brand="name">${esc(ctx.name)}</span>
     </a>
-    <nav>
+    <button class="bar__burger" type="button" aria-expanded="false" aria-controls="siteNav" aria-label="Menu" hidden><i></i></button>
+    <nav class="bar__nav" id="siteNav">
 ${links.join('\n')}${apply}
     </nav>
   </div>
-</header>`;
+</header>
+<button class="bar__scrim" type="button" tabindex="-1" aria-label="Close the menu" hidden></button>`;
 }
 
 function footerHtml(doc, ctx) {
     const note = doc.footer.note
         || `${ctx.name} is a virtual airline on Infinite Flight. Not affiliated with any real-world carrier.`;
+    const links = doc.pages.filter(p => p.nav).map((p) => {
+        const label = p.navLabel || p.title || (p.path === 'index.html' ? 'Home' : p.path.replace(/\.html$/, ''));
+        return `      <a href="${p.path === 'index.html' ? './' : esc(p.path)}">${esc(label)}</a>`;
+    });
+    links.push(`      <a href="${esc(ctx.crew)}">Crew centre</a>`);
+    links.push(`      <a href="${esc(ctx.join)}">Apply</a>`);
     return `<footer>
-  <p>${esc(note)}</p>
-  <p>Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a>.</p>
+  <div class="foot__in">
+    <div>
+      <p>${esc(note)}</p>
+      <p>Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a>.</p>
+    </div>
+    <div class="foot__links">
+${links.join('\n')}
+    </div>
+  </div>
 </footer>`;
 }
 
@@ -746,7 +1211,8 @@ function pageHtml(doc, page, ctx) {
     const title = page.title ? `${page.title} — ${ctx.name}` : ctx.name;
     const body = page.blocks.map((b) => {
         const def = BLOCKS[b.type];
-        return def ? def.render(b.props, ctx) : '';
+        if (!def) return '';
+        return withBackground(def.render(b.props, ctx), b.props, def);
     }).filter(Boolean).join('\n');
 
     return `<!DOCTYPE html>
@@ -845,7 +1311,10 @@ function blankDoc(va, { crewBase } = {}) {
 function newBlock(type, va, { crewBase } = {}) {
     const def = BLOCKS[type];
     if (!def) return null;
-    return { id: newId(), type, props: def.defaults(contextFor(va, { crewBase })) };
+    // BG_DEFAULTS first, so a freshly inserted section has the background
+    // fields the editor is about to draw a form for — without them the picture
+    // controls open empty and the first change writes an incomplete block.
+    return { id: newId(), type, props: { ...BG_DEFAULTS, ...def.defaults(contextFor(va, { crewBase })) } };
 }
 
 /** What the editor draws its palette and its forms from. Content-free. */
@@ -857,7 +1326,10 @@ function catalogue() {
             note: BLOCKS[id].note,
             icon: BLOCKS[id].icon || 'square',
             live: !!BLOCKS[id].live,
-            fields: BLOCKS[id].fields,
+            // The block's own fields AND the ones every block has. The editor
+            // draws whatever is in this list, so a background arrives on every
+            // section without the editor knowing what a background is.
+            fields: fieldsOf(BLOCKS[id]),
         })),
         limits: { pages: MAX_PAGES, blocks: MAX_BLOCKS, items: MAX_ITEMS },
     };

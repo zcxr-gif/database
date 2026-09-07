@@ -844,22 +844,64 @@ reads (routes, stats, events, the noticeboard, their Instagram wall) and nothing
 else. There is no key in a hosted site, so nothing there is a secret they could
 leak or you could accidentally publish.
 
-Text files only, 2 MB in total. **No image uploads** — a VA links to an
-`https://` address, so anything pictorial on a hosted site is hosted somewhere
-that is not us. That matters when a takedown lands: the picture is not ours to
-remove, but the page carrying it is.
+Text files only for the pages themselves, 2 MB in total.
+
+**Pictures are now hosted by us, and this is a change you need to know about.**
+It used to be the case that a VA linked to an `https://` address, so anything
+pictorial on a hosted site lived somewhere that was not us — which meant a
+takedown was about the page, never the picture. That is no longer true. A VA
+uploads pictures in the Website tab and they go to our S3 bucket, under the
+`va-sites/` prefix, up to 60 per site and 60 MB in total after we have resized
+and re-encoded them.
+
+So a copyright report about an image on a VA website is now a report about
+something **we are hosting**, and you can act on the picture itself rather than
+only on the page:
+
+| Instrument | Reach | When |
+|---|---|---|
+| Delete one picture | That image, everywhere on their site | One bad image, rest of the site fine |
+| **Blocked** | The whole site | The site is the problem, or repeat offences |
+
+`GET /api/crew-admin/sites/:id/media` lists every picture one airline has
+uploaded, with who uploaded it and when. `DELETE
+/api/crew-admin/sites/:id/media/:mediaId` removes it from the bucket and from
+their library. The VA is not asked first — that is what makes it a takedown —
+and what they see is a missing picture on their page, which they can see and
+replace.
+
+**Log a picture deletion like any other action** (§10), and record the image's
+name and the report that prompted it. A single deletion is not a warning; a
+second one for the same VA is (§7.3).
 
 ### They pick a design, they do not start from a blank file
 
-The Website tab opens on a gallery of six designs — Flightline, Concourse,
-Horizon, Terminal, Cabin, Livery. Picking one lays out a working airline
-homepage with that VA's real figures already wired in, and they change the words
-from there. Accent colour, typeface and light/dark are three controls on top.
+The Website tab opens on a gallery of designs — Flightline, Concourse, Horizon,
+Terminal, Cabin, Livery, Heritage, Skyline. Picking one lays out a working
+airline homepage with that VA's real figures already wired in, and they change
+the words from there. On top of the layout sit five controls: accent colour,
+typeface, light/dark, corner softness, and a **motif** — a pattern drawn in CSS
+that runs behind the hero and the apply band. A VA can change design at any time
+without losing a word they have written, and put the previous one back by name.
 
 Practical consequence for you: **a hosted site being well-made is not evidence
-the VA is well-run.** Every one of them starts from the same six layouts and
-arrives looking deliberate. Judge the listing on §2 activity signals as you
+the VA is well-run.** Every one of them starts from the same handful of layouts
+and arrives looking deliberate. Judge the listing on §2 activity signals as you
 always have; the website tells you nothing about whether anybody is flying.
+
+### Where the pictures on a fleet page come from
+
+Worth knowing before you read one as a §6 copyright problem. A hosted fleet page
+shows one of two things per aircraft:
+
+* **the VA's own uploaded livery image**, linked from wherever they host it —
+  this is theirs and is the usual §6 question;
+* **a silhouette we draw**, generated from the aircraft type as an inline SVG.
+  Ours, no external host, and the card says "Outline by Inflight".
+
+Neither is a third party's photograph, so a fleet grid full of plane pictures is
+not by itself evidence of anything. The credit line under each card says which
+it is — read that before acting.
 
 ### The two switches
 

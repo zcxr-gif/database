@@ -1012,6 +1012,41 @@ lists, because on most pages an empty list still has a fallback row worth
 showing; a block marked `[data-crew-section]` is saying the opposite.
 ---
 
+### Pictures on a hosted site
+
+A VA's website can carry photographs. They are **not** files in the site's 2 MB
+text budget — they go to S3 through the same sharp-to-WebP pipeline as a VA's
+logo and banner (`vaAds.uploadVaImageMeta`, kind `site`, capped at 2000px on the
+long edge), and the site document keeps a row of metadata each. Two budgets, two
+sets of caps: 60 files / 2 MB of text, and 60 pictures / 60 MB of pictures.
+
+| Route | What |
+|---|---|
+| `POST /site/media` | Multipart, field `file`. Uploads, optimises, appends a row. Returns the whole site. |
+| `POST /site/media/describe` | `{id, name?, alt?}` — what it is called and what a screen reader is told. |
+| `DELETE /site/media` | `{id}` — removes the row, then the object. |
+| `GET /api/crew-admin/sites/:id/media` | Staff: every picture one airline uploaded. |
+| `DELETE /api/crew-admin/sites/:id/media/:mediaId` | Staff: a single-picture takedown. |
+
+Both doors reach the first three: the portal at `/api/va-portal/site/media` and
+the crew centre at `/api/crew/<slug>/site/media`.
+
+Upload does the S3 work **first** and writes the row only if it succeeded, so a
+failure leaks an object rather than leaving a row pointing at nothing. Delete
+goes the other way — the row goes even if S3 refuses — because a picture a VA
+has asked to remove must stop being on their website whatever the bucket says.
+
+A block still pointing at a deleted picture is **not** hunted down and
+rewritten. The `<img>` 404s, which is visible; silently emptying somebody's hero
+because they tidied their library is a worse surprise than a missing picture
+they can see.
+
+Any section can carry a picture behind it — `class="has-bg"`, a
+`.has-bg__layer` holding an `<img>`, and `--dim` for the scrim. It is an `<img>`
+and not a `background-image` so that `loading="lazy"` works, so the address goes
+through the same attribute escaping as every other URL on the page, and so
+`object-position` can say which part of a wide photograph survives on a phone.
+
 ## 8. `crew-feed.js` — the same data on a site we do not host
 
 `https://inflight.info/crew-feed.js` puts a crew centre's public data on any
@@ -1040,8 +1075,15 @@ Readers, all of which resolve to `null` rather than throwing — and `null` mean
 | `CrewFeed.ranks()` | same | The **rank ladder**, sorted by the hours each rung asks for |
 | `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
 | `CrewFeed.roles()` | same | Role definitions (never who holds one) |
+| `CrewFeed.hubs()` | `/route-map` | The airports the airline flies most sectors out of |
+| `CrewFeed.partners()` | `/route-map` | The airlines it codeshares with, deduplicated |
 
-The last four read the **directory record**, not a crew endpoint — that is
+`hubs` and `partners` are **worked out, not stored**. A route map already knows
+which airports carry the most sectors and which of those are flown with somebody
+else, so neither is typed anywhere and neither can go stale — which is the whole
+point of this file. Both read the same single `/route-map` fetch as `network()`.
+
+The brand four read the **directory record**, not a crew endpoint — that is
 deliberate. Everything else here is data the VA's crew centre *produced* and
 lives in the VA's own store; this is what the airline *is* rather than what it
 has been doing. Two different things, so two paths. One fetch serves all four.
@@ -1076,7 +1118,31 @@ Declarative markup, for pages that would rather not write JavaScript:
 <ol data-crew-list="ranks">
   <template><li><img src="{{image}}" alt=""><b>{{name}}</b> <span>{{from}}</span></li></template>
 </ol>
+
+<!-- The fleet always has a picture, and always says whose it is. -->
+<ul data-crew-list="fleet">
+  <template><li>
+    <img src="{{image}}" data-fit="{{fit}}" alt="{{aircraft}}">
+    <b>{{aircraft}}</b> <span>{{livery}}</span>
+    <small><a href="{{creditHref}}">{{credit}}</a></small>
+  </li></template>
+</ul>
 ```
+
+### The fleet always has a picture
+
+`fleet()` guarantees an `image` for every aircraft. The VA's own livery upload
+wins where they made one; otherwise the reader **draws** a top-view silhouette
+for the type as an inline SVG data URI — no request, no host, nothing that can
+404, and available synchronously so a fleet page never flickers or reflows.
+`fit` says which it is: `cover` for a photograph, `contain` for a drawn outline,
+because cropping artwork to fill a card cuts the wingtips off.
+
+`credit` and `creditHref` come with it. A picture on a website belongs to
+whoever made it: the VA's own upload is credited to nobody because it is theirs,
+and an outline we drew says so. An `<a>` in a row template whose `href` came
+back empty is **unwrapped** — the words stay, the dead link goes — because an
+attribution deleted for want of a URL is an attribution not paid.
 
 `data-crew-brand` removes rather than leaving what is on the page, which is the
 opposite of the rule for figures — and deliberately. A figure has a true

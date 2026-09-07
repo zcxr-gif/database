@@ -836,8 +836,8 @@ async function deactivateRepAccount(ad, discordUserId, { actorName = 'Inflight B
  * @param {Function} [deps.isDiscordWebhookUrl] (url) => boolean — validates before we DELETE it
  * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number, webhook:boolean}>}
  */
-async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl } = {}) {
-    const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0, webhook: false };
+async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl } = {}) {
+    const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0, site: false, webhook: false };
     if (!ad || !ad._id) return counts;
     const vaAdId = ad._id;
 
@@ -878,6 +878,32 @@ async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscord
             if (ad.logoUrl)   { await deleteVaImage(s3Client, ad.logoUrl);   counts.images += 1; }
             if (ad.bannerUrl) { await deleteVaImage(s3Client, ad.bannerUrl); counts.images += 1; }
         } catch (e) { console.error('purgeVaData images:', e.message); }
+    }
+
+    /* THEIR WEBSITE, AND THE PICTURES ON IT.
+     *
+     * A hosted site can carry up to sixty photographs on our storage. Purge is
+     * the "everything about this VA goes" path, so leaving them would leave the
+     * one part of a VA's footprint that is somebody's uploaded imagery sitting
+     * in a bucket with nothing pointing at it — the worst of both: still ours to
+     * answer for, and no longer findable from any record.
+     *
+     * The objects go BEFORE the row, because the row is the only list of them.
+     * A failure part-way leaves a row pointing at some deleted objects, which is
+     * recoverable; the other order leaves objects nobody can enumerate. */
+    if (CrewSite) {
+        try {
+            const site = await CrewSite.findOne({ vaAdId }).select('media').lean();
+            if (site) {
+                if (deleteVaImage && s3Client) {
+                    for (const m of (site.media || [])) {
+                        if (m && m.url) { await deleteVaImage(s3Client, m.url); counts.images += 1; }
+                    }
+                }
+                await CrewSite.deleteOne({ vaAdId });
+                counts.site = true;
+            }
+        } catch (e) { console.error('purgeVaData website:', e.message); }
     }
 
     // Finally the flight-events webhook — deleted at Discord, so the VA's own
