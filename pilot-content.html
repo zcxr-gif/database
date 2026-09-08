@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pilot Content — Staff Hub</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Guarded: with the CDN blocked or slow, `tailwind` is undefined and an
+         unguarded line here throws on every load, burying the real errors. -->
+    <script>if (window.tailwind) tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 26px; height: 26px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        input, textarea, select { font-family: inherit; }
+        ::placeholder { color: #a1a1aa; }
+        .hidden { display: none !important; }
+
+        /* Thumbnails sit on a chequerboard so a transparent PNG cannot pass
+           itself off as a blank tile — what you are looking for is sometimes
+           exactly what a white-on-white image hides. */
+        .checker {
+            background-image:
+                linear-gradient(45deg, rgba(120,120,128,.14) 25%, transparent 25%),
+                linear-gradient(-45deg, rgba(120,120,128,.14) 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, rgba(120,120,128,.14) 75%),
+                linear-gradient(-45deg, transparent 75%, rgba(120,120,128,.14) 75%);
+            background-size: 16px 16px;
+            background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+        }
+        /* Blurred by default, and that is not squeamishness: this page exists
+           to find content nobody wants to be shown unprepared, and it is opened
+           in offices and on trains. Click reveals one; the header switch
+           reveals the page. */
+        .veil { filter: blur(14px); transition: filter .15s ease; }
+        .veil:hover { filter: blur(9px); }
+        body.shown .veil, .veil.shown { filter: none; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <header class="sticky top-0 z-40 backdrop-blur-xl bg-zinc-50/80 dark:bg-zinc-950/80 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div class="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <a href="/staff" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition" title="Back to hub"><i data-lucide="arrow-left" class="w-[18px] h-[18px]"></i></a>
+                <div class="flex items-center gap-2.5">
+                    <div class="w-9 h-9 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center"><i data-lucide="shield-alert" class="w-5 h-5"></i></div>
+                    <span class="font-semibold tracking-tight">Pilot Content</span>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <button id="revealBtn" onclick="toggleReveal()" title="Show or hide the pictures" class="h-9 px-3 rounded-full text-xs font-semibold border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"></button>
+                <button onclick="load()" title="Refresh" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition"><i data-lucide="refresh-cw" class="w-[18px] h-[18px]"></i></button>
+                <button onclick="toggleTheme()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition"><span id="themeIcon"></span></button>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-5 py-8">
+
+        <div id="loading" class="py-24 grid place-items-center"><div class="loader text-zinc-500"></div></div>
+
+        <!-- No service key: the console cannot do anything, and says so once
+             rather than as four failed requests. -->
+        <div id="unconfigured" class="hidden py-16">
+            <div class="surface rounded-2xl p-6 border-l-4 border-l-amber-500 max-w-2xl">
+                <p class="font-semibold flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4 text-amber-500"></i> Not configured on this deployment</p>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-2 leading-relaxed">
+                    Reviewing pilot pictures needs the tracker project's <code class="text-xs px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">service_role</code> key,
+                    because the functions behind this page are granted to that role and nothing else.
+                    Set <code class="text-xs px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">INFLIGHT_SUPABASE_SERVICE_KEY</code> and restart.
+                </p>
+            </div>
+        </div>
+
+        <div id="content" class="hidden">
+
+            <div class="flex items-center gap-1 mb-6 border-b border-zinc-200 dark:border-zinc-800">
+                <button data-tab="uploads" onclick="showTab('uploads')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
+                <button data-tab="restrictions" onclick="showTab('restrictions')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
+                <button data-tab="record" onclick="showTab('record')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
+            </div>
+
+            <!-- ============ UPLOADS ============ -->
+            <section id="tab-uploads">
+                <div class="flex flex-wrap items-center gap-2 mb-5">
+                    <div class="relative flex-1 min-w-[220px]">
+                        <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                        <input id="q" oninput="renderUploads()" placeholder="Search by handle or name"
+                               class="w-full pl-9 pr-3 h-10 rounded-xl surface text-sm outline-none focus:ring-2 focus:ring-zinc-900/10 dark:focus:ring-white/10">
+                    </div>
+                    <select id="kindFilter" onchange="renderUploads()" class="h-10 px-3 rounded-xl surface text-sm outline-none">
+                        <option value="">Avatars and banners</option>
+                        <option value="avatar">Avatars only</option>
+                        <option value="banner">Banners only</option>
+                    </select>
+                    <label class="h-10 px-3 rounded-xl surface text-sm inline-flex items-center gap-2 cursor-pointer select-none">
+                        <input id="onlyFlagged" type="checkbox" onchange="load()" class="accent-rose-600">
+                        <span class="text-zinc-600 dark:text-zinc-300">Only flagged</span>
+                    </label>
+                </div>
+                <p id="uploadsMeta" class="text-xs text-zinc-500 dark:text-zinc-400 mb-4"></p>
+                <div id="uploadsGrid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+                <div id="uploadsEmpty" class="hidden py-20 text-center text-sm text-zinc-500 dark:text-zinc-400"></div>
+            </section>
+
+            <!-- ============ RESTRICTIONS ============ -->
+            <section id="tab-restrictions" class="hidden">
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-5 leading-relaxed max-w-2xl">
+                    Pilots who cannot add pictures right now. A restriction rides on a warning, so rescinding
+                    the warning lifts it — and so does <span class="font-medium text-zinc-700 dark:text-zinc-200">Allow pictures again</span>,
+                    which leaves the warning itself standing on the record.
+                </p>
+                <div id="restrictionsList" class="space-y-3"></div>
+                <div id="restrictionsEmpty" class="hidden py-20 text-center text-sm text-zinc-500 dark:text-zinc-400"></div>
+            </section>
+
+            <!-- ============ RECORD ============ -->
+            <section id="tab-record" class="hidden">
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-5 leading-relaxed max-w-2xl">
+                    Everything taken down, and why. Kept indefinitely — this is the answer when a pilot asks
+                    what happened to their picture, and it outlives the account it was about.
+                </p>
+                <div id="recordList" class="space-y-2"></div>
+                <div id="recordEmpty" class="hidden py-20 text-center text-sm text-zinc-500 dark:text-zinc-400"></div>
+            </section>
+        </div>
+    </main>
+
+    <!-- ============ TAKEDOWN PANEL ============ -->
+    <div id="panel" class="hidden fixed inset-0 z-50 bg-zinc-900/60 backdrop-blur-sm p-4 overflow-y-auto" onclick="if (event.target === this) closePanel()">
+        <div class="max-w-lg mx-auto my-8 surface rounded-2xl overflow-hidden">
+            <div class="p-5 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                    <p class="font-semibold">Take this picture down</p>
+                    <p id="panelSub" class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate"></p>
+                </div>
+                <button onclick="closePanel()" class="w-8 h-8 shrink-0 grid place-items-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+
+            <div class="p-5 space-y-5">
+                <div id="panelPreview"></div>
+
+                <div>
+                    <label class="block text-xs font-semibold uppercase tracking-wide text-zinc-500 mb-2">Why is it coming down</label>
+                    <select id="pCategory" class="w-full h-10 px-3 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-sm outline-none"></select>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-semibold uppercase tracking-wide text-zinc-500 mb-2">Note for the record <span class="font-normal normal-case tracking-normal text-zinc-400">— optional, the pilot never sees this</span></label>
+                    <textarea id="pNote" rows="2" placeholder="Anything a colleague reading this back in six months would need."
+                              class="w-full px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-sm outline-none resize-none"></textarea>
+                </div>
+
+                <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden">
+                    <label class="flex items-center gap-2.5 p-3.5 cursor-pointer select-none">
+                        <input id="pWarn" type="checkbox" onchange="syncPanel()" class="accent-zinc-900 dark:accent-white">
+                        <span class="text-sm font-medium">Also warn this pilot</span>
+                    </label>
+                    <div id="pWarnBody" class="hidden px-3.5 pb-3.5 space-y-3.5 border-t border-zinc-200 dark:border-zinc-800 pt-3.5">
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wide text-zinc-500 mb-2">Level</label>
+                            <select id="pLevel" onchange="syncPanel()" class="w-full h-10 px-3 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-sm outline-none"></select>
+                            <p id="pLevelMeaning" class="text-xs text-zinc-500 dark:text-zinc-400 mt-2 leading-relaxed"></p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wide text-zinc-500 mb-2">What the pilot is told <span class="font-normal normal-case tracking-normal text-zinc-400">— optional</span></label>
+                            <textarea id="pReason" rows="3" placeholder="Left blank, they are told plainly what was removed and to choose something else."
+                                      class="w-full px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-sm outline-none resize-none"></textarea>
+                            <p class="text-xs text-zinc-400 mt-1.5">Shown in their profile editor, in the app.</p>
+                        </div>
+
+                        <label class="flex items-center gap-2.5 cursor-pointer select-none">
+                            <input id="pBlock" type="checkbox" onchange="syncPanel()" class="accent-rose-600">
+                            <span class="text-sm font-medium">Stop them adding any more pictures</span>
+                        </label>
+                        <div id="pBlockBody" class="hidden pl-7 space-y-2">
+                            <select id="pBlockDays" onchange="syncPanel()" class="h-9 px-3 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-sm outline-none">
+                                <option value="">Until we lift it</option>
+                                <option value="7">7 days</option>
+                                <option value="14">14 days</option>
+                                <option value="30">30 days</option>
+                                <option value="90">90 days</option>
+                            </select>
+                            <p id="pBlockNote" class="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed"></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="p-5 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-end gap-2">
+                <button onclick="closePanel()" class="h-10 px-4 rounded-xl text-sm font-semibold text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">Cancel</button>
+                <button id="pConfirm" onclick="takedown()" class="h-10 px-4 rounded-xl text-sm font-semibold bg-rose-600 hover:bg-rose-700 text-white transition inline-flex items-center gap-2"></button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-4 py-2.5 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm font-medium shadow-lg max-w-[90vw] text-center"></div>
+
+<script>
+/* ===========================================================================
+ * Pilot Content console.
+ *
+ * Three views over one idea: what has been uploaded, who is currently stopped
+ * from uploading, and what has already been taken down. The takedown panel is
+ * the only thing that writes, and it writes once — removal, record and warning
+ * go to the server as a single call, because they are one decision and a
+ * half-finished one is the failure worth designing out.
+ * ======================================================================== */
+let ITEMS = [];
+let CATEGORIES = [];
+let LEVELS = [];
+let RESTRICTIONS = [];
+let RECORD = [];
+let TARGET = null;
+let REVEALED = false;
+let TAB = 'uploads';
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const icons = () => { if (window.lucide) lucide.createIcons(); };
+
+/* ---- Theme, as every other staff tool does it ------------------------- */
+function applyThemeIcon() {
+    const dark = document.documentElement.classList.contains('dark');
+    $('themeIcon').innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`;
+    icons();
+}
+function toggleTheme() {
+    const dark = !document.documentElement.classList.contains('dark');
+    document.documentElement.classList.toggle('dark', dark);
+    try { localStorage.setItem('staff-theme', dark ? 'dark' : 'light'); } catch {}
+    applyThemeIcon();
+}
+(function () {
+    let p = null;
+    try { p = localStorage.getItem('staff-theme'); } catch {}
+    document.documentElement.classList.toggle('dark', p ? p === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches);
+})();
+
+function toast(msg) {
+    const el = $('toast');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => el.classList.add('hidden'), 4000);
+}
+
+/* ---- The API. Session is the staff cookie, like every tool here. ------- */
+async function api(path, opts) {
+    const res = await fetch(path, Object.assign({
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    }, opts || {}));
+    if (res.status === 401) { location.href = '/staff?next=' + encodeURIComponent(location.pathname); throw new Error('unauthenticated'); }
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+        const err = new Error((data && data.error) || 'That did not work.');
+        err.unconfigured = !!(data && data.unconfigured);
+        throw err;
+    }
+    return data;
+}
+
+const when = (d) => {
+    if (!d) return 'date unknown';
+    const t = new Date(d);
+    const mins = Math.round((Date.now() - t) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+    if (mins < 60 * 24 * 30) return `${Math.round(mins / 1440)}d ago`;
+    return t.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const exact = (d) => d ? new Date(d).toLocaleString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+/* ---- Load ------------------------------------------------------------- */
+async function load() {
+    try {
+        const flagged = $('onlyFlagged') && $('onlyFlagged').checked ? '?flagged=1' : '';
+        const [feed, restrictions, record] = await Promise.all([
+            api('/api/pilot-moderation/uploads' + flagged),
+            api('/api/pilot-moderation/restrictions'),
+            api('/api/pilot-moderation/log'),
+        ]);
+        ITEMS = feed.items || [];
+        CATEGORIES = feed.categories || [];
+        LEVELS = feed.levels || [];
+        RESTRICTIONS = restrictions.restrictions || [];
+        RECORD = record.actions || [];
+    } catch (err) {
+        $('loading').classList.add('hidden');
+        if (err.unconfigured) { $('unconfigured').classList.remove('hidden'); icons(); return; }
+        $('loading').classList.remove('hidden');
+        $('loading').innerHTML = `<p class="text-sm text-rose-600">${esc(err.message)}</p>`;
+        return;
+    }
+    $('loading').classList.add('hidden');
+    $('unconfigured').classList.add('hidden');
+    $('content').classList.remove('hidden');
+
+    // Built from what the server says exists, so adding a category or a level
+    // is one edit rather than two that have to agree.
+    $('pCategory').innerHTML = CATEGORIES.map(c => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join('');
+    $('pLevel').innerHTML = LEVELS.map(l => `<option value="${esc(l.key)}">${esc(l.label)}</option>`).join('');
+
+    applyReveal();
+    renderTabs();
+    renderUploads();
+    renderRestrictions();
+    renderRecord();
+    icons();
+}
+
+/* ---- Tabs ------------------------------------------------------------- */
+function renderTabs() {
+    const counts = { uploads: ITEMS.length, restrictions: RESTRICTIONS.length, record: RECORD.length };
+    const labels = { uploads: 'Pictures', restrictions: 'Restricted', record: 'Record' };
+    document.querySelectorAll('.tab').forEach(b => {
+        const k = b.dataset.tab;
+        const on = k === TAB;
+        b.className = 'tab px-4 py-2.5 text-sm font-semibold border-b-2 transition '
+            + (on ? 'border-zinc-900 dark:border-white text-zinc-900 dark:text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200');
+        b.innerHTML = `${labels[k]}<span class="ml-2 text-xs font-medium text-zinc-400">${counts[k]}</span>`;
+    });
+}
+function showTab(t) {
+    TAB = t;
+    ['uploads', 'restrictions', 'record'].forEach(k => $('tab-' + k).classList.toggle('hidden', k !== t));
+    renderTabs();
+    icons();
+}
+
+/* ---- Reveal switch ---------------------------------------------------- */
+function applyReveal() {
+    document.body.classList.toggle('shown', REVEALED);
+    $('revealBtn').innerHTML = `<i data-lucide="${REVEALED ? 'eye-off' : 'eye'}" class="w-4 h-4"></i> ${REVEALED ? 'Hide' : 'Show'} pictures`;
+    icons();
+}
+function toggleReveal() { REVEALED = !REVEALED; applyReveal(); }
+
+/* ---- Pictures --------------------------------------------------------- */
+function visibleUploads() {
+    const q = $('q').value.trim().toLowerCase();
+    const kind = $('kindFilter').value;
+    return ITEMS.filter(i => {
+        if (kind && i.kind !== kind) return false;
+        if (!q) return true;
+        return [i.handle, i.displayName].some(v => String(v || '').toLowerCase().includes(q));
+    });
+}
+
+function renderUploads() {
+    const rows = visibleUploads();
+    $('uploadsMeta').textContent = rows.length === ITEMS.length
+        ? `${ITEMS.length} pictures, most recently changed first.`
+        : `${rows.length} of ${ITEMS.length} shown.`;
+
+    $('uploadsEmpty').classList.toggle('hidden', rows.length > 0);
+    if (!rows.length) {
+        $('uploadsEmpty').textContent = ITEMS.length ? 'Nothing matches that.' : 'No pictures have been uploaded yet.';
+    }
+
+    $('uploadsGrid').innerHTML = rows.map((i, n) => {
+        const flags = [];
+        if (i.restricted) flags.push('<span class="px-1.5 py-0.5 rounded-md bg-rose-600 text-white text-[10px] font-bold">PAUSED</span>');
+        if (i.openReports) flags.push(`<span class="px-1.5 py-0.5 rounded-md bg-orange-500 text-white text-[10px] font-bold">${i.openReports} REPORT${i.openReports === 1 ? '' : 'S'}</span>`);
+        if (i.autohidden) flags.push('<span class="px-1.5 py-0.5 rounded-md bg-zinc-900 text-white text-[10px] font-bold">AUTO-HIDDEN</span>');
+        if (i.moderationState !== 'ok') flags.push(`<span class="px-1.5 py-0.5 rounded-md bg-zinc-700 text-white text-[10px] font-bold">${esc(i.moderationState.toUpperCase())}</span>`);
+        if (i.priorTakedowns) flags.push(`<span class="px-1.5 py-0.5 rounded-md bg-amber-500 text-white text-[10px] font-bold">${i.priorTakedowns} PRIOR</span>`);
+
+        return `
+        <div class="surface rounded-2xl overflow-hidden flex flex-col">
+            <div class="relative ${i.kind === 'banner' ? 'aspect-[16/7]' : 'aspect-square'} checker overflow-hidden cursor-zoom-in"
+                 onclick="this.querySelector('img') && this.querySelector('img').classList.toggle('shown')">
+                <img src="${esc(i.url)}" alt="" loading="lazy" class="veil w-full h-full object-contain"
+                     onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'w-full h-full grid place-items-center text-[11px] text-zinc-400',textContent:'image unavailable'}))">
+                ${flags.length ? `<div class="absolute top-2 left-2 flex flex-wrap gap-1 max-w-[calc(100%-1rem)]">${flags.join('')}</div>` : ''}
+                <span class="absolute bottom-2 right-2 px-1.5 py-0.5 rounded-md bg-zinc-900/70 text-white text-[10px] font-semibold">${i.kind === 'avatar' ? 'Avatar' : 'Banner'}</span>
+            </div>
+            <div class="p-3 flex-1 flex flex-col gap-1">
+                <p class="text-sm font-semibold truncate">@${esc(i.handle)}</p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">${esc(i.displayName || '—')}</p>
+                <p class="text-[11px] text-zinc-400 truncate" title="Profile last changed ${esc(exact(i.changedAt))}">
+                    profile changed ${esc(when(i.changedAt))}
+                </p>
+                <div class="mt-2 flex items-center gap-1.5">
+                    <button onclick="openPanel(${n})" class="flex-1 h-8 rounded-lg text-xs font-semibold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/70 transition inline-flex items-center justify-center gap-1.5">
+                        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Take down
+                    </button>
+                    <a href="${esc(i.url)}" target="_blank" rel="noopener" title="Open the full picture"
+                       class="w-8 h-8 shrink-0 grid place-items-center rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition"><i data-lucide="external-link" class="w-3.5 h-3.5"></i></a>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+
+    // The index the button passes is into the FILTERED list, so that is the
+    // list the panel has to read back from.
+    renderUploads._rows = rows;
+    renderTabs();
+    icons();
+}
+
+/* ---- Restrictions ----------------------------------------------------- */
+function renderRestrictions() {
+    $('restrictionsEmpty').classList.toggle('hidden', RESTRICTIONS.length > 0);
+    if (!RESTRICTIONS.length) $('restrictionsEmpty').textContent = 'Nobody is stopped from adding pictures.';
+
+    $('restrictionsList').innerHTML = RESTRICTIONS.map(r => `
+        <div class="surface rounded-2xl p-4 border-l-4 border-l-rose-500">
+            <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                    <p class="font-semibold text-sm">@${esc(r.handle || 'unknown')} <span class="font-normal text-zinc-500">${esc(r.displayName || '')}</span></p>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                        ${esc(r.levelLabel)} · since ${esc(when(r.since))} ·
+                        ${r.until ? 'lifts ' + esc(exact(r.until)) : '<span class="text-rose-600 dark:text-rose-400 font-medium">until lifted by hand</span>'}
+                    </p>
+                    <p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 leading-relaxed whitespace-pre-wrap">${esc(r.reason)}</p>
+                    <p class="text-[11px] text-zinc-400 mt-2">${r.acknowledgedAt ? 'Read ' + esc(when(r.acknowledgedAt)) : 'Not read yet'}</p>
+                </div>
+                <button onclick="lift('${esc(r.warningId)}', '${esc(r.handle)}')"
+                        class="shrink-0 h-9 px-3 rounded-xl text-xs font-semibold border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">
+                    Allow pictures again
+                </button>
+            </div>
+        </div>`).join('');
+    renderTabs();
+    icons();
+}
+
+async function lift(warningId, handle) {
+    if (!confirm(`Let @${handle || 'this pilot'} add pictures again?\n\nThe warning itself stays on their record.`)) return;
+    try {
+        await api(`/api/pilot-moderation/restrictions/${encodeURIComponent(warningId)}/lift`, { method: 'POST' });
+        toast('Pictures switched back on.');
+        await load();
+        showTab('restrictions');
+    } catch (err) { toast(err.message); }
+}
+
+/* ---- Record ----------------------------------------------------------- */
+function renderRecord() {
+    $('recordEmpty').classList.toggle('hidden', RECORD.length > 0);
+    if (!RECORD.length) $('recordEmpty').textContent = 'Nothing has been taken down yet.';
+
+    $('recordList').innerHTML = RECORD.map(a => `
+        <div class="surface rounded-xl px-4 py-3 flex items-start gap-3">
+            <i data-lucide="trash-2" class="w-4 h-4 mt-0.5 text-zinc-400 shrink-0"></i>
+            <div class="min-w-0 flex-1">
+                <p class="text-sm">
+                    <span class="font-semibold">${esc(a.kind)}</span>
+                    <span class="text-zinc-500 dark:text-zinc-400"> from </span>
+                    <span class="font-medium">@${esc(a.handle || 'a deleted account')}</span>
+                </p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                    ${esc(a.categoryLabel)} · removed by ${esc(a.removedBy)} · ${esc(when(a.createdAt))}
+                    ${a.warningLevel ? ' · <span class="text-amber-600 dark:text-amber-400 font-medium">warned</span>' : ''}
+                </p>
+                ${a.note ? `<p class="text-xs text-zinc-600 dark:text-zinc-300 mt-1.5 leading-relaxed whitespace-pre-wrap">${esc(a.note)}</p>` : ''}
+            </div>
+        </div>`).join('');
+    renderTabs();
+    icons();
+}
+
+/* ---- The takedown panel ----------------------------------------------- */
+function openPanel(n) {
+    TARGET = (renderUploads._rows || [])[n];
+    if (!TARGET) return;
+    $('panelSub').textContent = `${TARGET.kind} on @${TARGET.handle}`;
+    $('panelPreview').innerHTML = `
+        <div class="rounded-xl overflow-hidden checker aspect-[16/9] cursor-zoom-in"
+             onclick="this.querySelector('img') && this.querySelector('img').classList.toggle('shown')">
+            <img src="${esc(TARGET.url)}" alt="" class="veil w-full h-full object-contain">
+        </div>
+        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2">
+            @${esc(TARGET.handle)}${TARGET.openReports ? ` · <span class="text-orange-600 dark:text-orange-400 font-semibold">${TARGET.openReports} open report${TARGET.openReports === 1 ? '' : 's'}</span>` : ''}
+            ${TARGET.priorTakedowns ? ` · <span class="text-amber-600 dark:text-amber-400 font-semibold">${TARGET.priorTakedowns} previous takedown${TARGET.priorTakedowns === 1 ? '' : 's'}</span>` : ''}
+        </p>`;
+    $('pNote').value = '';
+    $('pReason').value = '';
+    $('pWarn').checked = false;
+    $('pBlock').checked = false;
+    $('pBlockDays').value = '';
+    // Somebody already reported, or this pilot has been here before: open with
+    // the warning ticked. It is the decision staff almost certainly want, and
+    // it is still theirs to untick.
+    if (TARGET.priorTakedowns || TARGET.openReports) $('pWarn').checked = true;
+    $('panel').classList.remove('hidden');
+    syncPanel();
+    icons();
+}
+function closePanel() { $('panel').classList.add('hidden'); TARGET = null; }
+
+function syncPanel() {
+    const warn = $('pWarn').checked;
+    const block = $('pBlock').checked;
+    $('pWarnBody').classList.toggle('hidden', !warn);
+    $('pBlockBody').classList.toggle('hidden', !block);
+
+    const lvl = LEVELS.find(l => l.key === $('pLevel').value);
+    $('pLevelMeaning').textContent = lvl ? (lvl.meaning || '') : '';
+
+    if (block) {
+        const days = $('pBlockDays').value;
+        $('pBlockNote').textContent = days
+            ? `They cannot add a picture for ${days} days. It lifts on its own, and nothing already on their profile is touched.`
+            : 'They cannot add a picture until somebody switches it back on. Nothing already on their profile is touched.';
+    }
+
+    $('pConfirm').innerHTML = warn
+        ? `<i data-lucide="shield-alert" class="w-4 h-4"></i> Remove${block ? ', warn and pause' : ' and warn'}`
+        : '<i data-lucide="trash-2" class="w-4 h-4"></i> Remove';
+    icons();
+}
+
+async function takedown() {
+    if (!TARGET) return;
+    const warn = $('pWarn').checked;
+    const block = $('pBlock').checked;
+
+    const body = {
+        userId: TARGET.userId,
+        kind: TARGET.kind,
+        category: $('pCategory').value,
+        note: $('pNote').value,
+    };
+    if (warn) {
+        body.warn = {
+            level: $('pLevel').value,
+            reason: $('pReason').value,
+            blockUploads: block,
+            blockDays: block ? ($('pBlockDays').value || null) : null,
+        };
+    }
+
+    const btn = $('pConfirm');
+    const was = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = 'Working…';
+    try {
+        const out = await api('/api/pilot-moderation/takedown', { method: 'POST', body: JSON.stringify(body) });
+        closePanel();
+        toast(
+            (out.uploadsBlocked ? 'Removed, warned, and pictures switched off.'
+             : out.warningIssued ? 'Removed and the pilot was warned.'
+             : 'Removed.')
+            // The row is gone either way, which is what took the picture down.
+            // A file that would not delete is worth saying out loud rather
+            // than leaving as a line in a log nobody reads.
+            + (out.objectDeleted === false ? ' The file could not be deleted from storage — check the logs.' : '')
+        );
+        await load();
+    } catch (err) {
+        toast(err.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = was;
+        icons();
+    }
+}
+
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePanel(); });
+
+applyThemeIcon();
+load();
+</script>
+</body>
+</html>

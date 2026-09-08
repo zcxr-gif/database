@@ -57,6 +57,13 @@ const {
 // this file), and the authoring API goes in with the rest of the routes.
 const vaSites = require('./vaSites');
 
+// Pilot content moderation — the staff hub's window onto what pilots have
+// uploaded to the iOS app (avatars and banners), the takedown that records
+// itself, and the warning that stops the next one. The data lives in the
+// tracker's Supabase project; this module is the courier. Inert without
+// INFLIGHT_SUPABASE_SERVICE_KEY, and its page says so.
+const pilotModeration = require('./pilotModeration');
+
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
 const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial } = require('./crewAuth');
@@ -2908,6 +2915,11 @@ vaSites.registerVaSiteRoutes(app, {
     requireCap,
     logActivity: logVaPortalActivity,
 });
+
+// The Pilot Content console's API (/api/pilot-moderation/*). Staff-gated like
+// the rest of the hub's tools; the service key that reaches the tracker project
+// never leaves this process.
+pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
@@ -15421,6 +15433,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/va-submissions', '/va-submissions.html',
     '/crew-centers', '/crew-centers.html',
     '/va-sites', '/va-sites.html',
+    '/pilot-content', '/pilot-content.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -15470,6 +15483,16 @@ app.get('/crew-centers', (req, res) => {
 // above); its data endpoints (/api/crew-admin/sites) are requireAuth.
 app.get('/va-sites', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-sites.html'));
+});
+
+// Pilot Content (staff hub tool) — every avatar and banner pilots have uploaded
+// to the iOS app, the takedown that records why, and the warning that switches
+// off their uploading. These pictures are served from our own storage to
+// anybody with the link, so being able to find one without three strangers
+// reporting it first is not optional tooling. Staff-only (STAFF_ONLY_PATHS
+// above); its data endpoints (/api/pilot-moderation/*) are requireAuth.
+app.get('/pilot-content', (req, res) => {
+    res.sendFile(path.join(__dirname, 'pilot-content.html'));
 });
 
 // Public Terms & Conditions page (mirrors the signed PDF). Rendered client-side
