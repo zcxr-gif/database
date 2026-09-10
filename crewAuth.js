@@ -1077,6 +1077,20 @@ function registerCrewAuthRoutes(app) {
             });
         } catch (err) {
             console.error('Crew settings error:', err);
+            // A rejected WRITE is not a server fault, and reporting it as one is
+            // how a schema that could never store a fleet row survived unnoticed:
+            // every save came back as a bare "Could not save settings." with the
+            // real reason (`Cast to [string] failed at path crewFleet.0`) visible
+            // only in the logs. Name the field that was refused so the next one
+            // is diagnosable from the dashboard.
+            if (err && (err.name === 'ValidationError' || err.name === 'CastError')) {
+                const path = err.path || Object.keys(err.errors || {})[0] || '';
+                return res.status(400).json({
+                    error: path
+                        ? `The server refused to store “${path}”. This is a bug on our side — please report it.`
+                        : 'The server refused those settings. This is a bug on our side — please report it.',
+                });
+            }
             res.status(500).json({ error: 'Could not save settings.' });
         }
     });

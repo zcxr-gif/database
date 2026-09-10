@@ -459,7 +459,18 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
-    crewFleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
+    //
+    // `type` MUST be written as `{ type: String }`, not `type: String`. Mongoose's
+    // default typeKey is 'type', so the inline form `{ _id: false, type: String,
+    // name: String, image: String }` is not read as an object schema at all — it
+    // is read as a SchemaType descriptor for a *String* path, with `name` and
+    // `image` taken as options. That made crewFleet an array of strings, so every
+    // save of a real fleet row threw `Cast to [string] failed` and came back as
+    // the generic "Could not save settings." The fleet had never once persisted.
+    // The nested form below is the documented way to name a field `type`; the
+    // sibling staffRoles/staffAssignments arrays avoid it only by luck (no field
+    // of theirs is called `type`).
+    crewFleet: { type: [{ _id: false, type: { type: String }, name: String, image: String }], default: [] },
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
     // capture and its hours roll straight onto the roster.
@@ -544,7 +555,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
     callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
     // A staff-built application form: ordered questions.
-    applicationForm: { type: [{ _id: false, label: String, type: String, options: [String], required: Boolean }], default: [] },
+    // `type` nested — see the crewFleet note above. Declared inline as
+    // `type: String` this was an array of strings, so no VA's application form
+    // ever saved either.
+    applicationForm: { type: [{ _id: false, label: String, type: { type: String }, options: [String], required: Boolean }], default: [] },
     // Extensible join requirements. Auto types are checked against the
     // applicant's REAL Infinite Flight stats (verified through our tooling);
     // 'agree' is a custom checkbox the applicant must tick.
@@ -552,7 +566,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     //   value: numeric threshold (min for most, MAX for 'violations')
     //   label: custom text (used by 'agree', optional note for others)
     //   required: for 'agree', whether ticking is mandatory
-    joinRequirements: { type: [{ _id: false, type: String, value: Number, label: String, required: Boolean }], default: [] },
+    // `type` nested — see the crewFleet note above. Same story: sanitizeRequirements
+    // emits `{ type, value, label, required }` rows into what was an array of strings.
+    joinRequirements: { type: [{ _id: false, type: { type: String }, value: Number, label: String, required: Boolean }], default: [] },
     // A Discord webhook the VA sets so recruitment activity (new applications,
     // accept / decline decisions + the staff's message) is posted to their
     // server. Secret (contains a token) → select:false, never echoed back.
