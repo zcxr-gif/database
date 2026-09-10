@@ -555,7 +555,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
     callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
     // A staff-built application form: ordered questions.
-    applicationForm: { type: [{ _id: false, label: String, type: String, options: [String], required: Boolean }], default: [] },
+    // `type` nested — see the crewFleet note above. Declared inline as
+    // `type: String` this was an array of strings, so no VA's application form
+    // ever saved either.
+    applicationForm: { type: [{ _id: false, label: String, type: { type: String }, options: [String], required: Boolean }], default: [] },
     // Extensible join requirements. Auto types are checked against the
     // applicant's REAL Infinite Flight stats (verified through our tooling);
     // 'agree' is a custom checkbox the applicant must tick.
@@ -563,7 +566,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     //   value: numeric threshold (min for most, MAX for 'violations')
     //   label: custom text (used by 'agree', optional note for others)
     //   required: for 'agree', whether ticking is mandatory
-    joinRequirements: { type: [{ _id: false, type: String, value: Number, label: String, required: Boolean }], default: [] },
+    // `type` nested — see the crewFleet note above. Same story: sanitizeRequirements
+    // emits `{ type, value, label, required }` rows into what was an array of strings.
+    joinRequirements: { type: [{ _id: false, type: { type: String }, value: Number, label: String, required: Boolean }], default: [] },
     // A Discord webhook the VA sets so recruitment activity (new applications,
     // accept / decline decisions + the staff's message) is posted to their
     // server. Secret (contains a token) → select:false, never echoed back.
