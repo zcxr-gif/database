@@ -250,7 +250,7 @@ T('…crediting its top-level contributor', legacy.embeds[1].description, 'Contr
 // is that the lists are longer than a Discord select can hold, so the paging
 // maths and the 25-option cap are the things worth pinning down.
 // ---------------------------------------------------------------------------
-const PICK_NAMES = ['PICKER_PAGE_SIZE', 'parsePickerCustomId', 'filterByQuery', 'pickerChoices', 'renderPicker'];
+const PICK_NAMES = ['PICKER_PAGE_SIZE', 'parsePickerCustomId', 'filterByQuery', 'pickerChoices', 'renderPicker', 'renderPickerConfirm', 'isListedAircraft'];
 // Stub the two API-backed lists: 60 aircraft (3 pages) and a per-aircraft
 // livery list, so the paging is exercised without touching the network.
 const AIRCRAFT = Array.from({ length: 60 }, (_, i) => ({ name: `Plane ${String(i + 1).padStart(2, '0')}`, id: `id${i + 1}` }));
@@ -266,6 +266,10 @@ const P = new Function(...Object.keys(DEPS), 'fetchAircraftMetadata', 'fetchLive
     async (id) => LIVERIES[id] || []);
 
 const session = (over = {}) => ({ id: 'abc123', step: 'type', type: null, query: '', page: 0, intro: '', ...over });
+const renderConfirm = (over) => {
+    const payload = P.renderPickerConfirm(session(over));
+    return { content: payload.content, view: inspect({ embeds: [], components: payload.components }) };
+};
 const picker = async (over) => {
     const s = session(over);
     const payload = await P.renderPicker(s);
@@ -301,7 +305,9 @@ T('whitespace is not a query', P.filterByQuery(['a', 'b'], '   '), ['a', 'b']);
     T('Prev is disabled on the first page', first.view.buttons[0].disabled, true);
     T('Next is live when there is more', Boolean(first.view.buttons[1].disabled), false);
     T('step 1 has no Back button', first.view.labels.includes('Back'), false);
-    T('typing it by hand is always offered', first.view.labels.includes('Type it myself'), true);
+    // The escape hatch for an aircraft the list doesn't carry yet, and it is on
+    // the very first screen — not buried behind an empty search.
+    T('typing it by hand is always offered', first.view.labels.includes('Not listed? Type it'), true);
 
     const last = await picker({ page: 2 });
     T('the last page holds the remainder', last.options.length, 10);
@@ -321,7 +327,7 @@ T('whitespace is not a query', P.filterByQuery(['a', 'b'], '   '), ['a', 'b']);
     const none = await picker({ query: 'Concorde' });
     T('a search with no matches drops the dropdown', none.select, null);
     ok('…and says so instead of rendering nothing', /Nothing matches/.test(none.content), none.content);
-    ok('…leaving the controls to recover with', none.view.labels.includes('Type it myself'), none.view.labels.join(' | '));
+    ok('…leaving the controls to recover with', none.view.labels.includes('Not listed? Type it'), none.view.labels.join(' | '));
 
     console.log('\nrenderPicker — step 2, that aircraft\'s liveries');
     const liveries = await picker({ step: 'livery', type: 'Plane 01' });
@@ -336,11 +342,47 @@ T('whitespace is not a query', P.filterByQuery(['a', 'b'], '   '), ['a', 'b']);
     // An aircraft the API has no liveries for still has to leave a way forward.
     const empty = await picker({ step: 'livery', type: 'Plane 03' });
     T('an aircraft with no liveries drops the dropdown', empty.select, null);
-    T('…and can still be typed by hand', empty.view.labels.includes('Type it myself'), true);
+    T('…and can still be typed by hand', empty.view.labels.includes('Not listed? Type it'), true);
     // An aircraft that isn't in the metadata at all (a stale session, a name the
     // API dropped) must not throw on the way to the livery step.
     const unknown = await picker({ step: 'livery', type: 'Not A Real Plane' });
     T('an unknown aircraft renders an empty step 2', unknown.select, null);
+
+    // An aircraft that isn't in the list yet — a new release, something the API
+    // hasn't caught up with — has to be submittable under its real name. The
+    // normalizer matches by substring and then fuzzily, so left alone it would
+    // rewrite "Plane 61" into a listed aircraft that merely reads like it. The
+    // confirm step is where the submitter overrules that.
+    console.log('\nrenderPickerConfirm — typed a name the normalizer wants to rewrite');
+    const confirm = renderConfirm({
+        raw: { type: 'Plane 61 Neo', livery: 'Brand New Air' },
+        match: { type: 'Plane 06', livery: 'Livery 01' },
+    });
+    ok('renders cleanly', confirm.view.problems.length === 0, confirm.view.problems.join('; '));
+    T('both readings are offered, plus a way back to the form',
+        confirm.view.ids, ['pick_usematch_abc123', 'pick_usemine_abc123', 'pick_manual_abc123']);
+    T('…labelled with the actual names', confirm.view.labels.slice(0, 2), ['Use Plane 06', 'Keep Plane 61 Neo']);
+    ok('the two readings are shown side by side',
+        /You typed: \*\*Plane 61 Neo\*\* — \*\*Brand New Air\*\*/.test(confirm.content)
+        && /Closest match: \*\*Plane 06\*\* — \*\*Livery 01\*\*/.test(confirm.content), confirm.content);
+    ok('…and it says outright that keeping your own wording is the right call for something new',
+        /isn't in the list yet, keep your own wording/.test(confirm.content), confirm.content);
+    // A long aircraft name must not blow the 80-char button label cap.
+    const longName = renderConfirm({
+        raw: { type: 'A'.repeat(120), livery: 'x' },
+        match: { type: 'B'.repeat(120), livery: 'y' },
+    });
+    ok('a very long name still renders', longName.view.problems.length === 0, longName.view.problems.join('; '));
+
+    console.log('\nisListedAircraft — what gets flagged for the admin');
+    T('a name straight off the list is not flagged', await P.isListedAircraft('Plane 01'), true);
+    T('…case and padding don\'t change that', await P.isListedAircraft('  plane 01 '), true);
+    // The flag is what tells an admin "this name is the submitter's, not the
+    // game's" — so anything the metadata doesn't carry has to come back false.
+    T('a new aircraft is flagged', await P.isListedAircraft('Plane 61 Neo'), false);
+    T('a near-miss is flagged rather than assumed', await P.isListedAircraft('Plane 0'), false);
+    T('empty is flagged', await P.isListedAircraft(''), false);
+    T('null is handled', await P.isListedAircraft(null), false);
 
     console.log(failures ? `\n${failures} failure(s)\n` : '\nall good\n');
     process.exit(failures ? 1 : 0);

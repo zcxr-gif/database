@@ -1682,6 +1682,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             const at = fields.findIndex(f => f.name === note.name);
             if (at >= 0) fields[at] = note; else fields.push(note);
         }
+
+        // Recomputed on every rebuild rather than passed in, so the flag tracks
+        // the name actually on the card: it appears when an edit moves the card
+        // to an aircraft the list doesn't carry, and clears itself when an admin
+        // edits it back onto a listed one.
+        const unlistedAt = fields.findIndex(f => f.name === UNLISTED_FIELD);
+        if (await isListedAircraft(type)) {
+            if (unlistedAt >= 0) fields.splice(unlistedAt, 1);
+        } else {
+            const flag = {
+                name: UNLISTED_FIELD,
+                value: 'Not in the aircraft list — check the name before approving.',
+                inline: false
+            };
+            if (unlistedAt >= 0) fields[unlistedAt] = flag; else fields.push(flag);
+        }
         newEmbed.setFields(fields);
 
         const submitterId = submitterTokenFrom(oldEmbed.footer?.text)
@@ -1904,6 +1920,38 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return names.filter(n => String(n).toLowerCase().includes(q));
     };
 
+    // Is this an aircraft the metadata knows about? Anything else is a new or
+    // unlisted type — a brand-new release, or something the API hasn't caught
+    // up with — which is allowed, but says so on the card so an admin checks
+    // the name rather than assuming the normalizer got it right.
+    const isListedAircraft = async (type) => {
+        const list = await fetchAircraftMetadata();
+        return list.some(a => String(a.name).toLowerCase() === String(type || '').trim().toLowerCase());
+    };
+
+    const UNLISTED_FIELD = '🆕 Not in the aircraft list';
+
+    // The picker's manual entry can end in a disagreement: the submitter typed
+    // something the normalizer then rewrote into a listed aircraft. That is
+    // usually right (a typo, a nickname) and sometimes badly wrong — a new
+    // aircraft fuzzy-matched onto last year's model. Rather than pick for them,
+    // show both and let them choose.
+    const renderPickerConfirm = (session) => ({
+        content: [
+            session.intro,
+            '**Is this the same aircraft?**',
+            `You typed: **${session.raw.type}** — **${session.raw.livery}**`,
+            `Closest match: **${session.match.type}** — **${session.match.livery}**`,
+            'If you are submitting an aircraft or livery that isn\'t in the list yet, keep your own wording — an admin will confirm the name.'
+        ].filter(Boolean).join('\n'),
+        embeds: [],
+        components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`pick_usematch_${session.id}`).setEmoji('✅').setLabel(`Use ${session.match.type}`.slice(0, 78)).setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`pick_usemine_${session.id}`).setEmoji('🆕').setLabel(`Keep ${session.raw.type}`.slice(0, 78)).setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`pick_manual_${session.id}`).setEmoji('✍️').setLabel('Edit again').setStyle(ButtonStyle.Secondary)
+        )]
+    });
+
     // The choices for the step the picker is on, already narrowed by the search.
     const pickerChoices = async (session) => {
         const list = await fetchAircraftMetadata();
@@ -1956,7 +2004,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         // Step 2 only: going back re-opens the aircraft list without losing the
         // photo or the flow it was opened from.
         if (!isType) nav.addComponents(new ButtonBuilder().setCustomId(`pick_back_${id}`).setEmoji('↩️').setLabel('Back').setStyle(ButtonStyle.Secondary));
-        nav.addComponents(new ButtonBuilder().setCustomId(`pick_manual_${id}`).setEmoji('✍️').setLabel('Type it myself').setStyle(ButtonStyle.Secondary));
+        nav.addComponents(new ButtonBuilder().setCustomId(`pick_manual_${id}`).setEmoji('✍️').setLabel('Not listed? Type it').setStyle(ButtonStyle.Secondary));
         rows.push(nav);
 
         return { content: lines.join('\n'), embeds: [], components: rows };
@@ -1983,11 +2031,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return interaction.reply({ ...payload, ephemeral: true }).catch(() => {});
     };
 
-    const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
-        
+    /**
+     * `opts.keepWording` sends the type and livery through exactly as given,
+     * skipping the normalizer. It is set when the values came from the picker —
+     * either straight off the API lists (nothing to normalize) or kept
+     * deliberately by a submitter who was shown the normalizer's suggestion and
+     * turned it down, which is how an aircraft the list doesn't carry yet
+     * reaches review under its real name instead of the nearest old one.
+     *
+     * Whether the result is an unlisted aircraft is then derived from the
+     * metadata, not taken on trust from the caller.
+     */
+    const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId, opts = {}) => {
+
         let currentType = rawType;
         let currentLivery = rawLivery;
-        let currentTail = 'UNKNOWN'; 
+        let currentTail = 'UNKNOWN';
+        let unlistedNaming = false;
 
         // Helper for initial checking (used for User Preview only)
         const checkDuplicate = async (t, l) => {
@@ -2000,11 +2060,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             } catch (err) { return false; }
         };
 
-        try {
-            const normalized = await normalizeData(currentType, currentLivery);
-            currentType = normalized.type;
-            currentLivery = normalized.livery;
-        } catch (e) { console.error("Normalization error:", e); }
+        if (opts.keepWording) {
+            currentType = String(currentType || '').trim();
+            currentLivery = String(currentLivery || '').trim();
+        } else {
+            try {
+                const normalized = await normalizeData(currentType, currentLivery);
+                currentType = normalized.type;
+                currentLivery = normalized.livery;
+            } catch (e) { console.error("Normalization error:", e); }
+        }
+        // Derived from the metadata, never from the caller: whether the name is
+        // in the list is a fact about the name, and deriving it here means no
+        // entry point can forget to flag one.
+        unlistedNaming = !(await isListedAircraft(currentType));
 
         const autoReg = lookupRegistration(currentType, currentLivery);
         if (autoReg) currentTail = autoReg;
@@ -2034,6 +2103,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             } else {
                 embed.setTitle('📝 Review Your Submission')
                     .setDescription('I auto-detected the registration and tidied the names.\nConfirm the details below — or edit them first.');
+            }
+            // Kept as typed because the aircraft isn't in the list: say so here,
+            // so nobody is surprised when the admin card flags it.
+            if (unlistedNaming) {
+                embed.addFields({
+                    name: UNLISTED_FIELD,
+                    value: 'Going in exactly as you typed it. An admin will confirm the name.',
+                    inline: false
+                });
             }
             return embed;
         };
@@ -2082,11 +2160,17 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     userId: user.id,
                     type: currentType,
                     intro: '✏️ **Change the details.**',
-                    apply: async (pick, pickedType, pickedLivery) => {
+                    apply: async (pick, pickedType, pickedLivery, pickOpts = {}) => {
                         await pick.deferUpdate();
-                        const normalized = await normalizeData(pickedType, pickedLivery);
-                        currentType = normalized.type;
-                        currentLivery = normalized.livery;
+                        if (pickOpts.keepWording) {
+                            currentType = String(pickedType || '').trim();
+                            currentLivery = String(pickedLivery || '').trim();
+                        } else {
+                            const normalized = await normalizeData(pickedType, pickedLivery);
+                            currentType = normalized.type;
+                            currentLivery = normalized.livery;
+                        }
+                        unlistedNaming = !(await isListedAircraft(currentType));
                         currentTail = lookupRegistration(currentType, currentLivery) || 'UNKNOWN';
                         isDuplicate = await checkDuplicate(currentType, currentLivery);
 
@@ -2149,6 +2233,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                         { name: 'Livery', value: currentLivery, inline: true },
                     )
                     .setTimestamp();
+
+                // An aircraft the metadata doesn't carry reaches an admin under
+                // the submitter's own name — correct for a new release, wrong if
+                // they meant something already in the list. Either way it is the
+                // admin's call, so the card says which it is.
+                if (unlistedNaming) {
+                    finalEmbed.addFields({
+                        name: UNLISTED_FIELD,
+                        value: 'Not in the aircraft list — this is the contributor\'s own wording. Check the name (or fix it with **Edit Details**) before approving.',
+                        inline: false
+                    });
+                }
 
                 // --- KEY FIX: Force Fresh Duplicate Check for Admins ---
                 // We do NOT rely on the previous 'isDuplicate' boolean here.
@@ -2834,7 +2930,10 @@ client.on('interactionCreate', async (interaction) => {
                 userSessions.set(originalUserId, session);
                 // deferUpdate so startSubmissionFlow edits THIS prompt into the preview.
                 await interaction.deferUpdate();
-                await startSubmissionFlow(interaction, session.type, session.livery, null, photoUrl, interaction.user, interaction.channelId);
+                // keepWording: these details were already resolved for the first
+                // photo of this session — re-normalizing here would quietly undo
+                // a name the submitter chose to keep.
+                await startSubmissionFlow(interaction, session.type, session.livery, null, photoUrl, interaction.user, interaction.channelId, { keepWording: true });
                 return;
             }
 
@@ -2865,7 +2964,7 @@ client.on('interactionCreate', async (interaction) => {
                 await openAircraftPicker(interaction, {
                     userId: originalUserId,
                     intro: '📸 **Identify your photo.**',
-                    apply: async (pick, type, livery) => {
+                    apply: async (pick, type, livery, pickOpts = {}) => {
                         const photoMsg = photoMsgId
                             ? await interaction.channel.messages.fetch(photoMsgId).catch(() => null)
                             : null;
@@ -2876,7 +2975,7 @@ client.on('interactionCreate', async (interaction) => {
                         // deferUpdate first: startSubmissionFlow edits this same
                         // ephemeral message into the preview card.
                         await pick.deferUpdate();
-                        await startSubmissionFlow(pick, type, livery, null, photoUrl, pick.user, pick.channelId);
+                        await startSubmissionFlow(pick, type, livery, null, photoUrl, pick.user, pick.channelId, pickOpts);
                         try { await promptMsg.delete(); } catch (_) {}
                     }
                 });
@@ -3190,11 +3289,15 @@ client.on('interactionCreate', async (interaction) => {
                     userId: interaction.user.id,
                     type: pendingEmbed.fields?.find(f => f.name === 'Aircraft')?.value || null,
                     intro: '🔧 **Correct the aircraft or livery.** An admin still reviews it, and can change it again.',
-                    apply: async (pick, pickedType, pickedLivery) => {
+                    apply: async (pick, pickedType, pickedLivery, pickOpts = {}) => {
                         await pick.deferUpdate();
-                        const normalized = await normalizeData(pickedType, pickedLivery);
-                        const type = normalized.type;
-                        const livery = normalized.livery;
+                        let type = String(pickedType || '').trim();
+                        let livery = String(pickedLivery || '').trim();
+                        if (!pickOpts.keepWording) {
+                            const normalized = await normalizeData(type, livery);
+                            type = normalized.type;
+                            livery = normalized.livery;
+                        }
                         const tail = lookupRegistration(type, livery) || 'UNKNOWN';
 
                         // The card may have been approved or rejected while the
@@ -3252,6 +3355,17 @@ client.on('interactionCreate', async (interaction) => {
                     session.page = 0;
                     return interaction.update(await renderPicker(session)).catch(() => {});
                 }
+                // The manual-entry disagreement, settled either way. "Keep mine"
+                // is the whole point of the prompt: an aircraft or livery the
+                // list doesn't carry yet goes in with the submitter's wording,
+                // flagged for an admin rather than silently renamed.
+                if (action === 'usematch' || action === 'usemine') {
+                    if (!session.raw || !session.match) return interaction.update(PICKER_EXPIRED).catch(() => {});
+                    const chosen = action === 'usematch' ? session.match : session.raw;
+                    pickerSessions.delete(session.id);
+                    return session.apply(interaction, chosen.type, chosen.livery, { keepWording: true });
+                }
+
                 if (action === 'search') {
                     const modal = new ModalBuilder().setCustomId(`pick_searchmodal_${session.id}`).setTitle('Search');
                     modal.addComponents(new ActionRowBuilder().addComponents(
@@ -3267,12 +3381,16 @@ client.on('interactionCreate', async (interaction) => {
                     // The escape hatch: a livery the API doesn't list yet, or an
                     // aircraft named differently in-game. The normalizer still
                     // runs on whatever is typed, and an admin still reviews it.
-                    const modal = new ModalBuilder().setCustomId(`pick_manualmodal_${session.id}`).setTitle('Enter the details');
+                    const modal = new ModalBuilder().setCustomId(`pick_manualmodal_${session.id}`).setTitle('Type it yourself');
                     modal.addComponents(
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_type').setLabel('Aircraft Type')
-                            .setPlaceholder('e.g. 737-8 MAX, A321, 777-300ER').setValue(session.type || '').setStyle(TextInputStyle.Short).setRequired(true)),
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_livery').setLabel('Livery Name')
-                            .setPlaceholder('e.g. Delta Air Lines, Generic, Private').setStyle(TextInputStyle.Short).setRequired(true))
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_type').setLabel('Aircraft Type (new or unlisted is fine)')
+                            .setPlaceholder('e.g. 737-8 MAX, A321, 777-300ER')
+                            // Prefilled with what was typed last (Edit again from
+                            // the confirm step), else whatever step 1 selected.
+                            .setValue(session.raw?.type || session.type || '').setStyle(TextInputStyle.Short).setRequired(true)),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_livery').setLabel('Livery Name (new or unlisted is fine)')
+                            .setPlaceholder('e.g. Delta Air Lines, Generic, Private')
+                            .setValue(session.raw?.livery || '').setStyle(TextInputStyle.Short).setRequired(true))
                     );
                     return interaction.showModal(modal).catch(() => {});
                 }
@@ -3672,7 +3790,10 @@ client.on('interactionCreate', async (interaction) => {
                     return interaction.update(await renderPicker(session)).catch(() => {});
                 }
                 pickerSessions.delete(session.id);
-                return session.apply(interaction, session.type, chosen);
+                // Both halves came straight from the API lists, so there is
+                // nothing for the normalizer to improve and a listed aircraft is
+                // never flagged.
+                return session.apply(interaction, session.type, chosen, { keepWording: true });
             }
 
             // --- PHOTO MANAGER: REORDER / REMOVE (from /photos) ---
@@ -3780,12 +3901,29 @@ client.on('interactionCreate', async (interaction) => {
                     session.page = 0;
                     return interaction.update(await renderPicker(session)).catch(() => {});
                 }
+                const rawType = (interaction.fields.getTextInputValue('p_type') || '').trim();
+                const rawLivery = (interaction.fields.getTextInputValue('p_livery') || '').trim();
+
+                // The normalizer matches by substring and then fuzzily, so a
+                // genuinely new aircraft can be rewritten into an older one that
+                // merely reads like it. Where it wants to change what was typed,
+                // the submitter decides which one is right.
+                let match = { type: rawType, livery: rawLivery };
+                try {
+                    const normalized = await normalizeData(rawType, rawLivery);
+                    match = { type: normalized.type, livery: normalized.livery };
+                } catch (e) { console.error('Picker normalize failed:', e); }
+
+                const rewritten = match.type.toLowerCase() !== rawType.toLowerCase()
+                    || match.livery.toLowerCase() !== rawLivery.toLowerCase();
+                if (rewritten) {
+                    session.raw = { type: rawType, livery: rawLivery };
+                    session.match = match;
+                    return interaction.update(renderPickerConfirm(session)).catch(() => {});
+                }
+
                 pickerSessions.delete(session.id);
-                return session.apply(
-                    interaction,
-                    interaction.fields.getTextInputValue('p_type'),
-                    interaction.fields.getTextInputValue('p_livery')
-                );
+                return session.apply(interaction, rawType, rawLivery, { keepWording: true });
             }
 
             if (customId === 'identify_modal') {
