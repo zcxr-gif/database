@@ -307,12 +307,46 @@ It needs a roster — build one in the VA portal (Flight events → Pilot roster
 via `GET/POST /api/public/va/:id/pilots`. A VA with an empty roster sees no
 change from any of these values.
 
-> **Event feed note.** For the Discord takeoff/landing feed, `"any"` also
-> requires the ACARS matcher to forward flights whose callsign matches no VA at
-> all. It picks those pilots up from `GET /api/va/roster-watch` (the usernames of
-> every opted-in VA running `"any"`), refreshed on the same interval as the VA
-> list, and forwards them unattributed for this backend to resolve. Nothing to
-> configure per VA.
+> **Event feed note.** For the Discord takeoff/landing feed, these values also
+> require the ACARS matcher to forward flights whose callsign matches no VA at
+> all. It picks those pilots up from `GET /api/va/roster-watch` (the usernames on
+> the roster of every opted-in VA that is not on `"off"`), refreshed on the same
+> interval as the VA list, and forwards them unattributed for this backend to
+> resolve. Nothing to configure per VA.
+
+### The codeshare claim (Discord feed, automatic)
+
+`rosterTrust` above is a dial a VA sets. On the **Discord takeoff/landing feed**
+there is one more rule, and no VA has to turn it on:
+
+> A flight is delivered to a VA when the callsign carries **that VA's tag** —
+> whatever airline is in front of it — **and** the pilot is on **that VA's
+> roster**.
+
+This is the `##<SUFFIX>` + roster case. A Norwegian Virtual member on partner
+metal files `Shamrock 214NV`: the airline is Aer Lingus's, and the `NV` is the
+only thing on the callsign saying whose flight it is. Both signals have to agree,
+which is what makes it safe to run for every VA:
+
+* **the tag alone** would hand a VA every callsign that happens to end in its
+  letters — which is why a tag claiming a flight *by itself* (`callsignMatch:
+  "tag"`) has to refuse the generic `VA`;
+* **the roster alone** would post a member's every flight to every VA they have
+  ever joined.
+
+Together they name one listing, so even a VA whose tag *is* `VA` is claimed
+correctly here. A VA on `rosterTrust: "off"` is excluded — half of this claim is
+its roster, and `"off"` means the roster never delivers.
+
+**A codeshare leg belongs to two VAs, and both receive it.** The operating
+airline's VA matches on its own callsign; the tag owner claims it under this
+rule. They are not in competition: each gets its own card, in its own configured
+look, on its own webhook. Previously the feed resolved one winner, and the leg
+landed in the operating airline's Discord and nowhere else.
+
+Diagnose it with `GET /api/va-ads/flight-events/diagnose?callsign=…&username=…`
+(staff): the response's `codeshareClaimants` lists every other VA the flight is
+delivered to, and `pilotOnRoster` says whether the roster half is satisfied.
 
 ### A limit worth stating plainly
 
@@ -320,11 +354,14 @@ The only thing a live flight gives us is the callsign the pilot typed. Nothing
 else about the aircraft says which VA the pilot belongs to. Two consequences
 follow, and neither can be engineered away:
 
-- **A member on a codeshare leg is invisible.** They type the partner airline's
-  callsign, with no VA tag on it, so there is nothing to match. Mixing codeshare
-  callsigns with your own prefix means some of your pilots will not appear on the
-  map, however the *callsign* rules are set. The only way out is to stop reading
-  the callsign and read the roster instead — `rosterTrust: "any"`, §2a.
+- **A member on a codeshare leg with NO tag is invisible.** They type the partner
+  airline's callsign and nothing else, so there is nothing to match. Mixing
+  untagged codeshare callsigns with your own prefix means some of your pilots
+  will not appear on the map, however the *callsign* rules are set. The way out
+  is to stop reading the callsign and read the roster instead — `rosterTrust:
+  "any"`, §2a. (A codeshare leg that **does** keep the VA's tag is a solved case
+  on the Discord feed — see *The codeshare claim* above — and on the map with
+  `callsignMatch: "tag"`.)
 - **A stranger can look like a member.** `VA` is a near-universal tag, so a pilot
   flying for a *different* airline's VA on a similar callsign is, by pattern
   alone, indistinguishable from one of yours.

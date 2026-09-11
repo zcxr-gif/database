@@ -47,13 +47,24 @@ const accentFor = (e) => EVENT_ACCENT[e && e.event === 'takeoff' ? 'takeoff' : '
 // The detail fields a VA may show and re-order. `route` (DEP → ARR) is always
 // shown and so is intentionally NOT in this list. Kept as an ordered array so
 // the UI, normalizer and both renderers share ONE source of truth.
-const CARD_FIELD_KEYS = ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete', 'position'];
+// `plan` is the filed route read out as fixes ("EGLL · DET · KJFK") and is only
+// ever shown when the pilot actually filed one.
+const CARD_FIELD_KEYS = ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete', 'position', 'plan'];
 // Default selection + order when a VA hasn't customized the field list.
 const DEFAULT_CARD_FIELDS = ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete'];
-// Card layouts: 'card' = the rendered composite PNG (+ optional route map);
-// 'compact' = the plain Discord embed only (no image upload), for VAs who want
-// a lighter post.
-const CARD_LAYOUTS = ['card', 'compact'];
+// Card layouts:
+//   'card'    — the rendered composite PNG (+ optional route map);
+//   'compact' — the plain Discord embed only (no image upload), for VAs who
+//               want a lighter post;
+//   'slick'   — the same information as 'card' on a different, quieter design:
+//               the aircraft photo runs the full width behind the text instead
+//               of sitting in a box beside it, the callsign leads at display
+//               size, and the details are chips along the bottom. Same renderer
+//               pipeline, same map underneath, so nothing else changes when a
+//               VA picks it.
+const CARD_LAYOUTS = ['card', 'compact', 'slick'];
+// Layouts that produce a composite PNG (everything except the text-only one).
+const IMAGE_LAYOUTS = CARD_LAYOUTS.filter((l) => l !== 'compact');
 // How the rendered card/map images sit in the Discord message:
 //   'embed' = boxed inside the embed (Discord's default, constrained width);
 //   'large' = posted as standalone attachments so Discord shows them at full
@@ -106,6 +117,10 @@ const normalizeCardOptions = (raw = {}) => {
         .filter(k => CARD_FIELD_KEYS.includes(k) && !seen.has(k) && seen.add(k));
     return {
         accent: normalizeHex(o.accent),
+        // Did the VA actually choose a field list, or is this the default one?
+        // A new field can be added to the default look without silently adding
+        // it to a card somebody deliberately configured.
+        fieldsCustomized: fields.length > 0,
         layout: CARD_LAYOUTS.includes(o.layout) ? o.layout : 'card',
         imageStyle: CARD_IMAGE_STYLES.includes(o.imageStyle) ? o.imageStyle : 'embed',
         showMap: o.showMap === undefined ? true : !!o.showMap,
@@ -151,9 +166,32 @@ const clip = (s, max, fallback = '—') => {
     return str.length > max ? str.slice(0, max - 1) + '…' : str;
 };
 
-// The "Track on Inflight" link shown on every card. No per-flight deep link
-// exists yet, so this points at the tracker home.
-const trackUrl = () => TRACK_BASE_URL;
+// The id a flight is addressable by on the tracker. Sanitised rather than
+// trusted: it arrives from the ACARS sender and is about to be pasted into a
+// URL that goes out to Discord, so anything that isn't the id shape an Infinite
+// Flight flight id has (a GUID, or our own "test-…" sample) is refused and the
+// link falls back to the tracker home.
+const flightLinkId = (e = {}) => {
+    const id = String(e.flightId == null ? '' : e.flightId).trim();
+    // The character class is the whole guard: the id is about to be pasted into
+    // a public URL, so anything outside URL-safe characters (a slash, a space, a
+    // query separator) is refused rather than escaped and hoped for. Length is
+    // only capped, not floored — a short id is unusual, not dangerous.
+    return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
+};
+
+// Where "Track on Inflight" sends people. With a flight id — which every real
+// event carries — this is the flight ITSELF: /share/<id> resolves the aircraft
+// on the tracker, opens the map on it, and (once the flight has ended) serves
+// the flight's own summary page instead of a dead link. That is the difference
+// between a notification somebody can act on and one they can only read.
+//
+// Without an id (an older sender, a malformed event) it degrades to the tracker
+// home, which is what this always used to return.
+const trackUrl = (e) => {
+    const id = flightLinkId(e || {});
+    return id ? `${TRACK_BASE_URL}/share/${encodeURIComponent(id)}` : TRACK_BASE_URL;
+};
 
 // ---------------------------------------------------------------------------
 // Derived route figures (leg distance + estimated time enroute), shared by the
@@ -200,9 +238,20 @@ const formatDuration = (mins) => {
 // showing "time to go" would be nonsense.
 const eteTextFor = (e = {}) => {
     if (e.event !== 'takeoff') return null;
-    const { dep, arr } = extractRoute(e);
     const gs = e.position && e.position.gs_kt;
-    return formatDuration(eteMinutes(routeDistanceNm(dep, arr), gs));
+    return formatDuration(eteMinutes(eventDistanceNm(e), gs));
+};
+
+// The leg distance to quote for an event: the track distance along the FILED
+// plan when the pilot filed one, and the great-circle between the airports
+// otherwise. The plan is the better answer wherever it exists — an aeroplane
+// flies the route it filed, not the straight line — and the fallback is what
+// every event used before plans were forwarded at all.
+const eventDistanceNm = (e = {}) => {
+    const viaPlan = planDistanceNm(extractFlightPlan(e));
+    if (viaPlan != null) return viaPlan;
+    const { dep, arr } = extractRoute(e);
+    return routeDistanceNm(dep, arr);
 };
 
 // Build a static map image URL with a plane marker at the flight's position, so
@@ -242,6 +291,106 @@ const firstIcao = (...vals) => {
     return '';
 };
 
+/* ---------------------------------------------------------------------------
+ * The filed flight plan
+ *
+ * The ACARS sender forwards the pilot's filed route with each event (see
+ * va_filter.cjs), flattened to the fixes that carry coordinates — a SID or STAR
+ * arrives as one item holding its fixes as children, and only the leaves have a
+ * position. Everything downstream (the route map, the card, the embed) reads the
+ * plan through here, so a sender that sends a different shape, an older sender
+ * that sends none, or a malformed one are all the same single case to handle.
+ *
+ * Nothing here trusts its input: coordinates are range-checked, the list is
+ * capped, and anything unusable yields [] rather than a half-drawn route.
+ * ------------------------------------------------------------------------- */
+
+// A plan longer than this is not a flight plan, it is a malformed response —
+// and the map is 1,200 px wide, so past a couple of hundred fixes the extra
+// points land on pixels that are already drawn.
+const MAX_PLAN_WAYPOINTS = 200;
+
+// One waypoint, or null when the entry can't be placed on a map. Tolerates the
+// field names a plan can arrive under: {lat,lon} (our sender), {latitude,
+// longitude} (Infinite Flight's own shape), or a bare [lat, lon] pair.
+const normalizeWaypoint = (w) => {
+    if (!w) return null;
+    let lat, lon, name = '';
+    if (Array.isArray(w)) {
+        [lat, lon] = w;
+    } else if (typeof w === 'object') {
+        lat = w.lat != null ? w.lat : (w.latitude != null ? w.latitude : (w.location || {}).latitude);
+        lon = w.lon != null ? w.lon : (w.lng != null ? w.lng : (w.longitude != null ? w.longitude : (w.location || {}).longitude));
+        name = w.name || w.ident || w.identifier || w.id || '';
+    } else return null;
+    lat = Number(lat); lon = Number(lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    // (0,0) is what an unresolved fix reports, not a point in the Gulf of Guinea
+    // that every third flight plan routes through.
+    if (lat === 0 && lon === 0) return null;
+    return { name: String(name || '').trim().slice(0, 12), lat, lon };
+};
+
+// The filed route as an ordered [{ name, lat, lon }], or [] when the pilot filed
+// nothing. Reads the plan off whichever field the sender used.
+const extractFlightPlan = (e = {}) => {
+    const fp = e.flightPlan || e.fpl || e.plan || {};
+    const raw = [fp.waypoints, fp.fixes, fp.items, fp.points,
+        e.waypoints, e.flightPlanWaypoints, Array.isArray(fp) ? fp : null]
+        .find((v) => Array.isArray(v) && v.length);
+    if (!raw) return [];
+    const out = [];
+    for (const w of raw) {
+        const p = normalizeWaypoint(w);
+        // Consecutive duplicates (a fix filed twice, an airport repeated as the
+        // first enroute point) draw a zero-length leg and a doubled label.
+        if (!p) continue;
+        const last = out[out.length - 1];
+        if (last && last.lat === p.lat && last.lon === p.lon) continue;
+        out.push(p);
+        if (out.length >= MAX_PLAN_WAYPOINTS) break;
+    }
+    // One point is a position, not a route — there is nothing to draw between.
+    return out.length >= 2 ? out : [];
+};
+
+// Great-circle distance in nautical miles between two [lat, lon] pairs.
+const legDistanceNm = (a, b) => {
+    const r = (d) => d * Math.PI / 180;
+    const dLat = r(b[0] - a[0]), dLon = r(b[1] - a[1]);
+    const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLon / 2) ** 2;
+    return 3440.065 * 2 * Math.asin(Math.min(1, Math.sqrt(h)));
+};
+
+// Track distance along the filed plan (the sum of its legs), in whole nautical
+// miles, or null for no plan. This is the honest figure for a filed route: the
+// great-circle between the two airports understates a plan that dog-legs around
+// terrain, airspace or an ocean track, sometimes by hundreds of miles.
+const planDistanceNm = (plan) => {
+    if (!Array.isArray(plan) || plan.length < 2) return null;
+    let nm = 0;
+    for (let i = 1; i < plan.length; i++) {
+        nm += legDistanceNm([plan[i - 1].lat, plan[i - 1].lon], [plan[i].lat, plan[i].lon]);
+    }
+    const r = Math.round(nm);
+    return r > 0 ? r : null;
+};
+
+// The plan read out as text — "EGLL · DET · KJFK" — for the embed field and the
+// card. Named fixes only: a plan is filed with idents, and an unnamed point
+// (a user waypoint dropped on the map) has nothing to print. Long routes are
+// elided in the MIDDLE so the two ends, which are the ones anyone reads, stay.
+const planRouteText = (plan, maxFixes = 12) => {
+    const names = (Array.isArray(plan) ? plan : []).map((w) => w.name).filter(Boolean);
+    if (names.length < 2) return '';
+    if (names.length <= maxFixes) return names.join(' · ');
+    const head = Math.ceil((maxFixes - 1) / 2);
+    const tail = maxFixes - 1 - head;
+    return [...names.slice(0, head), `… +${names.length - head - tail} …`, ...names.slice(names.length - tail)].join(' · ');
+};
+
 // Extract departure/arrival ICAO from an event, tolerant of the field names an
 // ACARS sender might use (flat strings, nested {icao}/{code}/{ident}, or a
 // route/flightPlan object). Returns { dep, arr } as ICAO strings ('' if absent).
@@ -271,8 +420,13 @@ const EMBED_FIELD_BUILDERS = {
     server:   (c) => [{ name: '🌐 Server', value: clip(c.e.server, 256), inline: true }],
     aircraft: (c) => c.aircraftLine ? [{ name: '✈️ Aircraft', value: clip(c.aircraftLine, 256), inline: true }] : [],
     altspeed: (c) => c.altSpeed ? [{ name: '📈 Alt · Speed', value: c.altSpeed, inline: true }] : [],
-    distance: (c) => c.distNm != null ? [{ name: '📏 Distance', value: `≈ ${c.distNm.toLocaleString('en-US')} NM`, inline: true }] : [],
+    distance: (c) => c.distNm != null
+        ? [{ name: '📏 Distance', value: `≈ ${c.distNm.toLocaleString('en-US')} NM${c.viaPlan ? ' (filed)' : ''}`, inline: true }]
+        : [],
     ete:      (c) => c.eteText ? [{ name: '⏱️ ETE', value: c.eteText, inline: true }] : [],
+    // The filed route, read out. Full width (not inline) — a route is a long
+    // string and Discord would squeeze it into a third of the card otherwise.
+    plan:     (c) => c.planText ? [{ name: '🗺️ Flight plan', value: clip(c.planText, 256), inline: false }] : [],
     // Plain coordinates — NOT a masked link. Raw URLs don't auto-linkify inside
     // embed fields and masked links can be stripped by clients/AutoMod, leaving
     // ugly `[..](..)` markdown. The map stays reachable via the clickable title.
@@ -293,7 +447,8 @@ const buildVaEventPayload = (e = {}, media = {}, opts) => {
 
     const hasCoords = Number.isFinite(pos.lat) && Number.isFinite(pos.lon);
     const coords = hasCoords ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : null;
-    const track = trackUrl();
+    // Per-flight: tapping the card opens THIS flight on the tracker.
+    const track = trackUrl(e);
 
     const aircraftLine = ac.aircraftName
         ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName)
@@ -304,7 +459,15 @@ const buildVaEventPayload = (e = {}, media = {}, opts) => {
     ].filter(Boolean).join(' · ') || null;
 
     const { dep, arr } = extractRoute(e);
-    const ctx = { e, aircraftLine, altSpeed, coords, distNm: routeDistanceNm(dep, arr), eteText: eteTextFor(e) };
+    const plan = extractFlightPlan(e);
+    const planNm = planDistanceNm(plan);
+    const ctx = {
+        e, aircraftLine, altSpeed, coords,
+        distNm: planNm != null ? planNm : routeDistanceNm(dep, arr),
+        viaPlan: planNm != null,
+        planText: planRouteText(plan),
+        eteText: eteTextFor(e),
+    };
 
     const fields = [];
     // Route first, laid out horizontally (two inline fields side by side) so
@@ -317,6 +480,14 @@ const buildVaEventPayload = (e = {}, media = {}, opts) => {
     for (const key of o.fields) {
         const build = EMBED_FIELD_BUILDERS[key];
         if (build) for (const f of build(ctx)) { if (fields.length < 25) fields.push(f); }
+    }
+    // The filed route rides along even for a VA that has never opened the card
+    // editor: it is new, it is the point of forwarding plans at all, and it only
+    // appears when the pilot actually filed one. A VA that explicitly dropped
+    // 'plan' from its field list has said no, so this only fills the gap for a
+    // list that predates the field.
+    if (ctx.planText && !o.fields.includes('plan') && !o.fieldsCustomized && fields.length < 25) {
+        fields.push(...EMBED_FIELD_BUILDERS.plan(ctx));
     }
 
     const brandIcon = `${PUBLIC_BASE_URL}/assets/brand/inflight-logo.png`;
@@ -331,7 +502,7 @@ const buildVaEventPayload = (e = {}, media = {}, opts) => {
         description: clip(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`
             + (aircraftLine ? ` flying the **${ac.aircraftName}**.` : '.')
-            + (isHttpUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
+            + (isHttpUrl(track) ? `\n[🔭 ${flightLinkId(e) ? 'Open this flight on Inflight' : 'Track on Inflight'}](${track})` : ''),
             2048),
         color: accent,
         fields,
@@ -353,9 +524,12 @@ const buildVaEventPayload = (e = {}, media = {}, opts) => {
 
 module.exports = {
     buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, clip, trackUrl,
-    accentFor, PUBLIC_BASE_URL,
+    accentFor, PUBLIC_BASE_URL, TRACK_BASE_URL, flightLinkId,
     // Derived route figures (shared with the image renderer).
     routeDistanceNm, eteMinutes, formatDuration, eteTextFor,
+    // The filed flight plan: extraction, track distance, and the readout.
+    extractFlightPlan, planDistanceNm, planRouteText, eventDistanceNm, MAX_PLAN_WAYPOINTS,
+    IMAGE_LAYOUTS,
     // Card customization vocabulary + helpers (shared with the API/UI/renderer).
     CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, CARD_IMAGE_STYLES, PHOTO_SIDES, MAP_STYLES, MAP_SIZES,
     DEFAULT_CARD_OPTIONS, normalizeCardOptions, resolveAccent, resolveMapLine,

@@ -107,6 +107,7 @@
                         <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Layout</label>
                         <select id="wh_card_layout" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
                             <option value="card">Full image card</option>
+                            <option value="slick">Slick — full-bleed photo</option>
                             <option value="compact">Compact (text only)</option>
                         </select>
                     </div>
@@ -117,7 +118,7 @@
                         <option value="embed">Standard — framed inside the embed</option>
                         <option value="large">Large — full-width standalone image</option>
                     </select>
-                    <p class="text-xs text-zinc-400 mt-1.5">Large posts the card (and route map) as standalone attachments so Discord shows them bigger, not boxed in the embed container.</p>
+                    <p class="text-xs text-zinc-400 mt-1.5">Large posts the card (and route map) as standalone attachments so Discord shows them bigger, not boxed in the embed container. Slick uses the aircraft photo as the whole card — the callsign leads, the route sits on a boarding-pass strip and the details become chips.</p>
                 </div>
                 <div>
                     <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Custom title <span class="font-normal text-zinc-400">· optional</span></label>
@@ -164,8 +165,9 @@
                         <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="distance"> Distance</label>
                         <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="ete"> ETE</label>
                         <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="position"> Position</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="plan"> Flight plan</label>
                     </div>
-                    <p class="text-xs text-zinc-400 mt-1.5">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                    <p class="text-xs text-zinc-400 mt-1.5">Route (departure → arrival) is always shown. ETE only appears on departures. Flight plan lists the filed fixes and only appears when the pilot filed one — the route map draws the whole plan either way.</p>
                 </div>
                 <!-- Live preview — rendered from the current settings; nothing is posted. -->
                 <div class="rounded-xl border-2 border-zinc-100 dark:border-zinc-800 p-3 bg-zinc-50/60 dark:bg-zinc-900/40">
@@ -313,7 +315,7 @@
             const accent = (c.accent || '').trim();
             document.getElementById('wh_card_accent').value = accent;
             document.getElementById('wh_card_accentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
-            document.getElementById('wh_card_layout').value = c.layout === 'compact' ? 'compact' : 'card';
+            document.getElementById('wh_card_layout').value = ['compact', 'slick'].includes(c.layout) ? c.layout : 'card';
             document.getElementById('wh_card_image_style').value = c.imageStyle === 'large' ? 'large' : 'embed';
             document.getElementById('wh_card_showPhoto').checked = c.showPhoto !== false;
             document.getElementById('wh_card_showMap').checked = c.showMap !== false;
