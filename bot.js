@@ -1339,6 +1339,77 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     const MAX_AIRCRAFT_IMAGES = 3;
 
     /**
+     * Where an approved photo lands, decided against the LIVE image count rather
+     * than the count that was on record when the review card was rendered.
+     *
+     * Actions an approve button can carry:
+     *   • 'replace' — overwrite that slot (the old photo is deleted from S3)
+     *   • 'add'     — append after the last photo
+     *   • 'insert'  — take that slot and push the photos at/after it DOWN one
+     *                 place, so nothing is deleted. This is how a better shot
+     *                 becomes Photo 1 while the current Photo 1 survives as
+     *                 Photo 2 (and Photo 2 as Photo 3).
+     *   • null      — a legacy button with no encoded intent; infer from state.
+     *
+     * Returns { slotIndex, mode } where mode is 'replace' | 'append' | 'insert'
+     * | 'full'. 'full' means the insert can no longer happen without pushing a
+     * photo out of the record entirely — the caller must abort rather than
+     * quietly trash the last one.
+     */
+    const resolveAircraftSlot = (action, chosenSlot, imageCount) => {
+        const count = Math.max(0, Math.min(imageCount || 0, MAX_AIRCRAFT_IMAGES));
+        const wanted = Math.min(Math.max((parseInt(chosenSlot, 10) || 1) - 1, 0), count);
+
+        if (action === 'insert') {
+            // Inserting past the last photo is just an append, and that stays
+            // legal on a full record only as a replace of the final slot — which
+            // 'insert' never is. Anything that would displace a photo off the
+            // end of a full record is refused.
+            if (wanted >= count) return { slotIndex: count, mode: count >= MAX_AIRCRAFT_IMAGES ? 'full' : 'append' };
+            if (count >= MAX_AIRCRAFT_IMAGES) return { slotIndex: wanted, mode: 'full' };
+            return { slotIndex: wanted, mode: 'insert' };
+        }
+
+        if (action === 'add') {
+            if (count < MAX_AIRCRAFT_IMAGES) return { slotIndex: count, mode: 'append' };
+            return { slotIndex: MAX_AIRCRAFT_IMAGES - 1, mode: 'replace' };
+        }
+
+        if (action === 'replace') {
+            // Replace the targeted slot if it still exists; if that photo is gone
+            // (images shrank since render), append instead.
+            const slotIndex = (parseInt(chosenSlot, 10) || 1) - 1;
+            if (slotIndex >= 0 && slotIndex < count) return { slotIndex, mode: 'replace' };
+            const fallback = Math.min(count, MAX_AIRCRAFT_IMAGES - 1);
+            return { slotIndex: fallback, mode: fallback < count ? 'replace' : 'append' };
+        }
+
+        return { slotIndex: wanted, mode: wanted < count ? 'replace' : 'append' };
+    };
+
+    // Apply a resolved placement to a record's image/contributor arrays (both
+    // mutated in step). Returns the URL that was overwritten and therefore needs
+    // deleting from S3, or null when nothing was displaced — an insert shifts the
+    // existing photos down a slot instead of trashing one.
+    const applyAircraftPlacement = (images, contributors, placement, url, contributor) => {
+        const { mode, slotIndex } = placement;
+        if (mode === 'replace' && slotIndex < images.length) {
+            const replaced = images[slotIndex];
+            images[slotIndex] = url;
+            contributors[slotIndex] = contributor;
+            return replaced;
+        }
+        if (mode === 'insert' && slotIndex < images.length) {
+            images.splice(slotIndex, 0, url);
+            contributors.splice(slotIndex, 0, contributor);
+            return null;
+        }
+        images.push(url);
+        contributors.push(contributor);
+        return null;
+    };
+
+    /**
      * The submitter token exactly as a pending review card carries it.
      *
      * Two shapes, both written into the footer as `User: <token>`:
@@ -1390,6 +1461,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const existingImages = getEntryImages(existingEntry);
         const extraEmbeds = [];
         const approveButtons = [];
+        const insertButtons = [];
 
         if (existingImages.length === 0) {
             // No photo yet: this is an "add" so the approval handler appends
@@ -1403,9 +1475,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             const slotsToShow = Math.min(existingImages.length + 1, MAX_AIRCRAFT_IMAGES);
             for (let slot = 1; slot <= slotsToShow; slot++) {
                 const isReplace = slot <= existingImages.length;
-                // Encode the intent (add/replace) in the customId so the approval
-                // handler re-checks the live image state instead of trusting the
-                // slot number captured when these buttons were first rendered.
+                // Encode the intent (add/replace/insert) in the customId so the
+                // approval handler re-checks the live image state instead of
+                // trusting the slot number captured when these buttons were
+                // first rendered.
                 const action = isReplace ? 'replace' : 'add';
                 approveButtons.push(
                     new ButtonBuilder()
@@ -1415,8 +1488,29 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                         .setEmoji(isReplace ? '♻️' : '➕')
                 );
             }
+
+            // Non-destructive alternative to Replace: the new photo takes the
+            // slot and the photo sitting there slides down one (Photo 1 → 2,
+            // 2 → 3). Only offered while there is a free slot to slide into —
+            // on a full record every insert would push a photo out.
+            const hasRoom = existingImages.length < MAX_AIRCRAFT_IMAGES;
+            if (hasRoom) {
+                for (let slot = 1; slot <= existingImages.length; slot++) {
+                    insertButtons.push(
+                        new ButtonBuilder()
+                            .setCustomId(`approve_insert_${slot}_${userId}`)
+                            .setLabel(`Insert as Photo ${slot} (${slot} → ${slot + 1})`)
+                            .setStyle(ButtonStyle.Secondary)
+                            .setEmoji('⬇️')
+                    );
+                }
+            }
+
+            const insertHint = hasRoom
+                ? `\n**Insert** puts it in that slot and pushes the current photo(s) down a slot — nothing is deleted.`
+                : `\nAll ${MAX_AIRCRAFT_IMAGES} slots are full, so there is no free slot to push a photo down into — **Replace** deletes the photo it overwrites.`;
             mainEmbed.setTitle('♻️ Replacement / Additional Photo — Awaiting Review').setColor(SUB_STATE.PENDING.color)
-                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
+                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites (and deletes) that photo, **Add** appends a new one.${insertHint}`);
 
             const existingContributors = getEntryContributors(existingEntry);
             existingImages.forEach((imgUrl, idx) => {
@@ -1425,7 +1519,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     .setTitle(`🖼️ Current Photo ${idx + 1}`)
                     .setColor(THEME.GRAY)
                     .setImage(imgUrl)
-                    .setFooter({ text: `Replacing Photo ${idx + 1} deletes this image.` });
+                    .setFooter({ text: hasRoom
+                        ? `Replacing Photo ${idx + 1} deletes this image — inserting keeps it (moves to Photo ${idx + 2}).`
+                        : `Replacing Photo ${idx + 1} deletes this image.` });
                 // Show who contributed each existing photo so admins know a replace
                 // only overwrites that one slot's contributor, not the others.
                 const lines = [`**Photo ${idx + 1} Contributor:** ${slotContributor}`];
@@ -1437,6 +1533,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
         const components = [
             new ActionRowBuilder().addComponents(...approveButtons),
+            // Own row: a row holds 5 buttons, and the insert choices must not be
+            // squeezed out by the replace/add ones on a 2-photo record.
+            ...(insertButtons.length ? [new ActionRowBuilder().addComponents(...insertButtons)] : []),
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(`edit_admin_${userId}`).setLabel('Edit Details').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
                 new ButtonBuilder().setCustomId(`reject_${userId}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
@@ -2363,7 +2462,7 @@ client.on('interactionCreate', async (interaction) => {
             if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
                 // customId format: approve_<action>_<slot>_<userId> where action is
-                // 'add' | 'replace'. Older formats are still accepted:
+                // 'add' | 'replace' | 'insert'. Older formats are still accepted:
                 //   approve_<slot>_<userId>  (slot only — intent inferred at approval)
                 //   approve_<userId>         (legacy single-photo => slot 1)
                 const approveParts = customId.split('_');
@@ -2394,6 +2493,49 @@ client.on('interactionCreate', async (interaction) => {
                     const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
                     const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
+                    // Find the existing record (if any) so we can place the new photo into
+                    // the admin-chosen slot without disturbing the other images.
+                    //
+                    // Read BEFORE the upload: an insert that no longer fits is refused
+                    // below, and aborting after the upload would leave an orphaned
+                    // object in the bucket.
+                    const existingEntry = await CommunityAircraftModel.findOne({
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                    });
+
+                    let images = getEntryImages(existingEntry);
+                    let contributors = getEntryContributors(existingEntry);
+
+                    // RE-CHECK against the LIVE database before placing the photo.
+                    // The slot baked into the button was decided when the buttons
+                    // were rendered; by the time an admin clicks, other submissions
+                    // for the same aircraft may already have been approved. Without
+                    // this re-check, a second pending "add" (rendered as slot 1 when
+                    // there were 0 photos) would overwrite the photo that was just
+                    // approved into slot 1. We honour the admin's intent (add vs
+                    // replace vs insert) against the current image count instead.
+                    const placement = resolveAircraftSlot(approveAction, chosenSlot, images.length);
+
+                    // The record filled up between render and click, so the insert the
+                    // admin asked for would now shove Photo 3 out of the database —
+                    // exactly the loss insert exists to avoid. Change nothing, re-render
+                    // the card against the live state, and let them choose again.
+                    if (placement.mode === 'full') {
+                        const stale = EmbedBuilder.from(receivedEmbed);
+                        const review = buildAircraftReview(stale, existingEntry, targetUserId);
+                        if (footerText) stale.setFooter({ text: footerText });
+                        // No `attachments` key: the pending photo is still a Discord
+                        // attachment this embed points at, and clearing it would blank
+                        // the card.
+                        await interaction.editReply({ embeds: [stale, ...review.extraEmbeds], components: review.components });
+                        await interaction.followUp({
+                            content: `⚠️ **${typeField}** (${liveryField}) now has ${MAX_AIRCRAFT_IMAGES}/${MAX_AIRCRAFT_IMAGES} photos, so inserting would push Photo ${MAX_AIRCRAFT_IMAGES} out of the database. Nothing was changed — the card is refreshed, so use **Replace** if you do want to overwrite a slot.`,
+                            ephemeral: true
+                        }).catch(() => {});
+                        return;
+                    }
+
                     // Both DM and web submissions carry a Discord-hosted attachment,
                     // so this moves it to S3. (If the image is somehow already in our
                     // bucket, reuse it instead of re-running the sharp pipeline.)
@@ -2421,67 +2563,14 @@ client.on('interactionCreate', async (interaction) => {
                     }
                     if (!contributorName) contributorName = footerCollab || 'Anonymous';
 
-                    // Find the existing record (if any) so we can place the new photo into
-                    // the admin-chosen slot without disturbing the other images.
-                    const existingEntry = await CommunityAircraftModel.findOne({
-                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
-                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
-                    });
-
-                    let images = getEntryImages(existingEntry);
-                    let contributors = getEntryContributors(existingEntry);
-
-                    // RE-CHECK against the LIVE database before placing the photo.
-                    // The slot baked into the button was decided when the buttons
-                    // were rendered; by the time an admin clicks, other submissions
-                    // for the same aircraft may already have been approved. Without
-                    // this re-check, a second pending "add" (rendered as slot 1 when
-                    // there were 0 photos) would overwrite the photo that was just
-                    // approved into slot 1. We honour the admin's intent (add vs
-                    // replace) against the current image count instead.
-                    let slotIndex;
-                    let isReplace;
-                    if (approveAction === 'add') {
-                        // Append as a NEW photo at the end of the current list. If
-                        // the aircraft is already full, fall back to the last slot.
-                        if (images.length < MAX_AIRCRAFT_IMAGES) {
-                            slotIndex = images.length;
-                            isReplace = false;
-                        } else {
-                            slotIndex = MAX_AIRCRAFT_IMAGES - 1;
-                            isReplace = true;
-                        }
-                    } else if (approveAction === 'replace') {
-                        // Replace the targeted slot if it still exists; if that photo
-                        // is gone (images shrank since render), append instead.
-                        slotIndex = chosenSlot - 1;
-                        if (slotIndex >= 0 && slotIndex < images.length) {
-                            isReplace = true;
-                        } else {
-                            slotIndex = Math.min(images.length, MAX_AIRCRAFT_IMAGES - 1);
-                            isReplace = slotIndex < images.length;
-                        }
-                    } else {
-                        // Legacy buttons (no encoded action): infer from live state.
-                        slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
-                        if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
-                        isReplace = slotIndex < images.length;
-                    }
-
                     // The person who submitted this photo is the contributor of THIS
-                    // slot only — adding/replacing photo 2 or 3 must not overwrite the
-                    // contributor(s) of the other images.
+                    // slot only — adding/replacing/inserting a photo must not overwrite
+                    // the contributor(s) of the other images. An insert carries each
+                    // existing photo's credit down with it.
                     const slotContributor = { name: contributorName, id: contributorId };
 
-                    let replacedUrl = null;
-                    if (isReplace && slotIndex < images.length) {
-                        replacedUrl = images[slotIndex];
-                        images[slotIndex] = permanentUrl;
-                        contributors[slotIndex] = slotContributor;
-                    } else {
-                        images.push(permanentUrl);
-                        contributors.push(slotContributor);
-                    }
+                    const slotIndex = placement.slotIndex;
+                    const replacedUrl = applyAircraftPlacement(images, contributors, placement, permanentUrl, slotContributor);
                     images = images.slice(0, MAX_AIRCRAFT_IMAGES);
                     contributors = contributors.slice(0, MAX_AIRCRAFT_IMAGES);
 
@@ -2513,7 +2602,9 @@ client.on('interactionCreate', async (interaction) => {
 
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    const approvedTitle = `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
+                    const approvedTitle = placement.mode === 'insert'
+                        ? `✅ Approved — Inserted as Photo ${slotIndex + 1} of ${images.length} (previous Photo ${slotIndex + 1} kept as ${slotIndex + 2})`
+                        : `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
                     // Keep the verified photo rendered inside the admin embed (using the
                     // permanent S3 URL) and drop the temporary upload attachment.
                     await interaction.editReply({
