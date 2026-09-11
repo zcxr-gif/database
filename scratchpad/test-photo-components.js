@@ -44,6 +44,7 @@ class ButtonBuilder {
     setLabel(l) { this.data.label = l; return this; }
     setStyle(s) { this.data.style = s; return this; }
     setEmoji(e) { this.data.emoji = { name: e }; return this; }
+    setDisabled(d) { this.data.disabled = d; return this; }
     toJSON() { return this.data; }
 }
 class StringSelectMenuOptionBuilder {
@@ -243,5 +244,104 @@ const legacy = inspect(H.buildPhotoManager({
 ok('a legacy single-image record renders', legacy.problems.length === 0, legacy.problems.join('; '));
 T('…crediting its top-level contributor', legacy.embeds[1].description, 'Contributor: Old Timer');
 
-console.log(failures ? `\n${failures} failure(s)\n` : '\nall good\n');
-process.exit(failures ? 1 : 0);
+// ---------------------------------------------------------------------------
+// The aircraft picker: two paged dropdowns (aircraft, then its liveries) that
+// replaced typing the type and livery into a modal. Its whole reason to exist
+// is that the lists are longer than a Discord select can hold, so the paging
+// maths and the 25-option cap are the things worth pinning down.
+// ---------------------------------------------------------------------------
+const PICK_NAMES = ['PICKER_PAGE_SIZE', 'parsePickerCustomId', 'filterByQuery', 'pickerChoices', 'renderPicker'];
+// Stub the two API-backed lists: 60 aircraft (3 pages) and a per-aircraft
+// livery list, so the paging is exercised without touching the network.
+const AIRCRAFT = Array.from({ length: 60 }, (_, i) => ({ name: `Plane ${String(i + 1).padStart(2, '0')}`, id: `id${i + 1}` }));
+const LIVERIES = {
+    id1: Array.from({ length: 30 }, (_, i) => `Livery ${String(i + 1).padStart(2, '0')}`),
+    id2: ['Generic', 'Delta Air Lines', 'Qatar Airways'],
+    id3: [],
+};
+const P = new Function(...Object.keys(DEPS), 'fetchAircraftMetadata', 'fetchLiveriesForAircraft',
+    `${PICK_NAMES.map(lift).join('\n')}\nreturn { ${PICK_NAMES.join(', ')} };`
+)(...Object.values(DEPS),
+    async () => AIRCRAFT,
+    async (id) => LIVERIES[id] || []);
+
+const session = (over = {}) => ({ id: 'abc123', step: 'type', type: null, query: '', page: 0, intro: '', ...over });
+const picker = async (over) => {
+    const s = session(over);
+    const payload = await P.renderPicker(s);
+    const view = inspect({ embeds: [], components: payload.components });
+    const select = view.selects[0] || null;
+    return { s, content: payload.content, view, select, options: select ? select.options.map(o => o.value) : [] };
+};
+
+console.log('\nparsePickerCustomId — reading a control back');
+T('a page button carries its page', P.parsePickerCustomId('pick_page_abc123_2'), { action: 'page', sessionId: 'abc123', page: 2 });
+T('page 0 parses as 0, not as missing', P.parsePickerCustomId('pick_page_abc123_0'), { action: 'page', sessionId: 'abc123', page: 0 });
+T('a search button is just an id', P.parsePickerCustomId('pick_search_abc123'), { action: 'search', sessionId: 'abc123', page: null });
+T('so is back', P.parsePickerCustomId('pick_back_abc123'), { action: 'back', sessionId: 'abc123', page: null });
+T('a foreign id is ignored', P.parsePickerCustomId('approve_add_1_123'), null);
+T('a truncated id is ignored', P.parsePickerCustomId('pick_page_'), null);
+T('null is handled', P.parsePickerCustomId(null), null);
+
+console.log('\nfilterByQuery — the search box');
+T('matches anywhere in the name', P.filterByQuery(['Boeing 737', 'Airbus A320'], '73'), ['Boeing 737']);
+T('is case-insensitive', P.filterByQuery(['Delta Air Lines'], 'delta'), ['Delta Air Lines']);
+T('an empty query keeps everything', P.filterByQuery(['a', 'b'], ''), ['a', 'b']);
+T('whitespace is not a query', P.filterByQuery(['a', 'b'], '   '), ['a', 'b']);
+
+(async () => {
+    console.log('\nrenderPicker — step 1, the aircraft list');
+    const first = await picker();
+    ok('page 1 renders cleanly', first.view.problems.length === 0, first.view.problems.join('; '));
+    T('a page holds exactly the select limit', first.options.length, P.PICKER_PAGE_SIZE);
+    T('it starts at the first aircraft', first.options[0], 'Plane 01');
+    // 60 aircraft over pages of 25 is 3 pages: the count and the page number are
+    // the only way a user knows there is more than what they can see.
+    ok('the header counts the options and the pages', /60 options .* page 1 of 3/.test(first.content), first.content);
+    T('Prev is disabled on the first page', first.view.buttons[0].disabled, true);
+    T('Next is live when there is more', Boolean(first.view.buttons[1].disabled), false);
+    T('step 1 has no Back button', first.view.labels.includes('Back'), false);
+    T('typing it by hand is always offered', first.view.labels.includes('Type it myself'), true);
+
+    const last = await picker({ page: 2 });
+    T('the last page holds the remainder', last.options.length, 10);
+    T('…ending at the last aircraft', last.options[9], 'Plane 60');
+    T('Next is disabled on the last page', last.view.buttons[1].disabled, true);
+    // A page number from a stale control must not render an empty dropdown.
+    const clamped = await picker({ page: 99 });
+    T('a page past the end is clamped back', clamped.s.page, 2);
+    T('…and still shows options', clamped.options.length, 10);
+
+    const searched = await picker({ query: 'ane 1' });
+    T('a search narrows the list', searched.options, ['Plane 10', 'Plane 11', 'Plane 12', 'Plane 13', 'Plane 14', 'Plane 15', 'Plane 16', 'Plane 17', 'Plane 18', 'Plane 19']);
+    ok('…and says what it matched', /matching \*\*ane 1\*\*/.test(searched.content), searched.content);
+    ok('the search button shows the active query',
+        searched.view.labels.some(l => l === 'Search: ane 1'), searched.view.labels.join(' | '));
+
+    const none = await picker({ query: 'Concorde' });
+    T('a search with no matches drops the dropdown', none.select, null);
+    ok('…and says so instead of rendering nothing', /Nothing matches/.test(none.content), none.content);
+    ok('…leaving the controls to recover with', none.view.labels.includes('Type it myself'), none.view.labels.join(' | '));
+
+    console.log('\nrenderPicker — step 2, that aircraft\'s liveries');
+    const liveries = await picker({ step: 'livery', type: 'Plane 01' });
+    ok('renders cleanly', liveries.view.problems.length === 0, liveries.view.problems.join('; '));
+    T('the dropdown holds the aircraft\'s liveries', liveries.options.length, P.PICKER_PAGE_SIZE);
+    T('…paged like the aircraft list', (await picker({ step: 'livery', type: 'Plane 01', page: 1 })).options.length, 5);
+    ok('the header names the aircraft being liveried',
+        /Step 2 of 2 .* \*\*Plane 01\*\*/.test(liveries.content), liveries.content);
+    T('step 2 offers Back to the aircraft list', liveries.view.labels.includes('Back'), true);
+    T('a short livery list fits one page',
+        (await picker({ step: 'livery', type: 'Plane 02' })).options, ['Generic', 'Delta Air Lines', 'Qatar Airways']);
+    // An aircraft the API has no liveries for still has to leave a way forward.
+    const empty = await picker({ step: 'livery', type: 'Plane 03' });
+    T('an aircraft with no liveries drops the dropdown', empty.select, null);
+    T('…and can still be typed by hand', empty.view.labels.includes('Type it myself'), true);
+    // An aircraft that isn't in the metadata at all (a stale session, a name the
+    // API dropped) must not throw on the way to the livery step.
+    const unknown = await picker({ step: 'livery', type: 'Not A Real Plane' });
+    T('an unknown aircraft renders an empty step 2', unknown.select, null);
+
+    console.log(failures ? `\n${failures} failure(s)\n` : '\nall good\n');
+    process.exit(failures ? 1 : 0);
+})();
