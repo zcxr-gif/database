@@ -5,6 +5,8 @@ const path = require('path');
 const {
     buildVaEventPayload, isHttpUrl, flightMapImageUrl, normalizeCardOptions,
     resolveAccent, eteTextFor, routeDistanceNm, DEFAULT_CARD_FIELDS,
+    extractFlightPlan, planDistanceNm, planRouteText, eventDistanceNm,
+    trackUrl, flightLinkId, CARD_LAYOUTS,
 } = require(path.join('..', 'vaEventCard.js'));
 
 let failures = 0;
@@ -174,6 +176,80 @@ check(n1 !== n2 && n1.fields !== n2.fields, 'each normalize call yields independ
 try { n1.fields.push('server'); } catch (e) { /* ignore */ }
 check(normalizeCardOptions({}).fields.length === DEFAULT_CARD_FIELDS.length, 'mutating a result never affects future defaults');
 check(Object.isFrozen(require(path.join('..', 'vaEventCard.js')).DEFAULT_CARD_OPTIONS), 'DEFAULT_CARD_OPTIONS is frozen');
+
+// 14. The filed flight plan — the route the card actually draws.
+console.log('• filed flight plan');
+const PLAN = [
+    { name: 'EGLL', lat: 51.4775, lon: -0.4614 },
+    { name: 'DET', lat: 51.3033, lon: 0.5975 },
+    { name: 'GAPLI', lat: 55.0, lon: -15.0 },
+    { name: 'KJFK', lat: 40.6398, lon: -73.7789 },
+];
+const planned = { ...full, flightPlan: { waypoints: PLAN } };
+check(extractFlightPlan(planned).length === 4, 'a plan on flightPlan.waypoints is read');
+check(extractFlightPlan({ ...full, fpl: { fixes: PLAN } }).length === 4, 'a plan under fpl.fixes is read too');
+check(extractFlightPlan({ ...full, waypoints: PLAN.map(w => [w.lat, w.lon]) }).length === 4, 'bare [lat, lon] pairs are read');
+check(extractFlightPlan(full).length === 0, 'an event with no plan yields an empty plan, not a throw');
+check(extractFlightPlan({ ...full, flightPlan: { waypoints: [PLAN[0]] } }).length === 0, 'a single point is not a route');
+// Unusable entries never reach the map.
+const dirty = extractFlightPlan({ ...full, flightPlan: { waypoints: [
+    PLAN[0], { name: 'ZERO', lat: 0, lon: 0 }, { name: 'NAN', lat: 'x', lon: 2 },
+    { name: 'OFF', lat: 120, lon: 5 }, PLAN[0], PLAN[3],
+] } });
+check(dirty.length === 2 && dirty[1].name === 'KJFK', '(0,0), NaN, out-of-range and repeated fixes are dropped');
+// Track distance along the plan, not the straight line between the airports.
+const gc = routeDistanceNm('EGLL', 'KJFK');
+const track = planDistanceNm(PLAN);
+check(track > gc, 'a dog-legged plan measures longer than the great circle');
+check(planDistanceNm([PLAN[0]]) === null && planDistanceNm(null) === null, 'no plan means no plan distance');
+check(eventDistanceNm(planned) === track, 'the event quotes the FILED distance when there is a plan');
+check(eventDistanceNm(full) === gc, 'and falls back to the great circle when there is not');
+// The readout, and its middle-elision on a long route.
+check(planRouteText(PLAN) === 'EGLL · DET · GAPLI · KJFK', 'the plan reads out as its fixes');
+const long = Array.from({ length: 40 }, (_, i) => ({ name: 'FIX' + i, lat: 40 + i / 10, lon: -70 + i / 10 }));
+const longTxt = planRouteText(long);
+check(longTxt.includes('FIX0') && longTxt.includes('FIX39') && /\+\d+/.test(longTxt),
+    'a long plan keeps both ends and elides the middle');
+check(planRouteText([{ lat: 1, lon: 1 }, { lat: 2, lon: 2 }]) === '', 'unnamed fixes have nothing to read out');
+// The plan reaches the embed, on a card nobody has customized.
+const planEmbed = buildVaEventPayload(planned, {}).embeds[0];
+const planField = planEmbed.fields.find(f => /Flight plan/.test(f.name));
+check(!!planField && planField.value === 'EGLL · DET · GAPLI · KJFK', 'the embed carries the filed route');
+check(planField.inline === false, 'the route field is full width, not squeezed into a column');
+check(/\(filed\)/.test((planEmbed.fields.find(f => /Distance/.test(f.name)) || {}).value || ''),
+    'the distance says it came from the plan');
+// …but never onto a card whose owner chose their fields.
+const chosen = buildVaEventPayload(planned, {}, normalizeCardOptions({ fields: ['pilot', 'server'] })).embeds[0];
+check(!chosen.fields.some(f => /Flight plan/.test(f.name)), 'a VA that chose its fields does not get the route added');
+check(buildVaEventPayload(planned, {}, normalizeCardOptions({ fields: ['plan'] })).embeds[0]
+    .fields.some(f => /Flight plan/.test(f.name)), 'a VA that asked for the route gets it');
+check(!buildVaEventPayload(full, {}).embeds[0].fields.some(f => /Flight plan/.test(f.name)),
+    'no plan filed means no route field at all');
+
+// 15. The link opens THIS flight, not the tracker's front page. A notification a
+// VA's members can act on is the entire point of sending it.
+console.log('• per-flight deep link');
+check(trackUrl({ flightId: 'abc-123' }) === 'https://inflight.info/share/abc-123', 'the link points at the flight');
+check(trackUrl({}) === 'https://inflight.info', 'no flight id degrades to the tracker home');
+check(trackUrl() === 'https://inflight.info', 'and so does no event at all');
+// The id goes into a URL that is posted publicly, so it is checked, not trusted.
+check(flightLinkId({ flightId: 'a/../b' }) === '', 'a path-traversing id is refused');
+check(flightLinkId({ flightId: 'x y' }) === '', 'an id with a space is refused');
+check(flightLinkId({ flightId: 'a'.repeat(200) }) === '', 'an absurdly long id is refused');
+check(flightLinkId({ flightId: '6f9a1b2c-1111-2222-3333-444455556666' }) !== '', 'a real GUID flight id is accepted');
+const linked = buildVaEventPayload(planned, {}).embeds[0];
+check(linked.url === 'https://inflight.info/share/' + full.flightId, 'the embed title links to the flight');
+check(linked.description.includes('/share/' + full.flightId), 'and so does the link in the description');
+const unlinked = buildVaEventPayload({ ...full, flightId: null }, {}).embeds[0];
+check(unlinked.url === 'https://inflight.info', 'without an id the embed still links somewhere valid');
+
+// 16. The 'slick' layout is a real, storable choice — not silently coerced away.
+console.log('• card layouts');
+check(CARD_LAYOUTS.includes('slick'), 'slick is a layout');
+check(normalizeCardOptions({ layout: 'slick' }).layout === 'slick', 'slick survives normalization');
+check(normalizeCardOptions({ layout: 'sparkly' }).layout === 'card', 'an unknown layout still falls back to card');
+check(buildVaEventPayload(planned, {}, normalizeCardOptions({ layout: 'slick' })).embeds.length === 1,
+    'slick still produces a valid embed for the fallback path');
 
 console.log('\n=== ' + (failures === 0 ? 'ALL CHECKS PASSED ✅' : failures + ' CHECK(S) FAILED ❌') + ' ===');
 process.exit(failures === 0 ? 0 : 1);

@@ -390,9 +390,10 @@
                         <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.layout">Layout</label>
                         <select id="pfCardLayout" class="field pf-edit">
                             <option value="card" data-i18n="fe.card.layoutCard">Full image card</option>
+                            <option value="slick" data-i18n="fe.card.layoutSlick">Slick (full-bleed photo)</option>
                             <option value="compact" data-i18n="fe.card.layoutCompact">Compact (text only)</option>
                         </select>
-                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.layoutHelp">Compact skips the rendered image for a lighter post.</p>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.layoutHelp">Slick uses the aircraft photo as the whole card; Compact skips the rendered image for a lighter post.</p>
                     </div>
                     <div>
                         <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.imageStyle">Image size</label>
@@ -452,8 +453,9 @@
                         <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="distance"> <span data-i18n="fe.card.f.distance">Distance</span></label>
                         <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="ete"> <span data-i18n="fe.card.f.ete">ETE</span></label>
                         <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="position"> <span data-i18n="fe.card.f.position">Position</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="plan"> <span data-i18n="fe.card.f.plan">Flight plan</span></label>
                     </div>
-                    <p class="text-[11px] text-zinc-400 mt-1.5" data-i18n="fe.card.fieldsHelp">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                    <p class="text-[11px] text-zinc-400 mt-1.5" data-i18n="fe.card.fieldsHelp">Route (departure → arrival) is always shown. ETE only appears on departures. Flight plan lists the filed fixes and only appears when the pilot filed one — the route map draws the whole plan either way.</p>
                 </div>
 
                 <!-- Live preview — rendered from the current settings, nothing is posted -->
@@ -1660,7 +1662,7 @@
             const accent = (c.accent || '').trim();
             $('pfCardAccent').value = accent;
             $('pfCardAccentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
-            $('pfCardLayout').value = c.layout === 'compact' ? 'compact' : 'card';
+            $('pfCardLayout').value = ['compact', 'slick'].includes(c.layout) ? c.layout : 'card';
             $('pfCardImageStyle').value = c.imageStyle === 'large' ? 'large' : 'embed';
             $('pfCardShowPhoto').checked = c.showPhoto !== false;
             $('pfCardShowMap').checked = c.showMap !== false;

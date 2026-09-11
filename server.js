@@ -831,7 +831,7 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // own webhook — the central feed always uses the default card.
     flightEventsCard: {
         accent:     { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
-        layout:     { type: String, enum: ['card', 'compact'], default: 'card' },
+        layout:     { type: String, enum: ['card', 'compact', 'slick'], default: 'card' }, // boxed dashboard / text-only / full-bleed photo design
         imageStyle: { type: String, enum: ['embed', 'large'], default: 'embed' }, // card/map framed in the embed vs. posted as full-width standalone attachments
         showMap:    { type: Boolean, default: true },               // post the route-map image
         showPhoto:  { type: Boolean, default: true },               // aircraft photo on the card
@@ -2520,6 +2520,28 @@ const callsignFitsVaMode = (callsign, ad, mode) => {
 
 // The same question, asked in the mode the listing actually runs under.
 const callsignFitsVa = (callsign, ad) => callsignFitsVaMode(callsign, ad, vaCallsignMode(ad));
+
+// Is this flight a CODESHARE LEG this listing may claim? The pure half of the
+// question resolveVaEventCodesharePartners asks; the roster half (is this pilot
+// one of theirs?) is a database lookup and lives there.
+//
+// Two things have to be true, and it is their conjunction that makes this safe
+// to run for every opted-in VA rather than only for the loose trust levels:
+// the callsign wears the VA's tag as a REAL tag — whatever airline is in front
+// of it ("Shamrock 214NV"; tokenHasSuffixTag wants a digit before the tag or the
+// token to BE it, so "MOSKVA" is never an NV flight) — and the pilot is on that
+// VA's roster.
+//
+// The tag alone cannot do this, which is exactly why isDistinctiveVaTag has to
+// refuse the generic "VA" wherever a tag claims a flight by itself. With the
+// roster alongside it even a VA tagged "VA" is identified precisely: "VA" names
+// nobody, but "VA, on a callsign flown by one of our rostered members" names one
+// listing.
+//
+// A VA on rosterTrust 'off' has said its roster never delivers, and half of this
+// claim is its roster, so 'off' is honoured here too.
+const isVaCodeshareClaim = (callsign, ad) =>
+    vaRosterTrust(ad) !== 'off' && callsignCarriesVaTag(callsign, ad);
 
 // True only for a well-formed Discord webhook URL. Partner VAs paste these into
 // the portal themselves, so we gate both the write (vaPortal.js) and the post
@@ -12643,6 +12665,40 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             callsign_rejected: `"${callsign}" does not fit ${ad.name}'s registered callsigns (${(vaCallsignBases(ad).map(formatCallsignDisplay).filter(Boolean).join(', ')) || 'none registered'}) under "${mode}" matching, and its roster trust is off. Loosen either in the VA portal.`,
         };
 
+        // The CODESHARE half. A leg can belong to a second VA — the one whose tag
+        // is on the end of somebody else's callsign — and the whole reason those
+        // legs used to vanish is that nothing ever said so out loud. Every
+        // opted-in listing whose tag this callsign carries is reported, with
+        // whether the pilot is on its roster when ?username= is given (the
+        // roster is the other half of the claim, so without it the answer is
+        // "would claim it if the pilot is one of theirs").
+        //
+        // A scan, not an indexed query: the tag lives inside a callsign MASK, so
+        // it cannot be queried directly — and the opted-in set is the handful of
+        // staff-approved partners, on a staff-only diagnostic route.
+        const username = String(req.query.username || '').trim();
+        let codeshare = [];
+        try {
+            const opted = await VirtualAirlineAd.find(OPTED_IN_PARTNER_FILTER)
+                .select(PARTNER_SELECT).sort({ name: 1 }).lean();
+            const rosterIds = username
+                ? new Set((await rosterPartnersFor({ username })).map((a) => String(a._id)))
+                : null;
+            codeshare = opted
+                .filter((a) => String(a._id) !== String(ad._id) && isVaCodeshareClaim(callsign, a))
+                .map((a) => ({
+                    id: a._id,
+                    name: a.name,
+                    // The tag half is confirmed by the filter above. This is the
+                    // roster half — null when no ?username= was given, meaning
+                    // "would claim it if the pilot is one of theirs". True here
+                    // is the whole claim, so the flight IS delivered to this VA.
+                    pilotOnRoster: rosterIds ? rosterIds.has(String(a._id)) : null,
+                }));
+        } catch (err) {
+            console.warn('[va-events] codeshare diagnose scan failed:', err.message);
+        }
+
         res.json({
             callsign, basesTried, matched: true,
             va: { id: ad._id, name: ad.name, callsigns: ad.callsigns || [] },
@@ -12653,6 +12709,11 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             rosterTrust: trust,
             callsignFitsFormat,
             webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
+            // Other VAs this same flight is ALSO delivered to. Not a conflict and
+            // not a fallback: a codeshare leg genuinely belongs to both listings,
+            // and both receive their own card.
+            username: username || null,
+            codeshareClaimants: codeshare,
             reason,
             ...(hints[reason] ? { hint: hints[reason] } : {}),
         });
@@ -12896,7 +12957,13 @@ app.get('/api/va/roster-watch', async (req, res) => {
     try {
         const ads = await VirtualAirlineAd.find({
             ...OPTED_IN_PARTNER_FILTER,
-            rosterTrust: { $in: VA_ROSTER_WATCH_TRUST_MODES },
+            // `null` is in the list so a listing saved BEFORE rosterTrust existed
+            // is included: $in does not match a missing field, and every one of
+            // those documents reads as the default ('airline') everywhere else —
+            // vaRosterTrust() coerces it. Without this the oldest VAs on the
+            // platform, which are the ones with the biggest rosters, had none of
+            // their pilots watched and so never received a codeshare leg at all.
+            rosterTrust: { $in: [...VA_ROSTER_WATCH_TRUST_MODES, null] },
         }).select('_id').lean();
         if (!ads.length) {
             res.set('Cache-Control', 'public, max-age=120');
@@ -13302,8 +13369,10 @@ const isDuplicateVaEvent = (e) => {
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
 const {
     buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed,
-    trackUrl, resolveAccent, normalizeCardOptions, DEFAULT_CARD_OPTIONS,
+    trackUrl, flightLinkId, resolveAccent, normalizeCardOptions, DEFAULT_CARD_OPTIONS,
     PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
+    // The pilot's filed route, forwarded with every event by the ACARS sender.
+    extractFlightPlan, planRouteText,
     // Also read by the crew route-map endpoint, so a VA's network map quotes
     // the same leg distances the flight-event card does.
     routeDistanceNm,
@@ -14225,7 +14294,11 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
     const routeTag = (dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : '';
-    const track = trackUrl();
+    // Per-flight: the title and the link under it open THIS flight on the
+    // tracker, not the tracker's front page. That is the difference between a
+    // notification a VA's members can act on and one they can only read.
+    const track = trackUrl(e);
+    const deepLinked = !!flightLinkId(e);
     const accentInt = resolveAccent(e, o).int;
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     // The Inflight brand mark ALWAYS rides in the footer icon — not customizable.
@@ -14236,6 +14309,9 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
     // title, description, footer) still rides above them for context. Default
     // 'embed' style frames the card inside the embed via attachment://card.png.
     const largeImages = o.imageStyle === 'large';
+    // The filed route, read out under the headline. The map image below draws
+    // the same plan; this is the part somebody can copy, quote or search for.
+    const planLine = planRouteText(extractFlightPlan(e));
     const embed = {
         color: accentInt,
         // The VA's own logo lives here, in the message (the card image carries our
@@ -14251,7 +14327,8 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
         ...(isHttpImageUrl(track) ? { url: track } : {}),
         description: clipEmbed(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
-            + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
+            + (planLine ? `\n🗺️ ${planLine}` : '')
+            + (isHttpImageUrl(track) ? `\n[🔭 ${deepLinked ? 'Open this flight on Inflight' : 'Track on Inflight'}](${track})` : ''),
             2048),
         ...(largeImages ? {} : { image: { url: 'attachment://card.png' } }),
         footer: {
@@ -14332,6 +14409,20 @@ const buildVaSampleEvent = (ad = {}) => {
         position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
         departure: 'CYYZ',
         arrival: 'KJFK',
+        // A real filed route, so the test card and the live preview show what a
+        // VA's actual flights will look like — plan drawn on the map, fixes read
+        // out in the embed — rather than a straight line the real ones won't have.
+        flightPlan: {
+            waypoints: [
+                { name: 'CYYZ', lat: 43.6777, lon: -79.6248 },
+                { name: 'DUNUP', lat: 43.4183, lon: -78.4167 },
+                { name: 'ART',   lat: 44.0058, lon: -76.0219 },
+                { name: 'SYR',   lat: 43.1622, lon: -76.2003 },
+                { name: 'HANKK', lat: 42.1400, lon: -74.9000 },
+                { name: 'LGA',   lat: 40.7772, lon: -73.8726 },
+                { name: 'KJFK',  lat: 40.6398, lon: -73.7789 },
+            ],
+        },
         timestamp: Date.now(),
     };
 };
@@ -14369,7 +14460,9 @@ const renderCardPreview = async (ad, rawOpts) => {
         opts.showMap ? renderVaRouteMapImage(sample, opts) : null,
     ]);
     const dataUri = (buf) => buf ? 'data:image/png;base64,' + buf.toString('base64') : null;
-    return { layout: 'card', card: dataUri(card), map: dataUri(map) };
+    // The layout is echoed back rather than hard-coded, so a UI showing the
+    // preview can label which design it is looking at.
+    return { layout: opts.layout, card: dataUri(card), map: dataUri(map) };
 };
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
@@ -14475,21 +14568,26 @@ const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUr
 //
 // Airline-matched candidates always outrank 'any' ones, so a pilot on two
 // rosters lands with the VA whose callsign they are actually flying.
-const resolveVaEventPartnerByRoster = async (e) => {
+// Every opted-in VA whose ROSTER holds this pilot. The shared first half of
+// both roster-driven questions below — "does the roster vouch for this
+// callsign?" and "is this a codeshare leg wearing our tag?" — so a single event
+// asks the database once instead of twice. Returns [] on any failure; never
+// throws.
+const rosterPartnersFor = async (e) => {
     // Roster entries are typed by VA staff and the live name comes off the IF
     // API, so the two disagree about separators far more often than they
     // disagree about the pilot — match every form the name could be written in.
     const keys = vaPilots.rosterMatchKeys(e.username);
-    if (!keys.length) return null;
+    if (!keys.length) return [];
     let vaIds;
     try {
         const rows = await VaPilot.find({ usernameLower: { $in: keys } }).select('vaAdId').lean();
         vaIds = [...new Set(rows.map((r) => String(r.vaAdId)))];
     } catch (err) {
         console.error('[va-events] roster lookup failed:', err.message);
-        return null;
+        return [];
     }
-    if (!vaIds.length) return null;
+    if (!vaIds.length) return [];
 
     let ads;
     try {
@@ -14497,9 +14595,55 @@ const resolveVaEventPartnerByRoster = async (e) => {
             .select(PARTNER_SELECT).sort({ name: 1 }).lean();
     } catch (err) {
         console.error('[va-events] roster partner lookup failed:', err.message);
-        return null;
+        return [];
     }
-    const opted = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+    return ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+};
+
+/**
+ * The CODESHARE claim: every opted-in VA that this flight belongs to because it
+ * wears THEIR tag on somebody else's airline AND is flown by one of THEIR
+ * rostered pilots.
+ *
+ * This is the case the feed kept missing. A VA's member flying a partner's metal
+ * files "Shamrock 214NV": the airline is Aer Lingus's, and the only thing on the
+ * callsign that says Norwegian Virtual is the "NV". Every other path resolves
+ * ONE VA and stops — the sender attributes the flight to whoever owns SHAMROCK,
+ * or the callsign lookup finds that listing first — so the VA whose tag it is
+ * was never even asked. The leg landed in the operating airline's Discord and
+ * nowhere else.
+ *
+ * Two signals have to agree here, which is what makes it safe to run for EVERY
+ * opted-in VA rather than only those on a loose rosterTrust:
+ *
+ *   1. the callsign carries the VA's registered tag as a real tag (the
+ *      "<anything> ##<SUFFIX>" shape — tokenHasSuffixTag demands a digit before
+ *      it or the token BE it, so "MOSKVA" is not an NV flight), and
+ *   2. the pilot is on that VA's roster.
+ *
+ * Either alone is a guess. The tag alone hands a VA every flight whose callsign
+ * happens to end in its letters — which is exactly why isDistinctiveVaTag has to
+ * refuse the generic "VA" on the tag-only path. The roster alone posts a
+ * member's every flight to every VA they have ever joined. Together they are the
+ * pilot and their VA both saying the same thing, so even a VA whose tag IS "VA"
+ * can be claimed this way: "VA" identifies nobody, but "VA on a callsign flown
+ * by one of our rostered members" identifies exactly one listing.
+ *
+ * A VA on rosterTrust 'off' has said its roster never delivers, and that is
+ * respected here too — it is still the roster doing half the vouching.
+ */
+const resolveVaEventCodesharePartners = async (e) => {
+    const rostered = await rosterPartnersFor(e);
+    if (!rostered.length) return [];
+    const claimed = rostered.filter((a) => isVaCodeshareClaim(e.callsign, a));
+    for (const a of claimed) {
+        console.log(`[va-events] codeshare claim: "${e.callsign}" carries ${a.name}'s tag and "${e.username}" is on their roster`);
+    }
+    return claimed;
+};
+
+const resolveVaEventPartnerByRoster = async (e) => {
+    const opted = await rosterPartnersFor(e);
     if (!opted.length) return null;
 
     // A roster pilot on a callsign this VA can still recognise. The two trust
@@ -14748,13 +14892,42 @@ const handleVaEvent = async (e) => {
     // live in its own channel, falling back to the shared DISCORD_WEBHOOK_URL.
     const centralWebhook = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL
         || process.env.DISCORD_WEBHOOK_URL || null;
-    const partnerAd = await resolveVaEventPartner(e);
+
+    // A flight can legitimately belong to MORE THAN ONE listing, and a codeshare
+    // leg is the case that proves it: the operating airline's VA owns the
+    // callsign, and the marketing VA owns the tag on the end of it and the pilot
+    // flying it. Resolving one winner meant the second VA — the one whose member
+    // it actually is — got nothing, which is the "our codeshares never show up"
+    // report. So both are asked, and both are delivered to.
+    //
+    // The primary attribution stays FIRST (it is the sender's own answer, and the
+    // one the statistics are recorded against); codeshare claimants are appended,
+    // de-duplicated by id so a VA that wins both ways is posted to once.
+    const [primaryAd, codeshareAds] = await Promise.all([
+        resolveVaEventPartner(e),
+        resolveVaEventCodesharePartners(e),
+    ]);
+    const partnerAds = [];
+    const seenVa = new Set();
+    for (const ad of [primaryAd, ...codeshareAds]) {
+        if (!ad) continue;
+        const id = String(ad._id || ad.name);
+        if (seenVa.has(id)) continue;
+        seenVa.add(id);
+        partnerAds.push(ad);
+    }
+    if (partnerAds.length > 1) {
+        console.log(`[va-events] "${e.callsign}" claimed by ${partnerAds.length} VAs (codeshare): ${partnerAds.map((a) => a.name).join(', ')}`);
+    }
+    // The listing the statistics belong to. One flight is one flight however many
+    // feeds it appears in, so it is counted against the primary attribution only.
+    const partnerAd = partnerAds[0] || null;
 
     // Record every incoming event for the staff feed, tagged with where it's
     // headed (or nothing, when it's un-hooked). The entry self-erases after 10m.
     const targets = [];
     if (centralWebhook) targets.push('central');
-    if (partnerAd) targets.push(partnerAd.name);
+    for (const ad of partnerAds) targets.push(ad.name);
     recordVaEventForFeed(e, targets);
 
     // Statistics. Runs for EVERY event, hooked or not — a VA's takeoff/landing
@@ -14772,7 +14945,7 @@ const handleVaEvent = async (e) => {
 
     // Nothing is hooked to this event — it still lives in the feed for 10 minutes,
     // but there's no delivery to do, so skip all the expensive work.
-    if (!centralWebhook && !partnerAd) {
+    if (!centralWebhook && !partnerAds.length) {
         console.log('[va-events] no delivery target — kept 10m in feed, not posted:', e.event, e.flightId);
         return;
     }
@@ -14782,7 +14955,6 @@ const handleVaEvent = async (e) => {
     // share it. A partner VA may have customized its card, so it renders its own
     // unless its config is the default look (then it reuses the central render).
     const media = await enrichEventMedia(e);
-    const partnerOpts = partnerAd ? resolveCardOpts(partnerAd) : null;
 
     let centralPre;
     if (centralWebhook) {
@@ -14802,19 +14974,23 @@ const handleVaEvent = async (e) => {
             console.error('[va-events] central Discord post failed:', err.message);
         }
     }
-    if (partnerAd) {
+    // Each claimant gets its own card, in its own configured look, with its own
+    // logo — and its own try/catch, so one VA's dead webhook can't cost the other
+    // claimant of the same codeshare its notification.
+    for (const ad of partnerAds) {
         try {
+            const partnerOpts = resolveCardOpts(ad);
             // The matched VA owns this card — prefer its own logo for the author icon.
-            const partnerMedia = partnerAd.logoUrl ? { ...media, vaLogoUrl: partnerAd.logoUrl } : media;
+            const partnerMedia = ad.logoUrl ? { ...media, vaLogoUrl: ad.logoUrl } : media;
             // Reuse the central render only when this VA hasn't customized the card
             // (same default look) and we actually rendered it; otherwise let
             // postVaEventCard render to the VA's own spec (or skip it for compact).
             const isDefault = JSON.stringify(partnerOpts) === JSON.stringify(DEFAULT_CARD_OPTIONS);
             const pre = (isDefault && centralPre) ? centralPre : undefined;
-            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, pre, partnerOpts);
-            console.log(`🔔 partner VA ${e.event} → ${partnerAd.name} (${e.callsign})`);
+            await postVaEventCard(ad.flightEventsWebhookUrl, e, partnerMedia, pre, partnerOpts);
+            console.log(`🔔 partner VA ${e.event} → ${ad.name} (${e.callsign})`);
         } catch (err) {
-            console.error(`[va-events] partner webhook post failed for ${partnerAd.name}:`, err.message);
+            console.error(`[va-events] partner webhook post failed for ${ad.name}:`, err.message);
         }
     }
 };

@@ -30,7 +30,8 @@ const sharp = require('sharp');
 const axios = require('axios');
 const {
     extractRoute, isHttpUrl, resolveAccent, resolveMapLine, normalizeCardOptions,
-    routeDistanceNm, eteTextFor,
+    routeDistanceNm, eteTextFor, trackUrl, flightLinkId,
+    extractFlightPlan, planDistanceNm, planRouteText, eventDistanceNm,
 } = require('./vaEventCard');
 
 const WIDTH = 1200;
@@ -241,18 +242,105 @@ const greatCirclePoints = (a, b, n = 64) => {
     return pts;
 };
 
+// Unwrap `lon` into the continuous domain around `ref`, so a route crossing the
+// dateline keeps running east instead of folding back across the whole map.
+const unwrapLon = (lon, ref) => {
+    let v = lon;
+    while (v - ref > 180) v -= 360;
+    while (v - ref < -180) v += 360;
+    return v;
+};
+
+// How finely to interpolate one leg: enough points that a long leg still reads
+// as a curve, few enough that a plan with sixty short fixes doesn't produce a
+// path with ten thousand nodes in it.
+const legSteps = (a, b) => {
+    const nm = haversineNm(a, b) || 0;
+    return Math.max(2, Math.min(48, Math.ceil(nm / 60)));
+};
+
+// The drawable path through a whole filed plan: each leg as its own great
+// circle, joined, with longitudes unwrapped CONTINUOUSLY across the join so a
+// route that crosses the dateline mid-plan doesn't tear.
+const planArcPoints = (points) => {
+    const out = [];
+    for (let i = 1; i < points.length; i++) {
+        const a = [points[i - 1].lat, points[i - 1].lon];
+        const b = [points[i].lat, points[i].lon];
+        const seg = greatCirclePoints(a, b, legSteps(a, b));
+        for (const pt of seg) {
+            if (out.length) {
+                const prev = out[out.length - 1];
+                const lon = unwrapLon(pt[1], prev[1]);
+                // Skip the duplicated join point (this leg's start is the last
+                // leg's end) so the path has no zero-length segment in it.
+                if (prev[0] === pt[0] && prev[1] === lon) continue;
+                out.push([pt[0], lon]);
+            } else {
+                out.push([pt[0], pt[1]]);
+            }
+        }
+    }
+    return out;
+};
+
+// Where the filed fixes land on the drawn path. Returned alongside the path so
+// the renderer can put a dot on each one without re-deriving the projection:
+// each entry is the fix plus its longitude in the path's unwrapped domain.
+const planFixPoints = (points, arc) => {
+    if (!arc.length) return [];
+    const out = [];
+    let ref = arc[0][1];
+    for (const w of points) {
+        const lon = unwrapLon(w.lon, ref);
+        ref = lon;
+        out.push({ name: w.name, lat: w.lat, lon });
+    }
+    return out;
+};
+
 // Build the route-map SVG fragment for the given panel rect, or null when
 // either endpoint is missing from the coords index. Pure string building.
-const buildRouteMapSvg = (route, pos, lineColor, pal, MAP) => {
+//
+// `plan` is the pilot's FILED route (see extractFlightPlan). When present the
+// map draws that — every leg, every fix — because that is where the aeroplane
+// is actually going; the straight great-circle between the two airports can sit
+// hundreds of miles off a real plan. Without one the map falls back to that
+// single arc, which is what it always drew.
+const buildRouteMapSvg = (route, pos, lineColor, pal, MAP, plan) => {
     // Explicit endpoint coordinates win over the bundled index. data/airport-
     // coords.json holds ~5,900 fields, so a caller with a fuller database (the
     // tracker ships every ICAO in airports.json) can map routes this module
     // would otherwise have to refuse.
     const a = route.depCoords || coordsOf(route.dep);
     const b = route.arrCoords || coordsOf(route.arr);
-    if (!a || !b) return null;
+    const filed = Array.isArray(plan) && plan.length >= 2 ? plan.slice() : null;
+    // A filed plan can be mapped on its own: it carries coordinates for every
+    // fix, so an airport missing from the bundled index no longer costs the
+    // flight its map. Without a plan we still need both endpoints.
+    if (!filed && (!a || !b)) return null;
 
-    const arc = greatCirclePoints(a, b);
+    // Anchor the plan at the airports when we know where they are and the plan
+    // doesn't already start/end there — a plan filed from the first enroute fix
+    // would otherwise draw a route that begins in mid-air.
+    // haversineNm answers null for a distance that rounds to zero as well as for
+    // unusable input, and "the plan already starts at this airport" is exactly
+    // the zero case — so a null distance between two real points means SAME
+    // point, not "no idea". Reading it the other way prepended a second copy of
+    // the departure airport and drew its label twice.
+    const nearly = (pt, ll) => {
+        if (!isLatLon(ll)) return false;
+        const nm = haversineNm([pt.lat, pt.lon], ll);
+        return nm === null || nm <= 12;
+    };
+    if (filed) {
+        if (a && !nearly(filed[0], a)) filed.unshift({ name: route.dep || '', lat: a[0], lon: a[1] });
+        if (b && !nearly(filed[filed.length - 1], b)) filed.push({ name: route.arr || '', lat: b[0], lon: b[1] });
+    }
+
+    const arc = filed ? planArcPoints(filed) : greatCirclePoints(a, b);
+    if (arc.length < 2) return null;
+    const fixes = filed ? planFixPoints(filed, arc) : [];
 
     // Aircraft position, unwrapped near the arc's longitude domain.
     let posPt = null;
@@ -348,10 +436,50 @@ const buildRouteMapSvg = (route, pos, lineColor, pal, MAP) => {
             : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${pal.ocean}" stroke="${lineColor}" stroke-width="${3 * S}"/>`)
             + label(1.5, 1.5, pal.labelShadow) + label(0, 0, pal.label);
     };
+    // Filed fixes: a dot on each, and a label on as many as the panel can hold
+    // without turning into a wall of text. The two ends are skipped — the
+    // departure and arrival markers below already name them, at a bigger size.
+    let fixSvg = '';
+    if (fixes.length > 2) {
+        const middle = fixes.slice(1, -1);
+        // One label per ~110 px of panel width, never more than every fix.
+        const labelBudget = Math.max(2, Math.floor(MAP.w / 110));
+        const step = Math.max(1, Math.ceil(middle.length / labelBudget));
+        // Where a label has already been drawn. Compared as a real distance, not
+        // as "further right than the last one": a route can run east→west (or
+        // fold back on itself over an ocean track), and a one-directional test
+        // then suppresses every label after the first.
+        // Seeded with the two endpoint labels, which are drawn below at a bigger
+        // size and win any collision: a fix a few miles off the departure
+        // airport must not print its ident across the airport's own.
+        const placed = [
+            [px(arc[0][0], arc[0][1])[0] + 26 * S, px(arc[0][0], arc[0][1])[1] + 5 * S],
+            [px(arc[arc.length - 1][0], arc[arc.length - 1][1])[0] + 26 * S,
+                px(arc[arc.length - 1][0], arc[arc.length - 1][1])[1] + 5 * S],
+        ];
+        const roomFor = (x, y) => !placed.some((q) => Math.abs(q[0] - x) < 62 * S && Math.abs(q[1] - y) < 22 * S);
+        middle.forEach((w, i) => {
+            const [x, y] = px(w.lat, w.lon);
+            if (x < MAP.x - 20 || x > MAP.x + MAP.w + 20 || y < MAP.y - 20 || y > MAP.y + MAP.h + 20) return;
+            fixSvg += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${3 * S}" fill="${pal.ocean}" stroke="${lineColor}" stroke-width="${1.6 * S}"/>`;
+            // Labels are thinned twice: by the budget, and again by measured
+            // distance, so a cluster of fixes over a terminal area can't
+            // overprint itself into an unreadable smear.
+            if (!w.name || i % step !== 0) return;
+            if (!roomFor(x, y - 10 * S)) return;
+            placed.push([x, y - 10 * S]);
+            const ly = y - 10 * S;
+            const label = (dx, dy, fill) =>
+                `<text x="${fmt(x + dx)}" y="${fmt(ly + dy)}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="${Math.round(11 * S)}" font-weight="bold" fill="${fill}">${esc(clipText(w.name, 7))}</text>`;
+            fixSvg += label(1, 1, pal.labelShadow) + label(0, 0, pal.label);
+        });
+    }
+
     // Anchor markers to the arc's own (longitude-unwrapped) endpoints — the raw
     // a/b lons can sit a full world away from the view after dateline handling.
-    let markers = marker(arc[0], clipText(route.dep, 5), false)
-        + marker(arc[arc.length - 1], clipText(route.arr, 5), true);
+    let markers = fixSvg
+        + marker(arc[0], clipText(route.dep || (fixes[0] && fixes[0].name) || '????', 5), false)
+        + marker(arc[arc.length - 1], clipText(route.arr || (fixes[fixes.length - 1] && fixes[fixes.length - 1].name) || '????', 5), true);
     if (posPt) {
         const [x, y] = px(posPt[0], posPt[1]);
         markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${lineColor}" fill-opacity="0.25"/>`
@@ -390,17 +518,25 @@ const renderVaRouteMapImageImpl = async (e = {}, opts) => {
         const dim = MAP_SIZE_PX[o.mapSize] || MAP_IMG;
         const line = resolveMapLine(e, o);
         const pal = paletteFor(o.mapStyle);
-        const inner = buildRouteMapSvg(route, e.position, line, pal, { x: 0, y: 0, w: dim.w, h: dim.h });
+        // The pilot's filed route, when the event carries one. This is what the
+        // map draws: every leg of the plan, not one straight line A→B.
+        const plan = extractFlightPlan(e);
+        const inner = buildRouteMapSvg(route, e.position, line, pal, { x: 0, y: 0, w: dim.w, h: dim.h }, plan);
         if (!inner) return null;
 
-        // Corner chip: DEP → ARR plus the leg distance when we know it. With
-        // overridden endpoints the bundled index can't answer, so the distance
-        // is measured off the coordinates actually being drawn.
-        const distNm = (route.depCoords || route.arrCoords)
-            ? haversineNm(route.depCoords || coordsOf(route.dep), route.arrCoords || coordsOf(route.arr))
-            : routeDistanceNm(route.dep, route.arr);
+        // Corner chip: DEP → ARR plus the distance when we know it. Track
+        // distance along the filed plan wins — it is the distance the aeroplane
+        // will actually cover. Failing that, and with overridden endpoints the
+        // bundled index can't answer, the figure is measured off the coordinates
+        // actually being drawn.
+        const planNm = planDistanceNm(plan);
+        const distNm = planNm != null ? planNm
+            : ((route.depCoords || route.arrCoords)
+                ? haversineNm(route.depCoords || coordsOf(route.dep), route.arrCoords || coordsOf(route.arr))
+                : routeDistanceNm(route.dep, route.arr));
         const chipTxt = `${clipText(route.dep, 5)} → ${clipText(route.arr, 5)}`
-            + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`);
+            + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`)
+            + (plan.length ? `  ·  ${plan.length} fixes` : '');
         const chipW = Math.round(estTextW(chipTxt, 20)) + 44;
         const chip = `
             <rect x="${dim.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="${pal.chipBg}" fill-opacity="0.82"/>
@@ -448,7 +584,7 @@ const cardLayout = (o) => {
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
 // we draw placeholders only where an image is missing. `opts` is a (normalized)
 // VA card customization — accent colour, which fields to show, photo on/off.
-const buildBaseSvg = (e, route, has, opts) => {
+const buildBaseSvg = (e, route, has, opts, plan = []) => {
     const o = normalizeCardOptions(opts || {});
     const { photoX, cx, cxR } = cardLayout(o);
     const isTakeoff = e.event === 'takeoff';
@@ -504,7 +640,11 @@ const buildBaseSvg = (e, route, has, opts) => {
         ry += rowStep;
     }
 
-    const distNm = routeDistanceNm(route.dep, route.arr);
+    // Track distance along the FILED plan when the pilot filed one, so the card,
+    // the map chip beneath it and the embed's own Distance field all quote the
+    // same number. The great-circle between the airports is the fallback, and it
+    // is what this always showed.
+    const distNm = eventDistanceNm(e);
     const distSvg = (distNm == null || !o.fields.includes('distance')) ? '' : `
         <text x="${cxR}" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
 
@@ -529,7 +669,11 @@ const buildBaseSvg = (e, route, has, opts) => {
         pathSvg = `
         <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>`;
     }
-    const routeSvg = routeText(cx, 'start', depTxt) + routeText(cxR, 'end', arrTxt) + pathSvg;
+    // "7 FIXES" under the route, so a card whose map draws the whole plan says
+    // where that plan came from. Only when a plan was actually filed.
+    const fixesSvg = plan.length ? `
+        <text x="${cxR}" y="238" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="14" font-weight="bold" letter-spacing="1.4" fill="#7a8699">${plan.length} FIXES FILED</text>` : '';
+    const routeSvg = routeText(cx, 'start', depTxt) + routeText(cxR, 'end', arrTxt) + pathSvg + fixesSvg;
 
     // Placeholder only when a photo was wanted but couldn't be shown. A VA that
     // turned the photo OFF gets a clean column, not an "unavailable" box.
@@ -572,11 +716,238 @@ const buildBaseSvg = (e, route, has, opts) => {
     </svg>`);
 };
 
+/* ===========================================================================
+ * The 'slick' card
+ *
+ * A second look for the same event, for VAs that want the post to read like a
+ * piece of design rather than a data sheet. The difference is structural, not
+ * decorative:
+ *
+ *   'card'  — a two-column dashboard. The photo is a boxed thumbnail on one
+ *             side; the route and a stack of labelled rows fill the other.
+ *   'slick' — the photo IS the card. It runs full-bleed behind a scrim, the
+ *             callsign leads at display size, the route sits on a boarding-pass
+ *             strip, and the details become chips along the bottom.
+ *
+ * Everything else is unchanged: same event, same accent, same route map posted
+ * underneath, same brand mark. A VA switching between them changes the look of
+ * its feed and nothing about what the feed says.
+ * ========================================================================= */
+
+const SLICK = {
+    pad: 64,                                   // left/right margin
+    logo: { x: 64, y: 48, w: 210, h: 44 },     // OUR brand mark, top-left
+};
+
+// A rounded "label · value" chip. Returns the SVG and how wide it came out, so
+// the caller can lay a row of them out left to right and stop before the edge.
+const CHIP_LABEL_TRACKING = 1.2;   // letter-spacing on the chip's small label
+// The label is TRACKED, so its drawn width is the glyph estimate plus one
+// tracking step per character. Leaving that out is what ran "CALLSIGN" into
+// "Ocean 12VA" with no gap between them.
+const chipLabelW = (label) => estTextW(label, 15) + String(label).length * CHIP_LABEL_TRACKING;
+
+const slickChip = (x, y, label, value, pal) => {
+    const labelW = chipLabelW(label);
+    const w = Math.round(labelW + estTextW(value, 19) + 58);
+    const svg = `
+        <rect x="${x}" y="${y}" width="${w}" height="46" rx="23" fill="${pal.chipBg}" fill-opacity="0.55" stroke="${pal.chipStroke}" stroke-width="1"/>
+        <text x="${x + 22}" y="${y + 29}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="${CHIP_LABEL_TRACKING}" fill="${pal.dim}">${esc(label)}</text>
+        <text x="${Math.round(x + 22 + labelW + 14)}" y="${y + 30}" font-family="DejaVu Sans, Arial, sans-serif" font-size="19" font-weight="bold" fill="${pal.text}">${esc(value)}</text>`;
+    return { svg, w };
+};
+
+// The overlay drawn on top of the full-bleed photo: scrim, header, callsign,
+// route strip and chips. `has.photo` decides how heavy the scrim needs to be —
+// over a photo it has to earn the text its contrast; over the plain gradient
+// background it would only mud the card up.
+const buildSlickSvg = (e, route, has, opts, plan) => {
+    const o = normalizeCardOptions(opts || {});
+    const isTakeoff = e.event === 'takeoff';
+    const accent = resolveAccent(e, o).hex;
+    const ac = e.aircraft || {};
+    const pos = e.position || {};
+    const pal = { text: '#f4f7fb', dim: '#9fb0c6', chipBg: '#0b1119', chipStroke: '#2a3546' };
+
+    const depTxt = clipText(route.dep || '????', 5);
+    const arrTxt = clipText(route.arr || '????', 5);
+    const distNm = eventDistanceNm(e);
+    const filed = planDistanceNm(plan) != null;
+    const eteText = eteTextFor(e);
+    const aircraftLine = ac.aircraftName
+        ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName) : '';
+    const altGs = [
+        Number.isFinite(pos.alt_ft) ? `${Math.round(pos.alt_ft).toLocaleString()} ft` : null,
+        Number.isFinite(pos.gs_kt) ? `${Math.round(pos.gs_kt)} kt` : null,
+    ].filter(Boolean).join(' · ');
+    const posTxt = (Number.isFinite(pos.lat) && Number.isFinite(pos.lon))
+        ? `${pos.lat.toFixed(1)}, ${pos.lon.toFixed(1)}` : '';
+
+    // Chips, in the VA's chosen field order, skipping anything with no value.
+    //
+    // Four of the nine fields are deliberately absent, because this design has
+    // already shown them somewhere better: the callsign IS the headline and the
+    // pilot and VA are the byline under it, while distance and ETE belong to the
+    // route and ride on the strip above. Repeating any of them in a chip would
+    // spend the row on things the reader has already been told.
+    const CHIP = {
+        aircraft: ['AIRCRAFT', clipText(aircraftLine, 30, '')],
+        server: ['SERVER', clipText(e.server, 18, '')],
+        altspeed: ['ALT · SPD', altGs],
+        position: ['POSITION', posTxt],
+        plan: ['FILED', plan.length ? `${plan.length} fixes` : ''],
+    };
+    let chipsSvg = '';
+    let cx = SLICK.pad;
+    const chipKeys = o.fields.filter((k) => CHIP[k]);
+    for (const key of chipKeys) {
+        const [label, value] = CHIP[key];
+        if (!value) continue;
+        const chip = slickChip(cx, 498, label, value, pal);
+        // Stop before the right margin rather than running a chip off the card.
+        if (cx + chip.w > WIDTH - SLICK.pad) break;
+        chipsSvg += chip.svg;
+        cx += chip.w + 12;
+    }
+
+    // Route strip: the two ICAOs at display size with a dashed path between
+    // them, the distance riding above the path and the ETE below it. The path
+    // fills whatever room the two idents leave, and collapses to just the plane
+    // when they leave almost none.
+    const R_FONT = 60, R_Y = 404;
+    const depW = estTextW(depTxt, R_FONT), arrW = estTextW(arrTxt, R_FONT);
+    const gapL = SLICK.pad + depW + 34;
+    const gapR = WIDTH - SLICK.pad - arrW - 34;
+    const mid = (gapL + gapR) / 2;
+    let strip = '';
+    if (gapR - gapL >= 160) {
+        strip = `
+        <line x1="${gapL}" y1="${R_Y - 18}" x2="${mid - 30}" y2="${R_Y - 18}" stroke="${accent}" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round"/>
+        <circle cx="${gapL}" cy="${R_Y - 18}" r="6" fill="none" stroke="${accent}" stroke-width="3"/>
+        <text x="${mid}" y="${R_Y - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" fill="${accent}">✈</text>
+        <line x1="${mid + 30}" y1="${R_Y - 18}" x2="${gapR - 14}" y2="${R_Y - 18}" stroke="${accent}" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round"/>
+        <circle cx="${gapR - 6}" cy="${R_Y - 18}" r="6" fill="${accent}"/>`
+        + (distNm == null ? '' : `
+        <text x="${mid}" y="${R_Y - 54}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="bold" letter-spacing="1.4" fill="${pal.dim}">≈ ${distNm.toLocaleString('en-US')} NM${filed ? ` FILED · ${plan.length} FIXES` : ''}</text>`)
+        + (!eteText ? '' : `
+        <text x="${mid}" y="${R_Y + 30}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="bold" letter-spacing="1.4" fill="${pal.dim}">ETE ${esc(eteText)}</text>`);
+    } else if (gapR - gapL >= 60) {
+        strip = `<text x="${mid}" y="${R_Y - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" fill="${accent}">✈</text>`;
+    }
+
+    const vaName = clipText((e.va && (e.va.name || e.va.code)) || '', 28, '');
+    const pilot = clipText(e.username, 26, '');
+    const byline = [vaName, pilot].filter(Boolean).join('  ·  ');
+    // The link is on the Discord message, not on the picture — but a card that
+    // says it is tappable gets tapped, and the whole point of the per-flight
+    // link is that somebody follows it.
+    const tapHint = flightLinkId(e)
+        ? `<text x="${WIDTH - SLICK.pad}" y="${HEIGHT - 34}" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.6" fill="${pal.dim}">TAP THE TITLE TO FOLLOW THIS FLIGHT</text>`
+        : '';
+    const logoText = has.brand ? '' : `
+        <text x="${SLICK.logo.x}" y="${SLICK.logo.y + 34}" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" font-weight="bold" fill="${pal.text}">Inflight</text>`;
+
+    return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}">
+        <defs>
+            <linearGradient id="scrimH" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0" stop-color="#05080d" stop-opacity="${has.photo ? 0.95 : 0.7}"/>
+                <stop offset="0.55" stop-color="#05080d" stop-opacity="${has.photo ? 0.8 : 0.45}"/>
+                <stop offset="1" stop-color="#05080d" stop-opacity="${has.photo ? 0.45 : 0.2}"/>
+            </linearGradient>
+            <linearGradient id="scrimV" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#05080d" stop-opacity="0.55"/>
+                <stop offset="0.45" stop-color="#05080d" stop-opacity="0.1"/>
+                <stop offset="1" stop-color="#05080d" stop-opacity="0.92"/>
+            </linearGradient>
+            <linearGradient id="accentFade" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0" stop-color="${accent}" stop-opacity="1"/>
+                <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
+            </linearGradient>
+        </defs>
+        <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#scrimH)"/>
+        <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#scrimV)"/>
+
+        <!-- header: brand mark, event pill, UTC stamp -->
+        ${logoText}
+        <rect x="${WIDTH - SLICK.pad - 196}" y="46" width="196" height="44" rx="22" fill="${accent}"/>
+        <text x="${WIDTH - SLICK.pad - 98}" y="75" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#080d14">${isTakeoff ? 'DEPARTURE' : 'ARRIVAL'}</text>
+        <text x="${WIDTH - SLICK.pad}" y="118" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="16" font-weight="bold" letter-spacing="1.2" fill="${pal.dim}">${esc(utcStamp(e.timestamp))}</text>
+
+        <!-- the callsign leads; the VA and pilot sit under it -->
+        <text x="${SLICK.pad}" y="252" font-family="DejaVu Sans, Arial, sans-serif" font-size="76" font-weight="bold" fill="${pal.text}">${esc(clipText(e.callsign, 22, 'FLIGHT'))}</text>
+        ${byline ? `<text x="${SLICK.pad}" y="296" font-family="DejaVu Sans, Arial, sans-serif" font-size="23" letter-spacing="0.4" fill="${pal.dim}">${esc(byline)}</text>` : ''}
+
+        <!-- boarding-pass route strip -->
+        <line x1="${SLICK.pad}" y1="330" x2="${WIDTH - SLICK.pad}" y2="330" stroke="${pal.chipStroke}" stroke-width="1.5"/>
+        <text x="${SLICK.pad}" y="${R_Y}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${R_FONT}" font-weight="bold" fill="${pal.text}">${esc(depTxt)}</text>
+        <text x="${WIDTH - SLICK.pad}" y="${R_Y}" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="${R_FONT}" font-weight="bold" fill="${pal.text}">${esc(arrTxt)}</text>
+        ${strip}
+        <line x1="${SLICK.pad}" y1="452" x2="${WIDTH - SLICK.pad}" y2="452" stroke="${pal.chipStroke}" stroke-width="1.5"/>
+
+        ${chipsSvg}
+        ${tapHint}
+        <rect x="0" y="${HEIGHT - 6}" width="${WIDTH}" height="6" fill="url(#accentFade)"/>
+    </svg>`);
+};
+
+// The plain background the slick card falls back to when there is no photo (or
+// the VA turned it off): the same near-black the boxed card uses, lifted by a
+// wash of the event's accent so it still reads as a designed surface.
+const slickBackgroundSvg = (accent) => Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}">
+        <defs>
+            <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#0b1016"/>
+                <stop offset="1" stop-color="#141c27"/>
+            </linearGradient>
+            <radialGradient id="wash" cx="0.75" cy="0.25" r="0.75">
+                <stop offset="0" stop-color="${accent}" stop-opacity="0.20"/>
+                <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
+            </radialGradient>
+        </defs>
+        <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#bg)"/>
+        <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#wash)"/>
+    </svg>`);
+
+// Render the slick card. The photo is the BACKGROUND here (not a composited
+// thumbnail), so the pipeline is the other way round from the boxed card: the
+// picture is laid down first, then the overlay and the brand mark go on top.
+const renderSlickCardImpl = async (e, media, o, plan) => {
+    const route = extractRoute(e);
+    const accent = resolveAccent(e, o).hex;
+
+    const photoRaw = o.showPhoto ? await fetchImage(media.aircraftImageUrl) : null;
+    let background = null;
+    if (photoRaw) {
+        try {
+            background = await sharp(photoRaw)
+                .resize(WIDTH, HEIGHT, { fit: 'cover', position: 'attention' })
+                .png().toBuffer();
+        } catch { background = null; }
+    }
+    const has = { photo: !!background, brand: !!BRAND_LOGO_BUF };
+    if (!background) background = await sharp(slickBackgroundSvg(accent)).png().toBuffer();
+
+    const brand = BRAND_LOGO_BUF ? await contain(BRAND_LOGO_BUF, SLICK.logo.w, SLICK.logo.h) : null;
+    has.brand = !!brand;
+
+    const layers = [{ input: buildSlickSvg(e, route, has, o, plan) }];
+    if (brand) {
+        const meta = await sharp(brand).metadata();
+        const top = SLICK.logo.y + Math.max(0, Math.round((SLICK.logo.h - (meta.height || SLICK.logo.h)) / 2));
+        layers.push({ input: brand, left: SLICK.logo.x, top });
+    }
+    return await sharp(background).composite(layers).png().toBuffer();
+};
+
 // Render the composite PNG for one event. Returns a Buffer, or null if rendering
 // failed (caller then falls back to the plain embed).
 const renderVaEventCardImpl = async (e = {}, media = {}, opts) => {
     try {
         const o = normalizeCardOptions(opts || {});
+        // The filed route, read once and handed to whichever design is drawing.
+        const plan = extractFlightPlan(e);
+        if (o.layout === 'slick') return await renderSlickCardImpl(e, media, o, plan);
         const route = extractRoute(e);
 
         // The aircraft photo is the only remote bitmap; the brand logo is local.
@@ -590,7 +961,7 @@ const renderVaEventCardImpl = async (e = {}, media = {}, opts) => {
 
         const has = { photo: !!photo, brand: !!brand };
         const { photoX } = cardLayout(o);
-        const baseSvg = buildBaseSvg(e, route, has, o);
+        const baseSvg = buildBaseSvg(e, route, has, o, plan);
 
         const layers = [];
         if (brand) {
