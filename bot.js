@@ -2186,9 +2186,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
+            // Two ways to name a record, neither required on its own: the type +
+            // livery pair the rest of the bot works in, or a tail number when
+            // that is what staff have in hand.
             new SlashCommandBuilder().setName('photos').setDescription('[STAFF] Reorder or remove the photos on an aircraft record')
-                .addStringOption(o => o.setName('aircraft_type').setDescription('Aircraft type').setAutocomplete(true).setRequired(true))
-                .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
+                .addStringOption(o => o.setName('aircraft_type').setDescription('Aircraft type (pair with livery)').setAutocomplete(true).setRequired(false))
+                .addStringOption(o => o.setName('livery').setDescription('Livery/airline (pair with aircraft type)').setAutocomplete(true).setRequired(false))
+                .addStringOption(o => o.setName('tail').setDescription('Or just the tail number on its own').setAutocomplete(true).setRequired(false))
                 .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
 
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
@@ -2505,6 +2509,24 @@ client.on('interactionCreate', async (interaction) => {
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
                 await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
                 return;
+            }
+
+            // Tail numbers for /photos, matched against what is actually in the
+            // database (each choice shows the type + livery it belongs to, so a
+            // near-miss is obvious before it's picked).
+            if (focused.name === 'tail') {
+                try {
+                    const q = (focused.value || '').trim();
+                    const rows = await CommunityAircraftModel
+                        .find(q ? { tailNumber: { $regex: escapeRegex(q), $options: 'i' } } : {})
+                        .select('tailNumber aircraftType liveryName').sort({ tailNumber: 1 }).limit(25).lean();
+                    return interaction.respond(rows.map(r => ({
+                        name: `${r.tailNumber} — ${r.aircraftType} (${r.liveryName})`.slice(0, 100),
+                        value: String(r.tailNumber).slice(0, 100)
+                    })));
+                } catch (_) {
+                    return interaction.respond([]);
+                }
             }
 
             if (focused.name === 'livery') {
@@ -4211,20 +4233,35 @@ client.on('interactionCreate', async (interaction) => {
             }
             const typeInput = interaction.options.getString('aircraft_type');
             const liveryInput = interaction.options.getString('livery');
+            const tailInput = (interaction.options.getString('tail') || '').trim();
+
+            // Either identifier works; neither is mandatory on its own. A tail
+            // number alone is enough because it's unique in the schema, so it
+            // names exactly one record.
+            if (!tailInput && !(typeInput && liveryInput)) {
+                return interaction.reply({
+                    content: '❌ Tell me which record: a **tail** number on its own, or an **aircraft_type** *and* a **livery**.',
+                    ephemeral: true
+                });
+            }
 
             // Ephemeral: this is a management surface, not something to leave
             // sitting in a channel for anyone to click.
             await interaction.deferReply({ ephemeral: true });
             try {
-                const entry = await CommunityAircraftModel.findOne({
-                    aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") },
-                    liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
-                });
+                const entry = await CommunityAircraftModel.findOne(tailInput
+                    ? { tailNumber: { $regex: new RegExp(`^${escapeRegex(tailInput)}$`, "i") } }
+                    : {
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
+                    });
                 if (!entry) {
-                    return interaction.editReply(`❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
+                    return interaction.editReply(tailInput
+                        ? `❌ No database record found for tail **${tailInput.toUpperCase()}**.`
+                        : `❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
                 }
                 if (getEntryImages(entry).length === 0) {
-                    return interaction.editReply(`⚠️ **${typeInput}** (${liveryInput}) has no photos on record yet — nothing to manage.`);
+                    return interaction.editReply(`⚠️ **${entry.aircraftType}** (${entry.liveryName}) has no photos on record yet — nothing to manage.`);
                 }
                 await interaction.editReply(buildPhotoManager(entry));
             } catch (e) {
@@ -4456,7 +4493,7 @@ client.on('interactionCreate', async (interaction) => {
                     {
                         name: '🛠️ Photo Management',
                         value: [
-                            '`/photos` — *(staff)* reorder the photos on a record (promote one to primary, push another back) or remove one',
+                            '`/photos` — *(staff)* reorder the photos on a record (promote one to primary, push another back) or remove one — find it by aircraft type + livery, or by tail number alone',
                             'On a review card, **Insert** saves a submission into a slot and keeps the photo that was there — only **Replace** deletes.'
                         ].join('\n')
                     }
