@@ -1360,14 +1360,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const count = Math.max(0, Math.min(imageCount || 0, MAX_AIRCRAFT_IMAGES));
         const wanted = Math.min(Math.max((parseInt(chosenSlot, 10) || 1) - 1, 0), count);
 
-        if (action === 'insert') {
+        if (action === 'insert' || action === 'insertend') {
             // Inserting past the last photo is just an append, and that stays
             // legal on a full record only as a replace of the final slot — which
             // 'insert' never is. Anything that would displace a photo off the
             // end of a full record is refused.
             if (wanted >= count) return { slotIndex: count, mode: count >= MAX_AIRCRAFT_IMAGES ? 'full' : 'append' };
             if (count >= MAX_AIRCRAFT_IMAGES) return { slotIndex: wanted, mode: 'full' };
-            return { slotIndex: wanted, mode: 'insert' };
+            // 'insertend' sends the displaced photo to the LAST slot rather than
+            // one place down — "make this the primary and push the old primary
+            // to the back". With no photo after the displaced one there is no
+            // difference between the two, so it collapses to a plain insert.
+            const sendsToEnd = action === 'insertend' && wanted < count - 1;
+            return { slotIndex: wanted, mode: sendsToEnd ? 'insertEnd' : 'insert' };
         }
 
         if (action === 'add') {
@@ -1404,9 +1409,36 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             contributors.splice(slotIndex, 0, contributor);
             return null;
         }
+        if (mode === 'insertEnd' && slotIndex < images.length) {
+            // The photo being displaced goes to the back instead of one place
+            // down; everything between it and the end moves up to close the gap.
+            const [displaced] = images.splice(slotIndex, 1);
+            const [displacedBy] = contributors.splice(slotIndex, 1);
+            images.splice(slotIndex, 0, url);
+            contributors.splice(slotIndex, 0, contributor);
+            images.push(displaced);
+            contributors.push(displacedBy);
+            return null;
+        }
         images.push(url);
         contributors.push(contributor);
         return null;
+    };
+
+    // Reorder a record that is already saved: pull the photo at `from` out and
+    // drop it back in at `to`, carrying its contributor credit with it. The
+    // after-the-fact counterpart to an insert — no upload, no deletion. Returns
+    // false for a no-op or out-of-range move so the caller re-renders against
+    // live state instead of writing.
+    const moveAircraftPhoto = (images, contributors, from, to) => {
+        const last = images.length - 1;
+        if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+        if (from < 0 || from > last || to < 0 || to > last || from === to) return false;
+        const [url] = images.splice(from, 1);
+        const [credit] = contributors.splice(from, 1);
+        images.splice(to, 0, url);
+        contributors.splice(to, 0, credit);
+        return true;
     };
 
     /**
@@ -1495,6 +1527,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             // on a full record every insert would push a photo out.
             const hasRoom = existingImages.length < MAX_AIRCRAFT_IMAGES;
             if (hasRoom) {
+                const endSlot = existingImages.length + 1;
                 for (let slot = 1; slot <= existingImages.length; slot++) {
                     insertButtons.push(
                         new ButtonBuilder()
@@ -1503,11 +1536,24 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                             .setStyle(ButtonStyle.Secondary)
                             .setEmoji('⬇️')
                     );
+                    // Where the displaced photo lands is the admin's call too:
+                    // one place down (above), or all the way to the back. Only
+                    // offered when those differ — with nothing after the
+                    // displaced photo, "down one" already IS the back.
+                    if (slot < existingImages.length) {
+                        insertButtons.push(
+                            new ButtonBuilder()
+                                .setCustomId(`approve_insertend_${slot}_${userId}`)
+                                .setLabel(`Insert as Photo ${slot} (${slot} → ${endSlot})`)
+                                .setStyle(ButtonStyle.Secondary)
+                                .setEmoji('⏬')
+                        );
+                    }
                 }
             }
 
             const insertHint = hasRoom
-                ? `\n**Insert** puts it in that slot and pushes the current photo(s) down a slot — nothing is deleted.`
+                ? `\n**Insert** puts it in that slot and keeps the photo that was there — the button says where that one lands (e.g. \`1 → 2\` moves it down one, \`1 → ${existingImages.length + 1}\` sends it to the back). Nothing is deleted.`
                 : `\nAll ${MAX_AIRCRAFT_IMAGES} slots are full, so there is no free slot to push a photo down into — **Replace** deletes the photo it overwrites.`;
             mainEmbed.setTitle('♻️ Replacement / Additional Photo — Awaiting Review').setColor(SUB_STATE.PENDING.color)
                 .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites (and deletes) that photo, **Add** appends a new one.${insertHint}`);
@@ -1520,7 +1566,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     .setColor(THEME.GRAY)
                     .setImage(imgUrl)
                     .setFooter({ text: hasRoom
-                        ? `Replacing Photo ${idx + 1} deletes this image — inserting keeps it (moves to Photo ${idx + 2}).`
+                        ? `Replacing Photo ${idx + 1} deletes this image — inserting keeps it, moved to the slot the button names.`
                         : `Replacing Photo ${idx + 1} deletes this image.` });
                 // Show who contributed each existing photo so admins know a replace
                 // only overwrites that one slot's contributor, not the others.
@@ -1591,6 +1637,110 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             console.error('refreshPendingReviewsFor failed:', e);
         }
     };
+
+    /**
+     * The staff photo manager behind /photos: a record's slots as they stand,
+     * plus the controls to reorder or remove one.
+     *
+     * Reordering here is the after-the-fact counterpart to the review card's
+     * Insert. Before this existed, the order a record ended up in at approval
+     * time was the order it kept — the only way to promote a photo to primary
+     * was to replace Photo 1, which deleted whatever was there.
+     *
+     * Removal is offered only while more than one photo is on record: dropping
+     * the last one would leave an entry with no image at all, which the site's
+     * gallery and every /pull would render as a hole. Clearing a record out
+     * entirely stays a staff-panel job.
+     */
+    const buildPhotoManager = (entry) => {
+        const images = getEntryImages(entry);
+        const contributors = getEntryContributors(entry);
+        const id = String(entry._id);
+
+        const header = themedEmbed(THEME.WHITE)
+            .setTitle('🛠️ Photo Manager')
+            .setDescription(
+                `**${entry.aircraftType}** — ${entry.liveryName}\n` +
+                `**${images.length}/${MAX_AIRCRAFT_IMAGES}** photo(s) on record. Photo 1 is the primary image shown everywhere.\n` +
+                (images.length > 1
+                    ? 'Reordering moves a photo and its credit to another slot — nothing is deleted.'
+                    : 'Only one photo on record: nothing to reorder, and the last photo cannot be removed here.')
+            );
+
+        const gallery = images.map((url, i) => new EmbedBuilder()
+            .setTitle(i === 0 ? '⭐ Photo 1 (primary)' : `📷 Photo ${i + 1}`)
+            .setColor(THEME.GRAY)
+            .setDescription(`Contributor: ${contributors[i]?.name || 'Unknown'}`)
+            .setImage(url));
+
+        const components = [];
+        if (images.length > 1) {
+            const moves = [];
+            for (let from = 1; from <= images.length; from++) {
+                for (let to = 1; to <= images.length; to++) {
+                    if (from === to) continue;
+                    moves.push(new StringSelectMenuOptionBuilder()
+                        .setLabel(`Move Photo ${from} → Photo ${to}`)
+                        .setDescription(to === 1 ? 'Becomes the primary image' : `Photo ${from} takes slot ${to}`)
+                        .setValue(`${from}:${to}`));
+                }
+            }
+            components.push(new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`photos_move_${id}`)
+                    .setPlaceholder('Reorder a photo…')
+                    .addOptions(moves.slice(0, 25))
+            ));
+            components.push(new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`photos_del_${id}`)
+                    .setPlaceholder('Remove a photo…')
+                    .addOptions(images.map((_, i) => new StringSelectMenuOptionBuilder()
+                        .setLabel(`Remove Photo ${i + 1}`)
+                        .setDescription(`By ${(contributors[i]?.name || 'Unknown').slice(0, 80)} — asks to confirm`)
+                        .setValue(String(i + 1))))
+            ));
+        }
+        components.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`photos_refresh_${id}`).setLabel('Refresh').setStyle(ButtonStyle.Secondary).setEmoji('🔄')
+        ));
+
+        return { content: '', embeds: [header, ...gallery], components };
+    };
+
+    // Write a reordered/trimmed image set back to a record. The legacy mirrors
+    // (imageUrl and the top-level contributor) track slot 0, so a reorder that
+    // changes the primary has to carry them with it or the site keeps showing
+    // the old primary and credits the wrong person.
+    const saveAircraftImages = async (entry, images, contributors) => {
+        entry.imageUrls = images;
+        entry.imageContributors = contributors;
+        entry.imageUrl = images[0] || null;
+        entry.contributorName = contributors[0]?.name || entry.contributorName || 'System';
+        entry.contributorId = contributors[0]?.id || null;
+        await entry.save();
+    };
+
+    // Reordering and removal are silent from the outside — the record just looks
+    // different — so every one of them leaves a line in the admin channel saying
+    // who did what to which aircraft.
+    const logPhotoAction = async (interaction, entry, text) => {
+        try {
+            const channel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+            if (!channel) return;
+            await channel.send({
+                embeds: [themedEmbed(THEME.GRAY)
+                    .setTitle('🛠️ Photo Manager')
+                    .setDescription(`**${entry.aircraftType}** — ${entry.liveryName}\n${text}\nBy <@${interaction.user.id}>`)
+                    .setTimestamp()]
+            });
+        } catch (_) { /* logging must never break the action itself */ }
+    };
+
+    // Staff gate shared by /photos and its components (mirrors the /va_remove guard).
+    const isPhotoStaff = (interaction) =>
+        Boolean(interaction.member?.roles?.cache?.has(ADMIN_ROLE_ID)) ||
+        Boolean(interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator));
 
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
@@ -2036,6 +2186,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
+            new SlashCommandBuilder().setName('photos').setDescription('[STAFF] Reorder or remove the photos on an aircraft record')
+                .addStringOption(o => o.setName('aircraft_type').setDescription('Aircraft type').setAutocomplete(true).setRequired(true))
+                .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
+
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
             new SlashCommandBuilder()
@@ -2602,8 +2757,9 @@ client.on('interactionCreate', async (interaction) => {
 
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    const approvedTitle = placement.mode === 'insert'
-                        ? `✅ Approved — Inserted as Photo ${slotIndex + 1} of ${images.length} (previous Photo ${slotIndex + 1} kept as ${slotIndex + 2})`
+                    const keptAt = placement.mode === 'insertEnd' ? images.length : slotIndex + 2;
+                    const approvedTitle = (placement.mode === 'insert' || placement.mode === 'insertEnd')
+                        ? `✅ Approved — Inserted as Photo ${slotIndex + 1} of ${images.length} (previous Photo ${slotIndex + 1} kept as ${keptAt})`
                         : `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
                     // Keep the verified photo rendered inside the admin embed (using the
                     // permanent S3 URL) and drop the temporary upload attachment.
@@ -2724,6 +2880,58 @@ client.on('interactionCreate', async (interaction) => {
                 modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
                 await interaction.showModal(modal);
                 return;
+            }
+
+            // --- PHOTO MANAGER BUTTONS (from /photos) ---
+            if (customId.startsWith('photos_refresh_') || customId.startsWith('photos_delok_') || customId === 'photos_cancel') {
+                if (!isPhotoStaff(interaction)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                await interaction.deferUpdate();
+                if (customId === 'photos_cancel') {
+                    return interaction.editReply({ content: '✋ Cancelled — nothing was deleted.', components: [] }).catch(() => {});
+                }
+                try {
+                    if (customId.startsWith('photos_refresh_')) {
+                        const entry = await CommunityAircraftModel.findById(customId.replace('photos_refresh_', '')).catch(() => null);
+                        if (!entry || getEntryImages(entry).length === 0) {
+                            return interaction.editReply({ content: '❌ That record no longer has photos on it.', embeds: [], components: [] }).catch(() => {});
+                        }
+                        return interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                    }
+
+                    // photos_delok_<recordId>_<slot> — the record id is a Mongo
+                    // ObjectId (no underscores), so the slot is the tail.
+                    const rest = customId.replace('photos_delok_', '');
+                    const cut = rest.lastIndexOf('_');
+                    const entry = await CommunityAircraftModel.findById(rest.slice(0, cut)).catch(() => null);
+                    const slot = parseInt(rest.slice(cut + 1), 10);
+                    if (!entry) {
+                        return interaction.editReply({ content: '❌ That record no longer exists.', components: [] }).catch(() => {});
+                    }
+                    const images = getEntryImages(entry);
+                    const contributors = getEntryContributors(entry);
+                    // Re-checked against live state: the photo may already be gone,
+                    // or be the only one left, in which case removing it would
+                    // leave the record with no image at all.
+                    if (!(slot >= 1 && slot <= images.length) || images.length <= 1) {
+                        return interaction.editReply({ content: '⚠️ Nothing was deleted — that photo is already gone, or it is the record\'s only photo.', components: [] }).catch(() => {});
+                    }
+                    const [removed] = images.splice(slot - 1, 1);
+                    contributors.splice(slot - 1, 1);
+                    // Storage last: a failed DB write must not leave the record
+                    // pointing at a file that no longer exists.
+                    await saveAircraftImages(entry, images, contributors);
+                    if (removed) await deleteImageFromS3(removed);
+                    await logPhotoAction(interaction, entry, `🗑️ Removed Photo ${slot} — ${images.length} left.`);
+                    return interaction.editReply({
+                        content: `🗑️ Photo ${slot} removed. **${images.length}** photo(s) remain — run \`/photos\` again for the updated record.`,
+                        components: []
+                    }).catch(() => {});
+                } catch (e) {
+                    console.error('Photo manager button failed:', e);
+                    return interaction.followUp({ content: '⚠️ That didn\'t go through — nothing was changed.', ephemeral: true }).catch(() => {});
+                }
             }
 
             // --- GIVEAWAY ENTRY BUTTON ---
@@ -3047,7 +3255,59 @@ client.on('interactionCreate', async (interaction) => {
 
         // --- 3. SELECT MENU HANDLERS ---
         if (interaction.isStringSelectMenu()) {
-            
+
+            // --- PHOTO MANAGER: REORDER / REMOVE (from /photos) ---
+            if (interaction.customId.startsWith('photos_move_') || interaction.customId.startsWith('photos_del_')) {
+                if (!isPhotoStaff(interaction)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                const isMove = interaction.customId.startsWith('photos_move_');
+                const recordId = interaction.customId.replace(isMove ? 'photos_move_' : 'photos_del_', '');
+                await interaction.deferUpdate();
+                try {
+                    // Re-read the record on every action: another staff member may
+                    // have reordered or removed a photo since this manager was
+                    // rendered, and the slot numbers in these options would then
+                    // point at the wrong photos.
+                    const entry = await CommunityAircraftModel.findById(recordId).catch(() => null);
+                    if (!entry) {
+                        return interaction.editReply({ content: '❌ That record no longer exists.', embeds: [], components: [] }).catch(() => {});
+                    }
+                    const images = getEntryImages(entry);
+                    const contributors = getEntryContributors(entry);
+
+                    if (isMove) {
+                        const [from, to] = String(interaction.values[0]).split(':').map(n => parseInt(n, 10));
+                        if (!moveAircraftPhoto(images, contributors, from - 1, to - 1)) {
+                            await interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                            return interaction.followUp({ content: '⚠️ Those slots have changed since this was opened — the manager is refreshed above.', ephemeral: true }).catch(() => {});
+                        }
+                        await saveAircraftImages(entry, images, contributors);
+                        await logPhotoAction(interaction, entry, `↕️ Moved Photo ${from} → Photo ${to}.`);
+                        return interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                    }
+
+                    // Removal deletes the file from S3, so it asks first — in its
+                    // own ephemeral message, leaving the manager on screen.
+                    const slot = parseInt(interaction.values[0], 10);
+                    if (!(slot >= 1 && slot <= images.length) || images.length <= 1) {
+                        await interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                        return interaction.followUp({ content: '⚠️ That photo is no longer there — the manager is refreshed above.', ephemeral: true }).catch(() => {});
+                    }
+                    return interaction.followUp({
+                        content: `⚠️ Deleting **Photo ${slot}** of **${entry.aircraftType}** (${entry.liveryName}) removes it from storage permanently — the photos after it move up a slot. Reorder it instead if you only want it out of the way.`,
+                        components: [new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId(`photos_delok_${recordId}_${slot}`).setLabel(`Delete Photo ${slot}`).setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
+                            new ButtonBuilder().setCustomId('photos_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+                        )],
+                        ephemeral: true
+                    }).catch(() => {});
+                } catch (e) {
+                    console.error('Photo manager action failed:', e);
+                    return interaction.followUp({ content: '⚠️ That didn\'t go through — nothing was changed.', ephemeral: true }).catch(() => {});
+                }
+            }
+
             // --- BOUNTY BOARD SORTING MENU ---
             if (interaction.customId.startsWith('bnty_sort_')) {
                 await interaction.deferUpdate();
@@ -3944,6 +4204,36 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
         
+        // --- PHOTO MANAGER (staff): reorder or remove photos already on record ---
+        if (interaction.commandName === 'photos') {
+            if (!isPhotoStaff(interaction)) {
+                return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+            }
+            const typeInput = interaction.options.getString('aircraft_type');
+            const liveryInput = interaction.options.getString('livery');
+
+            // Ephemeral: this is a management surface, not something to leave
+            // sitting in a channel for anyone to click.
+            await interaction.deferReply({ ephemeral: true });
+            try {
+                const entry = await CommunityAircraftModel.findOne({
+                    aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") },
+                    liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
+                });
+                if (!entry) {
+                    return interaction.editReply(`❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
+                }
+                if (getEntryImages(entry).length === 0) {
+                    return interaction.editReply(`⚠️ **${typeInput}** (${liveryInput}) has no photos on record yet — nothing to manage.`);
+                }
+                await interaction.editReply(buildPhotoManager(entry));
+            } catch (e) {
+                console.error('photos command error:', e);
+                await interaction.editReply('⚠️ Error loading that record.').catch(() => {});
+            }
+            return;
+        }
+
         if (interaction.commandName === 'pull_airport') {
             const icaoInput = interaction.options.getString('icao').toUpperCase().trim();
             await interaction.deferReply();
@@ -4162,9 +4452,16 @@ client.on('interactionCreate', async (interaction) => {
                             '`/va_addrep` / `/va_removerep` — *(staff)* manage a VA\'s reps',
                             '`/va_remove` — *(staff)* delete a VA\'s role + channel'
                         ].join('\n')
+                    },
+                    {
+                        name: '🛠️ Photo Management',
+                        value: [
+                            '`/photos` — *(staff)* reorder the photos on a record (promote one to primary, push another back) or remove one',
+                            'On a review card, **Insert** saves a submission into a slot and keeps the photo that was there — only **Replace** deletes.'
+                        ].join('\n')
                     }
                 )
-                .setFooter({ text: 'Staff-only: mod_*, /giveaway, and /va_* management commands.' });
+                .setFooter({ text: 'Staff-only: mod_*, /giveaway, /photos, and /va_* management commands.' });
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
       } catch (err) {
