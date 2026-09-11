@@ -13375,7 +13375,7 @@ const {
     extractFlightPlan, planRouteText,
     // Also read by the crew route-map endpoint, so a VA's network map quotes
     // the same leg distances the flight-event card does.
-    routeDistanceNm,
+    routeDistanceNm, MAX_PLAN_WAYPOINTS,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 const { RouteMapCache } = require('./routeMapCache');
@@ -13385,9 +13385,15 @@ const { RouteMapCache } = require('./routeMapCache');
  * GET /api/route-map?dep=EGLL&arr=KJFK
  *      [&lat=&lon=]                     live aircraft position, drawn as a dot
  *      [&deplat=&deplon=&arrlat=&arrlon=]  explicit endpoints (see below)
+ *      [&plan=lat,lon[,IDENT];…]        the FILED route — every leg is drawn
  *      [&style=dark|midnight|light|mono]
  *      [&line=%23rrggbb]                route/marker colour
  *      [&size=banner|og]                1200x420 (default) or 1200x630
+ *
+ * With `plan` the map draws the pilot's actual filed route — each leg as its own
+ * great circle, a dot on every fix and an ident on as many as fit — which is
+ * what the Discord flight card draws. Without it, the single great circle
+ * between dep and arr, as before.
  *
  * The same renderer the Discord webhook uses, exposed as a plain PNG so the
  * tracker can show a flight's route without shipping a map provider or a key.
@@ -13449,6 +13455,30 @@ const numParam = (v, limit) => {
     return (Number.isFinite(n) && Math.abs(n) <= limit) ? n : null;
 };
 
+// Parse the `plan=` query parameter: fixes as "lat,lon" or "lat,lon,IDENT",
+// separated by ';'. Anything unparseable is skipped rather than rejected, and
+// the result runs through extractFlightPlan's own validation downstream (range
+// checks, (0,0) drops, the length cap), so this only has to split the string.
+//
+// Capped here as well, before any of that: the parameter arrives from the open
+// internet, and a megabyte of semicolons should cost one split and a slice, not
+// a walk over every segment in it.
+const MAX_PLAN_PARAM_CHARS = 8000;
+const parsePlanParam = (raw) => {
+    const str = String(raw == null ? '' : raw).trim();
+    if (!str) return [];
+    const out = [];
+    for (const seg of str.slice(0, MAX_PLAN_PARAM_CHARS).split(';')) {
+        const parts = seg.split(',');
+        if (parts.length < 2) continue;
+        const lat = Number(parts[0]), lon = Number(parts[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        out.push({ lat, lon, name: String(parts[2] || '').trim().slice(0, 12) });
+        if (out.length >= MAX_PLAN_WAYPOINTS) break;
+    }
+    return out;
+};
+
 app.get('/api/route-map', async (req, res) => {
     try {
         const q = req.query || {};
@@ -13457,6 +13487,14 @@ app.get('/api/route-map', async (req, res) => {
         if (!ICAO_PARAM_RE.test(dep) || !ICAO_PARAM_RE.test(arr)) {
             return res.status(400).json({ message: 'dep and arr must be 3-4 character airport codes.' });
         }
+
+        // The FILED route, as a compact "lat,lon[,IDENT];…" list. A plan is the
+        // difference between a picture of where the aeroplane is going and a
+        // straight line between two airports, and the webhook card already draws
+        // it — this is how a shared flight's link preview gets the same map.
+        // Parsed leniently: a malformed segment is dropped, never a 400, because
+        // a crawler following a stale link should still get an image.
+        const plan = parsePlanParam(q.plan);
 
         const depLat = numParam(q.deplat, 90), depLon = numParam(q.deplon, 180);
         const arrLat = numParam(q.arrlat, 90), arrLon = numParam(q.arrlon, 180);
@@ -13479,6 +13517,10 @@ app.get('/api/route-map', async (req, res) => {
         const key = [
             dep, arr, opts.mapStyle, opts.mapSize, opts.mapLine || '',
             r2(depLat), r2(depLon), r2(arrLat), r2(arrLon), r2(posLat), r2(posLon),
+            // The plan is fixed geometry once filed, and two crawlers on the same
+            // link send the identical string — so it keys cleanly, rounded to the
+            // same 2 dp as everything else here.
+            plan.map((w) => `${r2(w.lat)},${r2(w.lon)}`).join('>'),
         ].join('|');
 
         const send = (buf) => {
@@ -13498,6 +13540,7 @@ app.get('/api/route-map', async (req, res) => {
                 depCoords: (depLat !== null && depLon !== null) ? [depLat, depLon] : undefined,
                 arrCoords: (arrLat !== null && arrLon !== null) ? [arrLat, arrLon] : undefined,
                 position: hasPos ? { lat: posLat, lon: posLon } : undefined,
+                flightPlan: plan.length ? { waypoints: plan } : undefined,
             }, opts),
             // A miss is not cached: an unmappable route is cheap to re-answer,
             // and caching the null would keep serving 404 for a field that has
