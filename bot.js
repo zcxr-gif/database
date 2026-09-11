@@ -1339,6 +1339,109 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     const MAX_AIRCRAFT_IMAGES = 3;
 
     /**
+     * Where an approved photo lands, decided against the LIVE image count rather
+     * than the count that was on record when the review card was rendered.
+     *
+     * Actions an approve button can carry:
+     *   • 'replace' — overwrite that slot (the old photo is deleted from S3)
+     *   • 'add'     — append after the last photo
+     *   • 'insert'  — take that slot and push the photos at/after it DOWN one
+     *                 place, so nothing is deleted. This is how a better shot
+     *                 becomes Photo 1 while the current Photo 1 survives as
+     *                 Photo 2 (and Photo 2 as Photo 3).
+     *   • null      — a legacy button with no encoded intent; infer from state.
+     *
+     * Returns { slotIndex, mode } where mode is 'replace' | 'append' | 'insert'
+     * | 'full'. 'full' means the insert can no longer happen without pushing a
+     * photo out of the record entirely — the caller must abort rather than
+     * quietly trash the last one.
+     */
+    const resolveAircraftSlot = (action, chosenSlot, imageCount) => {
+        const count = Math.max(0, Math.min(imageCount || 0, MAX_AIRCRAFT_IMAGES));
+        const wanted = Math.min(Math.max((parseInt(chosenSlot, 10) || 1) - 1, 0), count);
+
+        if (action === 'insert' || action === 'insertend') {
+            // Inserting past the last photo is just an append, and that stays
+            // legal on a full record only as a replace of the final slot — which
+            // 'insert' never is. Anything that would displace a photo off the
+            // end of a full record is refused.
+            if (wanted >= count) return { slotIndex: count, mode: count >= MAX_AIRCRAFT_IMAGES ? 'full' : 'append' };
+            if (count >= MAX_AIRCRAFT_IMAGES) return { slotIndex: wanted, mode: 'full' };
+            // 'insertend' sends the displaced photo to the LAST slot rather than
+            // one place down — "make this the primary and push the old primary
+            // to the back". With no photo after the displaced one there is no
+            // difference between the two, so it collapses to a plain insert.
+            const sendsToEnd = action === 'insertend' && wanted < count - 1;
+            return { slotIndex: wanted, mode: sendsToEnd ? 'insertEnd' : 'insert' };
+        }
+
+        if (action === 'add') {
+            if (count < MAX_AIRCRAFT_IMAGES) return { slotIndex: count, mode: 'append' };
+            return { slotIndex: MAX_AIRCRAFT_IMAGES - 1, mode: 'replace' };
+        }
+
+        if (action === 'replace') {
+            // Replace the targeted slot if it still exists; if that photo is gone
+            // (images shrank since render), append instead.
+            const slotIndex = (parseInt(chosenSlot, 10) || 1) - 1;
+            if (slotIndex >= 0 && slotIndex < count) return { slotIndex, mode: 'replace' };
+            const fallback = Math.min(count, MAX_AIRCRAFT_IMAGES - 1);
+            return { slotIndex: fallback, mode: fallback < count ? 'replace' : 'append' };
+        }
+
+        return { slotIndex: wanted, mode: wanted < count ? 'replace' : 'append' };
+    };
+
+    // Apply a resolved placement to a record's image/contributor arrays (both
+    // mutated in step). Returns the URL that was overwritten and therefore needs
+    // deleting from S3, or null when nothing was displaced — an insert shifts the
+    // existing photos down a slot instead of trashing one.
+    const applyAircraftPlacement = (images, contributors, placement, url, contributor) => {
+        const { mode, slotIndex } = placement;
+        if (mode === 'replace' && slotIndex < images.length) {
+            const replaced = images[slotIndex];
+            images[slotIndex] = url;
+            contributors[slotIndex] = contributor;
+            return replaced;
+        }
+        if (mode === 'insert' && slotIndex < images.length) {
+            images.splice(slotIndex, 0, url);
+            contributors.splice(slotIndex, 0, contributor);
+            return null;
+        }
+        if (mode === 'insertEnd' && slotIndex < images.length) {
+            // The photo being displaced goes to the back instead of one place
+            // down; everything between it and the end moves up to close the gap.
+            const [displaced] = images.splice(slotIndex, 1);
+            const [displacedBy] = contributors.splice(slotIndex, 1);
+            images.splice(slotIndex, 0, url);
+            contributors.splice(slotIndex, 0, contributor);
+            images.push(displaced);
+            contributors.push(displacedBy);
+            return null;
+        }
+        images.push(url);
+        contributors.push(contributor);
+        return null;
+    };
+
+    // Reorder a record that is already saved: pull the photo at `from` out and
+    // drop it back in at `to`, carrying its contributor credit with it. The
+    // after-the-fact counterpart to an insert — no upload, no deletion. Returns
+    // false for a no-op or out-of-range move so the caller re-renders against
+    // live state instead of writing.
+    const moveAircraftPhoto = (images, contributors, from, to) => {
+        const last = images.length - 1;
+        if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+        if (from < 0 || from > last || to < 0 || to > last || from === to) return false;
+        const [url] = images.splice(from, 1);
+        const [credit] = contributors.splice(from, 1);
+        images.splice(to, 0, url);
+        contributors.splice(to, 0, credit);
+        return true;
+    };
+
+    /**
      * The submitter token exactly as a pending review card carries it.
      *
      * Two shapes, both written into the footer as `User: <token>`:
@@ -1390,6 +1493,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const existingImages = getEntryImages(existingEntry);
         const extraEmbeds = [];
         const approveButtons = [];
+        const insertButtons = [];
 
         if (existingImages.length === 0) {
             // No photo yet: this is an "add" so the approval handler appends
@@ -1403,9 +1507,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             const slotsToShow = Math.min(existingImages.length + 1, MAX_AIRCRAFT_IMAGES);
             for (let slot = 1; slot <= slotsToShow; slot++) {
                 const isReplace = slot <= existingImages.length;
-                // Encode the intent (add/replace) in the customId so the approval
-                // handler re-checks the live image state instead of trusting the
-                // slot number captured when these buttons were first rendered.
+                // Encode the intent (add/replace/insert) in the customId so the
+                // approval handler re-checks the live image state instead of
+                // trusting the slot number captured when these buttons were
+                // first rendered.
                 const action = isReplace ? 'replace' : 'add';
                 approveButtons.push(
                     new ButtonBuilder()
@@ -1415,8 +1520,43 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                         .setEmoji(isReplace ? '♻️' : '➕')
                 );
             }
+
+            // Non-destructive alternative to Replace: the new photo takes the
+            // slot and the photo sitting there slides down one (Photo 1 → 2,
+            // 2 → 3). Only offered while there is a free slot to slide into —
+            // on a full record every insert would push a photo out.
+            const hasRoom = existingImages.length < MAX_AIRCRAFT_IMAGES;
+            if (hasRoom) {
+                const endSlot = existingImages.length + 1;
+                for (let slot = 1; slot <= existingImages.length; slot++) {
+                    insertButtons.push(
+                        new ButtonBuilder()
+                            .setCustomId(`approve_insert_${slot}_${userId}`)
+                            .setLabel(`Insert as Photo ${slot} (${slot} → ${slot + 1})`)
+                            .setStyle(ButtonStyle.Secondary)
+                            .setEmoji('⬇️')
+                    );
+                    // Where the displaced photo lands is the admin's call too:
+                    // one place down (above), or all the way to the back. Only
+                    // offered when those differ — with nothing after the
+                    // displaced photo, "down one" already IS the back.
+                    if (slot < existingImages.length) {
+                        insertButtons.push(
+                            new ButtonBuilder()
+                                .setCustomId(`approve_insertend_${slot}_${userId}`)
+                                .setLabel(`Insert as Photo ${slot} (${slot} → ${endSlot})`)
+                                .setStyle(ButtonStyle.Secondary)
+                                .setEmoji('⏬')
+                        );
+                    }
+                }
+            }
+
+            const insertHint = hasRoom
+                ? `\n**Insert** puts it in that slot and keeps the photo that was there — the button says where that one lands (e.g. \`1 → 2\` moves it down one, \`1 → ${existingImages.length + 1}\` sends it to the back). Nothing is deleted.`
+                : `\nAll ${MAX_AIRCRAFT_IMAGES} slots are full, so there is no free slot to push a photo down into — **Replace** deletes the photo it overwrites.`;
             mainEmbed.setTitle('♻️ Replacement / Additional Photo — Awaiting Review').setColor(SUB_STATE.PENDING.color)
-                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
+                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites (and deletes) that photo, **Add** appends a new one.${insertHint}`);
 
             const existingContributors = getEntryContributors(existingEntry);
             existingImages.forEach((imgUrl, idx) => {
@@ -1425,7 +1565,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     .setTitle(`🖼️ Current Photo ${idx + 1}`)
                     .setColor(THEME.GRAY)
                     .setImage(imgUrl)
-                    .setFooter({ text: `Replacing Photo ${idx + 1} deletes this image.` });
+                    .setFooter({ text: hasRoom
+                        ? `Replacing Photo ${idx + 1} deletes this image — inserting keeps it, moved to the slot the button names.`
+                        : `Replacing Photo ${idx + 1} deletes this image.` });
                 // Show who contributed each existing photo so admins know a replace
                 // only overwrites that one slot's contributor, not the others.
                 const lines = [`**Photo ${idx + 1} Contributor:** ${slotContributor}`];
@@ -1437,6 +1579,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
         const components = [
             new ActionRowBuilder().addComponents(...approveButtons),
+            // Own row: a row holds 5 buttons, and the insert choices must not be
+            // squeezed out by the replace/add ones on a 2-photo record.
+            ...(insertButtons.length ? [new ActionRowBuilder().addComponents(...insertButtons)] : []),
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(`edit_admin_${userId}`).setLabel('Edit Details').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
                 new ButtonBuilder().setCustomId(`reject_${userId}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
@@ -1493,11 +1638,416 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         }
     };
 
-    const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
-        
+    /**
+     * Re-render a pending review card around new type / livery / tail values.
+     *
+     * Shared by the admin's own Edit Details and by a submitter correcting
+     * their own pending submission, because both have to do the same three
+     * things: rewrite the fields, re-run the duplicate check (an edit that now
+     * matches an existing record needs the comparison embeds and the real slot
+     * buttons — and an edit away from one needs them gone), and keep the
+     * pending footer that later handlers read ids out of.
+     *
+     * The submitter token comes from the footer, then from the buttons already
+     * on the card, then 'web' — which credits the footer's `Collab:` name.
+     * NEVER from whoever clicked: that was the old fallback, and because
+     * `User: web` did not match a digits-only parse it fired on every site
+     * submission an admin edited. The moderator's id went into the approve
+     * buttons, approval read it back as the contributor, and the photo went
+     * live credited to staff instead of to the person who sent it in.
+     *
+     * `correctedBy` adds a line to the card naming who changed it, so an admin
+     * can see the details moved under them. It never changes who gets credit,
+     * and it never approves anything — the card still has to be actioned.
+     */
+    const rebuildReviewCard = async (adminMsg, { tail, type, livery, correctedBy = null }) => {
+        const oldEmbed = adminMsg?.embeds?.[0];
+        if (!oldEmbed) return false;
+
+        const newEmbed = EmbedBuilder.from(oldEmbed);
+        const fields = newEmbed.data.fields || [];
+        const setField = (name, value) => {
+            const f = fields.find(x => x.name === name);
+            if (f) f.value = value;
+        };
+        setField('Tail Number', String(tail || 'UNKNOWN').toUpperCase());
+        setField('Aircraft Type', type);
+        setField('Livery', livery);
+        if (correctedBy) {
+            const note = {
+                name: '✏️ Corrected by submitter',
+                value: `<@${correctedBy.id}> updated the details before review — edit or reject if it still looks wrong.`,
+                inline: false
+            };
+            const at = fields.findIndex(f => f.name === note.name);
+            if (at >= 0) fields[at] = note; else fields.push(note);
+        }
+
+        // Recomputed on every rebuild rather than passed in, so the flag tracks
+        // the name actually on the card: it appears when an edit moves the card
+        // to an aircraft the list doesn't carry, and clears itself when an admin
+        // edits it back onto a listed one.
+        const unlistedAt = fields.findIndex(f => f.name === UNLISTED_FIELD);
+        if (await isListedAircraft(type)) {
+            if (unlistedAt >= 0) fields.splice(unlistedAt, 1);
+        } else {
+            const flag = {
+                name: UNLISTED_FIELD,
+                value: 'Not in the aircraft list — check the name before approving.',
+                inline: false
+            };
+            if (unlistedAt >= 0) fields[unlistedAt] = flag; else fields.push(flag);
+        }
+        newEmbed.setFields(fields);
+
+        const submitterId = submitterTokenFrom(oldEmbed.footer?.text)
+            || submitterTokenFromComponents(adminMsg)
+            || 'web';
+
+        let embeds = [newEmbed];
+        let components;
+        try {
+            const existingEntry = await CommunityAircraftModel.findOne({
+                aircraftType: { $regex: new RegExp(`^${escapeRegex(type)}$`, "i") },
+                liveryName: { $regex: new RegExp(`^${escapeRegex(livery)}$`, "i") }
+            });
+            const review = buildAircraftReview(newEmbed, existingEntry, submitterId);
+            components = review.components;
+            embeds = [newEmbed, ...review.extraEmbeds];
+            // buildAircraftReview rewrites title/description but not the footer.
+            if (oldEmbed.footer?.text) newEmbed.setFooter({ text: oldEmbed.footer.text });
+        } catch (e) {
+            console.error('Review card duplicate re-check failed:', e);
+        }
+
+        const payload = { embeds };
+        if (components) payload.components = components;
+        await adminMsg.edit(payload);
+        return true;
+    };
+
+    // The pending review card for a given public feed message, found by the
+    // `Msg: <id>` its footer carries. Only cards that still have approve buttons
+    // count — a card that has been actioned is not a pending submission any more.
+    const findPendingReviewCard = async (publicMsgId) => {
+        try {
+            const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+            if (!adminChannel) return null;
+            const recent = await adminChannel.messages.fetch({ limit: 50 }).catch(() => null);
+            if (!recent) return null;
+            for (const [, msg] of recent) {
+                if (!client.user || msg.author.id !== client.user.id) continue;
+                const footer = msg.embeds?.[0]?.footer?.text || '';
+                if (footer.match(/Msg: (\d+)/)?.[1] !== String(publicMsgId)) continue;
+                const stillPending = (msg.components || []).some(row =>
+                    row.components.some(c => (c.customId || '').startsWith('approve_') && !(c.customId || '').startsWith('approve_apt_')));
+                return stillPending ? msg : null;
+            }
+        } catch (e) {
+            console.error('findPendingReviewCard failed:', e);
+        }
+        return null;
+    };
+
+    /**
+     * The staff photo manager behind /photos: a record's slots as they stand,
+     * plus the controls to reorder or remove one.
+     *
+     * Reordering here is the after-the-fact counterpart to the review card's
+     * Insert. Before this existed, the order a record ended up in at approval
+     * time was the order it kept — the only way to promote a photo to primary
+     * was to replace Photo 1, which deleted whatever was there.
+     *
+     * Removal is offered only while more than one photo is on record: dropping
+     * the last one would leave an entry with no image at all, which the site's
+     * gallery and every /pull would render as a hole. Clearing a record out
+     * entirely stays a staff-panel job.
+     */
+    const buildPhotoManager = (entry) => {
+        const images = getEntryImages(entry);
+        const contributors = getEntryContributors(entry);
+        const id = String(entry._id);
+
+        const header = themedEmbed(THEME.WHITE)
+            .setTitle('🛠️ Photo Manager')
+            .setDescription(
+                `**${entry.aircraftType}** — ${entry.liveryName}\n` +
+                `**${images.length}/${MAX_AIRCRAFT_IMAGES}** photo(s) on record. Photo 1 is the primary image shown everywhere.\n` +
+                (images.length > 1
+                    ? 'Reordering moves a photo and its credit to another slot — nothing is deleted.'
+                    : 'Only one photo on record: nothing to reorder, and the last photo cannot be removed here.')
+            );
+
+        const gallery = images.map((url, i) => new EmbedBuilder()
+            .setTitle(i === 0 ? '⭐ Photo 1 (primary)' : `📷 Photo ${i + 1}`)
+            .setColor(THEME.GRAY)
+            .setDescription(`Contributor: ${contributors[i]?.name || 'Unknown'}`)
+            .setImage(url));
+
+        const components = [];
+        if (images.length > 1) {
+            const moves = [];
+            for (let from = 1; from <= images.length; from++) {
+                for (let to = 1; to <= images.length; to++) {
+                    if (from === to) continue;
+                    moves.push(new StringSelectMenuOptionBuilder()
+                        .setLabel(`Move Photo ${from} → Photo ${to}`)
+                        .setDescription(to === 1 ? 'Becomes the primary image' : `Photo ${from} takes slot ${to}`)
+                        .setValue(`${from}:${to}`));
+                }
+            }
+            components.push(new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`photos_move_${id}`)
+                    .setPlaceholder('Reorder a photo…')
+                    .addOptions(moves.slice(0, 25))
+            ));
+            components.push(new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`photos_del_${id}`)
+                    .setPlaceholder('Remove a photo…')
+                    .addOptions(images.map((_, i) => new StringSelectMenuOptionBuilder()
+                        .setLabel(`Remove Photo ${i + 1}`)
+                        .setDescription(`By ${(contributors[i]?.name || 'Unknown').slice(0, 80)} — asks to confirm`)
+                        .setValue(String(i + 1))))
+            ));
+        }
+        components.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`photos_refresh_${id}`).setLabel('Refresh').setStyle(ButtonStyle.Secondary).setEmoji('🔄')
+        ));
+
+        return { content: '', embeds: [header, ...gallery], components };
+    };
+
+    // Write a reordered/trimmed image set back to a record. The legacy mirrors
+    // (imageUrl and the top-level contributor) track slot 0, so a reorder that
+    // changes the primary has to carry them with it or the site keeps showing
+    // the old primary and credits the wrong person.
+    const saveAircraftImages = async (entry, images, contributors) => {
+        entry.imageUrls = images;
+        entry.imageContributors = contributors;
+        entry.imageUrl = images[0] || null;
+        entry.contributorName = contributors[0]?.name || entry.contributorName || 'System';
+        entry.contributorId = contributors[0]?.id || null;
+        await entry.save();
+    };
+
+    // Reordering and removal are silent from the outside — the record just looks
+    // different — so every one of them leaves a line in the admin channel saying
+    // who did what to which aircraft.
+    const logPhotoAction = async (interaction, entry, text) => {
+        try {
+            const channel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+            if (!channel) return;
+            await channel.send({
+                embeds: [themedEmbed(THEME.GRAY)
+                    .setTitle('🛠️ Photo Manager')
+                    .setDescription(`**${entry.aircraftType}** — ${entry.liveryName}\n${text}\nBy <@${interaction.user.id}>`)
+                    .setTimestamp()]
+            });
+        } catch (_) { /* logging must never break the action itself */ }
+    };
+
+    // Staff gate shared by /photos and its components (mirrors the /va_remove guard).
+    const isPhotoStaff = (interaction) =>
+        Boolean(interaction.member?.roles?.cache?.has(ADMIN_ROLE_ID)) ||
+        Boolean(interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator));
+
+    // ---------------------------------------------------------------------
+    // AIRCRAFT PICKER
+    //
+    // Submitting used to mean typing the aircraft and livery into a modal and
+    // hoping the normalizer recognised them. "737 max 8", "delta", a typo, a
+    // livery that was retired two updates ago — each one reaches an admin
+    // wrong, and someone has to fix it by hand before it can be approved.
+    //
+    // The picker offers the real lists instead: the aircraft the game actually
+    // has, then the liveries that aircraft actually wears. Two taps, already
+    // matched. Discord caps a select at 25 options and both lists are longer
+    // than that, so each step pages and carries a Search button to narrow by
+    // text; free-text entry stays as a fallback for anything the API list
+    // doesn't carry (and for the odd custom livery).
+    //
+    // One ephemeral message per use. The state — and what to do once a livery
+    // is chosen — lives here, keyed by a short id carried in the component
+    // custom ids, because a custom id has 100 characters and a search string
+    // plus three message ids does not fit in them.
+    // ---------------------------------------------------------------------
+    const PICKER_TTL_MS = 10 * 60 * 1000;
+    const PICKER_PAGE_SIZE = 25;
+    // Every picker control falls back to this once its session is gone (expired,
+    // or the bot restarted under it). Re-opening costs two taps; guessing at
+    // what a stale picker meant costs an admin a correction.
+    const PICKER_EXPIRED = { content: '⏳ This picker expired — open it again and it will only take a moment.', embeds: [], components: [] };
+    const pickerSessions = new Map(); // pickerId -> { step, type, query, page, apply, … }
+
+    const sweepPickerSessions = () => {
+        const now = Date.now();
+        for (const [key, s] of pickerSessions) {
+            if (now > s.expiresAt) pickerSessions.delete(key);
+        }
+    };
+
+    // A live session, or null if it has expired or never existed (the bot
+    // restarted, or the user came back to an old picker). Callers tell the user
+    // to start again rather than guessing at what they meant.
+    const getPickerSession = (id) => {
+        const s = pickerSessions.get(id);
+        if (!s) return null;
+        if (Date.now() > s.expiresAt) { pickerSessions.delete(id); return null; }
+        return s;
+    };
+
+    // Picker control ids: `pick_<action>_<sessionId>`, with `pick_page_` alone
+    // carrying a trailing `_<page>`. Session ids are base36 (no underscores), so
+    // the page is whatever follows the last one.
+    const parsePickerCustomId = (customId) => {
+        const id = String(customId || '');
+        if (!id.startsWith('pick_')) return null;
+        const action = id.split('_')[1] || '';
+        const rest = id.slice(`pick_${action}_`.length);
+        if (!action || !rest) return null;
+        if (action !== 'page') return { action, sessionId: rest, page: null };
+        const cut = rest.lastIndexOf('_');
+        if (cut <= 0) return null;
+        const page = parseInt(rest.slice(cut + 1), 10);
+        return { action, sessionId: rest.slice(0, cut), page: Number.isInteger(page) ? page : 0 };
+    };
+
+    const filterByQuery = (names, query) => {
+        const q = (query || '').trim().toLowerCase();
+        if (!q) return names;
+        return names.filter(n => String(n).toLowerCase().includes(q));
+    };
+
+    // Is this an aircraft the metadata knows about? Anything else is a new or
+    // unlisted type — a brand-new release, or something the API hasn't caught
+    // up with — which is allowed, but says so on the card so an admin checks
+    // the name rather than assuming the normalizer got it right.
+    const isListedAircraft = async (type) => {
+        const list = await fetchAircraftMetadata();
+        return list.some(a => String(a.name).toLowerCase() === String(type || '').trim().toLowerCase());
+    };
+
+    const UNLISTED_FIELD = '🆕 Not in the aircraft list';
+
+    // The picker's manual entry can end in a disagreement: the submitter typed
+    // something the normalizer then rewrote into a listed aircraft. That is
+    // usually right (a typo, a nickname) and sometimes badly wrong — a new
+    // aircraft fuzzy-matched onto last year's model. Rather than pick for them,
+    // show both and let them choose.
+    const renderPickerConfirm = (session) => ({
+        content: [
+            session.intro,
+            '**Is this the same aircraft?**',
+            `You typed: **${session.raw.type}** — **${session.raw.livery}**`,
+            `Closest match: **${session.match.type}** — **${session.match.livery}**`,
+            'If you are submitting an aircraft or livery that isn\'t in the list yet, keep your own wording — an admin will confirm the name.'
+        ].filter(Boolean).join('\n'),
+        embeds: [],
+        components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`pick_usematch_${session.id}`).setEmoji('✅').setLabel(`Use ${session.match.type}`.slice(0, 78)).setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`pick_usemine_${session.id}`).setEmoji('🆕').setLabel(`Keep ${session.raw.type}`.slice(0, 78)).setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`pick_manual_${session.id}`).setEmoji('✍️').setLabel('Edit again').setStyle(ButtonStyle.Secondary)
+        )]
+    });
+
+    // The choices for the step the picker is on, already narrowed by the search.
+    const pickerChoices = async (session) => {
+        const list = await fetchAircraftMetadata();
+        if (session.step === 'type') {
+            // The metadata cache is sorted longest-name-first (the normalizer
+            // needs that so "737-800" doesn't match inside "737-8 MAX"); a human
+            // reading a dropdown needs it alphabetical.
+            return filterByQuery(list.map(a => a.name).sort((a, b) => a.localeCompare(b)), session.query);
+        }
+        const matched = list.find(a => a.name === session.type);
+        const liveries = matched ? await fetchLiveriesForAircraft(matched.id) : [];
+        return filterByQuery(liveries, session.query);
+    };
+
+    const renderPicker = async (session) => {
+        const all = await pickerChoices(session);
+        const pages = Math.max(1, Math.ceil(all.length / PICKER_PAGE_SIZE));
+        session.page = Math.min(Math.max(session.page, 0), pages - 1);
+        const page = session.page;
+        const slice = all.slice(page * PICKER_PAGE_SIZE, (page + 1) * PICKER_PAGE_SIZE);
+        const id = session.id;
+        const isType = session.step === 'type';
+
+        const lines = [];
+        if (session.intro) lines.push(session.intro);
+        lines.push(isType
+            ? '**Step 1 of 2 — pick the aircraft**'
+            : `**Step 2 of 2 — pick the livery** for **${session.type}**`);
+        lines.push(all.length === 0
+            ? `Nothing matches **${session.query}**. Search for something else, or enter it by hand.`
+            : `${all.length} option${all.length === 1 ? '' : 's'}${session.query ? ` matching **${session.query}**` : ''} • page ${page + 1} of ${pages}`);
+
+        const rows = [];
+        if (slice.length) {
+            rows.push(new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`pick_${isType ? 'type' : 'livery'}_${id}`)
+                    .setPlaceholder(isType ? 'Choose an aircraft…' : 'Choose a livery…')
+                    .addOptions(slice.map(name => new StringSelectMenuOptionBuilder()
+                        .setLabel(String(name).slice(0, 100))
+                        .setValue(String(name).slice(0, 100))))
+            ));
+        }
+
+        const nav = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`pick_page_${id}_${page - 1}`).setEmoji('◀️').setLabel('Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+            new ButtonBuilder().setCustomId(`pick_page_${id}_${page + 1}`).setEmoji('▶️').setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(page >= pages - 1),
+            new ButtonBuilder().setCustomId(`pick_search_${id}`).setEmoji('🔎').setLabel(session.query ? `Search: ${session.query}`.slice(0, 78) : 'Search').setStyle(ButtonStyle.Primary)
+        );
+        // Step 2 only: going back re-opens the aircraft list without losing the
+        // photo or the flow it was opened from.
+        if (!isType) nav.addComponents(new ButtonBuilder().setCustomId(`pick_back_${id}`).setEmoji('↩️').setLabel('Back').setStyle(ButtonStyle.Secondary));
+        nav.addComponents(new ButtonBuilder().setCustomId(`pick_manual_${id}`).setEmoji('✍️').setLabel('Not listed? Type it').setStyle(ButtonStyle.Secondary));
+        rows.push(nav);
+
+        return { content: lines.join('\n'), embeds: [], components: rows };
+    };
+
+    /**
+     * Open a picker as an ephemeral reply to `interaction`.
+     *
+     * `apply(pickInteraction, type, livery)` runs once a livery is chosen (or
+     * typed by hand) and OWNS the response to that interaction — it is what
+     * turns a choice into a preview, a corrected card, or whatever the caller
+     * needs. Everything else about the picker is the same wherever it is used.
+     */
+    const openAircraftPicker = async (interaction, { userId, type = null, intro = '', apply }) => {
+        sweepPickerSessions();
+        const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        const session = {
+            id, userId, apply, intro,
+            step: 'type', type, query: '', page: 0,
+            expiresAt: Date.now() + PICKER_TTL_MS
+        };
+        pickerSessions.set(id, session);
+        const payload = await renderPicker(session);
+        return interaction.reply({ ...payload, ephemeral: true }).catch(() => {});
+    };
+
+    /**
+     * `opts.keepWording` sends the type and livery through exactly as given,
+     * skipping the normalizer. It is set when the values came from the picker —
+     * either straight off the API lists (nothing to normalize) or kept
+     * deliberately by a submitter who was shown the normalizer's suggestion and
+     * turned it down, which is how an aircraft the list doesn't carry yet
+     * reaches review under its real name instead of the nearest old one.
+     *
+     * Whether the result is an unlisted aircraft is then derived from the
+     * metadata, not taken on trust from the caller.
+     */
+    const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId, opts = {}) => {
+
         let currentType = rawType;
         let currentLivery = rawLivery;
-        let currentTail = 'UNKNOWN'; 
+        let currentTail = 'UNKNOWN';
+        let unlistedNaming = false;
 
         // Helper for initial checking (used for User Preview only)
         const checkDuplicate = async (t, l) => {
@@ -1510,11 +2060,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             } catch (err) { return false; }
         };
 
-        try {
-            const normalized = await normalizeData(currentType, currentLivery);
-            currentType = normalized.type;
-            currentLivery = normalized.livery;
-        } catch (e) { console.error("Normalization error:", e); }
+        if (opts.keepWording) {
+            currentType = String(currentType || '').trim();
+            currentLivery = String(currentLivery || '').trim();
+        } else {
+            try {
+                const normalized = await normalizeData(currentType, currentLivery);
+                currentType = normalized.type;
+                currentLivery = normalized.livery;
+            } catch (e) { console.error("Normalization error:", e); }
+        }
+        // Derived from the metadata, never from the caller: whether the name is
+        // in the list is a fact about the name, and deriving it here means no
+        // entry point can forget to flag one.
+        unlistedNaming = !(await isListedAircraft(currentType));
 
         const autoReg = lookupRegistration(currentType, currentLivery);
         if (autoReg) currentTail = autoReg;
@@ -1545,6 +2104,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 embed.setTitle('📝 Review Your Submission')
                     .setDescription('I auto-detected the registration and tidied the names.\nConfirm the details below — or edit them first.');
             }
+            // Kept as typed because the aircraft isn't in the list: say so here,
+            // so nobody is surprised when the admin card flags it.
+            if (unlistedNaming) {
+                embed.addFields({
+                    name: UNLISTED_FIELD,
+                    value: 'Going in exactly as you typed it. An admin will confirm the name.',
+                    inline: false
+                });
+            }
             return embed;
         };
 
@@ -1568,7 +2136,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } catch (err) { return; }
 
         const finalPhotoUrl = reply.attachments.first() ? reply.attachments.first().url : photoUrl;
-        const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
+        // Long enough to outlast a picker session: choosing an aircraft and a
+        // livery happens on a separate ephemeral message, which doesn't touch
+        // this collector, and a preview whose Confirm button had gone dead by
+        // the time the user came back was a submission silently lost.
+        const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: PICKER_TTL_MS + 60000 });
 
         collector.on('collect', async i => {
             if (i.user.id !== user.id) return i.reply({ content: "This is not your submission.", ephemeral: true });
@@ -1582,49 +2154,39 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             }
 
             if (i.customId === 'edit_details') {
-                const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
-                
-                const typeInput = new TextInputBuilder()
-                    .setCustomId('m_type')
-                    .setLabel("Aircraft Type")
-                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER, A321") 
-                    .setValue(currentType)
-                    .setStyle(TextInputStyle.Short);
-                    
-                const liveryInput = new TextInputBuilder()
-                    .setCustomId('m_livery')
-                    .setLabel("Livery Name")
-                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
-                    .setValue(currentLivery)
-                    .setStyle(TextInputStyle.Short);
+                // The picker opens as its own ephemeral message, so the preview
+                // card stays on screen next to it while the user chooses.
+                await openAircraftPicker(i, {
+                    userId: user.id,
+                    type: currentType,
+                    intro: '✏️ **Change the details.**',
+                    apply: async (pick, pickedType, pickedLivery, pickOpts = {}) => {
+                        await pick.deferUpdate();
+                        if (pickOpts.keepWording) {
+                            currentType = String(pickedType || '').trim();
+                            currentLivery = String(pickedLivery || '').trim();
+                        } else {
+                            const normalized = await normalizeData(pickedType, pickedLivery);
+                            currentType = normalized.type;
+                            currentLivery = normalized.livery;
+                        }
+                        unlistedNaming = !(await isListedAircraft(currentType));
+                        currentTail = lookupRegistration(currentType, currentLivery) || 'UNKNOWN';
+                        isDuplicate = await checkDuplicate(currentType, currentLivery);
 
-                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
-                await i.showModal(modal);
-
-                const modalFilter = (submission) => submission.customId === 'editModal' && submission.user.id === user.id;
-                
-                try {
-                    const submission = await i.awaitModalSubmit({ filter: modalFilter, time: 60000 });
-                    await submission.deferUpdate(); 
-                    
-                    const editedType = submission.fields.getTextInputValue('m_type');
-                    const editedLivery = submission.fields.getTextInputValue('m_livery');
-                    
-                    const normalized = await normalizeData(editedType, editedLivery);
-                    currentType = normalized.type;
-                    currentLivery = normalized.livery;
-
-                    const reCheckReg = lookupRegistration(currentType, currentLivery);
-                    currentTail = reCheckReg ? reCheckReg : 'UNKNOWN';
-
-                    isDuplicate = await checkDuplicate(currentType, currentLivery);
-
-                    await submission.editReply({ 
-                        embeds: [createPreviewEmbed(currentTail, currentType, currentLivery, finalPhotoUrl, isDuplicate)],
-                        components: [row] 
-                    });
-
-                } catch (e) { }
+                        // The preview belongs to `source`, not to the picker, so
+                        // it is edited through the interaction that created it —
+                        // which works whether that reply was ephemeral or not.
+                        await source.editReply({
+                            embeds: [createPreviewEmbed(currentTail, currentType, currentLivery, finalPhotoUrl, isDuplicate)],
+                            components: [row]
+                        }).catch(() => {});
+                        await pick.editReply({
+                            content: `✅ Set to **${currentType}** — **${currentLivery}** (tail ${currentTail.toUpperCase()}).\nCheck the preview, then hit **Confirm & Submit**.`,
+                            embeds: [], components: []
+                        }).catch(() => {});
+                    }
+                });
             }
 
             if (i.customId === 'confirm_submission') {
@@ -1650,7 +2212,17 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     .setImage('attachment://aircraft.webp')
                     .setTimestamp();
 
-                const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
+                // The submitter keeps a way in after sending: a mis-matched type
+                // or livery used to mean waiting for an admin to notice, or a
+                // rejection and a re-upload. The button clears itself the moment
+                // the submission is approved or rejected.
+                const publicMsg = await feedChannel.send({
+                    embeds: [publicEmbed],
+                    files: [attachmentData],
+                    components: [new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`submission_fix_${user.id}`).setLabel('Fix Details').setEmoji('🔧').setStyle(ButtonStyle.Secondary)
+                    )]
+                });
 
                 // 2. Prepare Admin Embeds
                 const finalEmbed = new EmbedBuilder()
@@ -1661,6 +2233,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                         { name: 'Livery', value: currentLivery, inline: true },
                     )
                     .setTimestamp();
+
+                // An aircraft the metadata doesn't carry reaches an admin under
+                // the submitter's own name — correct for a new release, wrong if
+                // they meant something already in the list. Either way it is the
+                // admin's call, so the card says which it is.
+                if (unlistedNaming) {
+                    finalEmbed.addFields({
+                        name: UNLISTED_FIELD,
+                        value: 'Not in the aircraft list — this is the contributor\'s own wording. Check the name (or fix it with **Edit Details**) before approving.',
+                        inline: false
+                    });
+                }
 
                 // --- KEY FIX: Force Fresh Duplicate Check for Admins ---
                 // We do NOT rely on the previous 'isDuplicate' boolean here.
@@ -1910,6 +2494,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 });
             }
 
+            // Picker sessions hold a closure each (what to do once an aircraft
+            // and livery are chosen), so an abandoned one is worth more than its
+            // state. Sweeping here catches the pickers nobody re-opens.
+            // (Declared later in startDiscordBot's scope, like the map above.)
+            if (typeof sweepPickerSessions !== 'undefined') sweepPickerSessions();
+
             if (global.gc) {
                 global.gc();
             }
@@ -1937,6 +2527,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
+            // Two ways to name a record, neither required on its own: the type +
+            // livery pair the rest of the bot works in, or a tail number when
+            // that is what staff have in hand.
+            new SlashCommandBuilder().setName('photos').setDescription('[STAFF] Reorder or remove the photos on an aircraft record')
+                .addStringOption(o => o.setName('aircraft_type').setDescription('Aircraft type (pair with livery)').setAutocomplete(true).setRequired(false))
+                .addStringOption(o => o.setName('livery').setDescription('Livery/airline (pair with aircraft type)').setAutocomplete(true).setRequired(false))
+                .addStringOption(o => o.setName('tail').setDescription('Or just the tail number on its own').setAutocomplete(true).setRequired(false))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
+
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
             new SlashCommandBuilder()
@@ -2253,6 +2852,24 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
 
+            // Tail numbers for /photos, matched against what is actually in the
+            // database (each choice shows the type + livery it belongs to, so a
+            // near-miss is obvious before it's picked).
+            if (focused.name === 'tail') {
+                try {
+                    const q = (focused.value || '').trim();
+                    const rows = await CommunityAircraftModel
+                        .find(q ? { tailNumber: { $regex: escapeRegex(q), $options: 'i' } } : {})
+                        .select('tailNumber aircraftType liveryName').sort({ tailNumber: 1 }).limit(25).lean();
+                    return interaction.respond(rows.map(r => ({
+                        name: `${r.tailNumber} — ${r.aircraftType} (${r.liveryName})`.slice(0, 100),
+                        value: String(r.tailNumber).slice(0, 100)
+                    })));
+                } catch (_) {
+                    return interaction.respond([]);
+                }
+            }
+
             if (focused.name === 'livery') {
                 const selectedType = interaction.options.getString('aircraft_type');
                 if (!selectedType) return interaction.respond([{ name: "Select Aircraft Type first", value: "Unknown" }]);
@@ -2313,7 +2930,10 @@ client.on('interactionCreate', async (interaction) => {
                 userSessions.set(originalUserId, session);
                 // deferUpdate so startSubmissionFlow edits THIS prompt into the preview.
                 await interaction.deferUpdate();
-                await startSubmissionFlow(interaction, session.type, session.livery, null, photoUrl, interaction.user, interaction.channelId);
+                // keepWording: these details were already resolved for the first
+                // photo of this session — re-normalizing here would quietly undo
+                // a name the submitter chose to keep.
+                await startSubmissionFlow(interaction, session.type, session.livery, null, photoUrl, interaction.user, interaction.channelId, { keepWording: true });
                 return;
             }
 
@@ -2336,11 +2956,29 @@ client.on('interactionCreate', async (interaction) => {
                 const originalUserId = customId.split('_')[2];
                 if (interaction.user.id !== originalUserId) return interaction.reply({ content: "This is not your photo.", ephemeral: true });
 
-                const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
-                const typeInput = new TextInputBuilder().setCustomId('i_type').setLabel("What aircraft is this?").setPlaceholder("e.g. 737-8 MAX").setStyle(TextInputStyle.Short).setRequired(true);
-                const liveryInput = new TextInputBuilder().setCustomId('i_livery').setLabel("What livery is this?").setPlaceholder("e.g. Delta Air Lines").setStyle(TextInputStyle.Short).setRequired(true);
-                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
-                await interaction.showModal(modal);
+                // The picker instead of the old free-text modal: pick the
+                // aircraft, then its livery, both from the real in-game lists.
+                // (Typing it by hand is still one tap away inside the picker.)
+                const promptMsg = interaction.message;
+                const photoMsgId = interaction.message.reference?.messageId;
+                await openAircraftPicker(interaction, {
+                    userId: originalUserId,
+                    intro: '📸 **Identify your photo.**',
+                    apply: async (pick, type, livery, pickOpts = {}) => {
+                        const photoMsg = photoMsgId
+                            ? await interaction.channel.messages.fetch(photoMsgId).catch(() => null)
+                            : null;
+                        const photoUrl = photoMsg?.attachments?.first()?.url;
+                        if (!photoUrl) {
+                            return pick.update({ content: '❌ I can no longer find that photo — upload it again to start over.', embeds: [], components: [] }).catch(() => {});
+                        }
+                        // deferUpdate first: startSubmissionFlow edits this same
+                        // ephemeral message into the preview card.
+                        await pick.deferUpdate();
+                        await startSubmissionFlow(pick, type, livery, null, photoUrl, pick.user, pick.channelId, pickOpts);
+                        try { await promptMsg.delete(); } catch (_) {}
+                    }
+                });
                 return;
             }
 
@@ -2363,7 +3001,7 @@ client.on('interactionCreate', async (interaction) => {
             if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
                 // customId format: approve_<action>_<slot>_<userId> where action is
-                // 'add' | 'replace'. Older formats are still accepted:
+                // 'add' | 'replace' | 'insert'. Older formats are still accepted:
                 //   approve_<slot>_<userId>  (slot only — intent inferred at approval)
                 //   approve_<userId>         (legacy single-photo => slot 1)
                 const approveParts = customId.split('_');
@@ -2394,6 +3032,49 @@ client.on('interactionCreate', async (interaction) => {
                     const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
                     const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
+                    // Find the existing record (if any) so we can place the new photo into
+                    // the admin-chosen slot without disturbing the other images.
+                    //
+                    // Read BEFORE the upload: an insert that no longer fits is refused
+                    // below, and aborting after the upload would leave an orphaned
+                    // object in the bucket.
+                    const existingEntry = await CommunityAircraftModel.findOne({
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                    });
+
+                    let images = getEntryImages(existingEntry);
+                    let contributors = getEntryContributors(existingEntry);
+
+                    // RE-CHECK against the LIVE database before placing the photo.
+                    // The slot baked into the button was decided when the buttons
+                    // were rendered; by the time an admin clicks, other submissions
+                    // for the same aircraft may already have been approved. Without
+                    // this re-check, a second pending "add" (rendered as slot 1 when
+                    // there were 0 photos) would overwrite the photo that was just
+                    // approved into slot 1. We honour the admin's intent (add vs
+                    // replace vs insert) against the current image count instead.
+                    const placement = resolveAircraftSlot(approveAction, chosenSlot, images.length);
+
+                    // The record filled up between render and click, so the insert the
+                    // admin asked for would now shove Photo 3 out of the database —
+                    // exactly the loss insert exists to avoid. Change nothing, re-render
+                    // the card against the live state, and let them choose again.
+                    if (placement.mode === 'full') {
+                        const stale = EmbedBuilder.from(receivedEmbed);
+                        const review = buildAircraftReview(stale, existingEntry, targetUserId);
+                        if (footerText) stale.setFooter({ text: footerText });
+                        // No `attachments` key: the pending photo is still a Discord
+                        // attachment this embed points at, and clearing it would blank
+                        // the card.
+                        await interaction.editReply({ embeds: [stale, ...review.extraEmbeds], components: review.components });
+                        await interaction.followUp({
+                            content: `⚠️ **${typeField}** (${liveryField}) now has ${MAX_AIRCRAFT_IMAGES}/${MAX_AIRCRAFT_IMAGES} photos, so inserting would push Photo ${MAX_AIRCRAFT_IMAGES} out of the database. Nothing was changed — the card is refreshed, so use **Replace** if you do want to overwrite a slot.`,
+                            ephemeral: true
+                        }).catch(() => {});
+                        return;
+                    }
+
                     // Both DM and web submissions carry a Discord-hosted attachment,
                     // so this moves it to S3. (If the image is somehow already in our
                     // bucket, reuse it instead of re-running the sharp pipeline.)
@@ -2421,67 +3102,14 @@ client.on('interactionCreate', async (interaction) => {
                     }
                     if (!contributorName) contributorName = footerCollab || 'Anonymous';
 
-                    // Find the existing record (if any) so we can place the new photo into
-                    // the admin-chosen slot without disturbing the other images.
-                    const existingEntry = await CommunityAircraftModel.findOne({
-                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
-                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
-                    });
-
-                    let images = getEntryImages(existingEntry);
-                    let contributors = getEntryContributors(existingEntry);
-
-                    // RE-CHECK against the LIVE database before placing the photo.
-                    // The slot baked into the button was decided when the buttons
-                    // were rendered; by the time an admin clicks, other submissions
-                    // for the same aircraft may already have been approved. Without
-                    // this re-check, a second pending "add" (rendered as slot 1 when
-                    // there were 0 photos) would overwrite the photo that was just
-                    // approved into slot 1. We honour the admin's intent (add vs
-                    // replace) against the current image count instead.
-                    let slotIndex;
-                    let isReplace;
-                    if (approveAction === 'add') {
-                        // Append as a NEW photo at the end of the current list. If
-                        // the aircraft is already full, fall back to the last slot.
-                        if (images.length < MAX_AIRCRAFT_IMAGES) {
-                            slotIndex = images.length;
-                            isReplace = false;
-                        } else {
-                            slotIndex = MAX_AIRCRAFT_IMAGES - 1;
-                            isReplace = true;
-                        }
-                    } else if (approveAction === 'replace') {
-                        // Replace the targeted slot if it still exists; if that photo
-                        // is gone (images shrank since render), append instead.
-                        slotIndex = chosenSlot - 1;
-                        if (slotIndex >= 0 && slotIndex < images.length) {
-                            isReplace = true;
-                        } else {
-                            slotIndex = Math.min(images.length, MAX_AIRCRAFT_IMAGES - 1);
-                            isReplace = slotIndex < images.length;
-                        }
-                    } else {
-                        // Legacy buttons (no encoded action): infer from live state.
-                        slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
-                        if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
-                        isReplace = slotIndex < images.length;
-                    }
-
                     // The person who submitted this photo is the contributor of THIS
-                    // slot only — adding/replacing photo 2 or 3 must not overwrite the
-                    // contributor(s) of the other images.
+                    // slot only — adding/replacing/inserting a photo must not overwrite
+                    // the contributor(s) of the other images. An insert carries each
+                    // existing photo's credit down with it.
                     const slotContributor = { name: contributorName, id: contributorId };
 
-                    let replacedUrl = null;
-                    if (isReplace && slotIndex < images.length) {
-                        replacedUrl = images[slotIndex];
-                        images[slotIndex] = permanentUrl;
-                        contributors[slotIndex] = slotContributor;
-                    } else {
-                        images.push(permanentUrl);
-                        contributors.push(slotContributor);
-                    }
+                    const slotIndex = placement.slotIndex;
+                    const replacedUrl = applyAircraftPlacement(images, contributors, placement, permanentUrl, slotContributor);
                     images = images.slice(0, MAX_AIRCRAFT_IMAGES);
                     contributors = contributors.slice(0, MAX_AIRCRAFT_IMAGES);
 
@@ -2513,7 +3141,10 @@ client.on('interactionCreate', async (interaction) => {
 
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    const approvedTitle = `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
+                    const keptAt = placement.mode === 'insertEnd' ? images.length : slotIndex + 2;
+                    const approvedTitle = (placement.mode === 'insert' || placement.mode === 'insertEnd')
+                        ? `✅ Approved — Inserted as Photo ${slotIndex + 1} of ${images.length} (previous Photo ${slotIndex + 1} kept as ${keptAt})`
+                        : `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
                     // Keep the verified photo rendered inside the admin embed (using the
                     // permanent S3 URL) and drop the temporary upload attachment.
                     await interaction.editReply({
@@ -2536,7 +3167,11 @@ client.on('interactionCreate', async (interaction) => {
                                     .setColor(SUB_STATE.VERIFIED.color)
                                     .setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}\nThis photo has been verified and saved to the database.`)
                                     .setImage(permanentUrl)],
-                                attachments: []
+                                attachments: [],
+                                // Drops the submitter's Fix Details button: the
+                                // details are in the database now, and changing
+                                // them is /photos and an admin's job.
+                                components: []
                             });
                         } catch (e) {}
                     }
@@ -2633,6 +3268,185 @@ client.on('interactionCreate', async (interaction) => {
                 modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
                 await interaction.showModal(modal);
                 return;
+            }
+
+            // --- SUBMITTER CORRECTS THEIR OWN PENDING SUBMISSION ---
+            // The admin still has the last say: this only moves the details on a
+            // card that is still awaiting review, and the card keeps its Edit
+            // Details / Approve / Reject buttons either way.
+            if (customId.startsWith('submission_fix_')) {
+                const submitterId = customId.split('_')[2];
+                if (interaction.user.id !== submitterId && !isPhotoStaff(interaction)) {
+                    return interaction.reply({ content: "This isn't your submission — only the person who sent it in (or staff) can correct it.", ephemeral: true });
+                }
+                const publicMsg = interaction.message;
+                const pendingEmbed = publicMsg.embeds?.[0];
+                if (!(pendingEmbed?.description || '').includes(SUB_STATE.PENDING.badge)) {
+                    return interaction.reply({ content: 'ℹ️ This submission has already been reviewed — there is nothing left to correct.', ephemeral: true });
+                }
+
+                await openAircraftPicker(interaction, {
+                    userId: interaction.user.id,
+                    type: pendingEmbed.fields?.find(f => f.name === 'Aircraft')?.value || null,
+                    intro: '🔧 **Correct the aircraft or livery.** An admin still reviews it, and can change it again.',
+                    apply: async (pick, pickedType, pickedLivery, pickOpts = {}) => {
+                        await pick.deferUpdate();
+                        let type = String(pickedType || '').trim();
+                        let livery = String(pickedLivery || '').trim();
+                        if (!pickOpts.keepWording) {
+                            const normalized = await normalizeData(type, livery);
+                            type = normalized.type;
+                            livery = normalized.livery;
+                        }
+                        const tail = lookupRegistration(type, livery) || 'UNKNOWN';
+
+                        // The card may have been approved or rejected while the
+                        // picker was open — the review card is the authority on
+                        // that, so a missing one means the correction is too late.
+                        const reviewCard = await findPendingReviewCard(publicMsg.id);
+                        if (!reviewCard) {
+                            return pick.editReply({
+                                content: '⏳ That submission has just been reviewed, so nothing was changed. If the details came out wrong, ask an admin — the photo is already in the database.',
+                                embeds: [], components: []
+                            }).catch(() => {});
+                        }
+
+                        await rebuildReviewCard(reviewCard, { tail, type, livery, correctedBy: pick.user });
+
+                        const fresh = EmbedBuilder.from(pendingEmbed);
+                        const fields = fresh.data.fields || [];
+                        const setField = (name, value) => {
+                            const f = fields.find(x => x.name === name);
+                            if (f) f.value = value;
+                        };
+                        setField('Aircraft', type);
+                        setField('Livery', livery);
+                        setField('Tail Number', tail.toUpperCase());
+                        fresh.setFields(fields);
+                        await publicMsg.edit({ embeds: [fresh] }).catch(() => {});
+
+                        return pick.editReply({
+                            content: `✅ Updated to **${type}** — **${livery}** (tail ${tail.toUpperCase()}). The admins' review card now shows your correction.`,
+                            embeds: [], components: []
+                        }).catch(() => {});
+                    }
+                });
+                return;
+            }
+
+            // --- AIRCRAFT PICKER: PAGING, SEARCH, BACK, MANUAL ENTRY ---
+            if (customId.startsWith('pick_')) {
+                const parsed = parsePickerCustomId(customId);
+                if (!parsed) return;
+                const { action } = parsed;
+                const session = getPickerSession(parsed.sessionId);
+                if (!session) return interaction.update(PICKER_EXPIRED).catch(() => {});
+                if (session.userId !== interaction.user.id) {
+                    return interaction.reply({ content: "That picker isn't yours.", ephemeral: true });
+                }
+
+                if (action === 'page') {
+                    session.page = parsed.page;
+                    return interaction.update(await renderPicker(session)).catch(() => {});
+                }
+                if (action === 'back') {
+                    session.step = 'type';
+                    session.query = '';
+                    session.page = 0;
+                    return interaction.update(await renderPicker(session)).catch(() => {});
+                }
+                // The manual-entry disagreement, settled either way. "Keep mine"
+                // is the whole point of the prompt: an aircraft or livery the
+                // list doesn't carry yet goes in with the submitter's wording,
+                // flagged for an admin rather than silently renamed.
+                if (action === 'usematch' || action === 'usemine') {
+                    if (!session.raw || !session.match) return interaction.update(PICKER_EXPIRED).catch(() => {});
+                    const chosen = action === 'usematch' ? session.match : session.raw;
+                    pickerSessions.delete(session.id);
+                    return session.apply(interaction, chosen.type, chosen.livery, { keepWording: true });
+                }
+
+                if (action === 'search') {
+                    const modal = new ModalBuilder().setCustomId(`pick_searchmodal_${session.id}`).setTitle('Search');
+                    modal.addComponents(new ActionRowBuilder().addComponents(
+                        new TextInputBuilder().setCustomId('p_query')
+                            .setLabel(session.step === 'type' ? 'Part of the aircraft name' : 'Part of the livery name')
+                            .setPlaceholder(session.step === 'type' ? 'e.g. 737, A350, Cessna' : 'e.g. Delta, Qatar, Generic')
+                            .setValue(session.query || '')
+                            .setStyle(TextInputStyle.Short).setRequired(false)
+                    ));
+                    return interaction.showModal(modal).catch(() => {});
+                }
+                if (action === 'manual') {
+                    // The escape hatch: a livery the API doesn't list yet, or an
+                    // aircraft named differently in-game. The normalizer still
+                    // runs on whatever is typed, and an admin still reviews it.
+                    const modal = new ModalBuilder().setCustomId(`pick_manualmodal_${session.id}`).setTitle('Type it yourself');
+                    modal.addComponents(
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_type').setLabel('Aircraft Type (new or unlisted is fine)')
+                            .setPlaceholder('e.g. 737-8 MAX, A321, 777-300ER')
+                            // Prefilled with what was typed last (Edit again from
+                            // the confirm step), else whatever step 1 selected.
+                            .setValue(session.raw?.type || session.type || '').setStyle(TextInputStyle.Short).setRequired(true)),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_livery').setLabel('Livery Name (new or unlisted is fine)')
+                            .setPlaceholder('e.g. Delta Air Lines, Generic, Private')
+                            .setValue(session.raw?.livery || '').setStyle(TextInputStyle.Short).setRequired(true))
+                    );
+                    return interaction.showModal(modal).catch(() => {});
+                }
+                return;
+            }
+
+            // --- PHOTO MANAGER BUTTONS (from /photos) ---
+            if (customId.startsWith('photos_refresh_') || customId.startsWith('photos_delok_') || customId === 'photos_cancel') {
+                if (!isPhotoStaff(interaction)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                await interaction.deferUpdate();
+                if (customId === 'photos_cancel') {
+                    return interaction.editReply({ content: '✋ Cancelled — nothing was deleted.', components: [] }).catch(() => {});
+                }
+                try {
+                    if (customId.startsWith('photos_refresh_')) {
+                        const entry = await CommunityAircraftModel.findById(customId.replace('photos_refresh_', '')).catch(() => null);
+                        if (!entry || getEntryImages(entry).length === 0) {
+                            return interaction.editReply({ content: '❌ That record no longer has photos on it.', embeds: [], components: [] }).catch(() => {});
+                        }
+                        return interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                    }
+
+                    // photos_delok_<recordId>_<slot> — the record id is a Mongo
+                    // ObjectId (no underscores), so the slot is the tail.
+                    const rest = customId.replace('photos_delok_', '');
+                    const cut = rest.lastIndexOf('_');
+                    const entry = await CommunityAircraftModel.findById(rest.slice(0, cut)).catch(() => null);
+                    const slot = parseInt(rest.slice(cut + 1), 10);
+                    if (!entry) {
+                        return interaction.editReply({ content: '❌ That record no longer exists.', components: [] }).catch(() => {});
+                    }
+                    const images = getEntryImages(entry);
+                    const contributors = getEntryContributors(entry);
+                    // Re-checked against live state: the photo may already be gone,
+                    // or be the only one left, in which case removing it would
+                    // leave the record with no image at all.
+                    if (!(slot >= 1 && slot <= images.length) || images.length <= 1) {
+                        return interaction.editReply({ content: '⚠️ Nothing was deleted — that photo is already gone, or it is the record\'s only photo.', components: [] }).catch(() => {});
+                    }
+                    const [removed] = images.splice(slot - 1, 1);
+                    contributors.splice(slot - 1, 1);
+                    // Storage last: a failed DB write must not leave the record
+                    // pointing at a file that no longer exists.
+                    await saveAircraftImages(entry, images, contributors);
+                    if (removed) await deleteImageFromS3(removed);
+                    await logPhotoAction(interaction, entry, `🗑️ Removed Photo ${slot} — ${images.length} left.`);
+                    return interaction.editReply({
+                        content: `🗑️ Photo ${slot} removed. **${images.length}** photo(s) remain — run \`/photos\` again for the updated record.`,
+                        components: []
+                    }).catch(() => {});
+                } catch (e) {
+                    console.error('Photo manager button failed:', e);
+                    return interaction.followUp({ content: '⚠️ That didn\'t go through — nothing was changed.', ephemeral: true }).catch(() => {});
+                }
             }
 
             // --- GIVEAWAY ENTRY BUTTON ---
@@ -2956,7 +3770,84 @@ client.on('interactionCreate', async (interaction) => {
 
         // --- 3. SELECT MENU HANDLERS ---
         if (interaction.isStringSelectMenu()) {
-            
+
+            // --- AIRCRAFT PICKER: STEP 1 (aircraft) / STEP 2 (livery) ---
+            if (interaction.customId.startsWith('pick_type_') || interaction.customId.startsWith('pick_livery_')) {
+                const isType = interaction.customId.startsWith('pick_type_');
+                const session = getPickerSession(interaction.customId.replace(isType ? 'pick_type_' : 'pick_livery_', ''));
+                if (!session) return interaction.update(PICKER_EXPIRED).catch(() => {});
+                if (session.userId !== interaction.user.id) {
+                    return interaction.reply({ content: "That picker isn't yours.", ephemeral: true });
+                }
+                const chosen = interaction.values[0];
+                if (isType) {
+                    // Step 1 → step 2: the livery list is per-aircraft, so the
+                    // search from step 1 would filter the wrong list.
+                    session.type = chosen;
+                    session.step = 'livery';
+                    session.query = '';
+                    session.page = 0;
+                    return interaction.update(await renderPicker(session)).catch(() => {});
+                }
+                pickerSessions.delete(session.id);
+                // Both halves came straight from the API lists, so there is
+                // nothing for the normalizer to improve and a listed aircraft is
+                // never flagged.
+                return session.apply(interaction, session.type, chosen, { keepWording: true });
+            }
+
+            // --- PHOTO MANAGER: REORDER / REMOVE (from /photos) ---
+            if (interaction.customId.startsWith('photos_move_') || interaction.customId.startsWith('photos_del_')) {
+                if (!isPhotoStaff(interaction)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                const isMove = interaction.customId.startsWith('photos_move_');
+                const recordId = interaction.customId.replace(isMove ? 'photos_move_' : 'photos_del_', '');
+                await interaction.deferUpdate();
+                try {
+                    // Re-read the record on every action: another staff member may
+                    // have reordered or removed a photo since this manager was
+                    // rendered, and the slot numbers in these options would then
+                    // point at the wrong photos.
+                    const entry = await CommunityAircraftModel.findById(recordId).catch(() => null);
+                    if (!entry) {
+                        return interaction.editReply({ content: '❌ That record no longer exists.', embeds: [], components: [] }).catch(() => {});
+                    }
+                    const images = getEntryImages(entry);
+                    const contributors = getEntryContributors(entry);
+
+                    if (isMove) {
+                        const [from, to] = String(interaction.values[0]).split(':').map(n => parseInt(n, 10));
+                        if (!moveAircraftPhoto(images, contributors, from - 1, to - 1)) {
+                            await interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                            return interaction.followUp({ content: '⚠️ Those slots have changed since this was opened — the manager is refreshed above.', ephemeral: true }).catch(() => {});
+                        }
+                        await saveAircraftImages(entry, images, contributors);
+                        await logPhotoAction(interaction, entry, `↕️ Moved Photo ${from} → Photo ${to}.`);
+                        return interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                    }
+
+                    // Removal deletes the file from S3, so it asks first — in its
+                    // own ephemeral message, leaving the manager on screen.
+                    const slot = parseInt(interaction.values[0], 10);
+                    if (!(slot >= 1 && slot <= images.length) || images.length <= 1) {
+                        await interaction.editReply(buildPhotoManager(entry)).catch(() => {});
+                        return interaction.followUp({ content: '⚠️ That photo is no longer there — the manager is refreshed above.', ephemeral: true }).catch(() => {});
+                    }
+                    return interaction.followUp({
+                        content: `⚠️ Deleting **Photo ${slot}** of **${entry.aircraftType}** (${entry.liveryName}) removes it from storage permanently — the photos after it move up a slot. Reorder it instead if you only want it out of the way.`,
+                        components: [new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId(`photos_delok_${recordId}_${slot}`).setLabel(`Delete Photo ${slot}`).setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
+                            new ButtonBuilder().setCustomId('photos_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+                        )],
+                        ephemeral: true
+                    }).catch(() => {});
+                } catch (e) {
+                    console.error('Photo manager action failed:', e);
+                    return interaction.followUp({ content: '⚠️ That didn\'t go through — nothing was changed.', ephemeral: true }).catch(() => {});
+                }
+            }
+
             // --- BOUNTY BOARD SORTING MENU ---
             if (interaction.customId.startsWith('bnty_sort_')) {
                 await interaction.deferUpdate();
@@ -2997,6 +3888,44 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isModalSubmit()) {
             const customId = interaction.customId;
 
+            // --- AIRCRAFT PICKER MODALS (search / manual entry) ---
+            if (customId.startsWith('pick_searchmodal_') || customId.startsWith('pick_manualmodal_')) {
+                const isSearch = customId.startsWith('pick_searchmodal_');
+                const session = getPickerSession(customId.replace(isSearch ? 'pick_searchmodal_' : 'pick_manualmodal_', ''));
+                if (!session) return interaction.update(PICKER_EXPIRED).catch(() => {});
+                if (session.userId !== interaction.user.id) {
+                    return interaction.reply({ content: "That picker isn't yours.", ephemeral: true });
+                }
+                if (isSearch) {
+                    session.query = (interaction.fields.getTextInputValue('p_query') || '').trim();
+                    session.page = 0;
+                    return interaction.update(await renderPicker(session)).catch(() => {});
+                }
+                const rawType = (interaction.fields.getTextInputValue('p_type') || '').trim();
+                const rawLivery = (interaction.fields.getTextInputValue('p_livery') || '').trim();
+
+                // The normalizer matches by substring and then fuzzily, so a
+                // genuinely new aircraft can be rewritten into an older one that
+                // merely reads like it. Where it wants to change what was typed,
+                // the submitter decides which one is right.
+                let match = { type: rawType, livery: rawLivery };
+                try {
+                    const normalized = await normalizeData(rawType, rawLivery);
+                    match = { type: normalized.type, livery: normalized.livery };
+                } catch (e) { console.error('Picker normalize failed:', e); }
+
+                const rewritten = match.type.toLowerCase() !== rawType.toLowerCase()
+                    || match.livery.toLowerCase() !== rawLivery.toLowerCase();
+                if (rewritten) {
+                    session.raw = { type: rawType, livery: rawLivery };
+                    session.match = match;
+                    return interaction.update(renderPickerConfirm(session)).catch(() => {});
+                }
+
+                pickerSessions.delete(session.id);
+                return session.apply(interaction, rawType, rawLivery, { keepWording: true });
+            }
+
             if (customId === 'identify_modal') {
                 await interaction.deferReply({ ephemeral: true });
                 const type = interaction.fields.getTextInputValue('i_type');
@@ -3020,52 +3949,9 @@ client.on('interactionCreate', async (interaction) => {
                     newTail = lookupRegistration(newType, newLivery) || newTail;
                 }
 
-                const newEmbed = EmbedBuilder.from(oldEmbed);
-                const fields = newEmbed.data.fields;
-                fields.find(f => f.name === 'Tail Number').value = newTail.toUpperCase();
-                fields.find(f => f.name === 'Aircraft Type').value = newType;
-                fields.find(f => f.name === 'Livery').value = newLivery;
-                newEmbed.setFields(fields);
-
-                // Recover the submitter token from the pending footer so we can
-                // rebuild the buttons around the person who actually submitted
-                // this. Falling back to the buttons already on the card, and
-                // then to 'web' — which credits the footer's `Collab:` name, or
-                // 'Anonymous'.
-                //
-                // NEVER to interaction.user.id. That was the previous fallback,
-                // and because `User: web` did not match a digits-only parse it
-                // fired on every site submission an admin edited: the
-                // moderator's id went into the approve buttons, approval read it
-                // back as the contributor, and the photo went live credited to
-                // staff instead of to the person who sent it in.
-                const submitterId = submitterTokenFrom(oldEmbed.footer?.text)
-                    || submitterTokenFromComponents(interaction.message)
-                    || 'web';
-
-                // Re-run the duplicate check so an admin edit that now matches an existing
-                // record gets the replacement banner + per-photo comparison embeds and the
-                // correct slot-choice buttons (and an edit away from a duplicate clears them).
-                let embedsToSend = [newEmbed];
-                let components;
-                try {
-                    const existingEntry = await CommunityAircraftModel.findOne({
-                        aircraftType: { $regex: new RegExp(`^${escapeRegex(newType)}$`, "i") },
-                        liveryName: { $regex: new RegExp(`^${escapeRegex(newLivery)}$`, "i") }
-                    });
-
-                    const review = buildAircraftReview(newEmbed, existingEntry, submitterId);
-                    components = review.components;
-                    embedsToSend = [newEmbed, ...review.extraEmbeds];
-                    // Preserve the pending footer the buildAircraftReview helper doesn't touch.
-                    if (oldEmbed.footer?.text) newEmbed.setFooter({ text: oldEmbed.footer.text });
-                } catch (e) {
-                    console.error('Admin edit duplicate re-check failed:', e);
-                }
-
-                const editPayload = { embeds: embedsToSend };
-                if (components) editPayload.components = components;
-                await interaction.editReply(editPayload);
+                // Same rebuild a submitter correction goes through — fields, a
+                // fresh duplicate check, and the footer kept intact.
+                await rebuildReviewCard(interaction.message, { tail: newTail, type: newType, livery: newLivery });
                 return;
             }
 
@@ -3087,7 +3973,9 @@ client.on('interactionCreate', async (interaction) => {
                     try {
                         const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                         const msg = await feed.messages.fetch(publicMsgId);
-                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}\nThis submission was not approved.`).setImage(null)], attachments: [] });
+                        // components: [] drops the submitter's Fix Details button —
+                        // a rejected submission is closed, not correctable.
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}\nThis submission was not approved.`).setImage(null)], attachments: [], components: [] });
                     } catch(e) {}
                 }
 
@@ -3853,6 +4741,51 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
         
+        // --- PHOTO MANAGER (staff): reorder or remove photos already on record ---
+        if (interaction.commandName === 'photos') {
+            if (!isPhotoStaff(interaction)) {
+                return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+            }
+            const typeInput = interaction.options.getString('aircraft_type');
+            const liveryInput = interaction.options.getString('livery');
+            const tailInput = (interaction.options.getString('tail') || '').trim();
+
+            // Either identifier works; neither is mandatory on its own. A tail
+            // number alone is enough because it's unique in the schema, so it
+            // names exactly one record.
+            if (!tailInput && !(typeInput && liveryInput)) {
+                return interaction.reply({
+                    content: '❌ Tell me which record: a **tail** number on its own, or an **aircraft_type** *and* a **livery**.',
+                    ephemeral: true
+                });
+            }
+
+            // Ephemeral: this is a management surface, not something to leave
+            // sitting in a channel for anyone to click.
+            await interaction.deferReply({ ephemeral: true });
+            try {
+                const entry = await CommunityAircraftModel.findOne(tailInput
+                    ? { tailNumber: { $regex: new RegExp(`^${escapeRegex(tailInput)}$`, "i") } }
+                    : {
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
+                    });
+                if (!entry) {
+                    return interaction.editReply(tailInput
+                        ? `❌ No database record found for tail **${tailInput.toUpperCase()}**.`
+                        : `❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
+                }
+                if (getEntryImages(entry).length === 0) {
+                    return interaction.editReply(`⚠️ **${entry.aircraftType}** (${entry.liveryName}) has no photos on record yet — nothing to manage.`);
+                }
+                await interaction.editReply(buildPhotoManager(entry));
+            } catch (e) {
+                console.error('photos command error:', e);
+                await interaction.editReply('⚠️ Error loading that record.').catch(() => {});
+            }
+            return;
+        }
+
         if (interaction.commandName === 'pull_airport') {
             const icaoInput = interaction.options.getString('icao').toUpperCase().trim();
             await interaction.deferReply();
@@ -4028,7 +4961,9 @@ client.on('interactionCreate', async (interaction) => {
                         name: '📸 Submissions',
                         value: [
                             '`/submit` — submit a new aircraft photo',
-                            'Or drop a photo directly in the submission channels and follow the prompts.'
+                            'Or drop a photo directly in the submission channels and follow the prompts.',
+                            'Identifying it is two dropdowns — pick the aircraft, then its livery (search or type it by hand if it isn\'t listed).',
+                            'Got it wrong? Tap **🔧 Fix Details** on your pending post to correct it before an admin reviews it.'
                         ].join('\n')
                     },
                     {
@@ -4071,9 +5006,16 @@ client.on('interactionCreate', async (interaction) => {
                             '`/va_addrep` / `/va_removerep` — *(staff)* manage a VA\'s reps',
                             '`/va_remove` — *(staff)* delete a VA\'s role + channel'
                         ].join('\n')
+                    },
+                    {
+                        name: '🛠️ Photo Management',
+                        value: [
+                            '`/photos` — *(staff)* reorder the photos on a record (promote one to primary, push another back) or remove one — find it by aircraft type + livery, or by tail number alone',
+                            'On a review card, **Insert** saves a submission into a slot and keeps the photo that was there — only **Replace** deletes.'
+                        ].join('\n')
                     }
                 )
-                .setFooter({ text: 'Staff-only: mod_*, /giveaway, and /va_* management commands.' });
+                .setFooter({ text: 'Staff-only: mod_*, /giveaway, /photos, and /va_* management commands.' });
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
       } catch (err) {
