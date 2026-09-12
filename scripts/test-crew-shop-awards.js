@@ -85,6 +85,77 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
         crewShop.wallet({ _id: 'm2' }).balance === 0);
 }
 
+/* ------------------------------------------------------- the suggested shelf */
+
+{
+    const rates = { perHour: 120, perLanding: 25, fleetBonus: 40 };
+    const perFlight = crewShop.examplePay(rates);          // 325
+    const list = crewShop.suggestedItems({ earn: rates });
+
+    check('there is a catalogue to start a shelf from', list.length >= 10);
+    check('every suggestion is ready to be saved as it stands',
+        list.every(i => i.name && i.desc && i.icon && typeof i.price === 'number'));
+    check('…and is grouped, so twelve of them read as a few short lists',
+        new Set(list.map(i => i.group)).size >= 4);
+
+    /* THE POINT OF THE WHOLE THING: a price is a number of FLIGHTS, resolved
+       against this VA's rates. A fixed price would be a fortnight of flying to
+       one airline and a lifetime to another. */
+    const badge = list.find(i => i.id === 'badge');        // 3 flights
+    const dest = list.find(i => i.id === 'destination');   // 40 flights
+    check('a cheap suggestion costs a few flights',
+        badge.price >= 3 * perFlight && badge.price < 5 * perFlight, badge && badge.price);
+    check('…and an expensive one costs a season of them',
+        dest.price >= 40 * perFlight && dest.price < 42 * perFlight, dest && dest.price);
+
+    // The same catalogue on an airline paying a twentieth as much.
+    const small = crewShop.suggestedItems({ earn: { perHour: 6 } });
+    const smallBadge = small.find(i => i.id === 'badge');
+    check('a VA paying less is offered prices in its own money, not somebody else’s',
+        smallBadge.price > 0 && smallBadge.price < badge.price / 10,
+        `${smallBadge && smallBadge.price} vs ${badge.price}`);
+    check('…and the order of the shelf is the same whatever the rate',
+        small.map(i => i.id).join() === list.map(i => i.id).join());
+
+    /* A shelf of free things is worse than an empty one — a pilot buys the lot
+       before the VA has finished setting the rates. */
+    const unset = crewShop.suggestedItems({});
+    check('a VA who has not set a rate yet is still offered real prices',
+        unset.every(i => i.price > 0));
+    check('…priced off the stated placeholder flight',
+        unset.find(i => i.id === 'badge').price === crewShop.roundPrice(3 * crewShop.NOMINAL_FLIGHT));
+
+    // Prices that look like prices rather than like arithmetic.
+    check('prices are rounded to a step that grows with them',
+        crewShop.roundPrice(42) === 45 && crewShop.roundPrice(260) === 275
+        && crewShop.roundPrice(2610) === 2650 && crewShop.roundPrice(10010) === 10100);
+    check('…never down, so a suggestion cannot undercut the flying it stands for',
+        crewShop.roundPrice(101) >= 101 && crewShop.roundPrice(1001) >= 1001);
+    check('…and never to nothing', crewShop.roundPrice(1) > 0);
+
+    /* Scarcity and limits are part of the suggestion, not an afterthought: two
+       "lead the next group flight" is not a lead, and four badges is a
+       collection rather than a bug. */
+    check('a thing only one pilot can have is stocked at one',
+        list.find(i => i.id === 'lead').stock === 1
+        && list.find(i => i.id === 'feature').stock === 1);
+    check('…and a collectable carries no limit at all',
+        list.find(i => i.id === 'badge').limitPerPilot === 0);
+    check('anything absurd to hold two of is capped at one',
+        ['callsign', 'registration', 'route', 'livery', 'destination', 'leave']
+            .every(id => list.find(i => i.id === id).limitPerPilot === 1));
+    check('everything else is unlimited stock, because a role does not run out',
+        list.filter(i => !['registration', 'livery', 'lead', 'feature'].includes(i.id))
+            .every(i => i.stock === -1));
+
+    /* Nothing here is written into anybody's shop. Reading the catalogue is the
+       whole of what this module does with it. */
+    check('reading the catalogue is not the same as having a shelf',
+        crewShop.fromRecord(null).enabled === false && crewShop.CATALOGUE.length === list.length);
+    check('the icons are a fixed short list the picker can also offer',
+        new Set(list.map(i => i.icon)).size >= 8 && list.every(i => /^[a-z-]+$/.test(i.icon)));
+}
+
 /* -------------------------------------------------------------------- awards */
 
 {

@@ -4057,7 +4057,15 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
                 enabled: false,
                 canManage,
                 currency: settings.currency,
-                ...(canManage ? { earn: settings.earn } : {}),
+                ...(canManage ? {
+                    earn: settings.earn,
+                    // Offered here as well as on the shelf, because the screen
+                    // that switches a shop on is the screen where somebody is
+                    // deciding whether to bother — and "here are twelve things
+                    // you could actually sell" is the answer to that, where a
+                    // switch and an empty shelf is not.
+                    suggested: crewShop.suggestedItems(settings),
+                } : {}),
                 items: [],
                 wallet: null,
             });
@@ -4078,8 +4086,19 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
             canManage,
             currency: settings.currency,
             // The rates are staff's business: they are how the VA runs its
-            // economy, not something a pilot needs on the shelf.
-            ...(canManage ? { earn: settings.earn } : {}),
+            // economy, not something a pilot needs on the shelf. So is the
+            // catalogue — it is a back-office tool, and a pilot who could see
+            // it would be reading a list of things the airline does not sell.
+            //
+            // Priced HERE rather than in the browser, though the browser has
+            // the rates and could do the arithmetic. The prices a VA is offered
+            // and the worked example under the rates have to be the same
+            // function, for the same reason earnFor is shared by both doors
+            // into approval: two copies of a rule are two rules eventually.
+            ...(canManage ? {
+                earn: settings.earn,
+                suggested: crewShop.suggestedItems(settings),
+            } : {}),
             items: items.map(crewShop.publicItem),
             wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '' }),
         });
@@ -4101,7 +4120,14 @@ app.post('/api/crew/:slug/shop/settings', async (req, res) => {
         // The server's version of the settings, not the one that was typed — it
         // is the thing that clamps a rate somebody put 1e9 into, and the panel
         // takes this answer over its own form.
-        res.json({ ...settings, canManage: true });
+        //
+        // The catalogue comes back with it because every price in it is worked
+        // out FROM these rates. The panel merges this answer over what it is
+        // holding, so leaving it out would leave a shelf of suggestions priced
+        // in the rate the VA has just stopped using — and the one moment they
+        // are certain to look at those prices is immediately after setting the
+        // rate that decides them.
+        res.json({ ...settings, canManage: true, suggested: crewShop.suggestedItems(settings) });
     } catch (err) { crewFail(res, err, { log: 'shop settings error', message: 'That could not be saved.' }); }
 });
 
