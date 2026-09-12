@@ -152,6 +152,255 @@ function earnFor(pirep, rates) {
 const exampleFlight = { durationMin: 135, landings: 1, violations: 0, inFleet: true };
 const examplePay = (rates) => earnFor(exampleFlight, rates);
 
+/* ===========================================================================
+ * THE SHELF A VA STARTS WITH
+ *
+ * A shop with nothing in it is not a shop, and that is what every VA got: the
+ * back office drew "Nothing yet." and a blank form with a name, a price and a
+ * number of things in stock. Those are the easy three. The hard question, and
+ * the one that actually stops somebody, is WHAT DOES A VIRTUAL AIRLINE SELL —
+ * there is no warehouse, nothing ships, and a pilot who has flown forty hours
+ * cannot be handed anything physical.
+ *
+ * So this is the answer to that question, written down: a dozen things a VA
+ * can really give a pilot, every one of them deliverable by a staff member
+ * reading the orders queue and doing something they can already do.
+ *
+ * THEY ARE SUGGESTIONS AND THEY ARE NOT SEEDED
+ * --------------------------------------------
+ * Nothing here is written into anybody's shelf. A VA taps one and it becomes an
+ * ordinary item they own, edit and price like any other; a VA that wants none
+ * of them never sees a row they did not put there. That is the same rule the
+ * settings above follow and for the same reason — deploying a file must not
+ * start an economy in three hundred airlines that did not ask for one — and it
+ * is why this exports a function that RETURNS a catalogue rather than anything
+ * that writes one.
+ *
+ * PRICED IN FLIGHTS, NOT IN POINTS
+ * --------------------------------
+ * The interesting decision. A fixed price is wrong for everybody: a VA paying
+ * 120 an hour and a VA paying 5 an hour are running the same economy at
+ * different scales, and "1,500" means a fortnight of flying to one of them and
+ * a lifetime to the other. A suggestion priced in somebody else's currency is
+ * worse than no suggestion, because it looks like advice.
+ *
+ * So each entry carries what it should cost in TYPICAL FLIGHTS, and the price
+ * is worked out from the VA's own rates when the catalogue is read. `flights:
+ * 8` means "about eight flights' worth", and it means that at any rate the VA
+ * ever sets. The unit is examplePay above — the same 2h 15m in-fleet flight the
+ * back office shows its worked example for — so the sentence a VA reads under
+ * the rates and the prices they are offered come from one function.
+ *
+ * WHAT EARNED A PLACE
+ * -------------------
+ * Three tests, and a thing had to pass all of them:
+ *
+ *   1. A staff member can deliver it today. No new backend, no new column, no
+ *      integration. Everything here is something a VA already does — rename a
+ *      tail number, add a route, hand out a Discord role — just now in response
+ *      to an order rather than a direct message.
+ *   2. A pilot actually wants it. Status, a say in how the airline flies, or
+ *      being seen. Those are what people fly for once the hours stop being the
+ *      point.
+ *   3. It cannot be bought twice into nonsense. Anything that would be absurd
+ *      to hold two of carries its own limit, and anything genuinely scarce
+ *      carries stock.
+ *
+ * `group` is the shelf it sits on in the picker, so twelve suggestions read as
+ * five short lists rather than one long one.
+ * ======================================================================== */
+const CATALOGUE = [
+    /* IDENTITY — what a pilot is called and what they fly as. The cheapest
+       things on this list and the ones that get bought first, because they are
+       the ones that show up in a screenshot. */
+    {
+        id: 'badge',
+        group: 'Identity',
+        name: 'A badge on your profile',
+        desc: 'A mark beside your name on the roster and your crew profile. Yours to keep.',
+        icon: 'shield',
+        flights: 3,
+        // No limit: a badge is a collectable, and a pilot with four of them is
+        // a pilot who has been here a while rather than a bug.
+        limitPerPilot: 0,
+    },
+    {
+        id: 'callsign',
+        group: 'Identity',
+        name: 'Your own callsign',
+        desc: 'Reserve a flight number that is yours. Nobody else on the roster files it.',
+        icon: 'radio',
+        flights: 8,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'registration',
+        group: 'Identity',
+        name: 'A tail number of your choosing',
+        desc: 'Pick the registration on one of the airline’s aircraft. It goes on the fleet page under your name.',
+        icon: 'plane',
+        flights: 20,
+        // Genuinely scarce — there are only so many airframes, and a fleet page
+        // where everyone has named one has stopped meaning anything.
+        stock: 10,
+        limitPerPilot: 1,
+    },
+
+    /* THE NETWORK — a say in where the airline flies. The expensive end, and
+       the reason a long-haul pilot keeps flying after they have run out of
+       ranks to reach. */
+    {
+        id: 'route',
+        group: 'The network',
+        name: 'Name a route',
+        desc: 'Nominate a sector. Staff add it to the network and it is flown as that week’s featured route.',
+        icon: 'route',
+        flights: 25,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'livery',
+        group: 'The network',
+        name: 'Request a livery',
+        desc: 'Nominate a livery for the fleet. If it can be flown, it gets added and you fly it first.',
+        icon: 'paintbrush',
+        flights: 30,
+        stock: 3,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'destination',
+        group: 'The network',
+        name: 'Open a new destination',
+        desc: 'Pick an airport the airline does not serve yet. Staff build the routes into it.',
+        icon: 'map-pin',
+        flights: 40,
+        limitPerPilot: 1,
+    },
+
+    /* EVENTS — the things that are worth something precisely because only one
+       pilot can have them. */
+    {
+        id: 'slot',
+        group: 'Events',
+        name: 'First pick of the gate',
+        desc: 'Choose your gate and your aircraft on the next group flight before signups open.',
+        icon: 'ticket',
+        flights: 6,
+        limitPerPilot: 0,
+    },
+    {
+        id: 'lead',
+        group: 'Events',
+        name: 'Lead the next group flight',
+        desc: 'Fly as number one. Everybody else is behind you and the screenshots are of your aircraft.',
+        icon: 'users',
+        // One, because two is not a lead.
+        stock: 1,
+        flights: 15,
+        limitPerPilot: 1,
+    },
+
+    /* PROGRESSION — time and attempts, which are the two things a pilot cannot
+       get any other way. Neither of these buys a rank: they buy another go and
+       a longer clock, and the standard is unchanged. */
+    {
+        id: 'checkride',
+        group: 'Getting on',
+        name: 'An extra check-ride attempt',
+        desc: 'One more go at your next check ride without waiting out the usual gap. The ride itself is unchanged.',
+        icon: 'clipboard-check',
+        flights: 10,
+        limitPerPilot: 2,
+    },
+    {
+        id: 'leave',
+        group: 'Getting on',
+        name: 'Thirty more days of leave',
+        desc: 'Extend your leave without losing your rank or your seniority. For when life happens.',
+        icon: 'calendar-plus',
+        flights: 12,
+        limitPerPilot: 1,
+    },
+
+    /* RECOGNITION — being seen by the rest of the airline, which for a lot of
+       pilots is the only thing on this list they actually want. */
+    {
+        id: 'feature',
+        group: 'Recognition',
+        name: 'Featured on the website',
+        desc: 'Your name and your card on the airline’s own website for a month.',
+        icon: 'star',
+        // One at a time, or it is not featuring anybody.
+        stock: 1,
+        flights: 18,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'notam',
+        group: 'Recognition',
+        name: 'A line in the next NOTAM',
+        desc: 'Say something to the whole airline. Staff read it before it goes out.',
+        icon: 'megaphone',
+        flights: 4,
+        limitPerPilot: 0,
+    },
+];
+
+/**
+ * A price that looks like a price.
+ *
+ * Eight flights at a rate of 325 is 2,600, which is arithmetic rather than a
+ * price tag — and a shelf of them reads as a spreadsheet. Rounded to a step
+ * that grows with the number, so small things land on fives and expensive
+ * things land on hundreds, the way every real price list in the world does.
+ *
+ * Rounded UP, never down, and never to zero: a suggestion that undercuts the
+ * effort it was meant to represent is the one mistake here that costs a VA
+ * something, because it is their pilots' hours being sold cheap.
+ */
+function roundPrice(n) {
+    const v = Math.max(0, Math.round(Number(n) || 0));
+    if (v <= 0) return 0;
+    const step = v < 100 ? 5 : v < 1000 ? 25 : v < 10000 ? 50 : 100;
+    return Math.ceil(v / step) * step;
+}
+
+/* What one typical flight is assumed to be worth on a VA that has not set a
+ * rate yet. Without it every suggestion prices at nothing, and a shelf of free
+ * things is worse than an empty one: a pilot buys the lot in one go and the
+ * economy is over before the VA has finished setting it up.
+ *
+ * It is a placeholder and it says so — the back office tells a VA the prices
+ * are worked out from their rate, and the moment they set one these move. */
+const NOMINAL_FLIGHT = 250;
+
+/**
+ * The catalogue, priced for one VA.
+ *
+ * Returns items in exactly the shape POST /shop/items takes, so the back office
+ * hands one straight back rather than translating it — and the moment it is
+ * saved it is an ordinary item the VA owns, with no trace of having come from
+ * here. That is deliberate: a suggestion that stayed special would be a second
+ * kind of shelf item to reason about forever.
+ */
+function suggestedItems(settings) {
+    const s = normalizeSettings(settings);
+    const perFlight = examplePay(s.earn) || NOMINAL_FLIGHT;
+    return CATALOGUE.map(c => ({
+        id: c.id,
+        group: c.group,
+        name: c.name,
+        desc: c.desc,
+        icon: c.icon,
+        image: '',
+        price: roundPrice(c.flights * perFlight),
+        stock: c.stock === undefined ? -1 : c.stock,
+        limitPerPilot: c.limitPerPilot || 0,
+        active: true,
+    }));
+}
+
 /** One thing on the shelf, as any caller may see it. */
 const publicItem = (i) => ({
     id: i._id,
@@ -213,6 +462,10 @@ function wallet(member, { rank = '' } = {}) {
 
 module.exports = {
     RATES,
+    CATALOGUE,
+    NOMINAL_FLIGHT,
+    roundPrice,
+    suggestedItems,
     normalizeSettings,
     fromRecord,
     toRecord,

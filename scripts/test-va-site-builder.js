@@ -28,6 +28,7 @@ process.env.PUBLIC_SITE_ORIGIN = 'https://inflight.info';
 const express = require('express');
 const vaSites = require('../vaSites');
 const builder = require('../vaSiteBuilder');
+const templates = require('../vaSiteTemplates');
 
 const VA = { _id: 'va1', name: 'British Airways Virtual', slug: 'ba', callsign: 'BAW', status: 'approved' };
 
@@ -174,7 +175,34 @@ const server = app.listen(0, async () => {
 
     console.log('the catalogue');
     const cat = await call('/api/crew/ba/site/templates', { role: 'owner' });
-    check('six designs and the block vocabulary', cat.status === 200 && cat.json.templates.length === 6 && cat.json.builder.blocks.length >= 12, cat.json && Object.keys(cat.json));
+    /* Counted against the module rather than against a number typed in here.
+       This assertion used to read "=== 6" and had been failing silently since
+       the seventh design was added — which is the whole problem with asserting
+       a count: it tests how long ago the test was written, and the day it goes
+       red is the day somebody did the thing it exists to allow. What actually
+       matters is that every design the module defines reaches the picker. */
+    const designs = Object.keys(templates.TEMPLATES);
+    check('every design reaches the picker',
+        cat.status === 200 &&
+        cat.json.templates.length === designs.length &&
+        designs.every(id => cat.json.templates.some(t => t.id === id)),
+        cat.json && cat.json.templates && cat.json.templates.map(t => t.id));
+    check('and the block vocabulary comes with it',
+        cat.status === 200 && cat.json.builder.blocks.length >= 12,
+        cat.json && Object.keys(cat.json));
+
+    /* The picker cannot offer a control the catalogue does not carry. Each of
+       these is a row of choices the editor draws from the server's answer, so a
+       missing one is a control that silently disappears rather than breaks. */
+    for (const shelf of ['fonts', 'modes', 'patterns', 'motions']) {
+        check(shelf + ' are offered',
+            cat.status === 200 && Array.isArray(cat.json[shelf]) && cat.json[shelf].length > 0,
+            cat.json && cat.json[shelf]);
+    }
+    check('every design names a motion the catalogue offers',
+        cat.status === 200 && cat.json.templates.every(t =>
+            cat.json.motions.some(m => m.id === t.motion)),
+        cat.status === 200 && cat.json.templates.map(t => t.id + ':' + t.motion));
 
     console.log('another VA cannot reach this one');
     check('slug mismatch → 403', (await call('/api/crew/other/site', { role: 'owner' })).status === 403);

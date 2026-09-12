@@ -94,6 +94,101 @@ const MODES = {
 };
 
 /* ===========================================================================
+ * MOTION
+ *
+ * How much the site moves, as ONE choice rather than as a row of switches.
+ *
+ * WHY IT IS A THEME FIELD AND NOT A TEMPLATE DETAIL
+ * -------------------------------------------------
+ * Movement is taste in exactly the way colour is. Two airlines can pick the
+ * same design and want opposite things from it: a cargo VA wants a page that
+ * sits still and loads, and a 200-pilot flag carrier wants the thing to feel
+ * like a title sequence. Baking one answer into each design forces a VA to
+ * abandon a layout they like over a preference that has nothing to do with
+ * layout — which is the same complaint the accent picker exists to answer.
+ *
+ * WHY ONE CHOICE AND NOT SIX SLIDERS
+ * ----------------------------------
+ * Duration, distance, easing, stagger and scale are not independent. A long
+ * travel at a short duration is a twitch; a spring easing at 1.1s is a wobble.
+ * Offered separately they combine into far more wrong answers than right ones,
+ * and the VA who most wants to change this is the one least equipped to pick
+ * five numbers that agree. So a preset sets all of them together, and every
+ * preset is a combination somebody checked.
+ *
+ * WHAT A PRESET ACTUALLY IS
+ * -------------------------
+ *   tokens   custom properties written into theme.css. Every animated rule in
+ *            the base stylesheet reads through these, so changing the preset
+ *            is a rewrite of one small file and nothing else.
+ *   count    whether the live figures count UP to their value rather than
+ *            appearing at it. It is a flag and not a token because it is the
+ *            one piece of motion that is script rather than stylesheet.
+ *
+ * AND THE ONE THING THAT IS NOT A CHOICE
+ * --------------------------------------
+ * prefers-reduced-motion wins over every preset, including Cinematic. A visitor
+ * who has told their operating system that movement makes them ill is not
+ * overruled by a dropdown in somebody else's editor. That is enforced at the
+ * top of BASE_CSS for the stylesheet and again in site.js for the script.
+ * ======================================================================== */
+const MOTION = {
+    none: {
+        label: 'Still',
+        note: 'Nothing moves. The fastest answer, and the right one for a page that is mostly words.',
+        count: false,
+        tokens: {
+            in: '0s', ease: 'linear', rise: '0px', scale: '1',
+            blur: '0px', stagger: '0ms', hover: '0px',
+        },
+    },
+    subtle: {
+        label: 'Subtle',
+        note: 'A short fade as each section arrives. Noticed once, then forgotten.',
+        count: false,
+        tokens: {
+            in: '.42s', ease: 'cubic-bezier(.32, .72, 0, 1)', rise: '6px', scale: '1',
+            blur: '0px', stagger: '0ms', hover: '1px',
+        },
+    },
+    standard: {
+        label: 'Standard',
+        note: 'Sections rise into place, lists arrive a row at a time, and the figures count up.',
+        count: true,
+        tokens: {
+            in: '.55s', ease: 'cubic-bezier(.32, .72, 0, 1)', rise: '14px', scale: '1',
+            blur: '0px', stagger: '55ms', hover: '2px',
+        },
+    },
+    expressive: {
+        label: 'Expressive',
+        note: 'Further to travel and a spring at the end. For an airline with something to say.',
+        count: true,
+        // The overshoot in this curve is what "spring" means here — it passes
+        // its resting place and comes back. Paired with a start slightly SMALL,
+        // so the settle reads as the section arriving rather than as a bounce.
+        tokens: {
+            in: '.72s', ease: 'cubic-bezier(.22, 1.2, .36, 1)', rise: '26px', scale: '.97',
+            blur: '0px', stagger: '80ms', hover: '3px',
+        },
+    },
+    cinematic: {
+        label: 'Cinematic',
+        note: 'Slow, long and softened, like a title sequence. Best on a design built around photographs.',
+        count: true,
+        // Starting LARGER and settling is a camera pushing in; starting smaller
+        // is a thing being placed on a table. The first is what a photographic
+        // site wants, so this is the one preset whose scale is above 1.
+        tokens: {
+            in: '1.05s', ease: 'cubic-bezier(.16, 1, .3, 1)', rise: '30px', scale: '1.025',
+            blur: '6px', stagger: '105ms', hover: '3px',
+        },
+    },
+};
+
+const DEFAULT_MOTION = 'standard';
+
+/* ===========================================================================
  * PATTERN
  *
  * The half of a brand that a colour picker cannot reach.
@@ -198,6 +293,42 @@ const PATTERNS = {
         ].join(', '),
         size: '18px 18px',
         position: '0 0, 9px 9px',
+    },
+
+    /* The three below are about aviation rather than about decoration. A VA
+     * picking a motif is answering "what is my airline", and "a grid" is a
+     * weaker answer than "the marks on a runway threshold" — so the shelf
+     * carries a few that could not belong to a plumbing company.
+     *
+     * All three are still one gradient declaration each, still mixed from
+     * currentColor, and still under 15%: the rules at the top of this block do
+     * not bend for a better idea. */
+    contrail: {
+        label: 'Contrails',
+        note: 'Paired hairlines drawn high and wide apart, like vapour across a sky.',
+        // A PAIR of lines rather than one, and a long way apart. That is what
+        // separates it from Cheatline, which is a single rule repeated tightly:
+        // one reads as a stripe painted on metal, this reads as something a long
+        // way off having gone past.
+        image: `repeating-linear-gradient(108deg, transparent 0 17px, ${M} 17px 18px, transparent 18px 22px, ${M} 22px 23px, transparent 23px 56px)`,
+        size: 'auto',
+    },
+    radar: {
+        label: 'Radar',
+        note: 'Range rings sweeping out from the corner. Quiet, and unmistakably a screen.',
+        image: `repeating-radial-gradient(circle at 0% 100%, transparent 0 26px, ${M} 26px 27px, transparent 27px 54px)`,
+        size: 'auto',
+    },
+    threshold: {
+        label: 'Threshold',
+        note: 'The piano keys at the end of a runway. The most literal of these, on purpose.',
+        /* The lighter mix and the wider gap, not the 14% one every other broad
+           pattern here uses. A bar is a solid field of ink where a hairline is
+           a line through one, so the same percentage that whispers as a rule
+           SHOUTS as a stripe — behind a hero it stopped being a motif and
+           started being a background the headline sat on top of. */
+        image: `repeating-linear-gradient(90deg, ${M} 0 4px, transparent 4px 17px)`,
+        size: 'auto',
     },
 };
 
@@ -780,14 +911,47 @@ h3 { font-size: 1.02rem; margin: 0 0 .4rem; }
 .bar {
   position: sticky; top: 0; z-index: 50;
   padding-inline: var(--pad);
+  /* NOT painted here. See THE BAR'S OWN BACKGROUND below — this is the one
+     rule in the file whose absence is deliberate. */
+  background: none;
+  transition: box-shadow .2s ease;
+}
+
+/* THE BAR'S OWN BACKGROUND, AND WHY IT IS ON A PSEUDO-ELEMENT.
+ *
+ * This is not a flourish. It is the fix for the menu panel being cut off, and
+ * the reason is a rule of CSS that is easy to miss:
+ *
+ *   An element with a filter, a backdrop-filter, a transform or a perspective
+ *   becomes the CONTAINING BLOCK for every position:fixed descendant it has.
+ *
+ * .bar__nav is a fixed, full-height panel and it lives INSIDE this header. With
+ * backdrop-filter on .bar itself, "top: 0; bottom: 0" stopped meaning the
+ * viewport and started meaning the header — a strip about three and a half rems
+ * tall. The panel was laid out into that strip, its own overflow-y hid
+ * everything past the first link, and a menu that should be full height opened
+ * as a sliver with the links cut off. It looked intermittent because it tracks
+ * backdrop-filter support rather than anything the visitor did.
+ *
+ * Moving the frosting to a ::after fixes it at the root: a pseudo-element has
+ * no element children, so nothing can be trapped by it. The bar keeps its
+ * blur, the panel gets the viewport back, and no markup changed.
+ *
+ * inset: 0 is the PADDING box, so a design's border-bottom still shows.
+ */
+.bar::after {
+  content: ''; position: absolute; inset: 0; z-index: -1;
   background: var(--bar-bg, var(--bg));
-  transition: box-shadow .2s ease, background-color .2s ease;
+  transition: background-color .2s ease;
 }
 /* Frosted only where it is supported AND where the design has not painted the
    bar something opaque. Backdrop-filter on a fully opaque background is a GPU
    layer for no visual difference. */
 @supports (backdrop-filter: blur(8px)) {
-  .bar { background: color-mix(in srgb, var(--bar-bg, var(--bg)) 88%, transparent); backdrop-filter: saturate(160%) blur(10px); }
+  .bar::after {
+    background: color-mix(in srgb, var(--bar-bg, var(--bg)) 88%, transparent);
+    backdrop-filter: saturate(160%) blur(10px);
+  }
 }
 /* site.js sets this once the page has been scrolled. A shadow that is there
    from the start reads as a floating strip; one that arrives on scroll reads
@@ -845,6 +1009,14 @@ h3 { font-size: 1.02rem; margin: 0 0 .4rem; }
   background: none; border: 1px solid var(--line); border-radius: var(--radius-sm);
   color: var(--ink); cursor: pointer;
   transition: background-color .15s ease, border-color .15s ease;
+  /* ABOVE THE PANEL IT OPENS.
+     The panel is pinned to the right edge, which is exactly where this button
+     is — so without a z-index of its own the open panel slides over the top of
+     the only control that closes it, and the X you can see is a picture of a
+     button rather than the button. Both numbers are inside .bar's own stacking
+     context (it is sticky with a z-index), so this is above the panel's 60 and
+     still below nothing else on the page. */
+  position: relative; z-index: 70;
 }
 .bar__burger:hover { background: var(--surface); border-color: var(--accent-line); }
 .bar__burger i {
@@ -874,29 +1046,86 @@ h3 { font-size: 1.02rem; margin: 0 0 .4rem; }
 .bar__scrim[hidden] { display: none; }
 .bar__scrim[data-open] { opacity: 1; }
 
+/* THE PANEL.
+ *
+ * 54rem here and 54rem in site.js, and that is not a coincidence to be tidied
+ * away later: the two used to be 54rem and 54.0625rem, which left a half-rem
+ * band of window widths where the CSS had already given up the panel and the
+ * script had not yet closed it. A window resized into that band kept the page's
+ * scroll lock with no menu on screen to explain it — the site simply stopped
+ * scrolling. One number, quoted in both files, is the whole fix.
+ */
 @media (max-width: 54rem) {
   html[data-js] .bar__burger { display: inline-flex; }
   html[data-js] .bar__nav {
-    position: fixed; top: 0; right: 0; bottom: 0; z-index: 60;
+    position: fixed; top: 0; right: 0; z-index: 60;
     width: min(20rem, 84vw);
+    /* HEIGHT, NOT top+bottom.
+       A fixed element pinned top and bottom is laid into the LARGE viewport on
+       a phone — the one that assumes the browser's own toolbars have scrolled
+       away. They have not, when a menu is the first thing a visitor opens, so
+       the foot of the panel sat behind the toolbar and the Apply button at the
+       end of it was unreachable. 100dvh is the viewport as it is right now. */
+    height: 100dvh; max-height: 100dvh;
     flex-direction: column; align-items: stretch; justify-content: flex-start;
     gap: .25rem;
-    padding: 5rem 1.1rem 1.5rem;
+    /* Clear of the header WHATEVER the header turns out to be. site.js measures
+       it into --bar-h; the fallback is the bar's own min-height, so a page whose
+       script has not run yet is still laid out correctly. An airline with a tall
+       logo or a name long enough to wrap used to get its first link tucked
+       underneath the wordmark. */
+    padding: calc(var(--bar-h, 3.5rem) + .75rem) 1.1rem calc(1.5rem + env(safe-area-inset-bottom, 0px));
     background: var(--bg);
     border-left: 1px solid var(--line);
     box-shadow: var(--shadow-2);
-    overflow-y: auto;
+    /* contain, so reaching the end of a long menu does not start scrolling the
+       page underneath it. */
+    overflow-y: auto; overscroll-behavior: contain;
     /* visibility, not display: a transform animates and display:none does
        not, and visibility:hidden is what takes the links out of the tab order
        while the panel is shut. */
     visibility: hidden; transform: translateX(100%);
     transition: transform .24s cubic-bezier(.32, .72, 0, 1), visibility .24s;
   }
-  html[data-js] .bar__nav[data-open] { visibility: visible; transform: none; }
+  html[data-js] .bar__nav[data-open] { visibility: visible; transform: translateX(0); }
   html[data-js] .bar__nav a { padding: .8rem .75rem; font-size: 1rem; border-radius: var(--radius-sm); }
   html[data-js] .bar__nav .cta { margin-top: .6rem; text-align: center; padding: .85rem 1rem; font-size: .95rem; }
-  /* The page must not scroll behind an open panel. */
+
+  /* The links arrive one after another behind the panel's own slide. Only when
+     the site is set to move at all — [data-motion] is absent for Still and for
+     anybody whose system asked for less movement, and then they are simply
+     there. The cap is the same reasoning as the stagger everywhere else: past
+     about eight items a queue stops reading as sequence and starts reading as
+     lag. */
+  html[data-motion] .bar__nav a {
+    opacity: 0; transform: translateX(10px);
+    transition: opacity .26s ease, transform .26s cubic-bezier(.32, .72, 0, 1);
+  }
+  html[data-motion] .bar__nav[data-open] a { opacity: 1; transform: translateX(0); }
+  html[data-motion] .bar__nav[data-open] a:nth-child(1) { transition-delay: 60ms; }
+  html[data-motion] .bar__nav[data-open] a:nth-child(2) { transition-delay: 95ms; }
+  html[data-motion] .bar__nav[data-open] a:nth-child(3) { transition-delay: 130ms; }
+  html[data-motion] .bar__nav[data-open] a:nth-child(4) { transition-delay: 165ms; }
+  html[data-motion] .bar__nav[data-open] a:nth-child(5) { transition-delay: 200ms; }
+  html[data-motion] .bar__nav[data-open] a:nth-child(n + 6) { transition-delay: 235ms; }
+
+  /* The page must not scroll behind an open panel.
+
+     AND MUST NOT MOVE WHILE IT IS SHUT OUT. Locking the scroll takes the
+     scrollbar away, and a page that was 15px narrower than the window a moment
+     ago is suddenly not — so the header, the headline and the hero all slide
+     sideways as the menu opens and slide back as it shuts. That is the other
+     half of what "the menu jumps" usually means.
+
+     The width is MEASURED by site.js and put here, rather than reserved up
+     front with scrollbar-gutter. Reserving would have been one line, and it
+     costs a permanent strip of dead page down the right-hand side of every
+     site on every browser that draws a classic scrollbar — a visible band,
+     always, to smooth over a moment that happens when somebody opens a menu.
+     Measuring costs nothing at all when the visitor's scrollbar is an overlay,
+     which on a phone it always is, and is exact when it is not. */
   html[data-nav-open], html[data-nav-open] body { overflow: hidden; }
+  html[data-nav-open] body { padding-right: var(--lock-gap, 0px); }
 }
 
 /* ---------------------------------------------------------------------------
@@ -969,7 +1198,11 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
   line-height: 1.2; cursor: pointer;
   transition: filter .15s ease, transform .15s ease, box-shadow .15s ease;
 }
-.cta:hover { filter: brightness(1.07); transform: translateY(-1px); box-shadow: var(--shadow-1); }
+/* The lift is the motion preset's, not this rule's. A site set to Still has a
+   --motion-hover of 0 and its buttons brighten without moving; Expressive lifts
+   them further than Standard. One property, so "how much does this site move"
+   means the hovers as well as the arrivals. */
+.cta:hover { filter: brightness(1.07); transform: translateY(calc(var(--motion-hover, 1px) * -1)); box-shadow: var(--shadow-1); }
 .cta:active { transform: translateY(0); box-shadow: none; }
 /* The second button in a pair. Same box, no fill — so the two line up exactly
    and the primary one is still obviously the primary one. */
@@ -1055,7 +1288,10 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
   border-radius: var(--radius); overflow: hidden;
   transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
 }
-.card:hover { border-color: var(--accent-line); box-shadow: var(--shadow-1); }
+.card:hover {
+  border-color: var(--accent-line); box-shadow: var(--shadow-1);
+  transform: translateY(calc(var(--motion-hover, 1px) * -1));
+}
 /* THE PICTURE WELL.
 
    A fixed ratio, always. The pictures in a fleet come from three different
@@ -1269,7 +1505,7 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
   transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
 }
 button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
-.shot:hover { border-color: var(--accent-line); box-shadow: var(--shadow-1); transform: translateY(-1px); }
+.shot:hover { border-color: var(--accent-line); box-shadow: var(--shadow-1); transform: translateY(calc(var(--motion-hover, 1px) * -1)); }
 /* flex: none, or the image is the thing that stretches instead of the caption. */
 .shot img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; flex: none; }
 .shot figcaption, .shot > span {
@@ -1356,23 +1592,120 @@ footer p { margin: .3rem 0; max-width: 62ch; }
 .foot__links a:hover { color: var(--accent); }
 
 /* ---------------------------------------------------------------------------
-   ARRIVAL
+   MOTION
 
-   Sections fade up the first time they are scrolled to. site.js adds
-   [data-reveal] and takes it off once seen; with JavaScript off nothing is ever
-   marked, so nothing is ever hidden — which is why the hidden state lives on
-   the attribute and not on the class in the markup.
+   Every moving thing on the page reads its distance, its duration, its easing
+   and its stagger from the --motion-* properties in theme.css. Nothing below
+   names a number of its own, which is what makes "how much does this site move"
+   a single choice in the editor rather than a search through a stylesheet.
 
-   Wrapped in the reduced-motion query as a belt to the braces at the top of the
-   file, because this is the one animation on the page big enough to matter to
-   somebody who asked for less of it.
+   THE THREE RULES THIS SECTION IS BUILT ON
+
+   1. NOTHING IS EVER HIDDEN BY THE STYLESHEET ALONE. The hidden half of an
+      arrival lives behind [data-reveal], and only site.js ever writes that
+      attribute — and only onto sections that START below the fold. A page whose
+      script fails to load has no hidden sections at all, because nothing was
+      ever marked. That is the difference between an animation and a site that
+      arrives blank.
+
+   2. REDUCED MOTION WINS OVER THE PRESET. The blanket rule at the top of this
+      file already flattens every duration to nothing; this section is wrapped
+      again anyway, and site.js checks a third time before it marks anything.
+      Cinematic is a preference of the airline's. Not moving is a preference of
+      the visitor's, and the visitor's is not the one that gets overruled.
+
+   3. THE ONE THING THAT RUNS WITHOUT JAVASCRIPT IS THE HERO. It is the only
+      element whose arrival is not conditional on where the page is scrolled to,
+      so it is a plain CSS animation and starts on the first paint. Behind
+      [data-js] it would wait for the script, which means the headline would
+      render, be seen, and only then fade in from nothing.
    ------------------------------------------------------------------------ */
 @media (prefers-reduced-motion: no-preference) {
-  html[data-js] [data-reveal] { opacity: 0; transform: translateY(12px); }
-  html[data-js] [data-reveal="in"] {
-    opacity: 1; transform: none;
-    transition: opacity .5s ease, transform .5s cubic-bezier(.32, .72, 0, 1);
+
+  /* ARRIVAL — a section, the first time it is reached.
+
+     transform is written out as translateY(0) scale(1) rather than as the
+     keyword none, and the filter as blur(0px) rather than none, because a spring easing
+     interpolating out of the keyword rather than out of a matching function is
+     where transitions go subtly wrong in one engine and not another. Writing
+     the resting value in the same shape as the starting one costs nothing and
+     removes the question. */
+  html[data-js] [data-reveal] {
+    opacity: 0;
+    transform: translateY(var(--motion-rise, 14px)) scale(var(--motion-scale, 1));
+    filter: blur(var(--motion-blur, 0px));
   }
+  html[data-js] [data-reveal="in"] {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0px);
+    transition:
+      opacity var(--motion-in, .55s) var(--motion-ease, ease),
+      transform var(--motion-in, .55s) var(--motion-ease, ease),
+      filter var(--motion-in, .55s) var(--motion-ease, ease);
+  }
+
+  /* THE STAGGER — a list that arrives a row at a time.
+
+     The whole point of a stagger is that it is not a second animation. A row
+     travels the same distance on the same curve as the section it is in; the
+     only thing it is given is a place in the queue. So there is one rule here
+     and one custom property, and the queue position is arithmetic rather than a
+     rule per row:
+
+         delay = its index x --motion-stagger
+
+     site.js writes the index. It caps it, because past a dozen the last row of
+     a long fleet would be waiting a second and a half for its turn, and a
+     visitor reading a page does not experience that as choreography.
+
+     A preset with a stagger of 0ms — Subtle, Still — resolves this to a delay
+     of nothing, and every row moves with its section. The rule does not need to
+     know which preset is running. */
+  html[data-js] [data-reveal] [data-reveal-item] {
+    opacity: 0;
+    transform: translateY(calc(var(--motion-rise, 14px) * .6));
+  }
+  html[data-js] [data-reveal="in"] [data-reveal-item] {
+    opacity: 1;
+    transform: translateY(0);
+    transition:
+      opacity var(--motion-in, .55s) var(--motion-ease, ease),
+      transform var(--motion-in, .55s) var(--motion-ease, ease);
+    transition-delay: calc(var(--i, 0) * var(--motion-stagger, 0ms));
+  }
+
+  /* THE HERO, on load. No script, no scroll, no condition — see rule 3 above.
+
+     Five delays because a hero has an eyebrow, a headline, a sentence and a row
+     of buttons, and the fifth is there for the design that adds one more. Past
+     that they all share the last slot rather than queueing forever.
+
+     The fill mode matters: it holds the first frame before the delay elapses, so
+     the headline does not paint at full opacity and then drop to nothing to
+     begin. A preset of Still sets --motion-in to 0s, which finishes the whole
+     animation on the frame it starts — no movement, no flash, nothing to
+     special-case. */
+  @keyframes heroIn {
+    from { opacity: 0; transform: translateY(var(--motion-rise, 14px)); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .hero__in > * {
+    animation: heroIn var(--motion-in, .55s) var(--motion-ease, ease) both;
+  }
+  .hero__in > *:nth-child(1) { animation-delay: 0ms; }
+  .hero__in > *:nth-child(2) { animation-delay: calc(var(--motion-stagger, 0ms) * 1.2); }
+  .hero__in > *:nth-child(3) { animation-delay: calc(var(--motion-stagger, 0ms) * 2.4); }
+  .hero__in > *:nth-child(4) { animation-delay: calc(var(--motion-stagger, 0ms) * 3.6); }
+  .hero__in > *:nth-child(n + 5) { animation-delay: calc(var(--motion-stagger, 0ms) * 4.8); }
+
+  /* THE FIGURE THAT COUNTS UP.
+     site.js marks a number while it is running so a design can do something
+     with it — Concourse dims the amber, Flight Deck holds the bracket lit. The
+     tabular figures are the important half: a number counting up in
+     proportional digits changes width on every frame and shoves the label
+     beside it back and forth. */
+  .figures b[data-counting] { font-variant-numeric: tabular-nums; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1425,28 +1758,67 @@ const SITE_JS = `/* Your site's own script.
    figure and list by the time this runs, every block ships with a true fallback
    in its markup, and the header is a working row of links before a line of this
    executes. Delete the file and the site is plainer and still correct — which
-   is the test each of these five jobs had to pass to be in here:
+   is the test each of these jobs had to pass to be in here:
 
      1. the menu           a panel on a phone, with the keyboard and the
                            scroll lock a menu is wrong without
-     2. the header         a shadow once the page has moved under it
+     2. the header         a shadow once the page has moved under it, and its
+                           measured height, which the menu panel is laid out to
      3. the current page   marked in the nav, worked out from the address
-     4. arrival            sections fade up the first time they are reached
-     5. the lightbox       a gallery picture, opened larger
-     6. the Instagram wall and clearing away a section that came back empty
+     4. arrival            sections rise into place the first time they are
+                           reached, a row at a time
+     5. the figures        counting up to the numbers the feed wrote
+     6. the lightbox       a gallery picture, opened larger
+     7. the Instagram wall and clearing away a section that came back empty
 
-   Jobs 1 to 5 are pure DOM. Only 6 needs the feed. */
+   Jobs 1 to 6 are pure DOM. Only 7 needs the feed. */
 (function () {
   'use strict';
 
   var root = document.documentElement;
   var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+  /* WHERE THE PANEL STOPS BEING A PANEL.
+     Quoted once here and once in style.css, and the two must agree EXACTLY.
+     They used to differ by a sixteenth of a rem, and a window resized into the
+     gap between them kept the page's scroll lock with no menu on screen to
+     explain it — the site simply stopped scrolling until it was reloaded. */
+  var NARROW = '(max-width: 54rem)';
+
   /* This attribute is the contract with style.css: everything that would be
      broken or invisible without JavaScript is written behind html[data-js], so
      a page whose script never loads is never left with a hidden nav or a
      section stuck at opacity 0. */
   root.setAttribute('data-js', '');
+
+  /* -------------------------------------------------------------------------
+     HOW MUCH THIS SITE MOVES.
+
+     Read from the page's own theme.css rather than written into this file,
+     because this file is the same bytes on every site on the platform and the
+     preset is the airline's. --motion is a word ('standard', 'cinematic'); the
+     distances and durations that go with it are the other --motion-* properties
+     and belong to the stylesheet, which is why none of them are read here.
+
+     Two answers switch every moving thing below off: the airline chose Still,
+     or the visitor's own system asked for less movement. The visitor's is the
+     one that cannot be overruled.
+
+     A theme.css written before motion existed has no --motion at all, and that
+     reads as the default rather than as "off" — a site that has not been
+     republished since should go on behaving the way it already did.
+     --------------------------------------------------------------------- */
+  var motion = 'standard';
+  try {
+    var declared = getComputedStyle(root).getPropertyValue('--motion').trim();
+    if (declared) motion = declared;
+  } catch (err) { /* a browser that cannot answer keeps the default */ }
+  if (reduced) motion = 'none';
+  var moves = motion !== 'none';
+  /* The attribute is what style.css hangs the menu's stagger on, and its VALUE
+     is the preset's name — so a design can say "only when this site is set to
+     Cinematic" without this file needing to know that design exists. */
+  if (moves) root.setAttribute('data-motion', motion);
 
   /* -------------------------------------------------------------------------
      1. THE MENU
@@ -1478,14 +1850,44 @@ const SITE_JS = `/* Your site's own script.
         if (open) { scrim.hidden = false; requestAnimationFrame(function () { scrim.setAttribute('data-open', ''); }); }
         else { scrim.removeAttribute('data-open'); setTimeout(function () { if (!open) scrim.hidden = true; }, 220); }
       }
-      // The page must not scroll behind an open panel. Set on <html> rather
-      // than <body> so it holds on iOS as well.
-      if (open) root.setAttribute('data-nav-open', ''); else root.removeAttribute('data-nav-open');
+      /* The page must not scroll behind an open panel. Set on <html> rather
+         than <body> so it holds on iOS as well.
 
-      // Focus follows the panel, and comes back to the button when it shuts —
-      // otherwise a keyboard user closes the menu and their place is gone.
-      if (open) { var first = nav.querySelector('a'); if (first) first.focus(); }
-      else if (document.activeElement && nav.contains(document.activeElement)) burger.focus();
+         The gap is the scrollbar's own width, measured the instant BEFORE the
+         lock removes it — window.innerWidth counts the scrollbar and
+         clientWidth does not, so the difference is exactly what the page is
+         about to gain. Zero on any device with overlay scrollbars, which is
+         every phone, so the compensation costs nothing where it is not needed.
+         See THE PAGE MUST NOT SCROLL in style.css for why this is measured
+         rather than reserved in advance. */
+      if (open) {
+        var gap = window.innerWidth - root.clientWidth;
+        root.style.setProperty('--lock-gap', (gap > 0 ? gap : 0) + 'px');
+        root.setAttribute('data-nav-open', '');
+      } else {
+        root.removeAttribute('data-nav-open');
+        root.style.removeProperty('--lock-gap');
+      }
+
+      if (open) {
+        /* The panel opens at ITS OWN TOP, always. It is a scroll container, and
+           a container keeps its scroll position between openings — so a visitor
+           who scrolled down a long menu, closed it and opened it again used to
+           get it back halfway down with the first links above the fold. */
+        nav.scrollTop = 0;
+        /* Focus follows the panel, so a keyboard user is inside the thing they
+           just opened rather than behind the scrim.
+
+           preventScroll is the important half: focusing an element normally
+           scrolls its nearest scroll container to reveal it, and the first link
+           sits under the panel's top padding — so the browser helpfully scrolled
+           the padding away and the menu appeared to open already cut off at the
+           top. Nothing needs revealing here; the panel is the whole screen. */
+        var first = nav.querySelector('a');
+        if (first) { try { first.focus({ preventScroll: true }); } catch (err) { first.focus(); } }
+      } else if (document.activeElement && nav.contains(document.activeElement)) {
+        try { burger.focus({ preventScroll: true }); } catch (err) { burger.focus(); }
+      }
     }
 
     burger.addEventListener('click', function () { set(!open); });
@@ -1506,11 +1908,29 @@ const SITE_JS = `/* Your site's own script.
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     });
 
+    /* THE PANEL MUST NOT SURVIVE THE LAYOUT THAT HAS NO PANEL.
+
+       Watching the SAME query the stylesheet uses, rather than its inverse
+       written out by hand. The two were once 54rem and 54.0625rem: between them
+       lay a band of window widths that matched neither, where the CSS had
+       already turned the panel back into a row of links and this listener had
+       not yet fired. The scroll lock stayed on, the scrim stayed up, and the
+       page stopped scrolling with nothing on screen to say why.
+
+       Belt and braces: set(false) is called whenever the query stops matching,
+       and the lock is cleared unconditionally in case the panel was opened
+       before this listener existed. */
     if (window.matchMedia) {
-      var wide = window.matchMedia('(min-width: 54.0625rem)');
-      var onWide = function (m) { if (m.matches) set(false); };
-      if (wide.addEventListener) wide.addEventListener('change', onWide);
-      else if (wide.addListener) wide.addListener(onWide);
+      var narrow = window.matchMedia(NARROW);
+      var onChange = function (m) {
+        if (!m.matches) {
+          set(false);
+          root.removeAttribute('data-nav-open');
+          if (scrim) { scrim.removeAttribute('data-open'); scrim.hidden = true; }
+        }
+      };
+      if (narrow.addEventListener) narrow.addEventListener('change', onChange);
+      else if (narrow.addListener) narrow.addListener(onChange);
     }
   })();
 
@@ -1532,6 +1952,35 @@ const SITE_JS = `/* Your site's own script.
     };
     check();
     window.addEventListener('scroll', check, { passive: true });
+
+    /* HOW TALL THE HEADER ACTUALLY IS.
+       The menu panel's top padding is laid out against this. It cannot be a
+       constant in the stylesheet, because the header's height is the airline's:
+       a roundel logo and a short name give one height, a wordmark and "Trans
+       Continental Virtual Airways" wrapping to two lines give another — and the
+       constant used to be right for the first and put the first menu link
+       underneath the wordmark for the second.
+
+       ResizeObserver where it exists, because the height also changes when a
+       long name reflows on rotation, and a resize listener alone misses the
+       case where a web font arrives late and the name gets taller on its own. */
+    var measure = function () {
+      var h = Math.round(bar.getBoundingClientRect().height);
+      if (h > 0) root.style.setProperty('--bar-h', h + 'px');
+    };
+    measure();
+    if (typeof ResizeObserver === 'function') {
+      try { new ResizeObserver(measure).observe(bar); } catch (err) { /* measured once is enough */ }
+    } else {
+      window.addEventListener('resize', measure, { passive: true });
+    }
+    // The logo and the name are the two things that change the header's height
+    // after the fact — one when its image decodes, the other when the feed
+    // writes the airline's real name in.
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(measure).catch(function () {});
+    }
+    window.addEventListener('load', measure);
   })();
 
   /* -------------------------------------------------------------------------
@@ -1569,16 +2018,47 @@ const SITE_JS = `/* Your site's own script.
         Skipped entirely for anybody who asked their system for less movement.
      --------------------------------------------------------------------- */
   (function reveal() {
-    if (reduced || !('IntersectionObserver' in window)) return;
+    if (!moves || !('IntersectionObserver' in window)) return;
+
+    /* WHAT GETS A PLACE IN THE QUEUE.
+
+       A stagger is only worth having over things that read as a SERIES — the
+       aircraft in a fleet, the sectors in a network, the four figures. The
+       heading above them is not one of a series; it is the thing that says what
+       the series is, and delaying it behind its own list reads as the page
+       loading badly rather than as choreography. So this is a list of grids and
+       lists, not "every child of the section".
+
+       .figures > div is in it because the figures ARE the row: four numbers
+       arriving together is a block appearing, four arriving in sequence is an
+       airline counting itself up. */
+    var SERIES = '.cards > li, .tiles > li, .rows > li, .steps > li, .shots > li, .pills > li, .figures > div, .wall > *';
+
+    /* Past this many, a queue stops reading as sequence and starts reading as
+       lag: the twentieth card of a fleet would be waiting two seconds for its
+       turn behind a preset with a hundred-millisecond step. Everything past the
+       cap shares the last slot and arrives together. */
+    var CAP = 12;
+
     var sections = document.querySelectorAll('main > section');
     var fold = window.innerHeight;
     var pending = [];
     Array.prototype.forEach.call(sections, function (el) {
       if (el.getBoundingClientRect().top < fold) return;   // already in view
       el.setAttribute('data-reveal', '');
+      /* The index is written here and the delay is arithmetic in the
+         stylesheet — see THE STAGGER there. Writing the delay itself would put
+         the preset's timing in this file, which is the one thing it must not
+         contain: these bytes are identical on every site on the platform. */
+      var items = el.querySelectorAll(SERIES);
+      Array.prototype.forEach.call(items, function (item, i) {
+        item.setAttribute('data-reveal-item', '');
+        item.style.setProperty('--i', String(Math.min(i, CAP)));
+      });
       pending.push(el);
     });
     if (!pending.length) return;
+
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (en) {
         if (!en.isIntersecting) return;
@@ -1587,10 +2067,168 @@ const SITE_JS = `/* Your site's own script.
       });
     }, { rootMargin: '0px 0px -8% 0px' });
     pending.forEach(function (el) { io.observe(el); });
+
+    /* A LIST THAT ARRIVED LATE.
+
+       crew-feed.js writes the fleet and the network in after this has run, and
+       rows added to a section that was already marked would have no index — so
+       they would all carry --i: 0 and arrive in one lump in the middle of a
+       staggered page. Watching the marked sections for new children costs one
+       observer and keeps the sequence correct however late the feed answers.
+
+       Rows that land in a section which has ALREADY been reached are given the
+       resting state immediately rather than a place in a queue that has been
+       and gone: a row appearing at opacity 0 under a heading somebody is
+       already reading is a row that never appears. */
+    if (typeof MutationObserver !== 'function') return;
+    var mo = new MutationObserver(function (records) {
+      records.forEach(function (rec) {
+        var host = rec.target.closest ? rec.target.closest('[data-reveal]') : null;
+        if (!host) return;
+        var done = host.getAttribute('data-reveal') === 'in';
+        var all = host.querySelectorAll(SERIES);
+        Array.prototype.forEach.call(all, function (item, i) {
+          if (item.hasAttribute('data-reveal-item')) return;
+          item.setAttribute('data-reveal-item', '');
+          item.style.setProperty('--i', String(done ? 0 : Math.min(i, CAP)));
+        });
+      });
+    });
+    pending.forEach(function (el) { mo.observe(el, { childList: true, subtree: true }); });
   })();
 
   /* -------------------------------------------------------------------------
-     5. THE LIGHTBOX
+     5. THE FIGURES, COUNTING UP.
+
+     The one piece of motion here that is about what the number MEANS rather
+     than about where it sits. "1,284 hours flown" landing fully formed is a
+     fact on a page; the same number climbing to itself is an airline that has
+     been flying. It is the reason a stats band is on a VA's site at all, so it
+     is worth the fifty lines.
+
+     THE THREE THINGS THAT MAKE IT SAFE
+
+     1. IT NEVER INVENTS A NUMBER. The value counted to is parsed back out of
+        what crew-feed.js already wrote into the element. If that text is not a
+        plain number — a dash, an em dash, "coming soon", a figure with a unit
+        the feed decided to spell out — nothing happens at all and the text
+        stays exactly as it was found. There is no path here that leaves a wrong
+        figure on an airline's website.
+
+     2. IT WAITS FOR THE FEED RATHER THAN RACING IT. A figure starts as a
+        fallback dash and becomes a number whenever the crew centre answers,
+        which may be before this runs or a second after. So each one is watched:
+        if it is a number now it counts now, and if it becomes one later it
+        counts then. A slow network changes when it happens and not whether.
+
+     3. IT COUNTS ONLY WHAT IS ON SCREEN, ONCE. Off-screen it is pointless, and
+        twice is a glitch.
+
+     Only for presets that asked for it — Still and Subtle get their figures the
+     moment the feed does.
+     --------------------------------------------------------------------- */
+  (function countUp() {
+    if (!moves || !('IntersectionObserver' in window)) return;
+    var wanted = false;
+    try { wanted = getComputedStyle(root).getPropertyValue('--motion-count').trim() === '1'; }
+    catch (err) { return; }
+    if (!wanted) return;
+
+    var cells = document.querySelectorAll('.figures [data-crew-stat]');
+    if (!cells.length) return;
+
+    /* What the element says, as a number — or null, which means leave it alone.
+
+       The separators are kept and reapplied so that a figure the feed wrote as
+       "12,480" counts up as "1,248" and not as "1248" with the comma appearing
+       at the end. Anything with a decimal point, a letter or a sign in it is
+       refused: those are formats this cannot take apart and put back together
+       with confidence, and a figure it is not confident about is a figure it
+       does not touch. */
+    function readable(el) {
+      var text = (el.textContent || '').trim();
+      if (!/^[0-9][0-9,\\u00a0\\u202f ]*$/.test(text)) return null;
+      var digits = text.replace(/[^0-9]/g, '');
+      if (!digits.length || digits.length > 12) return null;
+      var value = parseInt(digits, 10);
+      // Nothing to watch climb, and a flicker where a number should be.
+      if (!isFinite(value) || value < 10) return null;
+      /* The separator THE FEED ITSELF USED, not the browser's idea of one.
+         toLocaleString would count "12,480" up through "1.248" for a visitor in
+         Berlin and then snap to a comma on the final frame. */
+      var sep = (text.match(/[,\\u00a0\\u202f ]/) || [null])[0];
+      return { value: value, sep: sep };
+    }
+
+    /* Thousands, in whatever separator the page is already using. */
+    function group(n, sep) {
+      var s = String(n);
+      if (!sep) return s;
+      var out = '';
+      for (var i = 0; i < s.length; i++) {
+        if (i > 0 && (s.length - i) % 3 === 0) out += sep;
+        out += s.charAt(i);
+      }
+      return out;
+    }
+
+    function run(el) {
+      var found = readable(el);
+      if (!found) return false;
+      var target = found.value;
+      var sep = found.sep;
+      var ms = 900 + Math.min(700, String(target).length * 120);
+      var start = 0;
+      el.setAttribute('data-counting', '');
+
+      function frame(now) {
+        if (!start) start = now;
+        var t = Math.min(1, (now - start) / ms);
+        // Out-cubic. Fast at first and settling onto the value, which is what
+        // makes the last few hundred readable instead of a blur.
+        var eased = 1 - Math.pow(1 - t, 3);
+        var at = Math.round(target * eased);
+        el.textContent = group(at, sep);
+        if (t < 1) { requestAnimationFrame(frame); return; }
+        // Written from the stored target rather than from the last frame, so
+        // the figure that ends up on the page is the feed's own number however
+        // the rounding went on the way there.
+        el.textContent = group(target, sep);
+        el.removeAttribute('data-counting');
+      }
+      requestAnimationFrame(frame);
+      return true;
+    }
+
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (!en.isIntersecting) return;
+        var el = en.target;
+        io.unobserve(el);
+        if (run(el)) return;
+        /* Not a number yet. The crew centre has not answered, or has answered
+           with something this cannot count. Watch the element itself: if a
+           number arrives it counts then, and if one never does the fallback the
+           airline wrote stays on the page untouched, which is the whole
+           contract every block on this site is built on.
+
+           Given up on after twelve seconds so a site whose crew centre is down
+           is not left with an observer per figure for as long as the tab is
+           open. */
+        if (typeof MutationObserver !== 'function') return;
+        var mo = new MutationObserver(function () {
+          if (run(el)) { mo.disconnect(); clearTimeout(giveUp); }
+        });
+        mo.observe(el, { childList: true, characterData: true, subtree: true });
+        var giveUp = setTimeout(function () { mo.disconnect(); }, 12000);
+      });
+    }, { rootMargin: '0px 0px -10% 0px' });
+
+    Array.prototype.forEach.call(cells, function (el) { io.observe(el); });
+  })();
+
+  /* -------------------------------------------------------------------------
+     6. THE LIGHTBOX
 
         A gallery tile that opens its picture larger. The tile is already a
         <button> in the markup — the builder decided that, because a thing you
@@ -1666,7 +2304,7 @@ const SITE_JS = `/* Your site's own script.
   })();
 
   /* -------------------------------------------------------------------------
-     6. THE FEED'S TWO LEFTOVERS
+     7. THE FEED'S TWO LEFTOVERS
 
         crew-feed.js fills in figures and lists by itself. It deliberately does
         NOT remove a list that came back empty, because on most pages an empty
@@ -1797,6 +2435,7 @@ const TEMPLATES = {
         accent: '#14375e',
         pattern: 'none',
         radius: 6,
+        motion: 'standard',
         css: `/* Flightline — editorial. Wide measure, generous air, a rule under every
    heading so the page reads as sections rather than one long column. */
 :root { --measure: 64rem; --gap: clamp(3rem, 7vw, 5.5rem); }
@@ -1837,6 +2476,7 @@ h2 { padding-bottom: .7rem; border-bottom: 2px solid var(--ink); display: inline
         accent: '#f2a03d',
         pattern: 'grid',
         radius: 2,
+        motion: 'subtle',
         css: `/* Concourse — a departure board. Tight leading, mono everywhere, the accent
    used the way a board uses amber: for the live numbers and nothing else. */
 :root { --measure: 68rem; --gap: clamp(2.2rem, 5vw, 3.6rem); --motif-opacity: .5; }
@@ -1885,6 +2525,7 @@ h2 {
         accent: '#1b5fc1',
         pattern: 'none',
         radius: 16,
+        motion: 'standard',
         css: `/* Horizon — air. The design decision here is restraint: one accent, one
    weight of rule, and a great deal of space doing the work a border would. */
 :root { --measure: 70rem; --gap: clamp(4rem, 10vw, 8rem); }
@@ -1932,6 +2573,7 @@ h2 { text-align: center; color: var(--muted); font-weight: 500; }
         accent: '#0e8c5a',
         pattern: 'none',
         radius: 0,
+        motion: 'none',
         css: `/* Terminal — a document, not a brochure. No cards, no shadows, no images.
    A narrow measure and one rule weight, because the only thing on this page is
    what the airline actually says. */
@@ -1990,6 +2632,7 @@ h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .1em; color: 
         accent: '#c05a2e',
         pattern: 'weave',
         radius: 18,
+        motion: 'standard',
         css: `/* Cabin — warm. Everything sits in a card with a soft edge; the point is that
    a small airline looks deliberate rather than sparse. */
 :root { --measure: 60rem; --gap: clamp(2.5rem, 6vw, 4rem); --motif-opacity: .7; }
@@ -2040,6 +2683,7 @@ h1 { font-weight: 700; letter-spacing: -.025em; }
         accent: '#d8102f',
         pattern: 'chevron',
         radius: 0,
+        motion: 'expressive',
         css: `/* Livery — the accent as the design. The hero is a full block of it and the
    figures sit on it, which is only legible because --on-accent is part of the
    theme rather than assumed to be white. */
@@ -2134,6 +2778,7 @@ footer { border-top: 4px solid var(--ink); }
         accent: '#1f5c4a',
         pattern: 'diamond',
         radius: 4,
+        motion: 'subtle',
         css: `/* Heritage — the motif as the structure. Nothing here is a card: the page is
    held together by patterned rules and one deep accent, the way a printed
    timetable from 1974 is. */
@@ -2211,6 +2856,7 @@ footer { border-top: 2px solid var(--accent); }
         accent: '#4da3ff',
         pattern: 'dots',
         radius: 14,
+        motion: 'cinematic',
         css: `/* Skyline — the pictures are the page. Quiet type, near-invisible rules, and
    one accent used sparingly, so that nothing on screen competes with a
    photograph. */
@@ -2241,7 +2887,9 @@ h2 { font-weight: 600; letter-spacing: -.025em; }
    the picture gets a taller well. */
 .cards { grid-template-columns: repeat(auto-fill, minmax(min(19rem, 100%), 1fr)); gap: 1.4rem; }
 .card { background: var(--surface); border-color: var(--line-soft); }
-.card:hover { transform: translateY(-2px); box-shadow: var(--shadow-2); }
+/* A deeper shadow than the base card gets, but the same LIFT — how far a thing
+   moves when it is pointed at belongs to the motion preset, not to the design. */
+.card:hover { box-shadow: var(--shadow-2); }
 .card__media { aspect-ratio: 3 / 2; }
 .tile { background: var(--surface); border-color: var(--line-soft); }
 .wall__tile { border-color: var(--line-soft); }
@@ -2264,6 +2912,470 @@ footer { border-top-color: var(--line-soft); }
 <g fill="#232b38"><rect x="14" y="70" width="34" height="17" rx="2"/><rect x="63" y="70" width="34" height="17" rx="2"/><rect x="112" y="70" width="34" height="17" rx="2"/></g>
 <g fill="#3a4454"><rect x="14" y="91" width="22" height="3" rx="1.5"/><rect x="63" y="91" width="26" height="3" rx="1.5"/><rect x="112" y="91" width="20" height="3" rx="1.5"/></g>
 <g fill="#1d222b"><rect x="10" y="108" width="90" height="3" rx="1.5"/></g>`,
+    },
+
+    /* BOARDING PASS — the page as the document the whole hobby is about.
+     *
+     * Every other design here is a website that belongs to an airline. This one
+     * is an artefact the airline issues: a ticket, with a stub, a perforation
+     * down the side of it, coupon numbers on the sections and a barcode at the
+     * foot. It is the design for a VA whose identity is the flying rather than
+     * the branding — the ones who name their Discord channels after gates.
+     *
+     * The structural idea is the TEAR: main is a card on a tinted ground with a
+     * punched notch on each side and a dashed rule between every section, so
+     * the page reads as one continuous stub rather than as stacked blocks. That
+     * is a different skeleton from anything else in this file, which is the bar
+     * for being here at all rather than a recolour of Terminal.
+     */
+    boardingpass: {
+        name: 'Boarding Pass',
+        blurb: 'The page as a ticket. Perforations, coupon numbers and a barcode at the foot.',
+        tags: ['Light', 'Playful', 'Technical'],
+        font: 'technical',
+        mode: 'light',
+        accent: '#1d4ed8',
+        pattern: 'threshold',
+        radius: 4,
+        motion: 'standard',
+        css: `/* Boarding Pass — an artefact, not a brochure. The page is one stub: a card
+   on a tinted ground, punched at the sides, torn between every section, with
+   the airline's own figures set as the fields on a ticket. */
+:root { --measure: 60rem; --gap: clamp(2.4rem, 6vw, 4rem); --motif-opacity: .35; }
+body { background: var(--surface-2); }
+
+/* THE STUB.
+   main is the ticket. It carries the page's own --bg so the tinted body shows
+   around it as the table the ticket is lying on, and it is the only element on
+   the page with a shadow — everything inside is flat, because a ticket is. */
+main {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-2);
+  margin-block: clamp(1rem, 3vw, 2rem);
+  position: relative;
+  /* ROOM FOR THE NOTCHES.
+     They are punched into the ticket's edge, which means half of each one is
+     OUTSIDE it — so the ticket cannot sit flush against the screen. On a wide
+     window the centring gutter already provides that room; on a phone there is
+     no gutter, and without this the right-hand notch is drawn past the edge of
+     the page. The width is given up rather than a margin set, so the auto
+     margins that centre it on a desktop still do. */
+  width: calc(100% - 1.8rem);
+  margin-inline: auto;
+}
+/* THE PUNCHED NOTCHES, one per side, at the tear. Two circles of the BODY's
+   colour sitting on the ticket's edge — the same trick a real stub uses, and
+   the reason the dashed rule below reads as a perforation rather than as a
+   dashed border somebody liked. */
+main::before, main::after {
+  content: ''; position: absolute; top: clamp(11rem, 26vw, 17rem);
+  width: 1.5rem; height: 1.5rem; border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+main::before { left: -.8rem; border-right-color: transparent; }
+main::after { right: -.8rem; border-left-color: transparent; }
+
+/* NOTHING ESCAPES THE STUB.
+   Two things in the block vocabulary run edge to edge by pulling their margins
+   out to the window — a hero banner, and any section given a photograph behind
+   it. On every other design that is right; here it would put the airline's
+   banner outside the ticket it is printed on, hanging over the table. So on
+   this design alone they stay inside the card and keep its corner. */
+.hero__bg { margin-inline: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
+.bleed { margin-inline: 0; padding-inline: var(--pad); }
+.band { margin-inline: var(--pad); }
+
+/* THE TEAR between sections. Dashed, and in the page's own line colour rather
+   than the accent, because a perforation is an absence and not a decoration. */
+.block, .figures { border-top: 2px dashed var(--line); }
+.hero { border-top: 0; }
+
+/* THE FIELD RULE above every heading — and the reason it is a rule and not the
+   coupon NUMBER this design obviously wants.
+ *
+ * The number was written first, as a CSS counter, on the reasoning that drawing
+ * it beats typing it: reorder the sections in the editor and the sequence looks
+ * after itself. What that missed is that the sections on a page of this site
+ * are not fixed at all. A block marked [data-crew-section] is removed at run
+ * time when the crew centre has nothing to put in it, so a homepage renders
+ * with a different set of sections on a quiet week than on a busy one.
+ *
+ * On the page, that came out as "Coupon 01" followed by "Coupon 04" — the
+ * counter had been computed before two empty sections were taken away and was
+ * not recomputed after. A number that skips is worse than no number: it reads
+ * as a missing section rather than as a design, which is precisely the
+ * complaint a drawn counter exists to prevent.
+ *
+ * It could have been held together — number them from JavaScript after the feed
+ * settles, or stop removing empty sections. Both are a real cost paid so that a
+ * decoration can be right. The ticket is already carried by the stub, the
+ * notches, the perforations, the field-set figures and the barcode; it did not
+ * need a number that can be wrong. So: a short rule in the airline's own
+ * accent, which says the same thing about a ticket and cannot count. */
+.block__head { position: relative; }
+.block__head h2::before {
+  content: ''; display: block;
+  width: 1.6rem; height: 3px; margin-bottom: .7rem;
+  background: var(--accent);
+}
+h1 { font-weight: 700; letter-spacing: -.04em; text-transform: uppercase; }
+h2 { font-size: clamp(1.15rem, 2.4vw, 1.5rem); font-weight: 700; letter-spacing: -.02em; }
+.eyebrow { color: var(--accent); font-weight: 500; }
+
+.bar { border-bottom: 2px dashed var(--line); }
+.bar__nav a { font-family: var(--font-mono); font-size: .76rem; letter-spacing: .1em; text-transform: uppercase; }
+
+/* THE FIELDS.
+   A ticket labels a value ABOVE it in small caps and prints the value large
+   underneath. The markup writes the number first, so the label is reordered
+   rather than moved — the reading order for a screen reader stays "1,284 hours
+   flown" and only the paint order changes. */
+.figures { gap: 1.2rem 2rem; }
+.figures > div { border-bottom: 1px solid var(--line); padding-bottom: .5rem; }
+.figures b { order: 2; font-size: clamp(1.6rem, 4vw, 2.4rem); color: var(--accent); letter-spacing: -.03em; }
+.figures span {
+  order: 1; font-family: var(--font-mono); font-size: .62rem;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--faint);
+}
+
+.rows li, .steps li { border-top: 1px dashed var(--line-soft); padding: .7rem 0; }
+.rows li:last-child, .steps li:last-child { border-bottom: 1px dashed var(--line-soft); }
+.rows li b { font-family: var(--font-mono); letter-spacing: .02em; }
+.tile .code, .pill, .card__body b { font-family: var(--font-mono); }
+.card, .tile { background: none; border-style: dashed; }
+.card__media { background: var(--surface); border-bottom: 1px dashed var(--line); }
+.cta { font-family: var(--font-mono); letter-spacing: .1em; text-transform: uppercase; font-size: .8rem; }
+
+.band { border: 2px dashed var(--on-accent); border-radius: var(--radius); }
+
+/* THE BARCODE. Pure gradient, so it costs no request and cannot 404 — and
+   deliberately not a real one: a scannable code on a virtual airline's website
+   would be a promise of something that is not there. It is the mark at the end
+   of a ticket, which is all it is pretending to be. */
+footer { border-top: 2px dashed var(--line); position: relative; }
+footer::before {
+  content: ''; display: block; height: 2.6rem;
+  max-width: var(--measure); margin: 1.6rem auto -.6rem;
+  background-image: repeating-linear-gradient(90deg,
+    var(--ink) 0 2px, transparent 2px 5px, var(--ink) 5px 6px, transparent 6px 11px,
+    var(--ink) 11px 14px, transparent 14px 16px, var(--ink) 16px 17px, transparent 17px 22px);
+  opacity: .5;
+}
+`,
+        pages: [
+            { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'contact'] },
+        ],
+        thumb: `<rect width="160" height="120" fill="#eef1f6"/>
+<rect x="8" y="6" width="144" height="108" rx="6" fill="#fff" stroke="#d8dee8"/>
+<circle cx="8" cy="52" r="6" fill="#eef1f6" stroke="#d8dee8"/>
+<circle cx="152" cy="52" r="6" fill="#eef1f6" stroke="#d8dee8"/>
+<rect x="18" y="16" width="58" height="8" rx="1" fill="#20242c"/>
+<rect x="18" y="29" width="34" height="3" rx="1" fill="#1d4ed8"/>
+<g stroke="#d8dee8" stroke-width="1.5" stroke-dasharray="4 3"><path d="M8 52 H152"/><path d="M8 84 H152"/></g>
+<g fill="#9aa4b3"><rect x="18" y="59" width="14" height="3"/><rect x="54" y="59" width="14" height="3"/><rect x="90" y="59" width="14" height="3"/><rect x="126" y="59" width="12" height="3"/></g>
+<g fill="#1d4ed8"><rect x="18" y="65" width="20" height="9" rx="1"/><rect x="54" y="65" width="20" height="9" rx="1"/><rect x="90" y="65" width="20" height="9" rx="1"/><rect x="126" y="65" width="16" height="9" rx="1"/></g>
+<g fill="#20242c" opacity=".45"><rect x="18" y="94" width="2" height="14"/><rect x="23" y="94" width="1" height="14"/><rect x="27" y="94" width="3" height="14"/><rect x="33" y="94" width="1" height="14"/><rect x="37" y="94" width="2" height="14"/><rect x="43" y="94" width="3" height="14"/><rect x="49" y="94" width="1" height="14"/><rect x="53" y="94" width="2" height="14"/><rect x="58" y="94" width="1" height="14"/><rect x="62" y="94" width="3" height="14"/><rect x="68" y="94" width="1" height="14"/><rect x="72" y="94" width="2" height="14"/><rect x="77" y="94" width="3" height="14"/><rect x="83" y="94" width="1" height="14"/><rect x="87" y="94" width="2" height="14"/><rect x="92" y="94" width="1" height="14"/><rect x="96" y="94" width="3" height="14"/><rect x="102" y="94" width="1" height="14"/><rect x="106" y="94" width="2" height="14"/><rect x="111" y="94" width="3" height="14"/><rect x="117" y="94" width="1" height="14"/><rect x="121" y="94" width="2" height="14"/><rect x="126" y="94" width="1" height="14"/><rect x="130" y="94" width="3" height="14"/><rect x="136" y="94" width="1" height="14"/><rect x="140" y="94" width="2" height="14"/></g>`,
+    },
+
+    /* FLIGHT DECK — the airline as the instruments rather than as the brochure.
+     *
+     * Dark like Concourse and nothing like it. Concourse is a departure board:
+     * flat rows of amber on black, read from thirty feet away by somebody who
+     * wants a gate number. This is the panel in front of the pilot — every
+     * section is a boxed instrument with corner brackets, the figures sit in
+     * bracketed tape readouts, and the headings are FMA annunciations rather
+     * than words.
+     *
+     * The corner brackets are the reason this is a design and not a palette.
+     * They are eight gradients on a single pseudo-element, so a section becomes
+     * an instrument without a line of extra markup — and they sit on ::after
+     * because ::before on a block already belongs to the motif layer.
+     */
+    flightdeck: {
+        name: 'Flight Deck',
+        blurb: 'A glass cockpit. Bracketed panels, tape readouts and annunciator headings on near-black.',
+        tags: ['Dark', 'Technical', 'Bold'],
+        font: 'technical',
+        mode: 'dark',
+        accent: '#32e0c8',
+        pattern: 'grid',
+        radius: 3,
+        motion: 'subtle',
+        css: `/* Flight Deck — instruments. Every section is a panel with its corners ticked,
+   every heading is an annunciation, and the accent is used the way a PFD uses
+   green: for the live values and for nothing else. */
+:root { --measure: 68rem; --gap: clamp(2.2rem, 5vw, 3.4rem); --motif-opacity: .35; }
+body { font-size: 15px; letter-spacing: .005em; }
+h1 { font-weight: 700; letter-spacing: -.035em; text-transform: uppercase; }
+
+/* THE ANNUNCIATION. A heading on a flight deck is a short word in a lit box,
+   not a sentence — so an h2 here is boxed, tracked out and small, and the
+   sentence that would have been the heading is the line underneath it. */
+h2 {
+  display: inline-block; margin-bottom: 1rem;
+  padding: .3rem .6rem;
+  font-family: var(--font-mono); font-size: .7rem; font-weight: 700;
+  letter-spacing: .2em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-soft);
+  border: 1px solid var(--accent-line); border-radius: var(--radius-sm);
+}
+.block__head p { font-family: var(--font-mono); font-size: .78rem; letter-spacing: .04em; }
+.eyebrow { color: var(--accent); }
+
+.bar { border-bottom: 1px solid var(--line); font-family: var(--font-mono); }
+.bar__nav a { font-family: var(--font-mono); font-size: .74rem; letter-spacing: .12em; text-transform: uppercase; }
+
+/* THE PANEL, AND ITS CORNER BRACKETS.
+
+   Eight gradients on one pseudo-element: a short horizontal and a short
+   vertical at each of the four corners. This is the whole reason the design
+   needs no markup of its own — a section becomes an instrument by having a
+   ::after, and the brackets scale with the box because each one is positioned
+   to a corner rather than offset from an origin.
+
+   ::after, not ::before: [data-motif]::before is the airline's own pattern and
+   the 'values' block carries data-motif. Two decorations on one pseudo-element
+   is one of them not rendering. */
+.block {
+  position: relative;
+  border: 1px solid var(--line);
+  padding: clamp(1.3rem, 3.4vw, 2rem);
+  margin-bottom: 1rem;
+  background: color-mix(in srgb, var(--surface) 60%, transparent);
+}
+.block::after {
+  content: ''; position: absolute; inset: -1px; pointer-events: none;
+  background-image:
+    linear-gradient(var(--accent), var(--accent)), linear-gradient(var(--accent), var(--accent)),
+    linear-gradient(var(--accent), var(--accent)), linear-gradient(var(--accent), var(--accent)),
+    linear-gradient(var(--accent), var(--accent)), linear-gradient(var(--accent), var(--accent)),
+    linear-gradient(var(--accent), var(--accent)), linear-gradient(var(--accent), var(--accent));
+  background-repeat: no-repeat;
+  background-size: 14px 1px, 1px 14px, 14px 1px, 1px 14px, 14px 1px, 1px 14px, 14px 1px, 1px 14px;
+  background-position: 0 0, 0 0, 100% 0, 100% 0, 0 100%, 0 100%, 100% 100%, 100% 100%;
+}
+/* Where color-mix is missing the panel loses its wash and keeps its rule, which
+   is the same instrument with less glass. */
+@supports not (background: color-mix(in srgb, red 50%, transparent)) {
+  .block { background: none; }
+}
+
+/* THE TAPE READOUT. A value on a PFD is bracketed, right up against its own
+   edges, in a box that is obviously a window onto something moving. */
+.figures { gap: .9rem; }
+.figures > div {
+  border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  padding: .7rem .85rem; background: var(--surface);
+}
+.figures b { font-family: var(--font-mono); font-size: clamp(1.5rem, 3.6vw, 2.2rem); color: var(--accent); letter-spacing: -.03em; }
+.figures span { font-family: var(--font-mono); font-size: .64rem; letter-spacing: .16em; text-transform: uppercase; }
+/* A value on its way to itself is the one moving thing on an instrument panel,
+   so it is the one thing allowed to glow. */
+.figures b[data-counting] { text-shadow: 0 0 14px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+.rows li, .steps li { padding: .5rem 0; font-family: var(--font-mono); font-size: .82rem; border-top-color: var(--line-soft); }
+.rows li b { color: var(--accent); }
+.rows span, .steps span { font-family: var(--font-body); }
+.card, .tile { background: var(--surface); border-color: var(--line); }
+.card__body b, .tile .code, .pill { font-family: var(--font-mono); }
+.cta {
+  font-family: var(--font-mono); font-size: .78rem;
+  letter-spacing: .14em; text-transform: uppercase;
+}
+.cta--ghost { border-color: var(--accent-line); color: var(--accent); }
+.band {
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--accent-line); border-top: 2px solid var(--accent);
+}
+/* The apply band gets its heading back.
+   An annunciation is a WORD in a lit box — "WHERE WE FLY" is one, and it is why
+   every other heading on this design is tracked out and boxed. The band's
+   heading is a whole sentence, and a sentence in an annunciator chip stops
+   reading as an instrument and starts reading as a mistake. */
+.band h2 {
+  display: block; padding: 0; background: none; border: 0;
+  font-family: var(--font-display); font-size: clamp(1.3rem, 3vw, 1.9rem);
+  font-weight: 700; letter-spacing: -.03em; text-transform: none;
+  color: inherit;
+}
+.band .cta { background: var(--accent); color: #07110f; }
+footer { border-top: 1px solid var(--line); font-family: var(--font-mono); font-size: .78rem; }
+`,
+        pages: [
+            { path: 'index.html', title: null, blocks: ['hero', 'figures', 'activity', 'network', 'hubs', 'notices', 'events', 'wall', 'cta'] },
+            { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'staff', 'contact'] },
+        ],
+        thumb: `<rect width="160" height="120" fill="#0a0d11"/>
+<rect x="0" y="0" width="160" height="12" fill="#111720"/>
+<g stroke="#1a2430" stroke-width="1"><path d="M0 26 H160 M0 46 H160 M0 66 H160 M0 86 H160 M20 12 V120 M50 12 V120 M80 12 V120 M110 12 V120 M140 12 V120"/></g>
+<rect x="10" y="19" width="62" height="8" rx="1" fill="#e8eef2"/>
+<g fill="#32e0c8"><rect x="10" y="34" width="24" height="5" rx="1"/></g>
+<g fill="#0f1720" stroke="#1e2833"><rect x="10" y="46" width="32" height="22"/><rect x="46" y="46" width="32" height="22"/><rect x="82" y="46" width="32" height="22"/><rect x="118" y="46" width="32" height="22"/></g>
+<g fill="#32e0c8"><rect x="10" y="46" width="2" height="22"/><rect x="46" y="46" width="2" height="22"/><rect x="82" y="46" width="2" height="22"/><rect x="118" y="46" width="2" height="22"/><rect x="16" y="54" width="18" height="7" rx="1"/><rect x="52" y="54" width="18" height="7" rx="1"/><rect x="88" y="54" width="18" height="7" rx="1"/><rect x="124" y="54" width="16" height="7" rx="1"/></g>
+<rect x="10" y="78" width="140" height="34" fill="none" stroke="#1e2833"/>
+<g fill="#32e0c8"><rect x="10" y="78" width="11" height="1"/><rect x="10" y="78" width="1" height="11"/><rect x="139" y="78" width="11" height="1"/><rect x="149" y="78" width="1" height="11"/><rect x="10" y="111" width="11" height="1"/><rect x="10" y="101" width="1" height="11"/><rect x="139" y="111" width="11" height="1"/><rect x="149" y="101" width="1" height="11"/></g>
+<rect x="18" y="85" width="26" height="6" rx="1" fill="#14342f" stroke="#1f5c52"/>
+<g fill="#26313d"><rect x="18" y="97" width="120" height="3"/><rect x="18" y="104" width="92" height="3"/></g>`,
+    },
+
+    /* ATLAS — the airline as its network.
+     *
+     * The structural idea is a ROUTE DOWN THE PAGE: a dotted line running the
+     * whole left margin with a waypoint ring at every heading, so scrolling the
+     * site is flying the sectors in order. No other design here has a spine —
+     * they are all stacks — and a spine changes how the page is read rather
+     * than how it is coloured.
+     *
+     * The accent is chart magenta because that is the colour controlled
+     * airspace is printed in on every VFR sectional in the world. It is the one
+     * accent in this file that means something before anybody picks it.
+     */
+    atlas: {
+        name: 'Atlas',
+        blurb: 'Map-led. A route line down the page with a waypoint at every section, on chart paper.',
+        tags: ['Light', 'Editorial', 'Network'],
+        font: 'grotesk',
+        mode: 'light',
+        accent: '#b4327a',
+        pattern: 'radar',
+        radius: 10,
+        motion: 'standard',
+        css: `/* Atlas — the network as the layout. A dotted track down the left margin, a
+   waypoint ring at every heading, and a great circle behind the headline. */
+:root { --measure: 64rem; --gap: clamp(3rem, 7vw, 5rem); --motif-opacity: .5; }
+h1 { font-weight: 500; letter-spacing: -.04em; }
+h2 { font-weight: 600; letter-spacing: -.025em; }
+.eyebrow { color: var(--accent); }
+
+/* THE GREAT CIRCLE.
+   A route on a chart is an arc, not a line. This is one: a box far wider than
+   the hero, rounded to an ellipse, showing only its top edge — so what crosses
+   behind the headline is a shallow curve rather than a circle somebody drew.
+   Dashed, in the accent's own line colour, and behind everything. */
+/* THE GREAT CIRCLE THAT IS NOT HERE.
+ *
+ * A dashed arc swept behind the headline, because a route on a chart is an arc
+ * and not a line. It was drawn, and it is gone, and both halves are worth
+ * writing down.
+ *
+ * It failed on legibility first. The hero's words fill the left of the section
+ * top to bottom, so an arc crossing the hero crosses the sentence — on the page
+ * it ran straight through "Write the sentence here that says what your airline
+ * is for", and a decoration that strikes through a paragraph is not a
+ * decoration. Lowering it put it through the buttons; raising it put it through
+ * the headline. There was no height at which it was behind the words rather
+ * than across them.
+ *
+ * And it failed on restraint second, which is the more useful lesson: this
+ * design already ships the Radar motif, which is concentric arcs. Two systems
+ * of curved lines in one section is not twice the idea, it is a smudge — the
+ * same reason the base stylesheet takes the motif away from a hero that has a
+ * photograph in it.
+ *
+ * What makes Atlas itself is the track down the page and the waypoint at every
+ * heading. Those are structure. The arc was a third thing in a space that
+ * already had two.
+ */
+
+/* THE TRACK.
+
+   ONE line down the whole page, drawn on main — not a piece of line per
+   section. A track assembled out of per-section segments breaks wherever a
+   section cannot carry one, and .figures is exactly that case: it is a grid, so
+   a pseudo-element on it becomes a grid item and lands in the layout as an
+   empty cell rather than behind it as a line. Drawing it once on the page's
+   container sidesteps the whole question and is the only way the route is
+   continuous from the headline to the footer.
+
+   Only from about 38rem up. On a phone the margin it needs is a quarter of the
+   screen, and a decoration costing a quarter of the reading width on the device
+   most visitors arrive on is not a decoration.
+
+   --track is the one number: the page's left padding grows by it, the line
+   sits at half of it, and the waypoint is centred on the line. Three things
+   that must agree, derived rather than typed out three times. */
+.block__head { position: relative; }
+@media (min-width: 38rem) {
+  :root { --track: 2.4rem; }
+  /* The SECTIONS move over, not main. Padding main itself would have been
+     fewer lines and would have quietly broken every full-bleed section on the
+     page: a bleed reaches the window by measuring 50% of the box it sits in,
+     and moving that box's content edge without telling it leaves the picture
+     hanging off one side. main keeps its own geometry; the route is drawn in
+     the margin the sections give up. */
+  main { position: relative; }
+  .hero, .figures, .block { padding-left: var(--track); }
+  main::after {
+    content: ''; position: absolute; pointer-events: none;
+    left: calc(var(--pad) + var(--track) / 2); top: 0; bottom: 0; width: 1px;
+    background-image: linear-gradient(to bottom, var(--line) 0 4px, transparent 4px 10px);
+    background-size: 1px 10px;
+  }
+  /* THE WAYPOINT. A ring, not a dot: an unfilled circle is how a reporting
+     point is drawn on a chart and a filled one is how a city is — and this is
+     a heading rather than a destination.
+
+     z-index, because both this and the track are positioned descendants of the
+     same box and the track is main's LAST child, so without it the line paints
+     over the ring. The ring's own background is what punches the track open
+     and makes the route read as passing through the waypoint. */
+  .block__head::after {
+    content: ''; position: absolute; z-index: 1; top: .42em;
+    left: calc(var(--track) / -2 - .5rem);
+    width: .75rem; height: .75rem;
+    border: 2px solid var(--accent); border-radius: 50%;
+    background: var(--bg);
+  }
+}
+
+.figures b { color: var(--accent); font-weight: 500; }
+.figures span { font-size: .84rem; letter-spacing: .01em; }
+
+/* A SECTOR LIST IS THE POINT OF THIS DESIGN, so it gets the one flourish: the
+   arrow between two airports is the airline's own accent, and the row lifts a
+   fraction of the page's own colour when it is pointed at. */
+.rows li { border-top-color: var(--line-soft); transition: background-color .15s ease; }
+.rows li b { color: var(--accent); letter-spacing: -.01em; }
+.rows li:hover { background: var(--accent-soft); }
+.steps li { border-top-color: var(--line-soft); }
+
+.card, .tile { border-color: var(--line-soft); box-shadow: var(--shadow-1); }
+.tile .code { letter-spacing: .04em; }
+.pill { border-color: var(--accent-line); }
+.quote p { max-width: 30ch; }
+/* THE ROUTE ENDS AT THE BAND.
+   The track is drawn down the whole of main, and the apply band is the last
+   thing in it — so without this the dotted line carries on over a block of
+   solid accent, which reads as a line drawn on top of the artwork rather than
+   as a route the page follows. Painting the band over it stops the route where
+   the page stops being a journey and starts being an invitation. */
+.band { border-radius: var(--radius-lg); position: relative; z-index: 1; }
+footer { border-top: 1px dashed var(--line); }
+`,
+        pages: [
+            { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'partners', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'quote', 'contact'] },
+        ],
+        thumb: `<rect width="160" height="120" fill="#fdfbfd"/>
+<rect x="0" y="0" width="160" height="13" fill="#fff"/>
+<rect x="0" y="13" width="160" height="1" fill="#ecdfe8"/>
+<path d="M-10 44 Q80 16 170 44" fill="none" stroke="#e7bcd6" stroke-width="1" stroke-dasharray="4 3"/>
+<rect x="12" y="24" width="76" height="9" rx="2" fill="#241d22"/>
+<rect x="12" y="38" width="48" height="4" rx="2" fill="#b4327a"/>
+<g stroke="#e2d6de" stroke-width="1" stroke-dasharray="3 5"><path d="M22 56 V114"/></g>
+<g fill="#fdfbfd" stroke="#b4327a" stroke-width="2"><circle cx="22" cy="60" r="3.5"/><circle cx="22" cy="88" r="3.5"/></g>
+<rect x="34" y="56" width="44" height="7" rx="1" fill="#241d22"/>
+<g fill="#b4327a"><rect x="34" y="69" width="22" height="4" rx="1"/><rect x="34" y="77" width="22" height="4" rx="1"/></g>
+<g fill="#ded2da"><rect x="62" y="69" width="52" height="4" rx="1"/><rect x="62" y="77" width="44" height="4" rx="1"/></g>
+<rect x="34" y="84" width="36" height="7" rx="1" fill="#241d22"/>
+<g fill="#f0e7ed"><rect x="34" y="97" width="34" height="16" rx="3"/><rect x="72" y="97" width="34" height="16" rx="3"/><rect x="110" y="97" width="34" height="16" rx="3"/></g>`,
     },
 };
 
@@ -2355,6 +3467,12 @@ function normaliseTheme(raw, template) {
         // would silently square off every corner on every site that had never
         // been asked. So absence is tested before the number is.
         radius: radiusOf(o.radius, radiusOf(t.radius, 12)),
+        // How much the site moves. Falls back to the design's own answer and
+        // then to Standard, so a site stored before motion existed opens on the
+        // behaviour it already had rather than on silence — Skyline is meant to
+        // be cinematic and Terminal is meant to sit still, and neither of those
+        // is a preference anybody typed.
+        motion: MOTION[o.motion] ? o.motion : (MOTION[t.motion] ? t.motion : DEFAULT_MOTION),
     };
 }
 
@@ -2370,6 +3488,23 @@ function renderPatternCss(pattern) {
     ].join('\n');
 }
 
+/* One motion preset, as the properties every animated rule reads through. */
+function renderMotionCss(motion) {
+    const m = MOTION[motion] || MOTION[DEFAULT_MOTION];
+    const t = m.tokens;
+    return [
+        `  --motion: ${MOTION[motion] ? motion : DEFAULT_MOTION};`,
+        `  --motion-count: ${m.count ? 1 : 0};`,
+        `  --motion-in: ${t.in};`,
+        `  --motion-ease: ${t.ease};`,
+        `  --motion-rise: ${t.rise};`,
+        `  --motion-scale: ${t.scale};`,
+        `  --motion-blur: ${t.blur};`,
+        `  --motion-stagger: ${t.stagger};`,
+        `  --motion-hover: ${t.hover};`,
+    ].join('\n');
+}
+
 function renderThemeCss(theme) {
     /* Defaulted here as well as in normaliseTheme, because this is an EXPORT: a
      * caller with a stored theme from before motifs existed, or a test handing
@@ -2382,7 +3517,8 @@ function renderThemeCss(theme) {
     const mode = MODES[t.mode] ? t.mode : 'auto';
     const pattern = PATTERNS[t.pattern] ? t.pattern : DEFAULT_PATTERN;
     const r = radiusOf(t.radius, 12);
-    theme = { accent: accent, font: FONTS[t.font] ? t.font : TEMPLATES[DEFAULT_TEMPLATE].font, mode: mode, pattern: pattern, radius: r };
+    const motion = MOTION[t.motion] ? t.motion : DEFAULT_MOTION;
+    theme = { accent: accent, font: FONTS[t.font] ? t.font : TEMPLATES[DEFAULT_TEMPLATE].font, mode: mode, pattern: pattern, radius: r, motion: motion };
     const onAccent = onAccentFor(theme.accent);
 
     /* THE TWO PALETTES.
@@ -2440,7 +3576,7 @@ function renderThemeCss(theme) {
    touches.
 
    Accent: ${theme.accent}   Type: ${FONTS[theme.font].label}   Mode: ${MODES[theme.mode].label}
-   Motif: ${PATTERNS[theme.pattern].label}   Corners: ${r}px */
+   Motif: ${PATTERNS[theme.pattern].label}   Corners: ${r}px   Motion: ${MOTION[theme.motion].label} */
 
 @import url('https://fonts.googleapis.com/css2?family=${f.google}&display=swap');
 
@@ -2472,6 +3608,22 @@ function renderThemeCss(theme) {
      it is currentColor and not a colour: the same declaration has to work
      behind dark text on the page and light text on the accent. */
 ${renderPatternCss(theme.pattern)}
+
+  /* HOW MUCH THIS SITE MOVES.
+
+     Every animated rule in style.css reads through these and none of them names
+     a number of its own, so the whole of "how does this site feel" is the eight
+     lines below. See MOTION in vaSiteTemplates.js for why they are one preset
+     rather than eight controls.
+
+     --motion is the preset's NAME and is the only one site.js reads: the
+     distances belong to the stylesheet, and the script's one question is
+     whether anything moves at all. --motion-count is the same question for the
+     figures, which are script rather than stylesheet.
+
+     A visitor whose system asks for less movement overrides all of this. That
+     is enforced in style.css and again in site.js, not here. */
+${renderMotionCss(theme.motion)}
 
   /* Spacing and measure. A template overrides these in style.css. */
   --pad: clamp(1.15rem, 5vw, 3rem);
@@ -2617,7 +3769,7 @@ Almost everything is a variable in \`theme.css\`. Change \`--accent\` and the
 buttons, links and figures all follow. Use the design controls in the Website tab
 and it will be rewritten for you.
 
-Four things live there: the **accent**, the **type**, **light or dark**, and two
+Five things live there: the **accent**, the **type**, **light or dark**, and two
 that are about your airline rather than about taste —
 
 - **\`--radius\`**, one number for how soft the corners are. \`--radius-sm\` and
@@ -2628,6 +3780,38 @@ that are about your airline rather than about taste —
   the one definition works behind dark text on the page and light text on a
   block of your accent. Two airlines both in navy are still nothing alike; this
   is the part of that a colour picker cannot reach.
+
+— and the fifth, **motion**.
+
+## How much the site moves
+
+One choice — Still, Subtle, Standard, Expressive or Cinematic — and it sets the
+whole of \`--motion-*\` in \`theme.css\`. Every animated rule in \`style.css\`
+reads through those and none of them names a duration of its own, so this is the
+only place movement is decided:
+
+| | |
+|---|---|
+| \`--motion-in\` | how long an arrival takes |
+| \`--motion-ease\` | the curve it takes. Expressive's overshoots on purpose |
+| \`--motion-rise\` | how far a section travels to get there |
+| \`--motion-scale\` | what size it starts at. Cinematic starts *larger* — a camera pushing in |
+| \`--motion-blur\` | how soft it starts |
+| \`--motion-stagger\` | the gap between one row of a list and the next |
+| \`--motion-hover\` | how far a card lifts when it is pointed at |
+
+Change one and the site follows. Set \`--motion-stagger\` to \`0ms\` and lists
+arrive all at once; raise \`--motion-rise\` and everything travels further.
+
+Two presets also count the live figures **up** to their values rather than
+printing them. That is \`--motion-count: 1\`, and it only ever counts to the
+number your crew centre actually sent — a figure that has not arrived, or that
+is not a plain number, is left exactly as your markup has it.
+
+**Nothing here overrules the visitor.** Anybody whose device asks for reduced
+motion gets a completely still page whichever preset you picked, and a page with
+its JavaScript blocked is complete and correct before a line of it runs — no
+section on this site is ever hidden by the stylesheet alone.
 
 ## Changing the design
 
@@ -2733,11 +3917,15 @@ function catalogue() {
             mode: TEMPLATES[id].mode,
             pattern: TEMPLATES[id].pattern || DEFAULT_PATTERN,
             radius: TEMPLATES[id].radius,
+            motion: TEMPLATES[id].motion || DEFAULT_MOTION,
             pages: TEMPLATES[id].pages.map(p => p.path),
             thumb: TEMPLATES[id].thumb,
         })),
         fonts: Object.keys(FONTS).map(id => ({ id, label: FONTS[id].label, note: FONTS[id].note })),
         modes: Object.keys(MODES).map(id => ({ id, label: MODES[id].label, note: MODES[id].note || '' })),
+        // In the order they are declared, which is least movement to most —
+        // the picker renders them as a row and that row should read as a dial.
+        motions: Object.keys(MOTION).map(id => ({ id, label: MOTION[id].label, note: MOTION[id].note })),
         // The motif list carries its own CSS so the picker can DRAW each swatch
         // with the real gradients rather than with a screenshot of them. A
         // swatch that is not the pattern it is offering is worse than no
@@ -2750,16 +3938,18 @@ function catalogue() {
         blocks: INSERTABLE,
         default: DEFAULT_TEMPLATE,
         defaultPattern: DEFAULT_PATTERN,
+        defaultMotion: DEFAULT_MOTION,
     };
 }
 
 module.exports = {
-    TEMPLATES, FONTS, MODES, PATTERNS, BLOCKS, INSERTABLE, DEFAULT_TEMPLATE, DEFAULT_PATTERN,
+    TEMPLATES, FONTS, MODES, PATTERNS, MOTION, BLOCKS, INSERTABLE,
+    DEFAULT_TEMPLATE, DEFAULT_PATTERN, DEFAULT_MOTION,
     // The two shared assets a builder site needs as much as a hand-written one:
     // the base stylesheet every design is layered on, and the script that hangs
     // the Instagram wall. Exported so vaSiteBuilder.js emits the same style.css
     // and site.js rather than a second copy that drifts.
     BASE_CSS, SITE_JS,
-    renderTemplate, renderBlock, renderThemeCss, normaliseTheme, catalogue,
+    renderTemplate, renderBlock, renderThemeCss, renderMotionCss, normaliseTheme, catalogue,
     luminance, relativeLuminance, contrast, onAccentFor, hex,
 };

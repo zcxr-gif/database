@@ -139,6 +139,10 @@ const crewLinks = require('./crewLinks');
 // that re-reads the price and tests the balance in the same statement is the
 // only kind that cannot be raced.
 const crewShop = require('./crewShop');
+// Only for the one public fact the sign-in page needs before it has a session:
+// whether this deployment has a Discord application configured at all. Every
+// route in the flow lives in crewAuth.js.
+const crewDiscord = require('./crewDiscord');
 const crewAwards = require('./crewAwards');
 const crewHealth = require('./crewHealth');
 
@@ -425,6 +429,12 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
     // Which login-page look the VA uses (owner-chosen). See the crew.html looks.
     loginLook: { type: String, default: 'center' },
+    // And what is behind the card on it. Separate from the look because the two
+    // are independent — every backdrop works under either layout — so two small
+    // choices give a VA twelve sign-in pages rather than two. 'auto' means "the
+    // banner if there is one, the drawn field if not", which is the right answer
+    // for a VA who never opens this screen. See LOGIN_BACKDROPS in crewAuth.js.
+    loginBackdrop: { type: String, default: 'auto' },
     // How a crew center topic opens: 'sheet' (a slide-over on the dashboard) or
     // 'page' (the topic takes the window and gets its own link). Owner-chosen,
     // and only the crew's default — a device that has picked for itself keeps
@@ -4057,7 +4067,15 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
                 enabled: false,
                 canManage,
                 currency: settings.currency,
-                ...(canManage ? { earn: settings.earn } : {}),
+                ...(canManage ? {
+                    earn: settings.earn,
+                    // Offered here as well as on the shelf, because the screen
+                    // that switches a shop on is the screen where somebody is
+                    // deciding whether to bother — and "here are twelve things
+                    // you could actually sell" is the answer to that, where a
+                    // switch and an empty shelf is not.
+                    suggested: crewShop.suggestedItems(settings),
+                } : {}),
                 items: [],
                 wallet: null,
             });
@@ -4078,8 +4096,19 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
             canManage,
             currency: settings.currency,
             // The rates are staff's business: they are how the VA runs its
-            // economy, not something a pilot needs on the shelf.
-            ...(canManage ? { earn: settings.earn } : {}),
+            // economy, not something a pilot needs on the shelf. So is the
+            // catalogue — it is a back-office tool, and a pilot who could see
+            // it would be reading a list of things the airline does not sell.
+            //
+            // Priced HERE rather than in the browser, though the browser has
+            // the rates and could do the arithmetic. The prices a VA is offered
+            // and the worked example under the rates have to be the same
+            // function, for the same reason earnFor is shared by both doors
+            // into approval: two copies of a rule are two rules eventually.
+            ...(canManage ? {
+                earn: settings.earn,
+                suggested: crewShop.suggestedItems(settings),
+            } : {}),
             items: items.map(crewShop.publicItem),
             wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '' }),
         });
@@ -4101,7 +4130,14 @@ app.post('/api/crew/:slug/shop/settings', async (req, res) => {
         // The server's version of the settings, not the one that was typed — it
         // is the thing that clamps a rate somebody put 1e9 into, and the panel
         // takes this answer over its own form.
-        res.json({ ...settings, canManage: true });
+        //
+        // The catalogue comes back with it because every price in it is worked
+        // out FROM these rates. The panel merges this answer over what it is
+        // holding, so leaving it out would leave a shelf of suggestions priced
+        // in the rate the VA has just stopped using — and the one moment they
+        // are certain to look at those prices is immediately after setting the
+        // rate that decides them.
+        res.json({ ...settings, canManage: true, suggested: crewShop.suggestedItems(settings) });
     } catch (err) { crewFail(res, err, { log: 'shop settings error', message: 'That could not be saved.' }); }
 });
 
@@ -13264,7 +13300,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -13300,6 +13336,15 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
+            loginBackdrop: ad.loginBackdrop || 'auto',
+            // Whether this deployment can offer "Continue with Discord" at all.
+            // Read by the sign-in page BEFORE anybody has a session, which is
+            // the only reason it is out here: a button that leaves for Discord
+            // and comes back saying the deployment is not set up is worse than
+            // no button, because the pilot has already been sent somewhere else
+            // and blamed themselves for it. It says nothing about this VA and
+            // nothing about any pilot — only that the door exists.
+            discordLogin: crewDiscord.configured(),
             // The crew's default for how a topic opens. Public for the same
             // reason the layout is: the crew center reads it before it has a
             // session, and it decides how the page is laid out on first paint.

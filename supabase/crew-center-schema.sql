@@ -229,6 +229,38 @@ create unique index if not exists crew_accounts_username_idx
     on crew_accounts (va_slug, lower(username));
 create index if not exists crew_accounts_member_idx on crew_accounts (va_slug, member_id);
 
+-- v16. Signing in with Discord.
+--
+-- A SECOND KEY TO AN EXISTING DOOR, and nothing more. A pilot signs in with the
+-- password they were given, links Discord from their own account page, and from
+-- then on the button signs them in. Nothing in the crew center creates or claims
+-- an account from a Discord identity: the callback finds a row that is already
+-- linked, or it signs nobody in. A VA's roster is the VA's, and a login button
+-- does not get to add to it.
+--
+-- Added separately, like every column since v2, so a project provisioned at
+-- v3-v15 picks them up on a re-run rather than needing the table dropped. They
+-- are LATE_COLUMNS in crewStore.js as well, which is what lets a VA who has not
+-- re-run the SQL carry on signing in with a password while the Discord button
+-- says it needs the database updating.
+alter table crew_accounts add column if not exists discord_id        text not null default '';
+alter table crew_accounts add column if not exists discord_username  text not null default '';
+alter table crew_accounts add column if not exists discord_avatar    text not null default '';
+alter table crew_accounts add column if not exists discord_linked_at timestamptz;
+
+-- ONE Discord account, ONE login, per crew center.
+--
+-- Partial, on the non-empty values only: every account that has not linked
+-- holds '' in this column, and a plain unique index would make the second
+-- unlinked account in a VA a constraint violation.
+--
+-- Scoped per va_slug rather than globally, because one person genuinely may fly
+-- for two airlines, and their Discord account is the same account in both. What
+-- must not happen is the same Discord identity opening two different pilots'
+-- logins inside ONE airline.
+create unique index if not exists crew_accounts_discord_idx
+    on crew_accounts (va_slug, discord_id) where discord_id <> '';
+
 -- ----------------------------------------------------------------------------
 -- Membership applications submitted through the crew center's join form.
 --
@@ -1980,5 +2012,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 15)
+insert into crew_schema_info (id, version) values (1, 16)
 on conflict (id) do update set version = excluded.version, updated_at = now();

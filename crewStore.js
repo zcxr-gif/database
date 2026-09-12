@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 15;
+const EXPECTED_SCHEMA_VERSION = 16;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -134,6 +134,15 @@ const LEAVE_SCHEMA_VERSION = 15;
 // about a project that has one and not the other.
 const SHOP_SCHEMA_VERSION = 15;
 
+// The version that added the Discord columns to crew_accounts. NOT its own
+// feature constant in the mould of events or the links board, and for the same
+// reason IF_LINK is not: signing in still works perfectly on a v15 project —
+// every pilot has a password, and that is the door Discord is a second key to.
+// What a v15 project cannot do is REMEMBER which Discord account belongs to
+// which login, so the columns sit in LATE_COLUMNS and linking degrades to "your
+// database needs updating first" instead of taking the login with it.
+const DISCORD_SCHEMA_VERSION = 16;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -165,6 +174,7 @@ const LATE_COLUMNS = {
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
     crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
+    crew_accounts: new Set(['discord_id', 'discord_username', 'discord_avatar', 'discord_linked_at']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -186,6 +196,10 @@ const DRIFT_LABELS = {
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
     'crew_routes.min_rank': 'rank-gated routes',
+    'crew_accounts.discord_id': 'signing in with Discord',
+    'crew_accounts.discord_username': 'signing in with Discord',
+    'crew_accounts.discord_avatar': 'signing in with Discord',
+    'crew_accounts.discord_linked_at': 'signing in with Discord',
     'crew_applications.discord_invite': 'Discord invites on acceptances',
     'crew_applications.invite_username': 'saved pilot invitations',
     'crew_applications.invite_password': 'saved pilot invitations',
@@ -356,6 +370,13 @@ const accountFromRow = (r) => r && {
     mustChangePassword: !!r.must_change_password,
     createdVia: r.created_via || '',
     createdByName: r.created_by_name || '',
+    // v16. Empty on a project that has not re-run the SQL, and empty on an
+    // account that has simply never linked — the two are the same thing to
+    // every reader, which is why neither needs telling apart here.
+    discordId: r.discord_id || '',
+    discordUsername: r.discord_username || '',
+    discordAvatar: r.discord_avatar || '',
+    discordLinkedAt: date(r.discord_linked_at),
     lastLoginAt: date(r.last_login_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -373,6 +394,13 @@ const accountToRow = (a) => {
     pick(a, out, 'createdVia', 'created_via', (v) => str(v, 40));
     pick(a, out, 'createdByName', 'created_by_name', (v) => str(v, 80));
     pick(a, out, 'lastLoginAt', 'last_login_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // A Discord id is digits. Bounded here as well as at the edge because this
+    // is the last thing between a value and a unique index somebody else's
+    // login depends on.
+    pick(a, out, 'discordId', 'discord_id', (v) => (/^[0-9]{5,32}$/.test(String(v || '')) ? String(v) : ''));
+    pick(a, out, 'discordUsername', 'discord_username', (v) => str(v, 40));
+    pick(a, out, 'discordAvatar', 'discord_avatar', (v) => str(v, 64));
+    pick(a, out, 'discordLinkedAt', 'discord_linked_at', (v) => (date(v) ? date(v).toISOString() : null));
     return out;
 };
 
@@ -1271,6 +1299,23 @@ class SupabaseStore {
         const u = str(username, 60).toLowerCase();
         if (!u) return Promise.resolve(null);
         return this.accounts(() => this.one('crew_accounts', { ...this.scope, username: `eq.${u}` }, accountFromRow));
+    }
+    /**
+     * The account a Discord identity opens, or null.
+     *
+     * THE ONLY QUESTION THE CALLBACK GETS TO ASK. It cannot create, cannot
+     * claim and cannot fall back to matching on a name — an id that is not
+     * already written against a row signs nobody in.
+     *
+     * The unique index makes this at most one row per crew center. It is still
+     * read through `one()` rather than assumed, because a project that has not
+     * re-run the SQL has no index and no column, and the answer there must be
+     * "nobody" rather than an exception on a login screen.
+     */
+    getAccountByDiscord(discordId) {
+        const id = String(discordId || '');
+        if (!/^[0-9]{5,32}$/.test(id)) return Promise.resolve(null);
+        return this.accounts(() => this.one('crew_accounts', { ...this.scope, discord_id: `eq.${id}` }, accountFromRow));
     }
     getAccountByMember(memberId) {
         if (!memberId) return Promise.resolve(null);
@@ -2916,6 +2961,7 @@ module.exports = {
     PURGE_DATASETS,
     SELECT,
     EXPECTED_SCHEMA_VERSION,
+    DISCORD_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,
     EVENTS_SCHEMA_VERSION,
     SCHEDULES_SCHEMA_VERSION,
