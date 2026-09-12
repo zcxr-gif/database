@@ -1481,14 +1481,34 @@ function registerCrewAuthRoutes(app) {
      * enumerate a roster by trying Discord accounts.
      * =================================================================== */
 
-    /** Where a pilot is sent back to, for a slug. Never from the request. */
-    const crewPageFor = (slug) => {
+    /* WHERE A PILOT IS SENT BACK TO.
+     *
+     * The origin is configuration and the path is this platform's own
+     * /crew/<slug> — neither is ever taken from the request, because a redirect
+     * whose destination a caller can influence is an open redirect with a login
+     * attached to it.
+     *
+     * THE SLUG IS THE CANONICAL ONE, sealed into the state before the pilot
+     * ever left. That is what makes this right for somebody who flies for two
+     * airlines: the crew center they pressed the button in is the crew center
+     * they come back to, and the account that is looked up lives in THAT
+     * airline's own database. A pilot linked at two VAs has two rows in two
+     * projects, and nothing here can cross from one to the other.
+     *
+     * `embed` is the one thing the page gets a say in, and it is a boolean: it
+     * decides whether ?embed=1 rides along so the app's overlay keeps its
+     * chrome. It cannot change where the pilot lands, only how that page dresses
+     * itself. Without it, a pilot who signed in inside the app was answered with
+     * the standalone page in the overlay's frame.
+     */
+    const crewPageFor = (slug, embed) => {
         const base = String(process.env.CREW_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL || '')
             .replace(/\/+$/, '');
-        return `${base}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
+        const path = `${base}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
+        return embed ? `${path}?embed=1&` : `${path}?`;
     };
-    const backToCrew = (res, slug, reason) =>
-        res.redirect(`${crewPageFor(slug)}?discord=${encodeURIComponent(reason)}`);
+    const backToCrew = (res, slug, reason, embed) =>
+        res.redirect(`${crewPageFor(slug, embed)}discord=${encodeURIComponent(reason)}`);
 
     /* --- 1a. Leaving for Discord, to SIGN IN -----------------------------
      *
@@ -1505,7 +1525,9 @@ function registerCrewAuthRoutes(app) {
         if (!va) return backToCrew(res, req.params.slug, 'unknown');
         const slug = va.slug || String(req.params.slug).toLowerCase();
         res.set('Cache-Control', 'no-store');
-        res.redirect(crewDiscord.authorizeUrl(crewDiscord.signState({ slug, intent: 'login', sub: '' })));
+        res.redirect(crewDiscord.authorizeUrl(crewDiscord.signState({
+            slug, intent: 'login', sub: '', embed: String(req.query.embed || '') === '1',
+        }), req));
     });
 
     /* --- 1b. Leaving for Discord, to LINK --------------------------------
@@ -1543,7 +1565,8 @@ function registerCrewAuthRoutes(app) {
         res.json({
             url: crewDiscord.authorizeUrl(crewDiscord.signState({
                 slug: va.slug || slug, intent: 'link', sub: String(p.sub),
-            })),
+                embed: String((req.body && req.body.embed) || '') === '1',
+            }), req),
         });
     });
 
@@ -1556,15 +1579,16 @@ function registerCrewAuthRoutes(app) {
         if (!state) return res.status(400).type('text/plain').send('That sign-in link has expired. Please try again from your crew center.');
 
         const slug = state.slug;
+        const embed = state.embed;
         // The pilot pressed Cancel on the consent screen, which is a decision
         // rather than a fault.
-        if (req.query.error || !req.query.code) return backToCrew(res, slug, 'cancelled');
+        if (req.query.error || !req.query.code) return backToCrew(res, slug, 'cancelled', embed);
 
         try {
             const va = await resolveVa(slug);
-            if (!va) return backToCrew(res, slug, 'unknown');
+            if (!va) return backToCrew(res, slug, 'unknown', embed);
 
-            const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code));
+            const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code, req));
             const store = await crewStore.forVa(va);
 
             /* --- LINKING ---
@@ -1573,7 +1597,7 @@ function registerCrewAuthRoutes(app) {
                back. */
             if (state.intent === 'link') {
                 const account = await store.getAccount(state.sub);
-                if (!account || !account.active) return backToCrew(res, slug, 'link_denied');
+                if (!account || !account.active) return backToCrew(res, slug, 'link_denied', embed);
 
                 // One Discord identity, one login, per crew center. The unique
                 // index is the thing that actually enforces this; the check is
@@ -1581,7 +1605,7 @@ function registerCrewAuthRoutes(app) {
                 // violation.
                 const taken = await store.getAccountByDiscord(profile.id);
                 if (taken && String(taken._id) !== String(account._id)) {
-                    return backToCrew(res, slug, 'link_taken');
+                    return backToCrew(res, slug, 'link_taken', embed);
                 }
 
                 await store.updateAccount(account._id, {
@@ -1590,7 +1614,7 @@ function registerCrewAuthRoutes(app) {
                     discordAvatar: profile.avatar,
                     discordLinkedAt: new Date(),
                 });
-                return backToCrew(res, slug, 'linked');
+                return backToCrew(res, slug, 'linked', embed);
             }
 
             /* --- SIGNING IN ---
@@ -1598,25 +1622,25 @@ function registerCrewAuthRoutes(app) {
                against this Discord id. A miss is a miss — nothing is created,
                nothing is claimed, and no other way of matching is tried. */
             const account = await store.getAccountByDiscord(profile.id);
-            if (!account) return backToCrew(res, slug, 'not_linked');
-            if (!account.active) return backToCrew(res, slug, 'not_linked');
+            if (!account) return backToCrew(res, slug, 'not_linked', embed);
+            if (!account.active) return backToCrew(res, slug, 'not_linked', embed);
 
             claimInvitation(store, account._id);
             const handoff = crewDiscord.signHandoff({ slug, sub: String(account._id) });
             res.set('Cache-Control', 'no-store');
             // The FRAGMENT, so the credential is never in a log, a Referer or a
             // proxy's history. The query beside it is only a hint for the page.
-            return res.redirect(`${crewPageFor(slug)}?discord=ok#discord=${encodeURIComponent(handoff)}`);
+            return res.redirect(`${crewPageFor(slug, embed)}discord=ok#discord=${encodeURIComponent(handoff)}`);
         } catch (err) {
             // Includes the case this feature exists in the shadow of: a VA whose
             // project has not had the v16 SQL run, where the column does not
             // exist. Nothing is broken for them — every pilot still has a
             // password — so they are told, and not with a stack trace.
             if (err && (err.code === 'store_schema_missing' || err.code === 'store_accounts_missing')) {
-                return backToCrew(res, slug, 'needs_update');
+                return backToCrew(res, slug, 'needs_update', embed);
             }
             console.error('Crew Discord callback error:', err && err.message ? err.message : err);
-            return backToCrew(res, slug, 'failed');
+            return backToCrew(res, slug, 'failed', embed);
         }
     });
 
