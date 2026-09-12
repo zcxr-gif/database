@@ -66,6 +66,24 @@ const TOKEN_TTL = '7d';
 // Known layout presets + login looks (mirrors the crew center front-end).
 const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
 const LOGIN_LOOKS = ['center', 'split'];
+
+/* WHAT IS BEHIND THE SIGN-IN CARD.
+ *
+ * Separate from the look, and deliberately so. A look is the LAYOUT — where the
+ * card sits and what is beside it; a backdrop is what fills the space around
+ * it. They are genuinely independent: every backdrop works under either layout,
+ * so two small choices give a VA twelve pages instead of two, and neither can
+ * be combined into something broken.
+ *
+ * `auto` is the default and is the answer for almost everybody: use the
+ * airline's banner where there is one, and the drawn field where there is not.
+ * A VA who has never opened this screen gets the right thing without choosing.
+ *
+ * The four drawn ones need no photograph at all, which matters more than it
+ * sounds: most VAs never upload a banner, and until now their sign-in page was
+ * a grey dot field with a card on it.
+ */
+const LOGIN_BACKDROPS = ['auto', 'banner', 'aurora', 'grid', 'horizon', 'paper'];
 // How a topic opens in the crew center: a slide-over on the dashboard, or a
 // page of its own with its own link. Mirrors CrewTopics.MODES in the tracker.
 const CREW_TOPIC_MODES = ['sheet', 'page'];
@@ -900,7 +918,7 @@ function registerCrewAuthRoutes(app) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'topicMode', 'ranks', 'roles', 'fleet', 'social'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
@@ -978,6 +996,13 @@ function registerCrewAuthRoutes(app) {
                     return res.status(400).json({ error: 'Unknown login look.' });
                 }
                 ad.loginLook = look;
+            }
+            if (typeof req.body?.loginBackdrop === 'string') {
+                const bg = req.body.loginBackdrop.toLowerCase();
+                if (!LOGIN_BACKDROPS.includes(bg)) {
+                    return res.status(400).json({ error: 'Unknown sign-in backdrop.' });
+                }
+                ad.loginBackdrop = bg;
             }
             if (req.body?.ranks !== undefined) {
                 const r = sanitizeRanks(req.body.ranks);
@@ -1079,7 +1104,8 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
-                loginLook: ad.loginLook || 'center', topicMode: ad.crewTopicMode || 'sheet',
+                loginLook: ad.loginLook || 'center', loginBackdrop: ad.loginBackdrop || 'auto',
+                topicMode: ad.crewTopicMode || 'sheet',
                 ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 discordInvite: ad.crewDiscordInvite || '',

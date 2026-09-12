@@ -429,6 +429,12 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
     // Which login-page look the VA uses (owner-chosen). See the crew.html looks.
     loginLook: { type: String, default: 'center' },
+    // And what is behind the card on it. Separate from the look because the two
+    // are independent — every backdrop works under either layout — so two small
+    // choices give a VA twelve sign-in pages rather than two. 'auto' means "the
+    // banner if there is one, the drawn field if not", which is the right answer
+    // for a VA who never opens this screen. See LOGIN_BACKDROPS in crewAuth.js.
+    loginBackdrop: { type: String, default: 'auto' },
     // How a crew center topic opens: 'sheet' (a slide-over on the dashboard) or
     // 'page' (the topic takes the window and gets its own link). Owner-chosen,
     // and only the crew's default — a device that has picked for itself keeps
@@ -13294,7 +13300,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -13330,6 +13336,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
+            loginBackdrop: ad.loginBackdrop || 'auto',
             // Whether this deployment can offer "Continue with Discord" at all.
             // Read by the sign-in page BEFORE anybody has a session, which is
             // the only reason it is out here: a button that leaves for Discord
