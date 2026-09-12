@@ -28,6 +28,9 @@ const vaSites = require('./vaSites');
 
 const crewStore = require('./crewStore');
 const crewAccounts = require('./crewAccounts');
+// Signing in with Discord. The rules and the two calls that touch the network
+// live there; the routes that use them are at the bottom of this file.
+const crewDiscord = require('./crewDiscord');
 const crewInvite = require('./crewInvite');
 // The schedule's rules are normalised by the module that enforces them, so the
 // bounds a VA can save and the bounds the endpoints apply are one definition.
@@ -747,6 +750,40 @@ async function resolveVa(slug) {
     return va;
 }
 
+/**
+ * The body a successful sign-in answers with, however it was signed in.
+ *
+ * Extracted the day Discord became a second door. Both doors establish exactly
+ * the same thing — this person is that account at this VA — and a second copy
+ * of "what a session looks like" is how one of them ends up quietly missing a
+ * capability, or handing out a token with a field the other has. The doors
+ * differ in how they decide WHO; they must not differ in what they hand over.
+ */
+function crewSession(va, identity, username, slugFallback) {
+    const view = viewForRole(identity.role);
+    const token = signCrewToken({
+        sub: identity.sub, kind: identity.kind, role: identity.role, view,
+        slug: va.slug || String(slugFallback || '').toLowerCase(), vaId: String(va._id),
+        name: identity.name, uname: username,
+    });
+    const payload = { kind: identity.kind, role: identity.role, uname: username };
+    const caps = effectiveCaps(va, payload);
+    return {
+        token, view, role: identity.role, oversight: identity.kind === 'inflight', name: identity.name,
+        username,
+        // The password this account was issued was generated for them and
+        // has been seen by whoever handed it over, so the crew center
+        // asks for a new one before it lets them do anything else. Only
+        // a store-backed account can change it here (see
+        // POST /api/crew/:slug/account/password); central accounts are
+        // told to use the portal.
+        mustChangePassword: !!identity.mustChangePassword,
+        canChangePassword: identity.kind === 'crew',
+        caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
+        va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
+    };
+}
+
 function registerCrewAuthRoutes(app) {
     // --- Sign in ---
     app.post('/api/crew/:slug/login', async (req, res) => {
@@ -826,30 +863,8 @@ function registerCrewAuthRoutes(app) {
             // Same response whether the user was missing or the password was wrong.
             if (!identity) return res.status(401).json({ error: 'Invalid username or password.' });
 
-            const view = viewForRole(identity.role);
-            const token = signCrewToken({
-                sub: identity.sub, kind: identity.kind, role: identity.role, view,
-                slug: va.slug || String(req.params.slug).toLowerCase(), vaId: String(va._id),
-                name: identity.name, uname: username,
-            });
-            const payload = { kind: identity.kind, role: identity.role, uname: username };
-            const caps = effectiveCaps(va, payload);
-
             res.set('Cache-Control', 'no-store');
-            res.json({
-                token, view, role: identity.role, oversight: identity.kind === 'inflight', name: identity.name,
-                username,
-                // The password this account was issued was generated for them and
-                // has been seen by whoever handed it over, so the crew center
-                // asks for a new one before it lets them do anything else. Only
-                // a store-backed account can change it here (see
-                // POST /api/crew/:slug/account/password); central accounts are
-                // told to use the portal.
-                mustChangePassword: !!identity.mustChangePassword,
-                canChangePassword: identity.kind === 'crew',
-                caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
-                va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
-            });
+            res.json(crewSession(va, identity, username, req.params.slug));
         } catch (err) {
             console.error('Crew login error:', err);
             res.status(500).json({ error: 'Sign-in failed.' });
@@ -1415,6 +1430,230 @@ function registerCrewAuthRoutes(app) {
     });
 
     // --- Who am I (verify a Bearer token for this crew center) ---
+    /* =====================================================================
+     * SIGNING IN WITH DISCORD
+     *
+     * Four routes, and the shape of the flow is the reason for each of them:
+     *
+     *   GET  /auth/discord            the pilot leaves for Discord
+     *   GET  /auth/discord/callback   Discord sends them back here, to the API
+     *   POST /auth/discord/exchange   the crew center swaps the handoff for a session
+     *   DEL  /account/discord         unlink
+     *
+     * THE THIRD ONE IS WHY THIS IS NOT TWO ROUTES. The callback lands on the
+     * API and the session it establishes belongs to a page on another origin.
+     * The crew center has never used a cookie — that is why its CORS is as
+     * simple as it is — so the session has to cross the redirect, and a bearer
+     * token good for a week has no business being in a URL. What crosses is a
+     * ninety-second handoff that can be spent at exactly one endpoint, and it
+     * crosses in the FRAGMENT, which no server ever sees.
+     *
+     * Every failure below leaves through the same door: back to the crew center
+     * with ?discord=<reason> in the QUERY, where the page can read it and say
+     * something. None of them says which of "no such link", "wrong airline" or
+     * "that account is switched off" happened in a way that would let somebody
+     * enumerate a roster by trying Discord accounts.
+     * =================================================================== */
+
+    /** Where a pilot is sent back to, for a slug. Never from the request. */
+    const crewPageFor = (slug) => {
+        const base = String(process.env.CREW_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL || '')
+            .replace(/\/+$/, '');
+        return `${base}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
+    };
+    const backToCrew = (res, slug, reason) =>
+        res.redirect(`${crewPageFor(slug)}?discord=${encodeURIComponent(reason)}`);
+
+    /* --- 1a. Leaving for Discord, to SIGN IN -----------------------------
+     *
+     * A plain redirect, because there is nothing to authenticate: a login flow
+     * can only ever find an account that is already linked, so starting one
+     * proves nothing and costs nothing. The button on the sign-in page is an
+     * ordinary navigation to here.
+     */
+    app.get('/api/crew/:slug/auth/discord', async (req, res) => {
+        if (!crewDiscord.configured()) {
+            return backToCrew(res, req.params.slug, 'unavailable');
+        }
+        const va = await resolveVa(req.params.slug);
+        if (!va) return backToCrew(res, req.params.slug, 'unknown');
+        const slug = va.slug || String(req.params.slug).toLowerCase();
+        res.set('Cache-Control', 'no-store');
+        res.redirect(crewDiscord.authorizeUrl(crewDiscord.signState({ slug, intent: 'login', sub: '' })));
+    });
+
+    /* --- 1b. Leaving for Discord, to LINK --------------------------------
+     *
+     * Answers with the address rather than redirecting to it, and that is the
+     * whole design of this route.
+     *
+     * A link flow has to know WHICH account is linking, and the only
+     * trustworthy answer is the caller's own session — which lives in an
+     * Authorization header, which a browser cannot attach to a navigation. The
+     * obvious workaround is to let the token ride in the query string instead,
+     * and it is the wrong one: it puts a week-long credential into browser
+     * history, into a Referer and into every log between here and there.
+     *
+     * So the page POSTs (header and all), gets back a URL that carries only a
+     * signed state, and navigates to that. The account id is sealed into the
+     * state here and is never read from anything the browser hands back later,
+     * which is what stops a link round trip being aimed at somebody else.
+     */
+    app.post('/api/crew/:slug/auth/discord/link', async (req, res) => {
+        const slug = String(req.params.slug || '').toLowerCase();
+        const p = verifyCrewRequest(req);
+        // Only a store-backed pilot account has anywhere to keep a link. A VA
+        // staff or Inflight login is a central account, and is told so rather
+        // than handed a button that would fail on the way back.
+        if (!p || p.kind !== 'crew') return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        if (!p.sub) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        if (!crewDiscord.configured()) {
+            return res.status(503).json({ error: 'Signing in with Discord is not switched on here.', code: 'unavailable' });
+        }
+        const va = await resolveVa(slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            url: crewDiscord.authorizeUrl(crewDiscord.signState({
+                slug: va.slug || slug, intent: 'link', sub: String(p.sub),
+            })),
+        });
+    });
+
+    /* --- 2. Coming back from Discord -------------------------------------- */
+    app.get('/api/crew/auth/discord/callback', async (req, res) => {
+        const state = crewDiscord.readState(req.query.state);
+        // Nothing to go back to. A callback with no readable state is either
+        // expired, forged, or somebody opening the URL out of their history,
+        // and in none of those cases do we know which crew center to return to.
+        if (!state) return res.status(400).type('text/plain').send('That sign-in link has expired. Please try again from your crew center.');
+
+        const slug = state.slug;
+        // The pilot pressed Cancel on the consent screen, which is a decision
+        // rather than a fault.
+        if (req.query.error || !req.query.code) return backToCrew(res, slug, 'cancelled');
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return backToCrew(res, slug, 'unknown');
+
+            const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code));
+            const store = await crewStore.forVa(va);
+
+            /* --- LINKING ---
+               The account was decided before the pilot ever left for Discord.
+               All that is established here is which Discord identity came
+               back. */
+            if (state.intent === 'link') {
+                const account = await store.getAccount(state.sub);
+                if (!account || !account.active) return backToCrew(res, slug, 'link_denied');
+
+                // One Discord identity, one login, per crew center. The unique
+                // index is the thing that actually enforces this; the check is
+                // here so the pilot gets a sentence instead of a constraint
+                // violation.
+                const taken = await store.getAccountByDiscord(profile.id);
+                if (taken && String(taken._id) !== String(account._id)) {
+                    return backToCrew(res, slug, 'link_taken');
+                }
+
+                await store.updateAccount(account._id, {
+                    discordId: profile.id,
+                    discordUsername: crewDiscord.displayName(profile),
+                    discordAvatar: profile.avatar,
+                    discordLinkedAt: new Date(),
+                });
+                return backToCrew(res, slug, 'linked');
+            }
+
+            /* --- SIGNING IN ---
+               The one question, asked once: which account is already written
+               against this Discord id. A miss is a miss — nothing is created,
+               nothing is claimed, and no other way of matching is tried. */
+            const account = await store.getAccountByDiscord(profile.id);
+            if (!account) return backToCrew(res, slug, 'not_linked');
+            if (!account.active) return backToCrew(res, slug, 'not_linked');
+
+            claimInvitation(store, account._id);
+            const handoff = crewDiscord.signHandoff({ slug, sub: String(account._id) });
+            res.set('Cache-Control', 'no-store');
+            // The FRAGMENT, so the credential is never in a log, a Referer or a
+            // proxy's history. The query beside it is only a hint for the page.
+            return res.redirect(`${crewPageFor(slug)}?discord=ok#discord=${encodeURIComponent(handoff)}`);
+        } catch (err) {
+            // Includes the case this feature exists in the shadow of: a VA whose
+            // project has not had the v16 SQL run, where the column does not
+            // exist. Nothing is broken for them — every pilot still has a
+            // password — so they are told, and not with a stack trace.
+            if (err && (err.code === 'store_schema_missing' || err.code === 'store_accounts_missing')) {
+                return backToCrew(res, slug, 'needs_update');
+            }
+            console.error('Crew Discord callback error:', err && err.message ? err.message : err);
+            return backToCrew(res, slug, 'failed');
+        }
+    });
+
+    /* --- 3. The handoff, for a session ------------------------------------
+     *
+     * Spending the handoff re-reads the account rather than trusting anything
+     * inside the token beyond the id: the ninety seconds between the callback
+     * and this call are ninety seconds in which staff could have switched the
+     * account off, and the login it produces has to be the one the password
+     * door would have produced at this instant.
+     */
+    app.post('/api/crew/:slug/auth/discord/exchange', async (req, res) => {
+        const d = crewDiscord.readHandoff((req.body && req.body.code) || '');
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (!d || !d.sub || d.slug !== slug) {
+            return res.status(401).json({ error: 'That sign-in has expired. Please try again.' });
+        }
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const store = await crewStore.forVa(va);
+            const account = await store.getAccount(d.sub);
+            if (!account || !account.active) {
+                return res.status(401).json({ error: 'That sign-in has expired. Please try again.' });
+            }
+            res.set('Cache-Control', 'no-store');
+            res.json(crewSession(va, {
+                sub: String(account._id), kind: 'crew', role: account.role || 'pilot',
+                name: account.displayName || account.username,
+                mustChangePassword: !!account.mustChangePassword,
+            }, account.username, slug));
+        } catch (err) {
+            console.error('Crew Discord exchange error:', err && err.message ? err.message : err);
+            res.status(500).json({ error: 'Sign-in failed.' });
+        }
+    });
+
+    /* --- 4. Unlinking -----------------------------------------------------
+     *
+     * Always allowed, and deliberately not gated on having another way in: a
+     * pilot who unlinks still has the password their VA issued, and staff can
+     * reset it. The alternative — refusing until they prove they know it —
+     * makes the safer action the harder one.
+     */
+    app.delete('/api/crew/:slug/account/discord', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (!p || p.kind !== 'crew') return res.status(401).json({ error: 'Not authenticated.' });
+        if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const store = await crewStore.forVa(va);
+            await store.updateAccount(p.sub, {
+                discordId: '', discordUsername: '', discordAvatar: '', discordLinkedAt: null,
+            });
+            res.json({ ok: true, discord: { available: crewDiscord.configured(), linked: false, name: '', avatar: '' } });
+        } catch (err) {
+            console.error('Crew Discord unlink error:', err && err.message ? err.message : err);
+            res.status(500).json({ error: 'That could not be unlinked.' });
+        }
+    });
+
     app.get('/api/crew/:slug/me', async (req, res) => {
         const token = getBearer(req);
         if (!token) return res.status(401).json({ error: 'Not authenticated.' });
@@ -1434,10 +1673,25 @@ function registerCrewAuthRoutes(app) {
         // stale claim in a 7-day token would either nag someone who has already
         // changed it or stop nagging someone who reloaded before doing so.
         let mustChangePassword = false;
+        /* WHAT THE ACCOUNT PAGE DRAWS UNDER "Signing in".
+           `available` is about this deployment (is there a Discord application
+           configured at all); `linked` is about this pilot. They are separate
+           because the answers differ and the sentences differ: one is "we do
+           not offer that", the other is "you have not set it up".
+           Only a store-backed pilot account can hold a link, so a VA staff or
+           Inflight login is told it is unavailable rather than shown a button
+           that would refuse them. */
+        let discord = { available: false, linked: false, name: '', avatar: '' };
         if (p.kind === 'crew' && va) {
+            discord.available = crewDiscord.configured();
             try {
                 const account = await (await crewStore.forVa(va)).getAccount(p.sub);
                 mustChangePassword = !!(account && account.mustChangePassword);
+                if (account && account.discordId) {
+                    discord.linked = true;
+                    discord.name = account.discordUsername || '';
+                    discord.avatar = crewDiscord.avatarUrl({ id: account.discordId, avatar: account.discordAvatar });
+                }
             } catch { /* unreachable store — don't block "who am I" on it */ }
         }
         res.set('Cache-Control', 'no-store');
@@ -1446,6 +1700,7 @@ function registerCrewAuthRoutes(app) {
             username: p.uname || '',
             mustChangePassword,
             canChangePassword: p.kind === 'crew',
+            discord,
             caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
             // Keyed on the capability rather than on being the owner, or a
             // chief of staff would be told they may manage the team and then

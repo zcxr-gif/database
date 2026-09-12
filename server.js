@@ -139,6 +139,10 @@ const crewLinks = require('./crewLinks');
 // that re-reads the price and tests the balance in the same statement is the
 // only kind that cannot be raced.
 const crewShop = require('./crewShop');
+// Only for the one public fact the sign-in page needs before it has a session:
+// whether this deployment has a Discord application configured at all. Every
+// route in the flow lives in crewAuth.js.
+const crewDiscord = require('./crewDiscord');
 const crewAwards = require('./crewAwards');
 const crewHealth = require('./crewHealth');
 
@@ -13326,6 +13330,14 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
+            // Whether this deployment can offer "Continue with Discord" at all.
+            // Read by the sign-in page BEFORE anybody has a session, which is
+            // the only reason it is out here: a button that leaves for Discord
+            // and comes back saying the deployment is not set up is worse than
+            // no button, because the pilot has already been sent somewhere else
+            // and blamed themselves for it. It says nothing about this VA and
+            // nothing about any pilot — only that the door exists.
+            discordLogin: crewDiscord.configured(),
             // The crew's default for how a topic opens. Public for the same
             // reason the layout is: the crew center reads it before it has a
             // session, and it decides how the page is laid out on first paint.

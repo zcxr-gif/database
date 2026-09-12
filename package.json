@@ -10,7 +10,8 @@
     "test:sites": "node scripts/test-va-site-builder.js && node scripts/test-session-cookies.js",
     "test:sites:browser": "node scripts/test-va-site-motion.js",
     "test:schema": "node scripts/test-schema-typekey.js",
-    "test:crew": "node scripts/test-crew-shop-awards.js"
+    "test:crew": "node scripts/test-crew-shop-awards.js",
+    "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js"
   },
   "keywords": [],
   "author": "Antony",
