@@ -209,6 +209,8 @@ is "a browser key cannot inflate the open counter" \
    "$(saidno "select crew_link_open('amv', (select id from crew_links limit 1))")" "yes"
 is "a pilot's inbox is refused at the door" "$(saidno 'select 1 from crew_notifications')" "yes"
 is "pilot logins are refused at the door" "$(saidno 'select 1 from crew_accounts')" "yes"
+is "check-ride requests are refused at the door" \
+   "$(saidno 'select 1 from crew_training_requests')" "yes"
 is "so are applications (emails, invites)" "$(saidno 'select 1 from crew_applications')" "yes"
 is "anon cannot write, even to a public table" \
    "$(saidno "insert into crew_members (va_slug,name) values ('amv','Intruder')")" "yes"

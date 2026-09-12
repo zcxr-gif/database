@@ -1042,6 +1042,56 @@ as $$
 $$;
 
 -- ----------------------------------------------------------------------------
+-- v14. Check-rides: the queue between "I think I'm ready" and a rank that moves.
+--
+-- The ladder already knew which rungs need a check-ride, and crew_members.
+-- checks_passed already held the sign-offs. What had no place to live was the
+-- MIDDLE of that process: a pilot asking, staff agreeing a time, and the result
+-- being written down. That happened in Discord, where a request scrolls away and
+-- the sign-off gets forgotten -- which is the exact failure the sign-off column
+-- was built to fix and could not, because nothing ever reached it.
+--
+-- One row per request, and the row IS the record: it outlives the check-ride, so
+-- "why am I still a First Officer?" has an answer with a date on it.
+--
+-- `for_rank` is a rung's NAME, like every other rank reference in this schema
+-- (crew_routes.min_rank, crew_documents.min_rank). A VA reordering their ladder
+-- must not silently repoint a pilot's pending check-ride at a different rank.
+--
+-- `scheduled_at` is a real timestamp and `scheduled_text` is what the examiner
+-- actually typed. Both, because staff write times the way people do -- "Saturday
+-- 19:00Z, KJFK -> EGLL" -- and half of that is an instant a calendar understands
+-- while the other half is the part the pilot needs. Parsing it and keeping only
+-- the instant loses the route; keeping only the words loses the ordering.
+--
+-- Hours and flights are deliberately NOT snapshotted here. Staff judge a
+-- check-ride against what a pilot has NOW, and a figure frozen at the moment
+-- they asked is worse than no figure -- the same reasoning that keeps rank
+-- itself derived rather than stored (see crewRanks.js).
+-- ----------------------------------------------------------------------------
+create table if not exists crew_training_requests (
+    id             uuid primary key default gen_random_uuid(),
+    va_slug        text not null,
+    member_id      uuid,
+    for_rank       text not null default '',
+    status         text not null default 'requested'
+                   check (status in ('requested','scheduled','passed','failed','withdrawn')),
+    scheduled_at   timestamptz,
+    scheduled_text text not null default '',
+    examiner_name  text not null default '',
+    notes          text not null default '',
+    decided_at     timestamptz,
+    created_at     timestamptz not null default now(),
+    updated_at     timestamptz not null default now()
+);
+-- The queue as staff work it: what is open, oldest ask first.
+create index if not exists crew_training_va_idx
+    on crew_training_requests (va_slug, status, created_at);
+-- And one pilot's own history, which is the other way it is read.
+create index if not exists crew_training_member_idx
+    on crew_training_requests (va_slug, member_id, created_at desc);
+
+-- ----------------------------------------------------------------------------
 -- updated_at maintenance
 -- ----------------------------------------------------------------------------
 create or replace function crew_touch_updated_at() returns trigger
@@ -1055,7 +1105,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -1262,7 +1312,7 @@ declare
     crew_tables text[] := array[
         'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
         'crew_events','crew_event_signups','crew_announcements','crew_schedules',
-        'crew_bookings','crew_documents','crew_notifications','crew_links','crew_schema_info'];
+        'crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_schema_info'];
     t              text;
     rel            regclass;
     tbl_bytes      bigint;
@@ -1364,6 +1414,7 @@ alter table crew_bookings      enable row level security;
 alter table crew_documents     enable row level security;
 alter table crew_notifications enable row level security;
 alter table crew_links         enable row level security;
+alter table crew_training_requests enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -1486,6 +1537,13 @@ revoke all on crew_accounts     from anon, authenticated;
 -- policy: one shared browser credential cannot express "only mine".
 revoke all on crew_notifications from anon, authenticated;
 
+-- v14. Check-ride requests, kept from the browser key for the same reason. A row
+-- names one pilot and carries what an examiner wrote about their flying; there
+-- is no filter a single shared credential could be scoped by, so the table gets
+-- no policy above and no grant here. Every read goes through the backend against
+-- a signed-in session that knows whose request it is.
+revoke all on crew_training_requests from anon, authenticated;
+
 -- v12. crew_link_open increments a counter and is reached only through the
 -- backend's service key, after IT has decided the caller may see the link. A
 -- browser key that could call this could inflate any VA's figures at will, and
@@ -1519,5 +1577,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 13)
+insert into crew_schema_info (id, version) values (1, 14)
 on conflict (id) do update set version = excluded.version, updated_at = now();

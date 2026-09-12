@@ -444,7 +444,18 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // Crew structure the VA defines (all optional): a rank ladder + roles, each
     // carrying a badge (colour + icon). These are the DEFINITIONS; per-pilot
     // assignments live in the VA's own Supabase.
-    ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
+    // `requiresCheck` / `checkNote` / `minFlights` MUST be declared here, not just
+    // produced by crewAuth.sanitizeRanks: mongoose drops undeclared paths inside a
+    // subdocument array on save, so a ladder saved with a check-ride rung came back
+    // without one and crewRanks read `requiresCheck: undefined` on every rung. The
+    // whole check-ride ladder was inert for that reason alone.
+    ranks: {
+        type: [{
+            _id: false, name: String, minHours: Number, color: String, icon: String, image: String,
+            requiresCheck: Boolean, checkNote: String, minFlights: Number,
+        }],
+        default: [],
+    },
     roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
     // Owner-defined STAFF roles (permissions) + which staff account (by login
     // username) holds each. Distinct from the display `roles` above: these gate
@@ -3226,6 +3237,48 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
 });
 
 /**
+ * Write a check-ride result onto a pilot, and let it promote them.
+ *
+ * Extracted because there are now two doors into the same act — a staff member
+ * signing someone off from the roster, and an examiner recording the result of a
+ * check-ride the training queue scheduled — and they must not be able to drift
+ * apart in what they do to a pilot's rank or in what the crew is told about it.
+ * The sign-off IS the promotion; that is the whole point of the column.
+ *
+ * `pass: false` takes a sign-off back. It announces nothing, like every other
+ * downward move in this codebase.
+ */
+async function recordCheckride(va, store, member, rung, { pass = true, by = '' } = {}) {
+    const before = Array.isArray(member.checksPassed) ? member.checksPassed : [];
+    const after = pass
+        ? [...new Set([...before, rung.name])]
+        : before.filter((c) => String(c).toLowerCase() !== rung.name.toLowerCase());
+
+    const saved = await store.updateMember(member._id, { checksPassed: after });
+    const promotion = crewRanks.promotionForCheck(va.ranks, saved.hours, before, after);
+    if (promotion) {
+        postPromotionNotice(va, saved, promotion, { by, viaCheck: true });
+        postAnnouncement(va, {
+            kind: 'promotion',
+            title: `${saved.name || 'A pilot'} is now ${promotion.to.name}`,
+            body: `Signed off after their ${rung.name} check-ride.`,
+            refId: saved._id,
+        });
+        // And tell the pilot. The board announces it to the crew; this is the
+        // one addressed to the person it happened to, which is the half that
+        // used to go unsaid unless a staff member remembered to DM them.
+        notifyPilot(va, saved, {
+            kind: 'promotion',
+            title: `You’re now ${promotion.to.name}`,
+            body: `Signed off after your ${rung.name} check-ride.`,
+            refId: saved._id,
+            senderName: by,
+        });
+    }
+    return { saved, promotion };
+}
+
+/**
  * Sign a pilot off for a rung — or take the sign-off back.
  *
  * A VA can mark any rung of their ladder "requires a check-ride", and hours
@@ -3258,34 +3311,364 @@ app.post('/api/crew/:slug/roster/:id/checkride', async (req, res) => {
         if (!rung) return res.status(400).json({ error: `${wanted} isn’t a rank on your ladder.` });
 
         const pass = (req.body || {}).pass !== false;
-        const before = Array.isArray(member.checksPassed) ? member.checksPassed : [];
-        const after = pass
-            ? [...new Set([...before, rung.name])]
-            : before.filter((c) => String(c).toLowerCase() !== rung.name.toLowerCase());
-
-        const saved = await store.updateMember(member._id, { checksPassed: after });
-        const promotion = crewRanks.promotionForCheck(va.ranks, saved.hours, before, after);
-        if (promotion) {
-            postPromotionNotice(va, saved, promotion, { by: (gate.p && gate.p.name) || '', viaCheck: true });
-            postAnnouncement(va, {
-                kind: 'promotion',
-                title: `${saved.name || 'A pilot'} is now ${promotion.to.name}`,
-                body: `Signed off after their ${rung.name} check-ride.`,
-                refId: saved._id,
-            });
-            // And tell the pilot. The board announces it to the crew; this is the
-            // one addressed to the person it happened to, which is the half that
-            // used to go unsaid unless a staff member remembered to DM them.
-            notifyPilot(va, saved, {
-                kind: 'promotion',
-                title: `You’re now ${promotion.to.name}`,
-                body: `Signed off after your ${rung.name} check-ride.`,
-                refId: saved._id,
-                senderName: (gate.p && gate.p.name) || '',
-            });
-        }
+        const { saved, promotion } = await recordCheckride(va, store, member, rung,
+            { pass, by: (gate.p && gate.p.name) || '' });
         res.json(withDrift(store, { member: publicMember(saved, va.ranks), promoted: !!promotion }));
     } catch (err) { crewFail(res, err, { log: 'checkride error', message: 'Could not record the check-ride.' }); }
+});
+
+/* ===========================================================================
+ * CHECK-RIDES (v14)
+ *
+ * The ladder could already gate a rung on a check-ride, and a staff member could
+ * already sign a pilot off for one. What sat between those two facts was a
+ * process nobody had written down: a pilot asking whether they are ready, staff
+ * agreeing a time, an examiner flying with them, and somebody remembering to
+ * record the result. That ran in Discord, where the ask scrolls away and the
+ * sign-off is the step that gets forgotten — which is why the sign-off column
+ * existed for six versions with almost nothing in it.
+ *
+ * These four routes are that process as rows. The important one is the last
+ * step: recording a pass goes through recordCheckride, the SAME function the
+ * roster's own sign-off button calls, so "passed" and "promoted" cannot come
+ * apart.
+ *
+ * WHO MAY DO WHAT. Asking and withdrawing belong to the pilot, on their own row.
+ * Scheduling, passing and failing are `roster.manage` — the capability that can
+ * already sign somebody off, because this is the same act reached another way.
+ * Editing what a rung ASKS FOR is the same capability rather than
+ * settings.branding: a flights figure and a check-ride note are roster policy,
+ * not appearance, and the person running training should not need the key to the
+ * airline's colours to write one down.
+ * ======================================================================== */
+
+// The ladder as this panel reads it. `checkride` is emitted as an explicit
+// boolean rather than left off: the setup screen's checkbox reads `!== false`,
+// so an absent field would draw every rung as needing a check-ride and a VA
+// would save that back.
+const trainingLadder = (va) => crewRanks.normalizeLadder(va && va.ranks).map((r) => ({
+    name: r.name,
+    minHours: r.minHours,
+    minFlights: r.minFlights || 0,
+    checkride: !!r.requiresCheck,
+    note: r.checkNote || '',
+}));
+
+/**
+ * How many flights each pilot has actually filed.
+ *
+ * One query for the whole airline rather than one per pilot: the queue puts the
+ * figure on every row, and a twenty-deep queue asking separately would be twenty
+ * round trips to the VA's project for a number in small print. Only approved
+ * reports count — a pending one is not a flight yet, and a rejected one never
+ * was.
+ *
+ * Best-effort: a project that cannot answer gives an empty tally and the screen
+ * shows hours alone, which is what almost every ladder gates on anyway.
+ */
+async function trainingFlightCounts(store) {
+    const out = new Map();
+    const pireps = await store.listPireps({ status: 'approved', limit: 5000 }).catch(() => []);
+    for (const p of pireps) {
+        const id = String(p.memberId || '');
+        if (id) out.set(id, (out.get(id) || 0) + 1);
+    }
+    return out;
+}
+
+// A request, as the panel draws it. The pilot's CURRENT hours and flights rather
+// than a snapshot from when they asked — staff decide against what somebody has
+// now, and a stale figure in a queue is worse than no figure at all.
+const publicTrainingRequest = (r, byId, flights, myId) => {
+    const m = byId.get(String(r.memberId || '')) || null;
+    return {
+        id: r._id,
+        mine: !!myId && String(r.memberId || '') === String(myId),
+        status: r.status,
+        forRank: r.forRank,
+        pilotName: m ? m.name : '',
+        callsign: m ? m.callsign : '',
+        hours: m ? m.hours : null,
+        flights: m ? (flights.get(String(m._id)) || 0) : null,
+        scheduledAt: r.scheduledAt,
+        // What the examiner actually typed. The panel prefers this to the parsed
+        // instant, because "Saturday 19:00Z, KJFK → EGLL" says the half a date
+        // formatter throws away.
+        scheduledText: r.scheduledText,
+        examinerName: r.examinerName,
+        notes: r.notes,
+        createdAt: r.createdAt,
+        decidedAt: r.decidedAt,
+    };
+};
+
+// ---- The ladder, where a pilot stands on it, and the queue ----
+app.get('/api/crew/:slug/training', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        // Neither a pilot nor staff: there is nothing here for the public. The
+        // ladder itself is on the crew center already; this screen is about one
+        // named person's progress along it.
+        if (!canManage && !myId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to see where you stand.',
+                code: 'not_authenticated',
+            });
+        }
+
+        const ladder = trainingLadder(va);
+        // Staff work the whole queue; a pilot sees their own asks and nobody
+        // else's — filtered in the query, so the rest never leave Postgres.
+        const requests = await store.listTrainingRequests(canManage ? {} : { memberId: myId });
+        const members = await store.listMembers().catch(() => []);
+        const byId = new Map(members.map((m) => [String(m._id), m]));
+
+        // Skipped when nothing on screen needs it: most ladders gate on hours
+        // alone and an empty queue asks nobody's flight count.
+        const needFlights = ladder.some((r) => r.minFlights > 0) || requests.length > 0;
+        const flights = needFlights ? await trainingFlightCounts(store) : new Map();
+
+        const me = myId ? byId.get(myId) || null : null;
+        const held = myId ? crewRanks.rankForHours(va.ranks, me ? me.hours : 0, me && me.checksPassed) : null;
+
+        res.json(withDrift(store, {
+            ranks: ladder,
+            canManage,
+            me: myId ? {
+                rank: held ? held.name : '',
+                hours: me ? me.hours : 0,
+                flights: flights.get(myId) || 0,
+            } : null,
+            requests: requests.map((r) => publicTrainingRequest(r, byId, flights, myId)),
+        }));
+    } catch (err) { crewFail(res, err, { log: 'training read error', message: 'Could not read the ladder.' }); }
+});
+
+// ---- A pilot asks ----
+app.post('/api/crew/:slug/training/requests', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewViewer(req, store);
+        if (!viewer || !viewer.memberId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to ask for a check-ride.',
+                code: 'not_authenticated',
+            });
+        }
+        const wanted = String((req.body || {}).forRank || '').trim().slice(0, 40);
+        const ladder = crewRanks.normalizeLadder(va.ranks);
+        const rung = ladder.find((r) => r.name.toLowerCase() === wanted.toLowerCase());
+        if (!rung) {
+            return res.status(400).json({ error: `${wanted || 'That rank'} isn’t a rank on your airline’s ladder.` });
+        }
+        if (!rung.requiresCheck) {
+            return res.status(400).json({
+                error: `${rung.name} is awarded on hours — there is no check-ride to ask for.`,
+                code: 'no_checkride',
+            });
+        }
+        const member = await store.getMember(viewer.memberId);
+        const already = (member && Array.isArray(member.checksPassed) ? member.checksPassed : [])
+            .some((c) => String(c).toLowerCase() === rung.name.toLowerCase());
+        if (already) {
+            return res.status(409).json({ error: `You have already been signed off for ${rung.name}.`, code: 'already_passed' });
+        }
+
+        // One outstanding ask at a time. A status rather than a unique index,
+        // because a pilot who withdraws — or who is told "not yet" — must be able
+        // to ask again, and a constraint on (member, rank) would stop them.
+        const mine = await store.listTrainingRequests({ memberId: viewer.memberId });
+        if (mine.some((r) => r.status === 'requested' || r.status === 'scheduled')) {
+            return res.status(409).json({
+                error: 'You already have a check-ride outstanding. Withdraw it first if you meant to ask for a different rank.',
+                code: 'already_requested',
+            });
+        }
+
+        const saved = await store.createTrainingRequest({
+            memberId: viewer.memberId, forRank: rung.name, status: 'requested',
+        });
+        res.status(201).json(withDrift(store, {
+            request: { id: saved._id, status: saved.status, forRank: saved.forRank },
+        }));
+    } catch (err) { crewFail(res, err, { log: 'training request error', message: 'Could not send that request.' }); }
+});
+
+// ---- Withdrawing, scheduling, and recording the result ----
+app.patch('/api/crew/:slug/training/requests/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const gate = await requireCap(req, req.params.slug, 'roster.manage');
+        const canManage = !gate.error;
+        const by = (gate.p && gate.p.name) || '';
+        const action = String((req.body || {}).action || '').trim();
+        const existing = await store.getTrainingRequest(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'That check-ride request no longer exists.' });
+
+        const open = existing.status === 'requested' || existing.status === 'scheduled';
+        const decided = { error: 'That check-ride has already been decided.', code: 'already_decided' };
+
+        // Withdrawing is the pilot's own move on their own row. Staff may also do
+        // it — somebody has to be able to clear a queue a pilot left behind.
+        if (action === 'withdraw') {
+            const viewer = await crewViewer(req, store);
+            const mine = viewer && viewer.memberId
+                && String(existing.memberId || '') === String(viewer.memberId);
+            if (!mine && !canManage) return res.status(403).json({ error: 'Not allowed.' });
+            if (!open) return res.status(409).json(decided);
+            const saved = await store.updateTrainingRequest(existing._id, {
+                status: 'withdrawn', decidedAt: new Date(),
+            });
+            return res.json(withDrift(store, { request: { id: saved._id, status: saved.status } }));
+        }
+
+        if (!canManage) {
+            return res.status(gate.error === 401 ? 401 : 403)
+                .json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+        }
+
+        const member = existing.memberId ? await store.getMember(existing.memberId).catch(() => null) : null;
+
+        if (action === 'schedule') {
+            if (!open) return res.status(409).json(decided);
+            const words = String((req.body || {}).at || '').trim().slice(0, 160);
+            if (!words) return res.status(400).json({ error: 'Say when the check-ride is.' });
+            // Both readings are kept. Staff write times the way people do, and
+            // only the front of "Saturday 19:00Z, KJFK → EGLL" is an instant —
+            // parsing it and keeping only that throws away the route the pilot
+            // needs, while keeping only the words leaves nothing to order by.
+            const parsed = new Date(words);
+            const saved = await store.updateTrainingRequest(existing._id, {
+                status: 'scheduled',
+                scheduledAt: Number.isNaN(parsed.getTime()) ? null : parsed,
+                scheduledText: words,
+                examinerName: by,
+            });
+            if (member) {
+                notifyPilot(va, member, {
+                    kind: 'system',
+                    title: `Your ${existing.forRank} check-ride is booked`,
+                    body: words,
+                    refId: saved._id,
+                    senderName: by,
+                });
+            }
+            return res.json(withDrift(store, { request: { id: saved._id, status: saved.status } }));
+        }
+
+        if (action === 'pass' || action === 'fail') {
+            if (existing.status === 'passed' || existing.status === 'failed') {
+                return res.status(409).json(decided);
+            }
+            if (!member) return res.status(404).json({ error: 'That pilot is no longer on the roster.' });
+            const notes = String((req.body || {}).notes || '').trim().slice(0, 300);
+
+            const ladder = crewRanks.normalizeLadder(va.ranks);
+            const rung = ladder.find((r) =>
+                r.name.toLowerCase() === String(existing.forRank || '').toLowerCase());
+            // The rung was renamed or removed while the request was open. A pass
+            // is still worth recording — it happened — but there is nothing to
+            // sign off, and writing the old name into checks_passed would leave a
+            // sign-off sitting in the column forever doing nothing.
+            if (action === 'pass' && !rung) {
+                return res.status(409).json({
+                    error: `${existing.forRank || 'That rank'} isn’t on your ladder any more, so there is nothing to sign off. Put the rung back, or decline this request.`,
+                    code: 'rank_gone',
+                });
+            }
+
+            // The sign-off is written FIRST, and the request is marked decided
+            // only once it has landed. The other order can leave a row saying
+            // "passed" over a pilot who was never signed off — a lie the screen
+            // has no way to notice. This way a failure part-way through leaves
+            // the request open, staff press Passed again, and recordCheckride
+            // is idempotent (the sign-off is a set union), so the retry costs
+            // nothing but a second announcement being skipped.
+            let promoted = false;
+            if (action === 'pass') {
+                // The same function the roster's own sign-off button calls. The
+                // pass IS the promotion, and routing both through one path is
+                // what stops them drifting apart.
+                const out = await recordCheckride(va, store, member, rung, { pass: true, by });
+                promoted = !!out.promotion;
+            }
+
+            const saved = await store.updateTrainingRequest(existing._id, {
+                status: action === 'pass' ? 'passed' : 'failed',
+                notes,
+                examinerName: by,
+                decidedAt: new Date(),
+            });
+
+            if (action === 'pass') {
+                // recordCheckride announces a promotion. A pass that does NOT
+                // promote — signed off early, still short of the hours — would
+                // otherwise reach the pilot as silence, which is the failure this
+                // whole screen exists to end.
+                if (!promoted) {
+                    notifyPilot(va, member, {
+                        kind: 'system',
+                        title: `You passed your ${rung.name} check-ride`,
+                        body: notes
+                            ? `${notes} — ${rung.name} follows once you have the hours.`
+                            : `${rung.name} follows once you have the hours.`,
+                        refId: saved._id,
+                        senderName: by,
+                    });
+                }
+            } else {
+                notifyPilot(va, member, {
+                    kind: 'system',
+                    title: `Your ${existing.forRank} check-ride: not yet`,
+                    body: notes || 'Your examiner has left you some notes.',
+                    refId: saved._id,
+                    senderName: by,
+                });
+            }
+            return res.json(withDrift(store, { request: { id: saved._id, status: saved.status }, promoted }));
+        }
+
+        return res.status(400).json({ error: 'Unknown action.' });
+    } catch (err) { crewFail(res, err, { log: 'training decide error', message: 'Could not record that.' }); }
+});
+
+// ---- What each rung asks for, beyond the hours ----
+app.post('/api/crew/:slug/training/settings', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const incoming = Array.isArray((req.body || {}).ranks) ? req.body.ranks : null;
+        if (!incoming) return res.status(400).json({ error: 'Send the ranks to save.' });
+
+        // MERGED BY NAME onto the ladder as it stands, never replacing it. The
+        // rungs themselves — their names, hours and badges — are edited in
+        // Settings → Crew, and a training screen that wrote the whole array back
+        // would silently undo an edit made in the other tab since this one
+        // loaded. Only the three fields this screen owns are taken, and a rung
+        // the request does not mention is left exactly as it was.
+        const wanted = new Map();
+        for (const r of incoming) {
+            const name = String((r && r.name) || '').trim().slice(0, 40).toLowerCase();
+            if (name) wanted.set(name, r);
+        }
+        const merged = (Array.isArray(va.ranks) ? va.ranks : []).map((r) => {
+            const hit = wanted.get(String(r.name || '').trim().toLowerCase());
+            if (!hit) return r;
+            return {
+                ...r,
+                minFlights: Math.max(0, Math.min(100000, Math.round(Number(hit.minFlights) || 0))),
+                requiresCheck: hit.checkride !== false,
+                checkNote: String(hit.note || '').trim().slice(0, 300),
+            };
+        });
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { ranks: merged } });
+        res.json({ ok: true, ranks: trainingLadder({ ranks: merged }) });
+    } catch (err) { crewFail(res, err, { log: 'training settings error', message: 'Could not save that.' }); }
 });
 
 // ---- Route network ----
@@ -9274,6 +9657,7 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             documentsSchemaVersion: crewStore.DOCUMENTS_SCHEMA_VERSION,
             notificationsSchemaVersion: crewStore.NOTIFICATIONS_SCHEMA_VERSION,
             linksSchemaVersion: crewStore.LINKS_SCHEMA_VERSION,
+            trainingSchemaVersion: crewStore.TRAINING_SCHEMA_VERSION,
             // The saved access token, described but never disclosed.
             token: tokenState(tokenMeta),
             // Set when this very request brought the project up to date, so the
