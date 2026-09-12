@@ -141,10 +141,20 @@ function lastFlightIndex(pireps = []) {
     return { byMember, byIfUser };
 }
 
-/** When this member last flew, or null if they never have. */
+/**
+ * When this member last flew, or null if they never have.
+ *
+ * `_id` first, then `id`. The roster rows this is handed come out of crewStore,
+ * where a member is `_id` — both the Supabase mapper and a mongoose `.lean()`
+ * document, which carries no `id` virtual. Reading only `id` therefore looked up
+ * the string "undefined" for every pilot and found nothing, which did not fail
+ * loudly: it made every pilot without an Infinite Flight link look as though
+ * they had NEVER FLOWN, so the inactivity rule never reached them and the
+ * probation rule reached the wrong ones.
+ */
 function lastFlightFor(member, index) {
     if (!member) return null;
-    const byId = index.byMember.get(String(member.id));
+    const byId = index.byMember.get(String(member._id || member.id || ''));
     // The IF id is the fallback, not the primary: reports captured
     // automatically can land before the roster row is linked to an account, and
     // a pilot whose first flight was captured that way has flown.
@@ -169,10 +179,23 @@ const alreadyWarned = (member, anchor) => {
     return !anchor || w >= anchor;
 };
 
-/** Is this member off-limits to the sweep, and why? */
-function exemptReason(member, rules) {
+/**
+ * Is this member off-limits to the sweep, and why?
+ *
+ * `now` is what makes leave finite. Before v15 'loa' was a flag with nothing
+ * attached — staff set it by hand and it exempted a pilot forever, which is the
+ * right behaviour for a flag nobody could put a date on. A pilot who says they
+ * are away until the 14th has told us when to start counting again, and
+ * ignoring that would turn every exam week into a permanent exemption. A leave
+ * with no `loaUntil` is open-ended and keeps behaving exactly as it always did,
+ * which is every hand-set one from before the column existed.
+ */
+function exemptReason(member, rules, now = Date.now()) {
     if (!member) return 'unknown';
-    if (member.status === 'loa') return 'loa';
+    if (member.status === 'loa') {
+        const until = when(member.loaUntil);
+        if (!until || until.getTime() > now) return 'loa';
+    }
     if (member.status === 'inactive') return 'already inactive';
     if (rules.exemptStaff && isStaff(member)) return 'staff';
     return '';
@@ -212,7 +235,7 @@ function assess({ members = [], pireps = [], rules = {}, now = Date.now() } = {}
 
     for (const m of members) {
         if (!m) continue;
-        const why = exemptReason(m, r);
+        const why = exemptReason(m, r, t);
         if (why) { out.exempt.push({ member: m, reason: why }); continue; }
         out.checked += 1;
 

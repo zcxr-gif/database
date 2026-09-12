@@ -146,6 +146,38 @@ create table if not exists crew_members (
 alter table crew_members add column if not exists checks_passed text[] not null default '{}';
 -- v10. Same, for the roster sweep's warning stamp.
 alter table crew_members add column if not exists retention_warned_at timestamptz;
+-- v15. Leave of absence, told properly.
+--
+-- `status = 'loa'` has existed since v1 and the roster sweep has always spared
+-- it, but it was a flag with nothing attached: staff set it by hand, nobody
+-- knew when the pilot was due back, and a pilot could not say it themselves.
+-- These three columns are the sentence around the flag — who said it, when they
+-- expect to be flying again, and why — which is what turns "away" from a label
+-- staff maintain into something the person actually away can set.
+--
+-- `loa_until` is the one the sweep reads: past it, the pilot is ordinary again
+-- and the clock they paused starts running. Null means open-ended, which is
+-- what a hand-set 'loa' from before this version looks like, so those keep
+-- behaving exactly as they did.
+alter table crew_members add column if not exists loa_until  timestamptz;
+alter table crew_members add column if not exists loa_reason text not null default '';
+alter table crew_members add column if not exists loa_since  timestamptz;
+
+-- v15. The wallet.
+--
+-- On the pilot rather than in a table of its own: a balance is a property of a
+-- member the way hours are, every read of it already has the roster row in
+-- hand, and a separate wallet table would mean a join on the one query the shop
+-- runs on every page. `points_earned` and `points_spent` are kept alongside the
+-- balance rather than derived, because the two figures the card shows are
+-- lifetime totals and a balance is not a history: refunding an order returns
+-- the money without unspending it.
+--
+-- Integers, not numeric. This is a game currency counted in whole units; a
+-- fractional mile would only ever be a rounding argument.
+alter table crew_members add column if not exists points_balance int not null default 0;
+alter table crew_members add column if not exists points_earned  int not null default 0;
+alter table crew_members add column if not exists points_spent   int not null default 0;
 create index if not exists crew_members_va_idx      on crew_members (va_slug);
 create index if not exists crew_members_hours_idx   on crew_members (va_slug, hours desc);
 create index if not exists crew_members_if_idx      on crew_members (va_slug, if_user_id) where if_user_id <> '';
@@ -756,6 +788,20 @@ end $$;
 create index if not exists crew_pireps_schedule_idx
     on crew_pireps (va_slug, schedule_id) where schedule_id is not null;
 
+-- v15. What this flight paid into the pilot's wallet, if the VA runs a shop.
+--
+-- Recorded ON THE FLIGHT rather than as a ledger row, because the only question
+-- ever asked of it is "has this one been paid?" — and a column that is null
+-- until it is not answers that in the same statement that does the paying, which
+-- is what makes approving a flight twice pay once. It is also what keeps a rate
+-- change out of history: the figure here is what the rates said on the day, and
+-- nothing re-reads it.
+--
+-- Null means "never paid", which is every flight on a VA that has no shop, and
+-- 0 means "paid, and the rates came to nothing" — a real answer, and a different
+-- one.
+alter table crew_pireps add column if not exists points_awarded int;
+
 -- ----------------------------------------------------------------------------
 -- The link to Infinite Flight Live. v13.
 --
@@ -930,7 +976,12 @@ create table if not exists crew_notifications (
     body        text not null default '',
     kind        text not null default 'message'
                 check (kind in ('message','application','promotion','booking',
-                                'event','document','checkride','system')),
+                                'event','document','checkride','system',
+                                -- v15. The three things the bell carries that
+                                -- nothing used to tell a pilot about at all: a
+                                -- flight they filed being reviewed, and an order
+                                -- they paid for being handed over.
+                                'flight_approved','flight_rejected','order')),
     -- What it is about, when it is about something — an event, a departure, a
     -- document. Untyped on purpose: `kind` says which table to read it against,
     -- and a hard reference to seven of them would make deleting any one of
@@ -944,6 +995,17 @@ create table if not exists crew_notifications (
     created_at  timestamptz not null default now(),
     updated_at  timestamptz not null default now()
 );
+-- v15. Widen the vocabulary on a project that already has the table. The check
+-- above only runs on a fresh create, so an established VA would otherwise refuse
+-- every "your flight was approved" with a constraint violation. Dropped by the
+-- name Postgres gives an inline column check; a project whose constraint has
+-- been renamed by hand simply gains a second, identical one.
+alter table crew_notifications drop constraint if exists crew_notifications_kind_check;
+alter table crew_notifications add constraint crew_notifications_kind_check
+    check (kind in ('message','application','promotion','booking',
+                    'event','document','checkride','system',
+                    'flight_approved','flight_rejected','order'));
+
 -- The inbox itself: one pilot's messages, newest first.
 create index if not exists crew_notifications_account_idx
     on crew_notifications (va_slug, account_id, created_at desc) where account_id is not null;
@@ -1091,6 +1153,311 @@ create index if not exists crew_training_va_idx
 create index if not exists crew_training_member_idx
     on crew_training_requests (va_slug, member_id, created_at desc);
 
+
+-- ----------------------------------------------------------------------------
+-- v15. The shop: what a flight is worth, and what a pilot spends it on.
+--
+-- A VA has exactly one thing to give a pilot for flying: hours. They go up, and
+-- they are never spent on anything. Every airline that has wanted more than
+-- that has built the same thing by hand -- a points spreadsheet, a channel of
+-- shop screenshots, and a staff member subtracting numbers by hand -- and it
+-- works for about a month.
+--
+-- Two tables and three functions are the whole of it. What is NOT here is as
+-- deliberate as what is:
+--
+--   * No "give this pilot 500 points" table. Points come from approved flight
+--     reports and nothing else (see crew_pireps.points_awarded), because a
+--     second, unaudited supply is how every hand-rolled VA economy has ended up
+--     in an argument.
+--   * No prices, rates or currency name. Those are settings, they live on the
+--     VA's record with the rank ladder and the fleet, and a project full of
+--     rows does not need a row to say what a mile is called.
+--
+-- WHERE THE ARITHMETIC HAPPENS. In crew_shop_buy, below, in one statement. The
+-- browser is never allowed to decide whether a pilot can afford something: it
+-- asks, and this debits, re-checking the price, the stock and the per-pilot
+-- limit against the rows as they are RIGHT NOW rather than as they were when
+-- the shelf was drawn.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_shop_items (
+    id              uuid primary key default gen_random_uuid(),
+    va_slug         text not null,
+    name            text not null default '',
+    description     text not null default '',
+    image_url       text not null default '',
+    icon            text not null default '',
+    price           int  not null default 0 check (price >= 0),
+    -- -1 is unlimited, and it is the default: a livery, a Discord role or a
+    -- callsign does not run out, and those are most of what a VA puts on a
+    -- shelf. 0 is sold out, which is a different and real state.
+    stock           int  not null default -1,
+    -- 0 means no limit. A cap belongs per item rather than per shop because
+    -- "one retro livery each" and "as many stickers as you like" are both
+    -- normal on the same shelf.
+    limit_per_pilot int  not null default 0 check (limit_per_pilot >= 0),
+    active          boolean not null default true,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now()
+);
+create index if not exists crew_shop_items_va_idx
+    on crew_shop_items (va_slug, active, created_at);
+
+-- An order is a receipt, so it keeps its own copy of the name and the price.
+-- The item it came from may be edited, repriced or taken off the shelf
+-- afterwards, and none of that may rewrite what a pilot actually paid -- which
+-- is why `item_id` is nullable and carries `on delete set null` rather than
+-- cascading a delete through somebody's history.
+create table if not exists crew_shop_orders (
+    id          uuid primary key default gen_random_uuid(),
+    va_slug     text not null,
+    member_id   uuid,
+    item_id     uuid references crew_shop_items (id) on delete set null,
+    item_name   text not null default '',
+    price       int  not null default 0,
+    status      text not null default 'placed'
+                check (status in ('placed','fulfilled','cancelled')),
+    -- What the pilot shows their staff to collect it. Short enough to read out.
+    code        text not null default '',
+    decided_at  timestamptz,
+    decided_by  text not null default '',
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+-- The queue as staff work it: what is waiting, newest first.
+create index if not exists crew_shop_orders_va_idx
+    on crew_shop_orders (va_slug, status, created_at desc);
+-- And one pilot's own receipts, which is the other way it is read.
+create index if not exists crew_shop_orders_member_idx
+    on crew_shop_orders (va_slug, member_id, created_at desc);
+
+-- ----------------------------------------------------------------------------
+-- Buying something.
+--
+-- One function, one transaction, and every check inside it. The order of the
+-- checks is the order a pilot would ask them in, so the message that comes back
+-- names the first real reason rather than a generic refusal.
+--
+-- The debit is `update ... where points_balance >= price returning`: the price
+-- is re-read and the balance is tested in the same statement that changes it,
+-- so two taps on a cheap item cannot both succeed against one balance. The same
+-- trick guards the stock.
+--
+-- SECURITY: definer, and reachable only by the service key (see the grants at
+-- the foot of this file). It moves money; a browser credential has no business
+-- with it, and the backend calls it only after deciding who the caller is.
+-- ----------------------------------------------------------------------------
+create or replace function crew_shop_buy(
+    p_va_slug   text,
+    p_member_id uuid,
+    p_item_id   uuid
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    it      crew_shop_items%rowtype;
+    mine    int;
+    bal     int;
+    ord     crew_shop_orders%rowtype;
+    m       crew_members%rowtype;
+begin
+    select * into it from crew_shop_items
+     where va_slug = p_va_slug and id = p_item_id
+       for update;
+    if not found or not it.active then
+        return jsonb_build_object('ok', false, 'code', 'item_gone',
+            'error', 'That is not on the shelf any more.');
+    end if;
+    if it.stock = 0 then
+        return jsonb_build_object('ok', false, 'code', 'sold_out',
+            'error', 'That is sold out.');
+    end if;
+
+    if it.limit_per_pilot > 0 then
+        select count(*) into mine from crew_shop_orders
+         where va_slug = p_va_slug and member_id = p_member_id
+           and item_id = p_item_id and status <> 'cancelled';
+        if mine >= it.limit_per_pilot then
+            return jsonb_build_object('ok', false, 'code', 'limit_reached',
+                'error', format('You have had all %s of those you can.', it.limit_per_pilot));
+        end if;
+    end if;
+
+    -- The debit. Balance tested and changed in one statement: nothing between
+    -- the two, so nothing to race.
+    update crew_members
+       set points_balance = points_balance - it.price,
+           points_spent   = points_spent + it.price
+     where va_slug = p_va_slug and id = p_member_id
+       and points_balance >= it.price
+    returning points_balance into bal;
+    if not found then
+        return jsonb_build_object('ok', false, 'code', 'short',
+            'error', 'That costs more than you have.');
+    end if;
+
+    -- Stock, where it is counted at all. Guarded the same way, and the debit is
+    -- rolled back with the whole function if this cannot take one.
+    if it.stock > 0 then
+        update crew_shop_items set stock = stock - 1
+         where id = it.id and stock > 0;
+        if not found then
+            raise exception 'sold out' using errcode = 'check_violation';
+        end if;
+    end if;
+
+    insert into crew_shop_orders (va_slug, member_id, item_id, item_name, price, code)
+    values (p_va_slug, p_member_id, it.id, it.name, it.price,
+            upper(substr(md5(gen_random_uuid()::text), 1, 6)))
+    returning * into ord;
+
+    select * into m from crew_members where va_slug = p_va_slug and id = p_member_id;
+
+    return jsonb_build_object(
+        'ok', true,
+        'order', to_jsonb(ord),
+        'wallet', jsonb_build_object(
+            'balance', bal,
+            'earned', coalesce(m.points_earned, 0),
+            'spent', coalesce(m.points_spent, 0)),
+        'stock', (select stock from crew_shop_items where id = it.id));
+end;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- Paying for a flight, exactly once.
+--
+-- `points_awarded is null` in the WHERE is the whole idempotency argument: the
+-- row that records the payment is the row that gates it, so approving an
+-- already-approved report updates nothing and credits nothing. Re-running this
+-- for a flight that has been paid is a no-op that reports what it was paid.
+--
+-- The amount is computed by the backend from the VA's rates (they live on the
+-- VA record, not here) and passed in, so a rate change cannot re-price history:
+-- this only ever writes the figure it is handed, once.
+-- ----------------------------------------------------------------------------
+create or replace function crew_shop_credit(
+    p_va_slug   text,
+    p_pirep_id  uuid,
+    p_member_id uuid,
+    p_amount    int
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    paid int;
+    bal  int;
+begin
+    update crew_pireps set points_awarded = greatest(0, coalesce(p_amount, 0))
+     where va_slug = p_va_slug and id = p_pirep_id and points_awarded is null
+    returning points_awarded into paid;
+    if not found then
+        return jsonb_build_object('ok', false, 'code', 'already_paid');
+    end if;
+
+    if p_member_id is null or paid = 0 then
+        return jsonb_build_object('ok', true, 'credited', coalesce(paid, 0));
+    end if;
+
+    update crew_members
+       set points_balance = points_balance + paid,
+           points_earned  = points_earned + paid
+     where va_slug = p_va_slug and id = p_member_id
+    returning points_balance into bal;
+
+    return jsonb_build_object('ok', true, 'credited', paid, 'balance', bal);
+end;
+$$;
+
+-- Taking it back, when an approved flight is rejected or deleted. The mirror of
+-- the above and guarded the same way round: `points_awarded is not null` means
+-- there is something to reverse, and clearing it is what makes a later
+-- re-approval pay again -- which is right, because the flight would be counting
+-- again too. The balance is floored at zero: a pilot who has already spent what
+-- a since-rejected flight paid does not go into debt over staff changing their
+-- mind, and `points_earned` carries the correction so the card's lifetime
+-- figures stay honest.
+create or replace function crew_shop_uncredit(
+    p_va_slug   text,
+    p_pirep_id  uuid,
+    p_member_id uuid
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    paid int;
+begin
+    update crew_pireps set points_awarded = null
+     where va_slug = p_va_slug and id = p_pirep_id and points_awarded is not null
+    returning points_awarded into paid;
+    if not found then
+        return jsonb_build_object('ok', false, 'code', 'not_paid');
+    end if;
+
+    if p_member_id is not null and paid > 0 then
+        update crew_members
+           set points_balance = greatest(0, points_balance - paid),
+               points_earned  = greatest(0, points_earned - paid)
+         where va_slug = p_va_slug and id = p_member_id;
+    end if;
+    return jsonb_build_object('ok', true, 'reversed', paid);
+end;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- Refunding an order.
+--
+-- Staff cancelling an order gives the pilot their money back and puts the item
+-- back on the shelf. `points_spent` comes down with the balance because a
+-- refunded order is not a purchase -- the lifetime figure on the card should
+-- read the same as if it had never happened.
+--
+-- Guarded on `status = 'placed'`, so pressing Refund twice refunds once.
+-- ----------------------------------------------------------------------------
+create or replace function crew_shop_refund(
+    p_va_slug  text,
+    p_order_id uuid,
+    p_by       text default ''
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    ord crew_shop_orders%rowtype;
+begin
+    update crew_shop_orders
+       set status = 'cancelled', decided_at = now(), decided_by = coalesce(p_by, '')
+     where va_slug = p_va_slug and id = p_order_id and status = 'placed'
+    returning * into ord;
+    if not found then
+        return jsonb_build_object('ok', false, 'code', 'not_open',
+            'error', 'That order has already been dealt with.');
+    end if;
+
+    if ord.member_id is not null and ord.price > 0 then
+        update crew_members
+           set points_balance = points_balance + ord.price,
+               points_spent   = greatest(0, points_spent - ord.price)
+         where va_slug = p_va_slug and id = ord.member_id;
+    end if;
+    -- Back on the shelf, but only where stock is counted. An unlimited item is
+    -- left at -1 rather than incremented into a number.
+    if ord.item_id is not null then
+        update crew_shop_items set stock = stock + 1
+         where id = ord.item_id and stock >= 0;
+    end if;
+
+    return jsonb_build_object('ok', true, 'order', to_jsonb(ord));
+end;
+$$;
+
 -- ----------------------------------------------------------------------------
 -- updated_at maintenance
 -- ----------------------------------------------------------------------------
@@ -1105,7 +1472,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_shop_items','crew_shop_orders','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -1312,7 +1679,8 @@ declare
     crew_tables text[] := array[
         'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
         'crew_events','crew_event_signups','crew_announcements','crew_schedules',
-        'crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_schema_info'];
+        'crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests',
+        'crew_shop_items','crew_shop_orders','crew_schema_info'];
     t              text;
     rel            regclass;
     tbl_bytes      bigint;
@@ -1415,6 +1783,8 @@ alter table crew_documents     enable row level security;
 alter table crew_notifications enable row level security;
 alter table crew_links         enable row level security;
 alter table crew_training_requests enable row level security;
+alter table crew_shop_items    enable row level security;
+alter table crew_shop_orders   enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -1544,6 +1914,39 @@ revoke all on crew_notifications from anon, authenticated;
 -- a signed-in session that knows whose request it is.
 revoke all on crew_training_requests from anon, authenticated;
 
+-- v15. The shelf is readable with the browser key, because it is a shop window:
+-- a VA's own website should be able to show what its pilots can earn without
+-- asking us for anything. Only the items, and only the ones that are on sale --
+-- the policy below is the whole of what anon may see.
+drop policy if exists crew_shop_items_public_read on crew_shop_items;
+create policy crew_shop_items_public_read on crew_shop_items
+    for select to anon, authenticated using (active);
+grant select on crew_shop_items to anon, authenticated;
+
+-- Orders are the opposite: a row names one pilot and what they spent, and one
+-- shared browser credential cannot express "only mine". No policy, no grant,
+-- and every read goes through the backend against a signed-in session -- the
+-- same treatment crew_notifications and crew_training_requests get, for the
+-- same reason.
+revoke all on crew_shop_orders from anon, authenticated;
+
+-- The three functions that move a balance are service-key only. A browser
+-- credential that could call crew_shop_credit could mint a VA's currency at
+-- will, and one that could call crew_shop_buy could spend somebody else's.
+revoke all on function crew_shop_buy(text, uuid, uuid) from public, anon, authenticated;
+revoke all on function crew_shop_credit(text, uuid, uuid, int) from public, anon, authenticated;
+revoke all on function crew_shop_uncredit(text, uuid, uuid) from public, anon, authenticated;
+revoke all on function crew_shop_refund(text, uuid, text) from public, anon, authenticated;
+do $$
+begin
+    if exists (select 1 from pg_roles where rolname = 'service_role') then
+        execute 'grant execute on function crew_shop_buy(text, uuid, uuid) to service_role';
+        execute 'grant execute on function crew_shop_credit(text, uuid, uuid, int) to service_role';
+        execute 'grant execute on function crew_shop_uncredit(text, uuid, uuid) to service_role';
+        execute 'grant execute on function crew_shop_refund(text, uuid, text) to service_role';
+    end if;
+end $$;
+
 -- v12. crew_link_open increments a counter and is reached only through the
 -- backend's service key, after IT has decided the caller may see the link. A
 -- browser key that could call this could inflate any VA's figures at will, and
@@ -1577,5 +1980,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 14)
+insert into crew_schema_info (id, version) values (1, 15)
 on conflict (id) do update set version = excluded.version, updated_at = now();

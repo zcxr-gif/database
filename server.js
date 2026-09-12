@@ -127,6 +127,21 @@ const crewInbox = require('./crewInbox');
 // same rank gate the library uses.
 const crewLinks = require('./crewLinks');
 
+// v15. Three more of the same kind, added for the crew center's shop, its
+// awards panel and its crew-health board. Each holds the decisions and nothing
+// that talks to a database: crewShop prices a flight and bounds a VA's rates,
+// crewAwards computes what a pilot has earned from a flight log it is handed,
+// crewHealth sorts a roster into the four groups the board draws. The routes
+// below hold the I/O.
+//
+// The arithmetic that MOVES a balance is deliberately in none of them — it is in
+// the VA's own database, in crew_shop_buy and crew_shop_credit, because a debit
+// that re-reads the price and tests the balance in the same statement is the
+// only kind that cannot be raced.
+const crewShop = require('./crewShop');
+const crewAwards = require('./crewAwards');
+const crewHealth = require('./crewHealth');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -559,6 +574,41 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         // A VA's own staff are not swept by default; running the airline is not
         // the same as flying it.
         exemptStaff: { type: Boolean, default: true },
+    },
+
+    // --- The shop (v15) ---
+    //
+    // What a flight is worth, and what the VA calls the thing it is worth. Here
+    // rather than in the VA's own Postgres for the same reason the rank ladder
+    // and the schedule rules are: these are definitions of how the airline is
+    // run, the crew center reads them before it has a store connection, and the
+    // dashboard needs `enabled` to decide whether to draw a Shop tile at all —
+    // a question that should not cost a round trip to somebody else's database
+    // on every page load.
+    //
+    // OFF unless a VA switches it on, and paying nothing inside that. A shop
+    // that appears uninvited is a feature nobody asked for; rates that default
+    // to a number would start an economy in every airline on the platform.
+    //
+    // The shelf, the orders and the balances are NOT here. Those are operational
+    // data, they belong to the VA, and they live in the VA's project with
+    // everything else of that kind — see crew_shop_items in
+    // supabase/crew-center-schema.sql.
+    //
+    // Bounds are enforced again in crewShop.normalizeSettings — the module that
+    // also applies them — so a value saved here cannot mean something different
+    // when a flight is priced against it.
+    crewShop: {
+        enabled: { type: Boolean, default: false },
+        // What this airline calls its currency. Miles, Credits, SkyCoins —
+        // nothing a pilot reads ever says "points" unless the VA chose it.
+        currencyName: { type: String, trim: true, default: 'Points' },
+        currencyShort: { type: String, trim: true, default: 'pts' },
+        // The four rates, applied by crewShop.earnFor when a flight is approved.
+        perHour: { type: Number, default: 0, min: 0, max: 100000 },
+        perLanding: { type: Number, default: 0, min: 0, max: 100000 },
+        fleetBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        violationPenalty: { type: Number, default: 0, min: 0, max: 100000 },
     },
 
     // --- Recruitment / join settings ---
@@ -3670,6 +3720,572 @@ app.post('/api/crew/:slug/training/settings', async (req, res) => {
         res.json({ ok: true, ranks: trainingLadder({ ranks: merged }) });
     } catch (err) { crewFail(res, err, { log: 'training settings error', message: 'Could not save that.' }); }
 });
+
+/* ===========================================================================
+ * THE BELL (v15)
+ *
+ * A crew center page has had a bell in its top bar since it shipped, with a dot
+ * on it that was a <span> in the markup: always there, never counting anything.
+ * These two routes are what makes it mean something.
+ *
+ * THERE IS NO ALERTS TABLE, and that is the design rather than a shortcut. Every
+ * thing the bell carries — a flight reviewed, a message from staff, a leg moved,
+ * a rank reached, an order handed over — is already a row in crew_notifications
+ * addressed to one pilot, because each of those is something the crew center
+ * already had to tell them. A second table would mean every one of those events
+ * written twice, two read states to keep in step, and a bell that could disagree
+ * with the inbox about whether a thing had been seen.
+ *
+ * So the bell is a VIEW of the inbox: the same rows, mapped to the vocabulary
+ * the bell draws icons from, and marked read through the same call. What the
+ * bell adds is the mapping and the count.
+ * ======================================================================== */
+
+/**
+ * What the stored kind looks like on a bell.
+ *
+ * The two vocabularies are deliberately not the same list. The inbox's `kind`
+ * says what a message is ABOUT and is a column with a check constraint on it;
+ * the bell's says which icon and colour to draw, and 'promotion' and 'checkride'
+ * are one thing to a reader — "your rank changed" — however differently they got
+ * there. Anything not in here draws the plain bell, which is the right answer
+ * for a kind added later by a version of the crew center this one has not met.
+ */
+const ALERT_KINDS = {
+    flight_approved: 'pirep_approved',
+    flight_rejected: 'pirep_rejected',
+    message: 'message',
+    booking: 'booking',
+    promotion: 'rank',
+    checkride: 'rank',
+    order: 'order',
+    event: 'event',
+};
+
+const publicAlert = (n) => ({
+    id: n._id,
+    kind: ALERT_KINDS[n.kind] || '',
+    title: n.title || '',
+    body: n.body || '',
+    readAt: n.readAt || null,
+    createdAt: n.createdAt,
+});
+
+// ---- What has happened to this pilot ----
+//
+// 40 rows, not the whole inbox: a bell is a list somebody glances down, and the
+// history it is a window onto is the inbox's job to hold.
+app.get('/api/crew/:slug/alerts', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        // Staff have no bell for the same reason they have no inbox: these are
+        // things that happened to one person, and there is no "whose?" parameter
+        // anywhere in this section.
+        if (!who) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to see your notifications.',
+                code: 'not_authenticated',
+            });
+        }
+        const list = await store.listNotifications({ ...who, limit: 40 });
+        res.json({
+            alerts: list.map(publicAlert),
+            unread: list.filter((n) => !n.readAt).length,
+        });
+    } catch (err) { crewFail(res, err, { log: 'alerts read error', message: 'Could not read your notifications.' }); }
+});
+
+// ---- Read is a fact, not a guess ----
+//
+// Exactly the ids it is given, and no `all`. The inbox has an "all" because a
+// reader there is looking at everything; the bell marks what was ON SCREEN, so
+// an alert that arrives while the panel is open is still unread when it closes
+// rather than being swallowed by a "before now" sweep.
+app.post('/api/crew/:slug/alerts/read', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to do that.', code: 'not_authenticated' });
+        const ids = Array.isArray((req.body || {}).ids)
+            ? req.body.ids.slice(0, 200).map((i) => String(i)).filter(Boolean) : [];
+        if (!ids.length) return res.json({ ok: true, marked: 0 });
+        // `who` goes with the ids: the store scopes the update to this pilot's
+        // own rows, so a guessed id belonging to somebody else marks nothing.
+        const marked = await store.markNotificationsRead({ ...who, ids });
+        res.json({ ok: true, marked: Number(marked) || 0 });
+    } catch (err) { crewFail(res, err, { log: 'alerts read-mark error', message: 'Could not mark those read.' }); }
+});
+
+/* ===========================================================================
+ * AWARDS (v15)
+ *
+ * One route, and it computes rather than reads. See crewAwards.js for why there
+ * is nothing stored: a badge is a fact about an approved flight log, and the
+ * date on it is the date of the flight that crossed the line.
+ *
+ * Public in the sense that the catalogue is: anybody who can open the crew
+ * center may see what there is to earn. What needs a signed-in pilot is
+ * `earned` and `progress`, because those are about one named person.
+ * ======================================================================== */
+app.get('/api/crew/:slug/awards', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        if (!myId) {
+            // Staff, or a pilot whose login has never been linked to a roster
+            // row. The shelf of things to come is a better answer to "what are
+            // awards?" than an empty panel, so it is still sent.
+            return res.json({ catalog: crewAwards.catalog(), earned: [], progress: {}, forName: '' });
+        }
+        const member = await store.getMember(myId);
+        // Every report, not only the approved ones: crewAwards filters, and
+        // asking the store twice for the same pilot's log would be two round
+        // trips to answer one question.
+        const pireps = await store.listPirepsForMember(myId, { limit: 5000 });
+        const { earned, progress } = crewAwards.forMember({ member, pireps });
+        res.json({
+            catalog: crewAwards.catalog(),
+            earned,
+            progress,
+            forName: (member && (member.name || member.callsign)) || '',
+        });
+    } catch (err) { crewFail(res, err, { log: 'awards read error', message: 'Those could not be counted up.' }); }
+});
+
+/* ===========================================================================
+ * LEAVE, AND CREW HEALTH (v15)
+ *
+ * The roster sweep has always spared `status = 'loa'`. What it could not do was
+ * tell a pilot who lost interest from one sitting an exam, because nobody could
+ * say which they were: 'loa' was a flag staff set by hand with no date on it and
+ * no way for the person actually going away to set it.
+ *
+ * These four routes are the two halves of fixing that. The first three are a
+ * pilot saying they are away and coming back. The fourth is the harder half —
+ * by the time the sweep removes somebody the airline lost them weeks ago, and
+ * the crew-health board is the shape of the moment that was actually useful.
+ * ======================================================================== */
+
+// ---- Am I away, and does this airline sweep? ----
+app.get('/api/crew/:slug/leave', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        if (!canManage && !myId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to tell your staff you are away.',
+                code: 'not_authenticated',
+            });
+        }
+        const me = myId ? await store.getMember(myId) : null;
+        // The sweep's own settings, so the panel can say "after 30 days" in the
+        // VA's numbers rather than in ours — and say nothing at all where the
+        // airline does not run a sweep.
+        const rules = crewRetention.publicRules(va.crewRetention);
+        res.json({
+            canManage,
+            mine: (me && me.status === 'loa') ? {
+                id: me._id,
+                until: me.loaUntil || null,
+                reason: me.loaReason || '',
+                createdAt: me.loaSince || me.updatedAt || null,
+            } : null,
+            sweep: {
+                enabled: rules.enabled && (rules.inactivity || rules.firstFlight),
+                quietDays: rules.inactivity ? rules.inactivityDays : 0,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'leave read error', message: 'That could not be read.' }); }
+});
+
+// ---- Going away ----
+//
+// The pilot's own act, on their own row. There is deliberately no `pilotId`
+// parameter: staff who need to mark somebody away have the roster editor and the
+// status field it has always had, and a route that let one signed-in pilot put
+// another on leave would be a way to quietly exempt somebody from the sweep.
+app.post('/api/crew/:slug/leave', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewViewer(req, store);
+        if (!viewer || !viewer.memberId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to do that.',
+                code: 'not_authenticated',
+            });
+        }
+        const b = req.body || {};
+        // A date, and it has to be in the future and inside a year. Leave with no
+        // end is what this feature exists to replace, and "back in 2087" is a
+        // pilot leaving rather than a pilot away.
+        let until = null;
+        if (b.until) {
+            const d = new Date(b.until);
+            if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'That date could not be read.' });
+            if (d.getTime() < Date.now() - 86400000) {
+                return res.status(400).json({ error: 'Pick a date you expect to be back — that one has passed.' });
+            }
+            if (d.getTime() > Date.now() + (400 * 86400000)) {
+                return res.status(400).json({ error: 'A year is the longest leave the roster will hold.' });
+            }
+            until = d.toISOString();
+        }
+        if (!until) return res.status(400).json({ error: 'Say roughly when you will be back.' });
+
+        const saved = await store.setLeave(viewer.memberId, { until, reason: b.reason });
+        if (!saved) return res.status(404).json({ error: 'Your roster row could not be found.' });
+        res.status(201).json(withDrift(store, {
+            mine: { id: saved._id, until: saved.loaUntil, reason: saved.loaReason, createdAt: saved.loaSince },
+        }));
+    } catch (err) { crewFail(res, err, { log: 'leave write error', message: 'That could not be saved.' }); }
+});
+
+// ---- Back ----
+//
+// The id in the path is the pilot's own roster row, and it is checked against
+// the session rather than trusted: staff may also end somebody's leave, because
+// somebody has to be able to tidy up after a pilot who came back and never said.
+app.delete('/api/crew/:slug/leave/:id', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const viewer = await crewViewer(req, store);
+        const mine = viewer && viewer.memberId && String(viewer.memberId) === String(req.params.id);
+        if (!mine && !canManage) return res.status(403).json({ error: 'Not allowed.' });
+        const saved = await store.endLeave(req.params.id);
+        if (!saved) return res.status(404).json({ error: 'That pilot is not on the roster.' });
+        res.json(withDrift(store, { ok: true }));
+    } catch (err) { crewFail(res, err, { log: 'leave end error', message: 'That could not be saved.' }); }
+});
+
+// ---- The board ----
+app.get('/api/crew/:slug/crew-health', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const [members, pireps] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            // Approved only, and the whole airline's in one query: the board puts
+            // an eight-week shape on every row, and asking per pilot would be one
+            // round trip per person to draw eight bars.
+            store.listPireps({ status: 'approved', limit: 20000 }).catch(() => []),
+        ]);
+        res.json({ groups: crewHealth.groups({ members, pireps, rules: va.crewRetention }) });
+    } catch (err) { crewFail(res, err, { log: 'crew health error', message: 'The roster could not be read.' }); }
+});
+
+// ---- Saying hello ----
+//
+// Gated on roster.manage rather than on members.message, which is the capability
+// messaging usually needs. The board and its one button are a single screen: a
+// staff member who can see who is slipping away and cannot say anything to them
+// has been given the half of this feature that only makes them feel bad.
+app.post('/api/crew/:slug/crew-health/nudge', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const message = String(b.message || '').trim().slice(0, 600);
+        if (!message) return res.status(400).json({ error: 'Write something to send.' });
+        const member = await store.getMember(String(b.pilotId || ''));
+        if (!member) return res.status(404).json({ error: 'That pilot is not on the roster.' });
+
+        // Through the inbox the crew center already has, from the staff member
+        // who wrote it, as a plain message — not a templated "we miss you" that
+        // every pilot in the group receives identically and recognises.
+        notifyPilot(va, member, {
+            kind: 'message',
+            title: `A note from ${va.name || 'your airline'}`,
+            body: message,
+            senderName: (gate.p && gate.p.name) || '',
+        });
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'crew health nudge error', message: 'That could not be sent.' }); }
+});
+
+/* ===========================================================================
+ * THE SHOP (v15)
+ *
+ * A VA has one thing to give a pilot for flying: hours, which go up and are
+ * never spent on anything. This is the rest of that sentence.
+ *
+ * THE BROWSER NEVER DECIDES WHETHER A PILOT CAN AFFORD SOMETHING. POST
+ * /shop/orders is the only thing in the product that moves a balance, and what
+ * it actually does is call crew_shop_buy in the VA's own database, which
+ * re-reads the price, tests the stock and the per-pilot limit and debits inside
+ * one statement. The "1,380 mi short" label on a shelf is a courtesy.
+ *
+ * WHO MAY DO WHAT. Buying is any signed-in pilot, on their own wallet. Stocking
+ * the shelf, setting the rates and working the order queue are
+ * `settings.branding` — the same capability the dashboard already uses to decide
+ * who is shown the shop at all, so the tile and the back office cannot disagree
+ * about who runs this.
+ * ======================================================================== */
+
+/** The VA's shop settings, in the shape everything below reads them in. */
+const shopSettingsFor = (va) => crewShop.fromRecord(va && va.crewShop);
+
+/**
+ * The shelf, the rates, and the caller's own card.
+ *
+ * One round trip for the whole screen, because it is one screen. `wallet` is
+ * null for staff and for a pilot whose login has never been linked to a roster
+ * row — the card draws its blank state from that rather than from a zero, which
+ * is a different and wrong sentence.
+ */
+app.get('/api/crew/:slug/shop', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const settings = shopSettingsFor(va);
+
+        // A shop that is off has nothing to say beyond the fact that it is off,
+        // and it says it without touching the VA's database. That matters for
+        // the VA this screen is FOR: somebody on an older schema who has not
+        // turned the shop on should be shown the one screen that switches it on,
+        // not "your database is behind" over a feature they have not asked for
+        // yet. They meet that message when they open the shelf, which is the
+        // moment it is true and the moment the button helps.
+        if (!settings.enabled) {
+            return res.json({
+                enabled: false,
+                canManage,
+                currency: settings.currency,
+                ...(canManage ? { earn: settings.earn } : {}),
+                items: [],
+                wallet: null,
+            });
+        }
+
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        const [items, member] = await Promise.all([
+            // Staff see what is hidden as well as what is on sale; a pilot sees
+            // the shelf. Filtered in the query rather than after it.
+            store.listShopItems({ activeOnly: !canManage }),
+            myId ? store.getMember(myId) : Promise.resolve(null),
+        ]);
+        const rank = member ? crewRanks.memberRank(va.ranks, member.hours, member.checksPassed) : null;
+
+        res.json({
+            enabled: settings.enabled,
+            canManage,
+            currency: settings.currency,
+            // The rates are staff's business: they are how the VA runs its
+            // economy, not something a pilot needs on the shelf.
+            ...(canManage ? { earn: settings.earn } : {}),
+            items: items.map(crewShop.publicItem),
+            wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '' }),
+        });
+    } catch (err) { crewFail(res, err, { log: 'shop read error', message: 'The shop could not be opened.' }); }
+});
+
+// ---- Turning it on, naming the currency, setting the rates ----
+app.post('/api/crew/:slug/shop/settings', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va } = await resolveCrewStore(req.params.slug);
+        // Merged over what is saved rather than replacing it: the back office
+        // saves the rates and the currency together but turns the shop off on its
+        // own, and a replace would quietly zero every rate on the way out.
+        const record = crewShop.toRecord(req.body || {}, va.crewShop);
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewShop: record } });
+        const settings = crewShop.fromRecord(record);
+        // The server's version of the settings, not the one that was typed — it
+        // is the thing that clamps a rate somebody put 1e9 into, and the panel
+        // takes this answer over its own form.
+        res.json({ ...settings, canManage: true });
+    } catch (err) { crewFail(res, err, { log: 'shop settings error', message: 'That could not be saved.' }); }
+});
+
+// ---- The shelf ----
+app.post('/api/crew/:slug/shop/items', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const item = cleanShopItem(req.body, {});
+        if (!item.name) return res.status(400).json({ error: 'Give it a name.' });
+        const saved = await store.createShopItem(item);
+        res.status(201).json(withDrift(store, { item: crewShop.publicItem(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'shop item add error', message: 'That could not be saved.' }); }
+});
+
+app.patch('/api/crew/:slug/shop/items/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getShopItem(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'That is not on the shelf.' });
+        const saved = await store.updateShopItem(req.params.id, cleanShopItem(req.body, existing));
+        res.json(withDrift(store, { item: crewShop.publicItem(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'shop item edit error', message: 'That could not be saved.' }); }
+});
+
+app.delete('/api/crew/:slug/shop/items/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteShopItem(req.params.id);
+        // Orders already placed for it keep their own copy of the name and the
+        // price — see crew_shop_orders — so somebody's receipt survives this.
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'shop item delete error', message: 'That could not be removed.' }); }
+});
+
+// ---- The orders ----
+//
+// Staff get everyone's; a pilot gets their own, filtered in the query so nobody
+// else's receipts leave the VA's database.
+app.get('/api/crew/:slug/shop/orders', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        if (!canManage && !myId) {
+            return res.status(401).json({ error: 'Sign in to see your orders.', code: 'not_authenticated' });
+        }
+        const orders = await store.listShopOrders(canManage ? {} : { memberId: myId });
+        // Names, for staff only, and one roster read for the whole queue rather
+        // than one per row.
+        let byId = new Map();
+        if (canManage && orders.length) {
+            const members = await store.listMembers({ limit: 5000 }).catch(() => []);
+            byId = new Map(members.map((m) => [String(m._id), m]));
+        }
+        res.json({
+            orders: orders.map((o) => crewShop.publicOrder(o, {
+                member: byId.get(String(o.memberId || '')) || null, canManage,
+            })),
+        });
+    } catch (err) { crewFail(res, err, { log: 'shop orders error', message: 'Those could not be read.' }); }
+});
+
+/**
+ * Buying something.
+ *
+ * Everything that matters happens in the VA's database, in one statement — see
+ * crew_shop_buy. What this route does is establish who is asking and hand the
+ * answer back, including the wallet the server now holds rather than the one the
+ * browser guessed.
+ */
+app.post('/api/crew/:slug/shop/orders', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const settings = shopSettingsFor(va);
+        if (!settings.enabled) {
+            return res.status(409).json({ error: 'This airline’s shop is closed.', code: 'shop_off' });
+        }
+        const viewer = await crewViewer(req, store);
+        if (!viewer || !viewer.memberId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to spend what you have earned.',
+                code: 'not_authenticated',
+            });
+        }
+        const itemId = String((req.body || {}).itemId || '');
+        if (!itemId) return res.status(400).json({ error: 'Say what you are buying.' });
+
+        const { order, wallet } = await store.buyShopItem(viewer.memberId, itemId);
+        // The shelf as it is now: one item's stock has just moved, and the panel
+        // behind the pay sheet is showing the old number.
+        const items = await store.listShopItems({ activeOnly: true }).catch(() => null);
+        res.status(201).json({
+            order: crewShop.publicOrder(order),
+            wallet: wallet ? {
+                balance: Number(wallet.balance) || 0,
+                earned: Number(wallet.earned) || 0,
+                spent: Number(wallet.spent) || 0,
+            } : null,
+            ...(items ? { items: items.map(crewShop.publicItem) } : {}),
+        });
+    } catch (err) { crewFail(res, err, { log: 'shop buy error', message: 'That purchase did not go through.' }); }
+});
+
+/**
+ * Handed over, or refunded.
+ *
+ * A refund puts the money back, puts the item back on the shelf and leaves the
+ * receipt in place marked cancelled — all in crew_shop_refund, and guarded on
+ * the order still being open so pressing Refund twice refunds once.
+ */
+app.patch('/api/crew/:slug/shop/orders/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const action = String((req.body || {}).action || '');
+        const by = (gate.p && gate.p.name) || '';
+        const settings = shopSettingsFor(va);
+
+        let order;
+        if (action === 'fulfil') {
+            order = await store.fulfilShopOrder(req.params.id, by);
+            if (!order) return res.status(409).json({ error: 'That order has already been dealt with.', code: 'not_open' });
+        } else if (action === 'cancel') {
+            order = await store.refundShopOrder(req.params.id, by);
+        } else {
+            return res.status(400).json({ error: 'Unknown action.' });
+        }
+
+        // And tell the pilot, because an order they cannot see the state of is
+        // one they will ask staff about in Discord.
+        if (order.memberId) {
+            const member = await store.getMember(order.memberId).catch(() => null);
+            if (member) {
+                notifyPilot(va, member, {
+                    kind: 'order',
+                    title: action === 'fulfil'
+                        ? `${order.itemName || 'Your order'} is ready`
+                        : `${order.itemName || 'Your order'} was refunded`,
+                    body: action === 'fulfil'
+                        ? (order.code ? `Show ${order.code} to collect it.` : 'Your staff have marked it handed over.')
+                        : `${order.price} ${settings.currency.short} is back in your balance.`,
+                    refId: order._id,
+                    senderName: by,
+                });
+            }
+        }
+        res.json({ order: crewShop.publicOrder(order, { canManage: true }) });
+    } catch (err) { crewFail(res, err, { log: 'shop order review error', message: 'That could not be saved.' }); }
+});
+
+/**
+ * One thing on the shelf, from a form.
+ *
+ * Merged over what is saved so a PATCH of one field does not blank the other
+ * six — the same shape cleanMember follows, and for the same reason.
+ */
+function cleanShopItem(b, existing) {
+    const src = { ...(existing || {}), ...(b || {}) };
+    const image = String(src.image || '').trim().slice(0, 500);
+    return {
+        name: String(src.name || '').trim().slice(0, 60),
+        desc: String(src.desc || '').trim().slice(0, 240),
+        // Rendered in an <img> on a page a pilot opens, so anything that is not
+        // plainly an https URL is dropped rather than passed through — the rule
+        // the branding fields and partner logos already follow.
+        image: /^https:\/\//i.test(image) ? image : '',
+        icon: String(src.icon || '').trim().slice(0, 40),
+        price: Math.max(0, Math.min(1e7, Math.round(Number(src.price) || 0))),
+        // -1 is unlimited and is what an absent figure means: most of what a VA
+        // sells is a livery or a role, and those do not run out.
+        stock: src.stock === undefined || src.stock === null || src.stock === ''
+            ? -1 : Math.max(-1, Math.min(1e6, Math.round(Number(src.stock) || 0))),
+        limitPerPilot: Math.max(0, Math.min(1e4, Math.round(Number(src.limitPerPilot) || 0))),
+        active: src.active === undefined ? true : !!src.active,
+    };
+}
 
 // ---- Route network ----
 const cleanRoute = (b) => {
@@ -8266,14 +8882,96 @@ async function applyPirepHours(store, pirep, va) {
             }
         }
     }
+    // v15. And what the flight is worth in the VA's own currency, where the VA
+    // runs a shop. Deliberately here rather than in the two routes that approve
+    // a flight: this is the one place hours move, and hours and miles moving
+    // apart is how an auto-approved leg ends up paying nothing.
+    //
+    // Paid at most once, and the database is what guarantees that rather than
+    // this code — crew_shop_credit writes the figure onto the report in the same
+    // statement that gates on it not already being there. Best-effort at this
+    // level: a project that cannot pay must not cost the pilot their hours, so
+    // the failure is logged and the approval stands.
+    if (va) await creditFlightPoints(store, pirep, va);
+
     return (await store.updatePirep(pirep._id, { hoursApplied: true })) || { ...pirep, hoursApplied: true };
+}
+
+/**
+ * Tell the pilot their flight was reviewed.
+ *
+ * The one beat in this product a pilot is least likely to notice unaided: they
+ * file a report and a staff member decides on it hours or days later, nowhere
+ * near them. The crew feed announces it to the airline and the logbook records
+ * it; this is the copy addressed to the person it happened to, and it is what
+ * the bell in the top bar is mostly carrying.
+ *
+ * Detached, like every other notice in this file: a pilot's message must not sit
+ * in front of the reply to the staff member who pressed the button, and a
+ * project that cannot take the row must not fail the review.
+ */
+function tellPilotAboutFlight(va, store, pirep, approved) {
+    if (!va || !pirep || !pirep.memberId) return;
+    const leg = [pirep.origin, pirep.destination].filter(Boolean).join(' → ')
+        || pirep.flightNumber || 'Your flight';
+    Promise.resolve()
+        .then(async () => {
+            const member = await store.getMember(pirep.memberId);
+            if (!member) return;
+            const hours = Math.round(((Number(pirep.durationMin) || 0) / 60) * 10) / 10;
+            notifyPilot(va, member, {
+                kind: approved ? 'flight_approved' : 'flight_rejected',
+                title: approved ? `${leg} was approved` : `${leg} was not approved`,
+                // What actually changed for them. A rejection deliberately says
+                // nothing about why: the reason is a conversation with staff, and
+                // inventing one here would put words in their mouth.
+                body: approved
+                    ? `${hours ? `${hours}h ` : ''}credited to your logbook.`
+                    : 'Ask your staff if you are not sure why.',
+                refId: pirep._id,
+            });
+        })
+        .catch((err) => console.warn('flight notice skipped —', (err && err.message) || err));
+}
+
+/**
+ * Pay for one approved flight.
+ *
+ * Split out because the calculation is the VA's settings and the payment is the
+ * VA's database, and because both doors into approval — a staff member pressing
+ * the button and the auto-approve rule in the sync — go through applyPirepHours
+ * above and must price a flight identically.
+ *
+ * Nothing happens at all for a VA with no shop, which is every VA until one
+ * turns it on: no round trip, no row, no column touched.
+ */
+async function creditFlightPoints(store, pirep, va) {
+    const settings = crewShop.fromRecord(va && va.crewShop);
+    if (!settings.enabled || !pirep || !pirep.memberId) return;
+    const amount = crewShop.earnFor(pirep, settings.earn);
+    try {
+        await store.creditFlight(pirep._id, pirep.memberId, amount);
+    } catch (err) {
+        // A shop that cannot pay is a shop to fix, not a reason to refuse a
+        // flight its hours. The VA sees this in the panel the next time they
+        // open it, with the update button attached.
+        console.warn('shop credit skipped —', (err && err.message) || err);
+    }
 }
 // Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
 // at 0 by the store.
-async function reversePirepHours(store, pirep) {
+async function reversePirepHours(store, pirep, va) {
     if (!pirep || !pirep.hoursApplied || !pirep.memberId) return pirep;
     const hrs = (Number(pirep.durationMin) || 0) / 60;
     if (hrs > 0) await store.addMemberHours(pirep.memberId, -hrs);
+    // v15. And what it paid, where it paid anything. Clearing the figure is what
+    // lets a re-approval pay again — which is right, because the flight would be
+    // counting for hours again too. `va` is optional for the same reason it is
+    // above: the hours come back either way.
+    if (va) {
+        try { await store.uncreditFlight(pirep._id, pirep.memberId); }
+        catch (err) { console.warn('shop reversal skipped —', (err && err.message) || err); }
+    }
     return (await store.updatePirep(pirep._id, { hoursApplied: false })) || { ...pirep, hoursApplied: false };
 }
 const publicPirep = (p) => ({
@@ -8799,6 +9497,10 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                 if (willApprove) {
                     await applyPirepHours(store, doc, va);
                     postPirepNotice(va, 'approved', doc, { name: 'Auto-approval' });
+                    // The pilot's own copy, exactly as a hand-approved flight
+                    // earns: from their side the two are the same event, and a
+                    // rule approving it is not a reason to tell them less.
+                    tellPilotAboutFlight(va, store, doc, true);
                     approved++;
                 }
             }
@@ -8825,12 +9527,16 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
                 p = await store.updatePirep(p._id, { status: 'approved', reviewedAt: new Date() });
                 p = await applyPirepHours(store, p, va);
                 postPirepNotice(va, 'approved', p, gate.p);
+                tellPilotAboutFlight(va, store, p, true);
             }
         } else if (action === 'reject') {
             const was = p.status;
-            p = await reversePirepHours(store, p);
+            p = await reversePirepHours(store, p, va);
             p = await store.updatePirep(p._id, { status: 'rejected', reviewedAt: new Date() });
-            if (was !== 'rejected') postPirepNotice(va, 'rejected', p, gate.p);
+            if (was !== 'rejected') {
+                postPirepNotice(va, 'rejected', p, gate.p);
+                tellPilotAboutFlight(va, store, p, false);
+            }
         } else return res.status(400).json({ error: 'Unknown action.' });
         res.json({ pirep: publicPirep(p) });
     } catch (err) { crewFail(res, err, { log: 'pirep review error', message: 'Could not update the flight.' }); }
@@ -8841,10 +9547,10 @@ app.delete('/api/crew/:slug/pireps/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const p = await store.getPirep(req.params.id);
         if (!p) return res.status(404).json({ error: 'Flight not found.' });
-        await reversePirepHours(store, p);
+        await reversePirepHours(store, p, va);
         await store.deletePirep(p._id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'pirep delete error', message: 'Could not remove the flight.' }); }
@@ -9658,6 +10364,8 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             notificationsSchemaVersion: crewStore.NOTIFICATIONS_SCHEMA_VERSION,
             linksSchemaVersion: crewStore.LINKS_SCHEMA_VERSION,
             trainingSchemaVersion: crewStore.TRAINING_SCHEMA_VERSION,
+            leaveSchemaVersion: crewStore.LEAVE_SCHEMA_VERSION,
+            shopSchemaVersion: crewStore.SHOP_SCHEMA_VERSION,
             // The saved access token, described but never disclosed.
             token: tokenState(tokenMeta),
             // Set when this very request brought the project up to date, so the
@@ -12556,7 +13264,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -12611,6 +13319,16 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             // visitor either. Nothing here is a secret; it is the same class of
             // thing as the rank ladder sitting above it.
             schedule: crewSchedules.publicRules(ad.crewSchedule),
+            // Whether this VA runs a shop, and what it calls its currency.
+            // ONLY that: the rates are the VA's business, the shelf and every
+            // balance live in the VA's own database, and none of it belongs on
+            // an endpoint a signed-out visitor reads. The flag is here so the
+            // dashboard can decide whether to draw a Shop tile without asking
+            // for the whole shop on a page that may never open it.
+            shop: (() => {
+                const shop = crewShop.fromRecord(ad.crewShop);
+                return { enabled: shop.enabled, currency: shop.currency };
+            })(),
             join: {
                 mode: ad.joinMode || 'application',
                 minGrade: ad.minGrade || 0,
