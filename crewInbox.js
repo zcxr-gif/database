@@ -70,6 +70,13 @@ const KINDS = [
     'document',     // a manual published or revised
     'checkride',    // due, booked, passed
     'system',       // the crew center itself: account created, password reset
+    // v15. The three the bell carries that nothing used to tell a pilot about
+    // at all. Approved and rejected are separate kinds rather than one 'flight'
+    // with the answer in the body, because the icon and the colour are the whole
+    // of the glanceable difference between them.
+    'flight_approved', // a report they filed was credited
+    'flight_rejected', // a report they filed was not
+    'order',        // something they bought was handed over, or refunded
 ];
 
 /** Who a send goes to. See the header for why this list is closed. */

@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 14;
+const EXPECTED_SCHEMA_VERSION = 15;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -119,6 +119,20 @@ const IF_LINK_SCHEMA_VERSION = 13;
 // offers the update button itself rather than reporting a broken store over a
 // VA whose roster, routes and flights are all answering perfectly.
 const TRAINING_SCHEMA_VERSION = 14;
+
+// The version that introduced the leave columns on crew_members. Its own
+// constant even though `status = 'loa'` is as old as the roster: the flag has
+// always been there, and what a pre-v15 project cannot hold is the date a pilot
+// is coming back — which is the whole of what makes leave something a pilot can
+// set for themselves rather than a label staff maintain.
+const LEAVE_SCHEMA_VERSION = 15;
+
+// The version that introduced crew_shop_items, crew_shop_orders, the wallet
+// columns and the four functions that move a balance. One constant for the lot,
+// unlike the library and the inbox: a shop with a shelf and no wallet is not a
+// half-working shop, it is a broken one, and there is no useful sentence to say
+// about a project that has one and not the other.
+const SHOP_SCHEMA_VERSION = 15;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -292,6 +306,22 @@ const memberFromRow = (r) => r && {
     // flying moves the anchor past it and the next silence warns afresh. See
     // crewRetention.alreadyWarned.
     retentionWarnedAt: date(r.retention_warned_at),
+    // v15. Leave of absence, as the pilot themselves set it. `status === 'loa'`
+    // is still the flag the roster sweep reads; these are the sentence around
+    // it. A null `loaUntil` on an 'loa' member is open-ended leave — which is
+    // what every hand-set one from before v15 looks like, and is why the sweep
+    // treats it exactly as it always did.
+    loaUntil: date(r.loa_until),
+    loaReason: r.loa_reason || '',
+    loaSince: date(r.loa_since),
+    // v15. The wallet. Absent columns read as zero rather than as nothing, so a
+    // project that predates the shop answers "0" to a balance question instead
+    // of putting NaN on a card.
+    points: {
+        balance: Number(r.points_balance) || 0,
+        earned: Number(r.points_earned) || 0,
+        spent: Number(r.points_spent) || 0,
+    },
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -414,6 +444,10 @@ const pirepFromRow = (r) => r && {
     source: r.source || 'auto',
     status: r.status || 'pending',
     hoursApplied: !!r.hours_applied,
+    // v15. What this flight paid into the wallet, or null if it never has.
+    // Null and 0 are different answers — see the column's note in the schema —
+    // so this is deliberately not coerced to a number.
+    pointsAwarded: r.points_awarded == null ? null : Number(r.points_awarded) || 0,
     flownAt: date(r.flown_at),
     reviewedAt: date(r.reviewed_at),
     createdAt: date(r.created_at),
@@ -887,6 +921,58 @@ const trainingToRow = (t) => {
     pick(t, out, 'notes', 'notes', (v) => str(v, 300));
     pick(t, out, 'decidedAt', 'decided_at', (v) => (v ? new Date(v).toISOString() : null));
     return out;
+};
+
+// v15. One thing on the shop's shelf.
+//
+// `stock` is deliberately not clamped at 0: -1 is unlimited and is the default,
+// which is what most of what a VA sells actually is (a livery, a Discord role, a
+// callsign). `description` is the column and `desc` is the document field,
+// because `desc` is a reserved word in the SQL the VA may one day read this
+// table with by hand.
+const shopItemFromRow = (r) => r && {
+    _id: r.id,
+    name: r.name || '',
+    desc: r.description || '',
+    image: r.image_url || '',
+    icon: r.icon || '',
+    price: Number(r.price) || 0,
+    stock: r.stock == null ? -1 : Number(r.stock),
+    limitPerPilot: Number(r.limit_per_pilot) || 0,
+    active: r.active !== false,
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const shopItemToRow = (i) => {
+    const out = {};
+    pick(i, out, 'name', 'name', (v) => str(v, 60));
+    pick(i, out, 'desc', 'description', (v) => str(v, 240));
+    pick(i, out, 'image', 'image_url', (v) => str(v, 500));
+    pick(i, out, 'icon', 'icon', (v) => str(v, 40));
+    pick(i, out, 'price', 'price', (v) => int(v, 0, 1e7));
+    // -1 (unlimited) through to a sensible ceiling. Rounded, because the field
+    // in the editor is a number input and a VA pasting "12.5" means twelve.
+    pick(i, out, 'stock', 'stock', (v) => int(v, -1, 1e6));
+    pick(i, out, 'limitPerPilot', 'limit_per_pilot', (v) => int(v, 0, 1e4));
+    pick(i, out, 'active', 'active', (v) => v !== false);
+    return out;
+};
+
+// An order, which is a receipt: it carries its own copy of what was bought and
+// what it cost, so editing or deleting the item afterwards cannot rewrite what a
+// pilot actually paid. See the table's note in the schema.
+const shopOrderFromRow = (r) => r && {
+    _id: r.id,
+    memberId: r.member_id || null,
+    itemId: r.item_id || null,
+    itemName: r.item_name || '',
+    price: Number(r.price) || 0,
+    status: r.status || 'placed',
+    code: r.code || '',
+    decidedAt: date(r.decided_at),
+    decidedBy: r.decided_by || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
 };
 
 // ---------------------------------------------------------------------------
@@ -1851,6 +1937,215 @@ class SupabaseStore {
         });
     }
 
+    /* --- Leave of absence (v15) ---
+     *
+     * Two codes collapse into one here, and deliberately. A project that has
+     * never had the crew tables answers `store_schema_missing`; one that has
+     * them but predates the leave columns answers `store_schema_outdated`, which
+     * is what PostgREST says when a write names `loa_until` and the column is
+     * not there. From the panel's side those are the same sentence — "your
+     * database is behind, here is the button" — and `store_leave_missing` is
+     * what CrewPanels.isSchemaGap recognises.
+     */
+    async leave(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError
+                && (err.code === 'store_schema_missing' || err.code === 'store_schema_outdated')) {
+                throw new CrewStoreError(
+                    'This crew center’s project cannot record leave yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_leave_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Put a pilot on leave.
+     *
+     * `status` moves with it because the roster sweep reads the status and
+     * nothing else — the three columns are the record, the flag is the rule.
+     * Writing both in one PATCH is what stops a pilot being marked away with a
+     * sweep that still has them in its sights.
+     */
+    setLeave(memberId, { until = null, reason = '' } = {}) {
+        return this.leave(async () => {
+            const [row] = await this.db.update('crew_members', this.ident(memberId), {
+                status: 'loa',
+                loa_until: until ? new Date(until).toISOString() : null,
+                loa_reason: str(reason, 120),
+                loa_since: new Date().toISOString(),
+            });
+            return row ? memberFromRow(row) : null;
+        });
+    }
+
+    /**
+     * Back early, or back on time.
+     *
+     * Clears the record as well as the flag, so a pilot who goes away twice does
+     * not carry the first trip's sentence into the second. Returning to 'active'
+     * rather than to whatever they were before is right for the same reason the
+     * sweep only ever marks people inactive: this is the pilot saying they are
+     * flying again, and that is the status for it.
+     */
+    endLeave(memberId) {
+        return this.leave(async () => {
+            const [row] = await this.db.update('crew_members', this.ident(memberId), {
+                status: 'active', loa_until: null, loa_reason: '', loa_since: null,
+            });
+            return row ? memberFromRow(row) : null;
+        });
+    }
+
+    /* --- The shop (v15) ---
+     *
+     * One wrapper for the shelf, the orders and the wallet, because they fail
+     * together: see SHOP_SCHEMA_VERSION for why there is no useful sentence
+     * about a project with one and not the others.
+     */
+    async shop(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError
+                && (err.code === 'store_schema_missing' || err.code === 'store_schema_outdated')) {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the shop yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_shop_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    listShopItems({ activeOnly = false, limit = 200 } = {}) {
+        return this.shop(async () => {
+            const q = { ...this.scope, order: 'created_at.asc', limit };
+            if (activeOnly) q.active = 'is.true';
+            const rows = await this.db.select('crew_shop_items', q);
+            return (rows || []).map(shopItemFromRow);
+        });
+    }
+    getShopItem(id) {
+        return this.shop(() => this.one('crew_shop_items', this.ident(id), shopItemFromRow));
+    }
+    createShopItem(data) {
+        return this.shop(async () => {
+            const [row] = await this.db.insert('crew_shop_items', { va_slug: this.slug, ...shopItemToRow(data) });
+            return shopItemFromRow(row);
+        });
+    }
+    updateShopItem(id, patch) {
+        return this.shop(async () => {
+            const [row] = await this.db.update('crew_shop_items', this.ident(id), shopItemToRow(patch));
+            return row ? shopItemFromRow(row) : null;
+        });
+    }
+    /**
+     * Take something off the shelf.
+     *
+     * A real delete, not a flag: `crew_shop_orders.item_id` is `on delete set
+     * null` and every order keeps its own copy of the name and the price, so
+     * somebody's receipt survives the thing they bought being removed. Staff who
+     * want it back later add it again; staff who want it hidden for a week use
+     * `active`, which is what that column is for.
+     */
+    deleteShopItem(id) {
+        return this.shop(async () => { await this.db.remove('crew_shop_items', this.ident(id)); return true; });
+    }
+
+    /**
+     * The orders.
+     *
+     * `memberId` narrows it to one pilot, which is what a pilot with no staff
+     * capability is allowed to see — applied in the query rather than after it,
+     * so nobody else's receipts leave Postgres.
+     */
+    listShopOrders({ memberId = '', limit = 300 } = {}) {
+        return this.shop(async () => {
+            const q = { ...this.scope, order: 'created_at.desc', limit };
+            if (memberId) q.member_id = `eq.${memberId}`;
+            const rows = await this.db.select('crew_shop_orders', q);
+            return (rows || []).map(shopOrderFromRow);
+        });
+    }
+    getShopOrder(id) {
+        return this.shop(() => this.one('crew_shop_orders', this.ident(id), shopOrderFromRow));
+    }
+
+    /**
+     * Handed over.
+     *
+     * Guarded on `status = 'placed'` in the query rather than by reading first:
+     * two staff members pressing Delivered on the same order is a normal thing
+     * to happen in a busy VA, and the second press should change nothing rather
+     * than stamp a second name on it.
+     */
+    fulfilShopOrder(id, by = '') {
+        return this.shop(async () => {
+            const [row] = await this.db.update('crew_shop_orders',
+                { ...this.ident(id), status: 'eq.placed' },
+                { status: 'fulfilled', decided_at: new Date().toISOString(), decided_by: str(by, 80) });
+            return row ? shopOrderFromRow(row) : null;
+        });
+    }
+
+    /**
+     * Buying, refunding, and paying for a flight.
+     *
+     * All four go through the schema's own functions rather than through reads
+     * and writes from here, because each of them is several statements that must
+     * not tear: a balance tested and debited, a stock taken, a payment recorded
+     * exactly once. See their notes in supabase/crew-center-schema.sql.
+     */
+    buyShopItem(memberId, itemId) {
+        return this.shop(async () => {
+            const out = await this.db.rpc('crew_shop_buy', {
+                p_va_slug: this.slug, p_member_id: memberId, p_item_id: itemId,
+            });
+            const r = (Array.isArray(out) ? out[0] : out) || {};
+            if (!r.ok) {
+                throw new CrewStoreError(r.error || 'That purchase did not go through.',
+                    { status: 409, code: `shop_${r.code || 'refused'}` });
+            }
+            return { order: shopOrderFromRow(r.order), wallet: r.wallet || null, stock: r.stock };
+        });
+    }
+    refundShopOrder(id, by = '') {
+        return this.shop(async () => {
+            const out = await this.db.rpc('crew_shop_refund', {
+                p_va_slug: this.slug, p_order_id: id, p_by: str(by, 80),
+            });
+            const r = (Array.isArray(out) ? out[0] : out) || {};
+            if (!r.ok) {
+                throw new CrewStoreError(r.error || 'That order could not be refunded.',
+                    { status: 409, code: `shop_${r.code || 'refused'}` });
+            }
+            return shopOrderFromRow(r.order);
+        });
+    }
+    /**
+     * Credit a flight, once.
+     *
+     * Best-effort at the CALLER's discretion, never here: the function itself is
+     * the thing that guarantees one payment per flight, and swallowing its
+     * answer would leave the server unable to tell "paid" from "already paid".
+     */
+    creditFlight(pirepId, memberId, amount) {
+        return this.shop(async () => {
+            const out = await this.db.rpc('crew_shop_credit', {
+                p_va_slug: this.slug, p_pirep_id: pirepId,
+                p_member_id: memberId || null, p_amount: Math.max(0, Math.round(Number(amount) || 0)),
+            });
+            return (Array.isArray(out) ? out[0] : out) || { ok: false };
+        });
+    }
+    uncreditFlight(pirepId, memberId) {
+        return this.shop(async () => {
+            const out = await this.db.rpc('crew_shop_uncredit', {
+                p_va_slug: this.slug, p_pirep_id: pirepId, p_member_id: memberId || null,
+            });
+            return (Array.isArray(out) ? out[0] : out) || { ok: false };
+        });
+    }
+
     // --- Aggregates ---
     // One round trip via the schema's crew_stats() function. If the project is
     // on an older schema that predates it, fall back to counting client-side so
@@ -1941,6 +2236,12 @@ class SupabaseStore {
                 // missing thing and offer the update button itself rather than
                 // leaving a VA to work out what "outdated" means for them.
                 training: version >= TRAINING_SCHEMA_VERSION,
+                // v15. Whether a pilot can say they are away with a date on it,
+                // and whether the project can hold a shelf, an order and a
+                // balance. Their own flags, like every feature above, so the
+                // panel that needs one can offer the update button itself.
+                leave: version >= LEAVE_SCHEMA_VERSION,
+                shop: version >= SHOP_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1958,6 +2259,8 @@ class SupabaseStore {
                 links: false,
                 ifLink: false,
                 training: false,
+                leave: false,
+                shop: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2374,6 +2677,44 @@ class LegacyStore {
     getTrainingRequest() { return this.training(); }
     createTrainingRequest() { return this.training(); }
     updateTrainingRequest() { return this.training(); }
+
+    // v15. Leave was never built on the retiring managed path. `status = 'loa'`
+    // can still be set by hand on a managed roster — that column is as old as
+    // the roster — but the date a pilot is coming back has nowhere to live here,
+    // and a leave with no end is the thing this feature exists to replace.
+    leave() {
+        return Promise.reject(new CrewStoreError(
+            'Leave needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_leave_unsupported' }));
+    }
+    setLeave() { return this.leave(); }
+    endLeave() { return this.leave(); }
+
+    // v15. Nor the shop. This one is not close: it is two tables, a wallet on
+    // every pilot and four functions that move money inside one statement, and
+    // building that on a path we are retiring would mean writing a migration for
+    // somebody's balance.
+    shop() {
+        return Promise.reject(new CrewStoreError(
+            'The shop needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_shop_unsupported' }));
+    }
+    listShopItems() { return this.shop(); }
+    getShopItem() { return this.shop(); }
+    createShopItem() { return this.shop(); }
+    updateShopItem() { return this.shop(); }
+    deleteShopItem() { return this.shop(); }
+    listShopOrders() { return this.shop(); }
+    getShopOrder() { return this.shop(); }
+    fulfilShopOrder() { return this.shop(); }
+    buyShopItem() { return this.shop(); }
+    refundShopOrder() { return this.shop(); }
+    // Not a refusal: crediting a flight is something the approve path does on
+    // every VA, shop or no shop, and a managed VA approving a report must not
+    // see it fail because they have no wallet to pay into. Nothing happened, and
+    // that is the honest answer.
+    creditFlight() { return Promise.resolve({ ok: false, code: 'no_shop' }); }
+    uncreditFlight() { return Promise.resolve({ ok: false, code: 'no_shop' }); }
     listLinks() { return this.links(); }
     getLink() { return this.links(); }
     createLink() { return this.links(); }
@@ -2536,7 +2877,7 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // crew route — the roster, the route network's gating, a promotion notice — and
 // fetching the same small array again in each handler would be a second query
 // per request for a field that is a few hundred bytes.
-const SELECT = '_id slug callsign name contactEmail crewAccent ranks supabaseUrl supabaseAnonKey +supabaseServiceKey';
+const SELECT = '_id slug callsign name contactEmail crewAccent ranks crewShop crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);
@@ -2584,5 +2925,7 @@ module.exports = {
     LINKS_SCHEMA_VERSION,
     IF_LINK_SCHEMA_VERSION,
     TRAINING_SCHEMA_VERSION,
+    LEAVE_SCHEMA_VERSION,
+    SHOP_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

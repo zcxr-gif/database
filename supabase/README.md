@@ -165,6 +165,20 @@ than at the row.
 | `POST /api/crew/:slug/if/push` | `schedules.manage` | push published upcoming departures onto that aircraft's rota |
 | `POST /api/crew/:slug/if/pull` | `schedules.manage` | import the aircraft's rota into the crew center as drafts |
 | `GET /api/crew/:slug/if/board` | any crew login | the pilot's read-only view: the fleet, where it is, what is going out next |
+| `GET /api/crew/:slug/alerts` | the pilot | what has happened to them, newest 40, with an unread count. A view over `crew_notifications` — there is no alerts table |
+| `POST /api/crew/:slug/alerts/read` | the pilot | mark exactly the ids given. No `all`: the bell marks what was on screen |
+| `GET /api/crew/:slug/awards` | public / the pilot | the catalogue always; `earned` and `progress` for the signed-in pilot. Computed from approved flights, never stored |
+| `GET /api/crew/:slug/leave` | the pilot or `roster.manage` | whether they are away, and what the airline's sweep does |
+| `POST /api/crew/:slug/leave` | the pilot | go away until a date. Their own row only — there is no `pilotId` |
+| `DELETE /api/crew/:slug/leave/:id` | the pilot or `roster.manage` | back early, or staff tidying up after somebody who came back and never said |
+| `GET /api/crew/:slug/crew-health` | `roster.manage` | the roster sorted into going quiet / never started / nearly out / away, each row with eight weeks of flying |
+| `POST /api/crew/:slug/crew-health/nudge` | `roster.manage` | send one of them a note, in the staff member's own words, through the inbox |
+| `GET /api/crew/:slug/shop` | public / the pilot | the shelf, the currency and the caller's own card. `wallet` is null for staff and for an unlinked login |
+| `POST /api/crew/:slug/shop/settings` | `settings.branding` | turn it on, name the currency, set the four rates. Merged over what is saved |
+| `POST/PATCH/DELETE /api/crew/:slug/shop/items[/:id]` | `settings.branding` | stock the shelf. Deleting leaves existing orders alone |
+| `GET /api/crew/:slug/shop/orders` | the pilot / `settings.branding` | staff get everyone's, a pilot gets their own — filtered in the query |
+| `POST /api/crew/:slug/shop/orders` | the pilot | **the only thing that moves a balance.** Calls `crew_shop_buy`, which re-checks price, stock and per-pilot limit and debits in one statement |
+| `PATCH /api/crew/:slug/shop/orders/:id` | `settings.branding` | `fulfil` or `cancel`. Cancelling refunds and restocks; both tell the pilot |
 
 Everything else under `/api/crew/:slug/*` (roster, routes, pireps,
 applications) reads and writes through `crewStore.js`, which hides which
@@ -582,7 +596,12 @@ optional:
 2. Bump `version` in the final `insert` of `crew-center-schema.sql` **and**
    `EXPECTED_SCHEMA_VERSION` in `crewStore.js`.
 3. Add the column to `LATE_COLUMNS` in `crewStore.js` — the set of columns a
-   write may drop when the project has not got them (below).
+   write may drop when the project has not got them (below) — **or**, where the
+   feature is meaningless without it, give it a wrapper that turns the missing
+   column into a named `*_missing` code instead. `SupabaseStore.leave` is the
+   example: leave with no return date is the thing the columns exist to replace,
+   so dropping `loa_until` and carrying on would save a row that means the
+   opposite of what the pilot asked for.
 4. Add a line to the version history at the end of this section.
 
 Only ever add nullable columns or new tables. A VA runs this script against
@@ -672,6 +691,37 @@ Version history:
   examiner records the result, and recording a pass is the same act as the
   sign-off that promotes them — so it can no longer be the step that gets
   forgotten in a Discord channel
+
+- **v15** — the shop, awards and leave. `crew_shop_items`, `crew_shop_orders`,
+  the wallet columns on `crew_members` (`points_balance` / `points_earned` /
+  `points_spent`), `crew_pireps.points_awarded`, and four functions that move a
+  balance inside one statement (`crew_shop_buy`, `crew_shop_credit`,
+  `crew_shop_uncredit`, `crew_shop_refund`). Plus `crew_members.loa_until` /
+  `loa_reason` / `loa_since`, which put a date on the `status = 'loa'` flag the
+  roster sweep has spared since v1 — so a pilot can say they are away themselves
+  and the sweep starts counting again when they said they would be back.
+  `crew_notifications.kind` also gains `flight_approved`, `flight_rejected` and
+  `order`, which is what the bell in the top bar carries.
+
+Note what v15 does NOT add: an awards table. A badge is a fact about an approved
+flight log, computed on read by `crewAwards.js`, and the date on one is the date
+of the flight that crossed the line — so there is nothing to migrate, nothing for
+staff to award by hand, and a VA that never opens the panel still has them
+accruing.
+
+Note where v15's arithmetic lives: in the database, not in `server.js`. A debit
+that re-reads the price and tests the balance in the same statement is the only
+kind that cannot be raced by two taps on the same item, and `points_awarded is
+null` in `crew_shop_credit`'s WHERE is the whole of why approving a flight twice
+pays once. The backend decides what a flight is worth (`crewShop.earnFor`, from
+rates on the VA record); the project decides whether a pilot can afford
+something.
+
+Note the one alter v15 makes that is not an add: `crew_notifications_kind_check`
+is dropped and recreated with three more values in it. The inline check only runs
+on a fresh `create table`, so without the alter an established VA would refuse
+every "your flight was approved" with a constraint violation. It is still purely
+widening — no existing row can fail the new check.
 
 Note what v14 finally makes usable: `crew_members.checks_passed` has been there
 since v7 and stayed almost empty, because the ladder's `requiresCheck` flag was
