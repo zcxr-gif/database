@@ -667,6 +667,20 @@ Version history:
   so the second push is an update rather than the same leg twice on somebody's
   real aircraft
 
+- **v14** — `crew_training_requests`: the queue between "I think I'm ready" and
+  a rank that moves. A pilot asks for a check-ride, staff agree a time, an
+  examiner records the result, and recording a pass is the same act as the
+  sign-off that promotes them — so it can no longer be the step that gets
+  forgotten in a Discord channel
+
+Note what v14 finally makes usable: `crew_members.checks_passed` has been there
+since v7 and stayed almost empty, because the ladder's `requiresCheck` flag was
+being dropped on save (it was missing from the `ranks` subdocument schema on the
+VA record, and mongoose silently discards undeclared paths inside a subdocument
+array). Every rung therefore resolved as ungated and nothing ever asked to be
+signed off. The column is unchanged; what changed is that a gate now survives
+being saved, and there is a queue that reaches the sign-off.
+
 Note what v13 is not: it is not what makes the Live panel work. The fleet, the
 positions and the Live schedules all come from Infinite Flight, so a project on
 v12 gets the whole feature — what it cannot do is *remember* which of its own

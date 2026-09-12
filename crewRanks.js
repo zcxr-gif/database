@@ -81,6 +81,12 @@ function normalizeLadder(ranks) {
         .map((r) => ({
             name: clampStr(r.name, 40),
             minHours: Math.max(0, Number(r.minHours) || 0),
+            // v14. A second, optional requirement on the same rung: sectors
+            // flown, alongside the hours. Hours alone reward one long flight
+            // the same as twenty short ones, which is not what most airlines
+            // mean by ready — so a VA may ask for both, and 0 (the default,
+            // and what almost every rung carries) asks for neither.
+            minFlights: Math.max(0, Number(r.minFlights) || 0),
             color: clampStr(r.color, 20),
             icon: clampStr(r.icon, 30),
             image: clampStr(r.image, 600),

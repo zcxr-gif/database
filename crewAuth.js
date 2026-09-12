@@ -132,6 +132,8 @@ function sanitizeRanks(arr) {
     return arr.slice(0, 40).map(r => ({
         name: clampStr(r && r.name, 40),
         minHours: Math.max(0, Math.min(100000, Number(r && r.minHours) || 0)),
+        // v14. Sectors as well as hours, when a VA wants both. See crewRanks.
+        minFlights: Math.max(0, Math.min(100000, Number(r && r.minFlights) || 0)),
         color: isHexColor(r && r.color) ? r.color : '',
         icon: clampStr(r && r.icon, 30),
         image: cleanImageUrl(r && r.image),

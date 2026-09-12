@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 13;
+const EXPECTED_SCHEMA_VERSION = 14;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -112,6 +112,13 @@ const LINKS_SCHEMA_VERSION = 12;
 // own departures it pushed, so the columns sit in LATE_COLUMNS and the push
 // degrades to "sent, but we cannot record it here yet" instead of failing.
 const IF_LINK_SCHEMA_VERSION = 13;
+
+// The version that introduced crew_training_requests. Its own constant, like
+// events and the links board: check-rides are a whole feature a pre-v14 project
+// has not got a table for, so the training panel names the missing thing and
+// offers the update button itself rather than reporting a broken store over a
+// VA whose roster, routes and flights are all answering perfectly.
+const TRAINING_SCHEMA_VERSION = 14;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -843,6 +850,42 @@ const linkToRow = (l) => {
     pick(l, out, 'status', 'status', (v) => (crewLinks.STATUSES.includes(v) ? v : 'published'));
     pick(l, out, 'sortOrder', 'sort_order', (v) => int(v, 0, 9999));
     pick(l, out, 'authorName', 'author_name', (v) => str(v, 80));
+    return out;
+};
+
+// v14. One pilot's ask for a check-ride, and everything that then happened to
+// it. The row is the record rather than a workflow token: it survives the
+// decision so a pilot can be shown why they are still where they are, and so a
+// VA can see who is waiting on whom.
+//
+// `scheduledAt` and `scheduledText` are both kept on purpose -- an examiner
+// types "Saturday 19:00Z, KJFK -> EGLL", of which only the front half is an
+// instant. Parsing it and keeping only the instant throws away the route the
+// pilot needs; keeping only the words leaves the queue with nothing to sort by.
+const trainingFromRow = (r) => r && {
+    _id: r.id,
+    memberId: r.member_id || null,
+    forRank: r.for_rank || '',
+    status: r.status || 'requested',
+    scheduledAt: date(r.scheduled_at),
+    scheduledText: r.scheduled_text || '',
+    examinerName: r.examiner_name || '',
+    notes: r.notes || '',
+    decidedAt: date(r.decided_at),
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const TRAINING_STATUSES = ['requested', 'scheduled', 'passed', 'failed', 'withdrawn'];
+const trainingToRow = (t) => {
+    const out = {};
+    pick(t, out, 'memberId', 'member_id', (v) => v || null);
+    pick(t, out, 'forRank', 'for_rank', (v) => str(v, 40));
+    pick(t, out, 'status', 'status', (v) => (TRAINING_STATUSES.includes(v) ? v : 'requested'));
+    pick(t, out, 'scheduledAt', 'scheduled_at', (v) => (v ? new Date(v).toISOString() : null));
+    pick(t, out, 'scheduledText', 'scheduled_text', (v) => str(v, 160));
+    pick(t, out, 'examinerName', 'examiner_name', (v) => str(v, 80));
+    pick(t, out, 'notes', 'notes', (v) => str(v, 300));
+    pick(t, out, 'decidedAt', 'decided_at', (v) => (v ? new Date(v).toISOString() : null));
     return out;
 };
 
@@ -1759,6 +1802,55 @@ class SupabaseStore {
         } catch { return 0; }
     }
 
+    // --- Check-rides (v14) ---
+    async training(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center\u2019s project does not have the check-ride queue yet. Re-run the setup SQL (Settings \u2192 Data store) to add it.',
+                    { status: 409, code: 'store_training_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The queue, oldest ask first.
+     *
+     * Ascending rather than descending, unlike every other list here: this one is
+     * worked rather than read, and the person who has been waiting longest is the
+     * one who should be at the top. The pilot's own view re-sorts client-side,
+     * where "my latest" is what matters.
+     *
+     * `memberId` narrows it to one pilot, which is what a signed-in pilot with no
+     * staff capability is allowed to see \u2014 the filter is applied in the query
+     * rather than after it, so the rows never leave Postgres in the first place.
+     */
+    listTrainingRequests({ memberId = '', limit = 300 } = {}) {
+        return this.training(async () => {
+            const q = { ...this.scope, order: 'created_at.asc', limit };
+            if (memberId) q.member_id = `eq.${memberId}`;
+            const rows = await this.db.select('crew_training_requests', q);
+            return (rows || []).map(trainingFromRow);
+        });
+    }
+    getTrainingRequest(id) {
+        return this.training(() => this.one('crew_training_requests', this.ident(id), trainingFromRow));
+    }
+    createTrainingRequest(data) {
+        return this.training(async () => {
+            const [row] = await this.db.insert('crew_training_requests',
+                { va_slug: this.slug, ...trainingToRow(data) });
+            return trainingFromRow(row);
+        });
+    }
+    updateTrainingRequest(id, patch) {
+        return this.training(async () => {
+            const [row] = await this.db.update('crew_training_requests', this.ident(id), trainingToRow(patch));
+            return row ? trainingFromRow(row) : null;
+        });
+    }
+
     // --- Aggregates ---
     // One round trip via the schema's crew_stats() function. If the project is
     // on an older schema that predates it, fall back to counting client-side so
@@ -1844,6 +1936,11 @@ class SupabaseStore {
                 // update button attached, rather than pushing the same leg
                 // again next time because it forgot the first one.
                 ifLink: version >= IF_LINK_SCHEMA_VERSION,
+                // v14. Whether the project can hold a check-ride request. Its own
+                // flag, like events and links, so the training panel can name the
+                // missing thing and offer the update button itself rather than
+                // leaving a VA to work out what "outdated" means for them.
+                training: version >= TRAINING_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1860,6 +1957,7 @@ class SupabaseStore {
                 notifications: false,
                 links: false,
                 ifLink: false,
+                training: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2264,6 +2362,18 @@ class LegacyStore {
             'The quick-links board needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
             { status: 409, code: 'store_links_unsupported' }));
     }
+
+    // v14. Check-rides were never built on the retiring managed path either.
+    // Same reasoning as events and the schedule, same shape of refusal.
+    training() {
+        return Promise.reject(new CrewStoreError(
+            'Check-rides need your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_training_unsupported' }));
+    }
+    listTrainingRequests() { return this.training(); }
+    getTrainingRequest() { return this.training(); }
+    createTrainingRequest() { return this.training(); }
+    updateTrainingRequest() { return this.training(); }
     listLinks() { return this.links(); }
     getLink() { return this.links(); }
     createLink() { return this.links(); }
@@ -2473,5 +2583,6 @@ module.exports = {
     NOTIFICATIONS_SCHEMA_VERSION,
     LINKS_SCHEMA_VERSION,
     IF_LINK_SCHEMA_VERSION,
+    TRAINING_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };
