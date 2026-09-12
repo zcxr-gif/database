@@ -1502,13 +1502,29 @@ function registerCrewAuthRoutes(app) {
      * the standalone page in the overlay's frame.
      */
     const crewPageFor = (slug, embed) => {
-        const base = String(process.env.CREW_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL || '')
-            .replace(/\/+$/, '');
+        const base = crewDiscord.crewBaseUrl();
+        // NEVER A RELATIVE ADDRESS. An empty base used to leave this as
+        // "/crew/<slug>", and a relative redirect from the API resolves against
+        // the API — so a pilot finishing a sign-in was handed the backend's own
+        // staff portal. Nothing errored; the round trip simply ended in the
+        // wrong building. There is no sensible place to send somebody when the
+        // deployment has not said where the crew center is, so this says so
+        // rather than guessing.
+        if (!base) return '';
         const path = `${base}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
         return embed ? `${path}?embed=1&` : `${path}?`;
     };
-    const backToCrew = (res, slug, reason, embed) =>
-        res.redirect(`${crewPageFor(slug, embed)}discord=${encodeURIComponent(reason)}`);
+    /* The one place a misconfigured deployment surfaces. It is a plain sentence
+       rather than a redirect, because a redirect is exactly what cannot be
+       built — and it names the setting, so whoever sees it can fix it. */
+    const noCrewBase = (res) => res.status(500).type('text/plain').send(
+        'This deployment has not been told where its crew centers are served from. '
+        + 'Set CREW_PUBLIC_BASE_URL (or PUBLIC_BASE_URL) on the API and try again.');
+    const backToCrew = (res, slug, reason, embed) => {
+        const page = crewPageFor(slug, embed);
+        if (!page) return noCrewBase(res);
+        return res.redirect(`${page}discord=${encodeURIComponent(reason)}`);
+    };
 
     /* --- 1a. Leaving for Discord, to SIGN IN -----------------------------
      *
@@ -1630,7 +1646,9 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             // The FRAGMENT, so the credential is never in a log, a Referer or a
             // proxy's history. The query beside it is only a hint for the page.
-            return res.redirect(`${crewPageFor(slug, embed)}discord=ok#discord=${encodeURIComponent(handoff)}`);
+            const page = crewPageFor(slug, embed);
+            if (!page) return noCrewBase(res);
+            return res.redirect(`${page}discord=ok#discord=${encodeURIComponent(handoff)}`);
         } catch (err) {
             // Includes the case this feature exists in the shadow of: a VA whose
             // project has not had the v16 SQL run, where the column does not

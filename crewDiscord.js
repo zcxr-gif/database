@@ -89,7 +89,26 @@ const str = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
  * blamed themselves for it.
  */
 function configured() {
-    return !!(process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_SECRET);
+    return !!(process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_SECRET && crewBaseUrl());
+}
+
+/**
+ * The origin the crew center is served from, or '' if this deployment has not
+ * said.
+ *
+ * PART OF configured() ABOVE, AND THAT IS THE POINT. Knowing where to send a
+ * pilot BACK is as much a part of being set up as holding a client secret, and
+ * it was not checked — so a deployment with a secret and no base drew the
+ * button, sent a pilot to Discord, and answered the return with a RELATIVE
+ * redirect. A relative redirect from the API resolves against the API, so the
+ * pilot was handed the backend's own staff portal: no error anywhere, and a
+ * sign-in that ends somewhere it has no business being.
+ *
+ * Now the button simply does not appear until the deployment can finish the
+ * round trip, which is the rule the rest of this file already followed.
+ */
+function crewBaseUrl() {
+    return str(process.env.CREW_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL, 200).replace(/\/+$/, '');
 }
 
 /**
@@ -323,7 +342,7 @@ async function fetchProfile(accessToken) {
 
 module.exports = {
     SCOPE, STATE_TTL, HANDOFF_TTL,
-    configured, redirectUri, authorizeUrl,
+    configured, crewBaseUrl, redirectUri, authorizeUrl,
     signState, readState, signHandoff, readHandoff,
     profileFrom, avatarUrl, displayName,
     exchangeCode, fetchProfile,

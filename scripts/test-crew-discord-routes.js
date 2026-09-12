@@ -380,6 +380,38 @@ const server = app.listen(0, async () => {
                 !/[?&]embed=1/.test(plain.headers.get('location') || ''));
         }
 
+        /* ---- a deployment that never said where its crew centers are ---------- */
+        console.log('\nNo crew base configured');
+        {
+            ACCOUNTS = freshAccounts(); ACCOUNTS[0].discordId = WHO.id;
+            const keep = process.env.CREW_PUBLIC_BASE_URL;
+            delete process.env.CREW_PUBLIC_BASE_URL;
+            delete process.env.PUBLIC_BASE_URL;
+
+            /* THE BUG THIS IS FOR. With no base the return address used to come
+               out RELATIVE — "/crew/<slug>?..." — and a relative redirect from
+               the API resolves against the API. A pilot finishing a sign-in was
+               handed the backend's own staff portal, with nothing anywhere
+               reporting a fault. */
+            const back = await get(`/api/crew/auth/discord/callback?code=xyz&state=${
+                encodeURIComponent(crewDiscord.signState({ slug: 'ba', intent: 'login' }))}`);
+            const loc = back.headers.get('location') || '';
+            check('the callback does not redirect anywhere at all', !loc, loc);
+            check('…it says what is not set up', back.status === 500);
+            const said = await back.text();
+            check('…and names the setting to fix', /CREW_PUBLIC_BASE_URL/.test(said), said.slice(0, 120));
+
+            /* And the button should never have been drawn in the first place —
+               knowing where to send a pilot back is part of being set up. */
+            check('the feature reports itself unavailable, so no button is drawn',
+                crewDiscord.configured() === false);
+
+            process.env.CREW_PUBLIC_BASE_URL = keep;
+            process.env.PUBLIC_BASE_URL = 'https://inflight.example';
+            check('…and it is available again once the base is set',
+                crewDiscord.configured() === true);
+        }
+
         /* ---- everything that can go wrong on the way back ---------------------- */
         {
             const noState = await get('/api/crew/auth/discord/callback?code=xyz');

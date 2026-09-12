@@ -42,6 +42,33 @@ const check = (what, ok, extra) => {
         typeof d.configured === 'function');
 }
 
+/* --------------------------------- knowing where to send them BACK ------- */
+{
+    /* KNOWING WHERE THE CREW CENTER IS COUNTS AS BEING SET UP, and it did not.
+       A deployment holding a secret but no base drew the button, sent a pilot
+       to Discord, and answered the return with a relative redirect — which from
+       the API resolves against the API, handing them the backend's own staff
+       portal. Nothing errored. The sign-in just ended in the wrong building. */
+    process.env.DISCORD_CLIENT_ID = '1234567890';
+    process.env.DISCORD_CLIENT_SECRET = 'shh';
+    delete process.env.CREW_PUBLIC_BASE_URL;
+    delete process.env.PUBLIC_BASE_URL;
+    delete require.cache[require.resolve('../crewDiscord')];
+    const off = require('../crewDiscord');
+    check('a secret with nowhere to come back to is NOT set up', off.configured() === false);
+    check('…and the base reads as nothing rather than as a relative path',
+        off.crewBaseUrl() === '', off.crewBaseUrl());
+
+    process.env.PUBLIC_BASE_URL = 'https://inflight.example';
+    check('the public base answers when nothing more specific is set',
+        off.crewBaseUrl() === 'https://inflight.example');
+    process.env.CREW_PUBLIC_BASE_URL = 'https://crew.example/';
+    check('…and a crew base beats it', off.crewBaseUrl() === 'https://crew.example');
+    check('…with the trailing slash taken off, so the join is never doubled',
+        !off.crewBaseUrl().endsWith('/'));
+    check('now it is set up', off.configured() === true);
+}
+
 /* --------------------------------------------------------------- the setup */
 process.env.DISCORD_CLIENT_SECRET = 'shh';
 process.env.DISCORD_CLIENT_ID = '1234567890';
