@@ -369,6 +369,11 @@ const CrewSiteSchema = new mongoose.Schema({
         // on its design's own choices instead of on a pattern nobody picked.
         pattern: { type: String, default: '' },
         radius: { type: Number, default: null },
+        // How much the site moves. Empty for the same reason as the two above:
+        // a site stored before motion existed should open on its DESIGN's own
+        // answer — Skyline cinematic, Terminal still — rather than on a preset
+        // nobody chose. normaliseTheme is where that is decided.
+        motion: { type: String, default: '' },
     },
 
     /* THE PICTURES ON THIS SITE.
