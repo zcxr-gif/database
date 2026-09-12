@@ -149,12 +149,16 @@ function redirectUri(req) {
  *           the browser sends back afterwards.
  *   nonce   so two states are never the same string.
  * ------------------------------------------------------------------------ */
-function signState({ slug, intent, sub }) {
+function signState({ slug, intent, sub, embed }) {
     return jwt.sign({
         typ: 'crew-discord-state',
         slug: str(slug, 80).toLowerCase(),
         intent: intent === 'link' ? 'link' : 'login',
         sub: str(sub, 80) || undefined,
+        // Whether the pilot started this inside the app's crew-center overlay.
+        // A BOOLEAN, and sealed with everything else — it decides one query
+        // flag on the way back and can never influence WHERE that is.
+        embed: embed ? 1 : undefined,
         nonce: crypto.randomBytes(9).toString('base64url'),
     }, JWT_SECRET, { expiresIn: STATE_TTL });
 }
@@ -164,7 +168,7 @@ function readState(token) {
     try {
         const d = jwt.verify(String(token || ''), JWT_SECRET);
         if (!d || d.typ !== 'crew-discord-state' || !d.slug) return null;
-        return { slug: d.slug, intent: d.intent === 'link' ? 'link' : 'login', sub: d.sub || '' };
+        return { slug: d.slug, intent: d.intent === 'link' ? 'link' : 'login', sub: d.sub || '', embed: d.embed === 1 };
     } catch (err) { return null; }
 }
 
