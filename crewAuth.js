@@ -1505,7 +1505,7 @@ function registerCrewAuthRoutes(app) {
         if (!va) return backToCrew(res, req.params.slug, 'unknown');
         const slug = va.slug || String(req.params.slug).toLowerCase();
         res.set('Cache-Control', 'no-store');
-        res.redirect(crewDiscord.authorizeUrl(crewDiscord.signState({ slug, intent: 'login', sub: '' })));
+        res.redirect(crewDiscord.authorizeUrl(crewDiscord.signState({ slug, intent: 'login', sub: '' }), req));
     });
 
     /* --- 1b. Leaving for Discord, to LINK --------------------------------
@@ -1543,7 +1543,7 @@ function registerCrewAuthRoutes(app) {
         res.json({
             url: crewDiscord.authorizeUrl(crewDiscord.signState({
                 slug: va.slug || slug, intent: 'link', sub: String(p.sub),
-            })),
+            }), req),
         });
     });
 
@@ -1564,7 +1564,7 @@ function registerCrewAuthRoutes(app) {
             const va = await resolveVa(slug);
             if (!va) return backToCrew(res, slug, 'unknown');
 
-            const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code));
+            const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code, req));
             const store = await crewStore.forVa(va);
 
             /* --- LINKING ---

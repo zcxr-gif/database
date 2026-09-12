@@ -51,9 +51,33 @@ delete require.cache[require.resolve('../crewDiscord')];
 const d = require('../crewDiscord');
 
 {
-    check('with a secret and a base URL it is offered', d.configured() === true);
-    check('the redirect is derived from the deployment, not from a request',
-        d.redirectUri() === 'https://inflight.example/api/crew/auth/discord/callback', d.redirectUri());
+    check('with an id and a secret it is offered', d.configured() === true);
+
+    /* THE REDIRECT IS CONFIGURATION FIRST.
+       It has to match what is registered on the Discord application character
+       for character, and it has to be the same string in the authorize and in
+       the token exchange. */
+    process.env.DISCORD_OAUTH_REDIRECT_URI = 'https://api.example/api/crew/auth/discord/callback';
+    check('an explicit redirect is used exactly as given',
+        d.redirectUri() === 'https://api.example/api/crew/auth/discord/callback', d.redirectUri());
+    check('…and a request cannot talk it out of that',
+        d.redirectUri({ headers: { 'x-forwarded-host': 'evil.example' }, protocol: 'https', get: () => 'evil.example' })
+        === 'https://api.example/api/crew/auth/discord/callback');
+
+    /* WITHOUT ONE it falls back to the request's own host — NOT to
+       PUBLIC_BASE_URL, which on this platform is the site rather than the API,
+       and which built an address the callback route does not live at: Discord
+       redirected the pilot to the site's catch-all, nothing errored, and the
+       sign-in never completed. */
+    delete process.env.DISCORD_OAUTH_REDIRECT_URI;
+    const fromReq = d.redirectUri({ headers: {}, protocol: 'https', get: () => 'api.example' });
+    check('with none set it falls back to the host the request arrived on',
+        fromReq === 'https://api.example/api/crew/auth/discord/callback', fromReq);
+    check('…and never to the public site, which does not serve this route',
+        !d.redirectUri({ headers: {}, protocol: 'https', get: () => 'api.example' }).includes('inflight.example'));
+    check('…and answers nothing at all rather than guessing with no request',
+        d.redirectUri() === '');
+    process.env.DISCORD_OAUTH_REDIRECT_URI = 'https://api.example/api/crew/auth/discord/callback';
 }
 
 /* ------------------------------------------------------------ the authorize */
@@ -61,7 +85,7 @@ const d = require('../crewDiscord');
     const url = new URL(d.authorizeUrl(d.signState({ slug: 'baw', intent: 'login' })));
     check('a pilot is sent to Discord itself', url.origin === 'https://discord.com', url.origin);
     check('…with our application', url.searchParams.get('client_id') === '1234567890');
-    check('…and our fixed redirect', url.searchParams.get('redirect_uri') === d.redirectUri());
+    check('…and our fixed redirect', url.searchParams.get('redirect_uri') === d.redirectUri(), url.searchParams.get('redirect_uri'));
 
     /* IDENTIFY AND NOTHING ELSE. Not email, which we have no use for; not
        guilds, which would read every server a pilot is in to answer a question

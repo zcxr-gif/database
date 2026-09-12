@@ -89,9 +89,7 @@ const str = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
  * blamed themselves for it.
  */
 function configured() {
-    return !!(process.env.DISCORD_CLIENT_ID
-        && process.env.DISCORD_CLIENT_SECRET
-        && redirectUri());
+    return !!(process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_SECRET);
 }
 
 /**
@@ -104,11 +102,30 @@ function configured() {
  * they were standing in travels inside the signed state instead, where it
  * cannot be edited.
  */
-function redirectUri() {
+function redirectUri(req) {
     const explicit = str(process.env.DISCORD_OAUTH_REDIRECT_URI, 300);
     if (explicit) return explicit;
-    const base = str(process.env.PUBLIC_BASE_URL, 200).replace(/\/+$/, '');
-    return base ? `${base}/api/crew/auth/discord/callback` : '';
+    /* LAST RESORT, and NOT PUBLIC_BASE_URL — which was the first version of this
+     * and was wrong in a way that fails silently.
+     *
+     * PUBLIC_BASE_URL on this deployment is the SITE (inflight.info). The
+     * callback route is on the API, which is a different host, and the site
+     * does not proxy /api to it. So the default built an address that resolves
+     * to the site's own catch-all: Discord redirects the pilot to a page that
+     * is not this route, nothing errors, and the sign-in simply never
+     * completes. The Infinite Flight flow already carries a warning about
+     * exactly this (see IF_OAUTH_REDIRECT_URI in .env.example); this is the
+     * same trap and now the same answer.
+     *
+     * Derived from the request's own host, which is why it is the last resort
+     * and not the first: behind a proxy forwarding a host header we do not
+     * control, this is a value an attacker has a say in. It is here so a local
+     * instance works without configuration, and a real deployment should set
+     * DISCORD_OAUTH_REDIRECT_URI so the value cannot move. */
+    if (!req) return '';
+    const proto = String((req.headers && req.headers['x-forwarded-proto']) || req.protocol || 'https').split(',')[0].trim();
+    const host = String((req.headers && req.headers['x-forwarded-host']) || (req.get && req.get('host')) || '').split(',')[0].trim();
+    return host ? `${proto}://${host}/api/crew/auth/discord/callback` : '';
 }
 
 /* ---------------------------------------------------------------------------
@@ -189,10 +206,10 @@ function readHandoff(token) {
  * is the sort of convenience that makes people unsure whether they just logged
  * in to something.
  */
-function authorizeUrl(state) {
+function authorizeUrl(state, req) {
     const p = new URLSearchParams({
         client_id: str(process.env.DISCORD_CLIENT_ID, 60),
-        redirect_uri: redirectUri(),
+        redirect_uri: redirectUri(req),
         response_type: 'code',
         scope: SCOPE,
         state: String(state || ''),
@@ -262,13 +279,15 @@ async function post(url, body) {
 }
 
 /** A one-time code, for an access token. */
-async function exchangeCode(code) {
+async function exchangeCode(code, req) {
     const data = await post(TOKEN, {
         client_id: str(process.env.DISCORD_CLIENT_ID, 60),
         client_secret: str(process.env.DISCORD_CLIENT_SECRET, 120),
         grant_type: 'authorization_code',
         code: String(code || ''),
-        redirect_uri: redirectUri(),
+        // The SAME string the authorize carried. Discord compares them and
+        // refuses the code if they differ by a character.
+        redirect_uri: redirectUri(req),
     });
     const token = str(data && data.access_token, 300);
     if (!token) throw new Error('discord token exchange returned no token');
