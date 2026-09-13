@@ -314,6 +314,68 @@ const server = http.createServer((req, res) => {
         OK('an unreachable project is a 502, not a 500', err.status === 502 && err.code === 'store_unreachable', `got ${err.status}/${err.code}`);
     }
 
+    /* ---------------------------------------------------------------------
+     * WHICH COLUMNS A WRITE MAY LOSE, AND WHICH IT MAY NOT.
+     *
+     * A project on an older schema has columns this code writes. For most of
+     * them the right answer is to drop the column and write the row anyway: the
+     * pilot is still added, and the codeshare flag waits for the upgrade.
+     *
+     * For the Discord columns it is the WRONG answer, and quietly so. On a link
+     * the column IS the write — drop it and the update succeeds, changes
+     * nothing, and the pilot is told "Discord linked. You can use it to sign in
+     * from now on." They then cannot, ever, and nothing says why.
+     *
+     * So this drives `write` directly with a run() that refuses exactly once,
+     * the way PostgREST refuses an unknown column, and asserts on which of the
+     * two happens. Named columns rather than "some late column", because the
+     * whole defect was one name being in a list it should not have been in.
+     * ------------------------------------------------------------------- */
+    console.log('• a write only loses the columns it can afford to lose');
+    {
+        const undefinedColumn = (col) => Object.assign(
+            new crewStore.CrewStoreError(`no ${col} column`, { status: 409, code: 'store_schema_outdated' }),
+            { column: col });
+
+        // Refuses while the named column is still in the body, then succeeds.
+        const refusing = (col) => {
+            const seen = [];
+            return {
+                seen,
+                run: async (data) => {
+                    seen.push(Object.keys(data).sort());
+                    if (Object.prototype.hasOwnProperty.call(data, col)) throw undefinedColumn(col);
+                    return [data];
+                },
+            };
+        };
+
+        const drift = new crewStore.SupabaseStore({ slug: 'x', supabaseUrl: url, supabaseServiceKey: 'k' });
+        crewStore.forgetSchemaDrift();
+
+        const late = refusing('kind');
+        const wrote = await drift.db.write('crew_routes', { flight_number: 'BA1', kind: 'codeshare' }, late.run);
+        OK('a codeshare flag the project lacks is dropped and the route still saved',
+            wrote && wrote[0] && wrote[0].flight_number === 'BA1' && !('kind' in wrote[0]),
+            JSON.stringify(wrote));
+
+        crewStore.forgetSchemaDrift();
+        const link = refusing('discord_id');
+        let refused = null;
+        try {
+            await drift.db.write('crew_accounts', {
+                discord_id: '80351110224678912', discord_username: 'rae',
+            }, link.run);
+        } catch (err) { refused = err; }
+        OK('a Discord id the project lacks fails the write instead of vanishing from it',
+            refused && refused.code === 'store_schema_outdated',
+            refused ? `${refused.code}` : 'the write succeeded, which is the bug');
+        OK('…and it was never retried without the column',
+            link.seen.length === 1 && link.seen[0].includes('discord_id'),
+            JSON.stringify(link.seen));
+        crewStore.forgetSchemaDrift();
+    }
+
     console.log('• computeStats (legacy + older-schema fallback) agrees in shape');
     const js = crewStore.computeStats({
         members: [{ name: 'A', callsign: 'A1', hours: 10, status: 'active', ifUserId: 'x', createdAt: new Date() },

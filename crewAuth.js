@@ -1695,6 +1695,68 @@ function registerCrewAuthRoutes(app) {
         });
     });
 
+    /* WHY THE CALLBACK WENT WRONG, IN ONE WORD THE PAGE CAN PRINT.
+     *
+     * This used to be three store codes and then 'failed' for everything else,
+     * and 'failed' is drawn by the crew center as "Discord didn't answer.
+     * Please try again." That sentence is right for exactly one of the things
+     * that actually happen here. For the rest it is advice that cannot ever
+     * work, and a pilot who follows it fails again and reports that Discord is
+     * down — which sends the VA's staff, and us, looking in the wrong place.
+     *
+     * Every branch below is a DIFFERENT PERSON'S problem to fix:
+     *
+     *   needs_update   the VA's staff, by re-running the setup SQL
+     *   store_offline  nobody, yet — the VA's project did not answer
+     *   store_denied   the VA's staff, by re-copying their service key
+     *   store_readonly the VA's staff, by making room in Supabase
+     *   link_taken     the pilot, by unlinking that Discord elsewhere
+     *   discord_setup  US. Discord answered and said no: the secret, the
+     *                  client id, or a redirect URI that does not match the
+     *                  one registered on the application. A pilot retrying is
+     *                  wasted effort, and the log line below is the whole
+     *                  diagnosis — it names Discord's own error slug and the
+     *                  redirect_uri we sent.
+     *   failed         genuinely unknown, and only now does "try again" apply.
+     *
+     * Every one of them is LOGGED with the store's or Discord's own detail,
+     * because the reason a pilot sees has to stay vague enough not to enumerate
+     * a roster and the reason in the log does not.
+     */
+    function discordFailure(err, slug) {
+        const code = (err && err.code) || '';
+        const detail = (err && err.detail) || '';
+        const say = (reason) => {
+            const line = [`Crew Discord callback [${reason}]`, slug, code, detail,
+                !detail && err && err.message].filter(Boolean).join(' · ');
+            if (reason === 'failed' || reason === 'discord_setup') console.error(line);
+            else console.warn(line);
+            return reason;
+        };
+
+        // The VA's project. Each of these already carries the store's own
+        // sentence and its own fix; what is chosen here is only which of them
+        // the pilot's page is allowed to say out loud.
+        if (code === 'store_schema_missing' || code === 'store_accounts_missing'
+            || code === 'store_schema_outdated') return say('needs_update');
+        if (code === 'store_unreachable' || code === 'store_timeout') return say('store_offline');
+        if (code === 'store_unauthorized') return say('store_denied');
+        if (code === 'store_read_only') return say('store_readonly');
+        /* The unique index on (va_slug, discord_id) firing anyway. The check
+           above it is a read and this is the write, so two link attempts a
+           moment apart can both pass the read — and the loser has to be told
+           the same thing the check would have told them, not "Discord didn't
+           answer". */
+        if (code === 'store_conflict') return say('link_taken');
+
+        // Discord itself. 'refused' means it answered and declined, which is
+        // always a configuration fault at our end rather than a bad moment.
+        if (code === 'discord_refused') return say('discord_setup');
+        if (code === 'discord_unreachable') return say('failed');
+
+        return say('failed');
+    }
+
     /* --- 2. Coming back from Discord -------------------------------------- */
     app.get('/api/crew/auth/discord/callback', async (req, res) => {
         const state = crewDiscord.readState(req.query.state);
@@ -1760,25 +1822,7 @@ function registerCrewAuthRoutes(app) {
             // proxy's history. The query beside it is only a hint for the page.
             return res.redirect(`${crewPageFor(slug, embed)}discord=ok#discord=${encodeURIComponent(handoff)}`);
         } catch (err) {
-            // Includes the case this feature exists in the shadow of: a VA whose
-            // project has not had the v16 SQL run, where the column does not
-            // exist. Nothing is broken for them — every pilot still has a
-            // password — so they are told, and not with a stack trace.
-            // `store_schema_outdated` belongs here too, and is in fact the
-            // likelier of the three: a project that ran the SQL before v16 has
-            // the crew_accounts TABLE and not the discord_id COLUMN, and a
-            // filter naming a column that does not exist comes back as
-            // outdated, not missing. Without it that VA was told "Discord
-            // sign-in didn't work, try again" — advice that cannot ever work —
-            // instead of "your database needs updating", which is the one thing
-            // that fixes it.
-            if (err && (err.code === 'store_schema_missing'
-                || err.code === 'store_accounts_missing'
-                || err.code === 'store_schema_outdated')) {
-                return backToCrew(res, slug, 'needs_update', embed, back);
-            }
-            console.error('Crew Discord callback error:', err && err.message ? err.message : err);
-            return backToCrew(res, slug, 'failed', embed, back);
+            return backToCrew(res, slug, discordFailure(err, slug), embed, back);
         }
     });
 

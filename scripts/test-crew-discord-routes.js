@@ -62,9 +62,15 @@ const freshAccounts2 = () => ([
 
 // One implementation over whichever roster belongs to the airline being asked.
 const storeOver = (rows) => ({
-    getAccount: async (id) => rows().find((a) => String(a._id) === String(id)) || null,
-    getAccountByDiscord: async (did) => (/^[0-9]{5,32}$/.test(String(did || ''))
-        ? rows().find((a) => a.discordId === String(did)) || null : null),
+    getAccount: async (id) => {
+        if (STORE_THROWS) throw STORE_THROWS;
+        return rows().find((a) => String(a._id) === String(id)) || null;
+    },
+    getAccountByDiscord: async (did) => {
+        if (STORE_THROWS) throw STORE_THROWS;
+        return /^[0-9]{5,32}$/.test(String(did || ''))
+            ? rows().find((a) => a.discordId === String(did)) || null : null;
+    },
     updateAccount: async (id, patch) => {
         const a = rows().find((x) => String(x._id) === String(id));
         if (a) Object.assign(a, patch);
@@ -98,9 +104,19 @@ mongoose.model = (name) => {
    stubbed — everything else under test is the real code. */
 const crewDiscord = require('../crewDiscord');
 let WHO = { id: '80351110224678912', username: 'rae', globalName: 'Rae M', avatar: 'abc' };
-let EXCHANGE_FAILS = false;
-crewDiscord.exchangeCode = async () => { if (EXCHANGE_FAILS) throw new Error('nope'); return 'access-token'; };
+/* What the two network calls do this time round.
+ * null            they work
+ * an Error        they throw it, exactly as the real ones would */
+let EXCHANGE_THROWS = null;
+crewDiscord.exchangeCode = async () => { if (EXCHANGE_THROWS) throw EXCHANGE_THROWS; return 'access-token'; };
 crewDiscord.fetchProfile = async () => WHO;
+
+/* The VA's data store, failing the way the real adapter fails. Its errors carry
+ * a `code` from one taxonomy and Discord's carry a `code` from another, and the
+ * whole point of the callback's mapping is that it can tell them apart — so the
+ * fakes have to carry the codes rather than just throwing. */
+let STORE_THROWS = null;
+const storeError = (code, message) => Object.assign(new Error(message || code), { code, detail: 'from the fake' });
 
 const crewAuth = require('../crewAuth');
 const app = express();
@@ -393,11 +409,64 @@ const server = app.listen(0, async () => {
             check('pressing Cancel is a decision, not a fault',
                 reasonOf(cancelled.headers.get('location') || '') === 'cancelled');
 
-            EXCHANGE_FAILS = true;
+            EXCHANGE_THROWS = new crewDiscord.DiscordError('did not answer', { code: 'discord_unreachable' });
             const broke = await get(`/api/crew/auth/discord/callback?code=xyz&state=${encodeURIComponent(state)}`);
             check('Discord not answering sends the pilot back with a reason',
                 reasonOf(broke.headers.get('location') || '') === 'failed');
-            EXCHANGE_FAILS = false;
+
+            /* DISCORD ANSWERED AND SAID NO, which is a different thing and
+               used to be indistinguishable from the line above. It is always a
+               fault at OUR end — a rotated secret, a redirect URI that does not
+               match the application — so the pilot must not be told to try
+               again, because no number of tries changes it. */
+            EXCHANGE_THROWS = new crewDiscord.DiscordError('refused', {
+                code: 'discord_refused', status: 400, oauthError: 'invalid_grant',
+            });
+            const refused = await get(`/api/crew/auth/discord/callback?code=xyz&state=${encodeURIComponent(state)}`);
+            check('Discord turning us away is our fault, and says so',
+                reasonOf(refused.headers.get('location') || '') === 'discord_setup',
+                refused.headers.get('location'));
+
+            EXCHANGE_THROWS = new Error('something nobody has seen before');
+            const weird = await get(`/api/crew/auth/discord/callback?code=xyz&state=${encodeURIComponent(state)}`);
+            check('…and an error with no code at all is still the vague one',
+                reasonOf(weird.headers.get('location') || '') === 'failed');
+            EXCHANGE_THROWS = null;
+        }
+
+        /* ---- the VA's data store failing is not Discord failing ---------------
+         *
+         * Every one of these used to come back as 'failed', which the crew
+         * center prints as "Discord didn't answer. Please try again." Four
+         * different people's problems, one sentence, and the sentence named the
+         * only party that was working.
+         */
+        {
+            const state = crewDiscord.signState({ slug: 'ba', intent: 'login' });
+            const reasonFor = async (err) => {
+                STORE_THROWS = err;
+                const res = await get(`/api/crew/auth/discord/callback?code=xyz&state=${encodeURIComponent(state)}`);
+                STORE_THROWS = null;
+                return reasonOf(res.headers.get('location') || '');
+            };
+
+            check('a project that has not run the SQL is told to run it',
+                (await reasonFor(storeError('store_schema_outdated'))) === 'needs_update');
+            check('…and one with no pilot-logins table, the same',
+                (await reasonFor(storeError('store_accounts_missing'))) === 'needs_update');
+            check('a project that did not answer is named as the thing that did not answer',
+                (await reasonFor(storeError('store_unreachable'))) === 'store_offline');
+            check('…and one that timed out, the same',
+                (await reasonFor(storeError('store_timeout'))) === 'store_offline');
+            check('a service key the project rejects says so',
+                (await reasonFor(storeError('store_unauthorized'))) === 'store_denied');
+            check('a project out of room says THAT, rather than blaming Discord',
+                (await reasonFor(storeError('store_read_only'))) === 'store_readonly');
+            /* The pre-check for this is a read and the write is a write, so two
+               attempts a moment apart can both pass the read. The loser has to
+               hear the same thing the read would have told them. */
+            check('the unique index firing anyway reads as "already linked"',
+                (await reasonFor(storeError('store_conflict'))) === 'link_taken');
         }
     } catch (err) {
         fails.push('threw — ' + (err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err));

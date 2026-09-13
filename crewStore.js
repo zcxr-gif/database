@@ -183,10 +183,26 @@ const LATE_COLUMNS = {
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
     crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
-    crew_accounts: new Set([
-        'discord_id', 'discord_username', 'discord_avatar', 'discord_linked_at',
-        'portal_account_id', 'terms_version', 'terms_accepted_at',
-    ]),
+    /* THE DISCORD COLUMNS ARE NOT IN HERE, AND THAT IS THE POINT OF THE RULE
+     * ABOVE RATHER THAN AN EXCEPTION TO IT.
+     *
+     * A droppable column has to pass one test: a row written without it is a
+     * valid row on the old shape. `crew_routes.kind` passes — the route is
+     * still added, and it is the codeshare flag that waits for the upgrade.
+     *
+     * `discord_id` fails it, because on a link the column IS the write. Nothing
+     * else in that patch matters; drop it and the update succeeds, writes
+     * nothing, and the pilot is told "Discord linked. You can use it to sign in
+     * from now on." They then cannot, ever, and nothing anywhere says why —
+     * the one failure mode worse than an error is a confirmation that is not
+     * true. The other three go with it: a username and an avatar with no id
+     * against them are a link that does not exist.
+     *
+     * So a VA on a pre-v16 schema now gets `store_schema_outdated` from the
+     * link, which the callback prints as "your database needs updating" with
+     * the button that fixes it. `portal_account_id` and the terms columns stay
+     * droppable: those writes carry other fields that are worth keeping. */
+    crew_accounts: new Set(['portal_account_id', 'terms_version', 'terms_accepted_at']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -208,10 +224,8 @@ const DRIFT_LABELS = {
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
     'crew_routes.min_rank': 'rank-gated routes',
-    'crew_accounts.discord_id': 'signing in with Discord',
-    'crew_accounts.discord_username': 'signing in with Discord',
-    'crew_accounts.discord_avatar': 'signing in with Discord',
-    'crew_accounts.discord_linked_at': 'signing in with Discord',
+    // No crew_accounts.discord_* here: they are not droppable, so nothing can
+    // ever report them as dropped. See LATE_COLUMNS.
     'crew_accounts.portal_account_id': 'a staff member’s own pilot account',
     'crew_accounts.terms_version': 'the pilot terms a pilot has agreed to',
     'crew_accounts.terms_accepted_at': 'the pilot terms a pilot has agreed to',
@@ -1337,10 +1351,16 @@ class SupabaseStore {
      * claim and cannot fall back to matching on a name — an id that is not
      * already written against a row signs nobody in.
      *
-     * The unique index makes this at most one row per crew center. It is still
-     * read through `one()` rather than assumed, because a project that has not
-     * re-run the SQL has no index and no column, and the answer there must be
-     * "nobody" rather than an exception on a login screen.
+     * The unique index makes this at most one row per crew center.
+     *
+     * A PROJECT THAT HAS NOT RE-RUN THE SQL RAISES rather than answering
+     * "nobody", and that is deliberate — an earlier version of this comment
+     * claimed the opposite and the code never did it. A filter naming a column
+     * the project has not got comes back as `store_schema_outdated`, which the
+     * sign-in callback turns into "your database needs updating" with the
+     * button that fixes it. Swallowing it would print "that Discord account
+     * isn't linked to anybody here" to a pilot who had linked it, on a crew
+     * center where linking cannot work yet.
      */
     getAccountByDiscord(discordId) {
         const id = String(discordId || '');

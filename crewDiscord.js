@@ -281,34 +281,127 @@ const displayName = (profile) => (profile && (profile.globalName || profile.user
 
 const TIMEOUT_MS = 10000;
 
-async function post(url, body) {
+/**
+ * A failure with a CAUSE attached, rather than a sentence to grep.
+ *
+ * WHY THIS EXISTS. The callback used to answer every exception from this file
+ * with one reason — 'failed', which the crew center prints as "Discord didn't
+ * answer. Please try again." That sentence is true for exactly one of the
+ * things that actually go wrong here, and it is advice that can never work for
+ * the rest: a redirect URI that does not match, an application whose secret has
+ * been rotated, a code that has already been spent. A pilot reading it tries
+ * again, fails again, and reports that Discord is down.
+ *
+ * So a caller gets a code:
+ *
+ *   discord_refused      Discord answered, and said no. The credentials, the
+ *                        redirect URI or the code itself — which one is in
+ *                        `oauthError`, straight from Discord's own body.
+ *   discord_unreachable  Discord did not answer, or answered 5xx. This is the
+ *                        one where "please try again" is the right advice.
+ *
+ * `detail` is built to be LOGGED, never shown: it names the status and
+ * Discord's own error slug, and it never contains the code, the access token or
+ * the client secret. That is the same bar the old message met and the reason
+ * this is not simply the response body.
+ */
+class DiscordError extends Error {
+    constructor(message, { code, status, oauthError, detail } = {}) {
+        super(message);
+        this.name = 'DiscordError';
+        this.code = code || 'discord_unreachable';
+        this.status = status || 0;
+        this.oauthError = oauthError || '';
+        this.detail = detail || '';
+    }
+}
+
+/* Discord's own words for why it said no, and nothing else out of the body.
+ * `error` is a fixed slug from the OAuth spec ('invalid_grant',
+ * 'invalid_client', 'redirect_uri_mismatch'); `error_description` is a sentence
+ * Discord wrote. Neither can contain anything we sent. */
+function oauthErrorFrom(text) {
+    try {
+        const body = JSON.parse(text);
+        return {
+            slug: str(body && body.error, 60),
+            said: str(body && (body.error_description || body.message), 160),
+        };
+    } catch { return { slug: '', said: str(text, 160) }; }
+}
+
+/* One shape for both calls, so a caller never has to ask which of the two it
+ * was talking to in order to know whether trying again could help. */
+function failed(what, res, text) {
+    const { slug, said } = oauthErrorFrom(text);
+    const refused = res.status >= 400 && res.status < 500;
+    return new DiscordError(`discord ${what} failed (${res.status})`, {
+        code: refused ? 'discord_refused' : 'discord_unreachable',
+        status: res.status,
+        oauthError: slug,
+        detail: [`${what} → HTTP ${res.status}`, slug, said].filter(Boolean).join(' · '),
+    });
+}
+
+/* A fetch that never came back, told apart from one that came back with a
+ * refusal. An abort is our own ten-second timer; anything else thrown by fetch
+ * is DNS, TLS or the socket. Neither is a thing the VA can fix and both are
+ * worth trying again, so they share a code and differ only in the log. */
+function unreachable(what, err) {
+    const timedOut = err && (err.name === 'AbortError' || /abort/i.test(err.message || ''));
+    return new DiscordError(`discord ${what} did not answer`, {
+        code: 'discord_unreachable',
+        detail: `${what} → ${timedOut ? `no answer in ${TIMEOUT_MS}ms` : (err && err.message) || 'network error'}`,
+    });
+}
+
+async function post(url, body, what) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    let res;
     try {
-        const res = await fetch(url, {
+        res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
             body: new URLSearchParams(body).toString(),
             signal: ctl.signal,
         });
-        if (!res.ok) throw new Error(`discord token exchange failed (${res.status})`);
-        return await res.json();
+    } catch (err) {
+        throw unreachable(what || 'token exchange', err);
     } finally { clearTimeout(timer); }
+    if (!res.ok) throw failed(what || 'token exchange', res, await res.text().catch(() => ''));
+    return res.json();
 }
 
 /** A one-time code, for an access token. */
 async function exchangeCode(code, req) {
-    const data = await post(TOKEN, {
-        client_id: str(process.env.DISCORD_CLIENT_ID, 60),
-        client_secret: str(process.env.DISCORD_CLIENT_SECRET, 120),
-        grant_type: 'authorization_code',
-        code: String(code || ''),
-        // The SAME string the authorize carried. Discord compares them and
-        // refuses the code if they differ by a character.
-        redirect_uri: redirectUri(req),
-    });
+    // The SAME string the authorize carried. Discord compares them and refuses
+    // the code if they differ by a character — and this is the single most
+    // common way this flow breaks on a deployment that has moved host, so the
+    // value is carried on the error where a log can show it. It is a public
+    // URL; nothing about it is a secret.
+    const redirect = redirectUri(req);
+    let data;
+    try {
+        data = await post(TOKEN, {
+            client_id: str(process.env.DISCORD_CLIENT_ID, 60),
+            client_secret: str(process.env.DISCORD_CLIENT_SECRET, 120),
+            grant_type: 'authorization_code',
+            code: String(code || ''),
+            redirect_uri: redirect,
+        }, 'token exchange');
+    } catch (err) {
+        if (err instanceof DiscordError && err.code === 'discord_refused') {
+            err.detail += ` · redirect_uri=${redirect || '(empty)'}`;
+        }
+        throw err;
+    }
     const token = str(data && data.access_token, 300);
-    if (!token) throw new Error('discord token exchange returned no token');
+    if (!token) {
+        throw new DiscordError('discord token exchange returned no token', {
+            code: 'discord_refused', status: 200, detail: 'token exchange → 200 with no access_token',
+        });
+    }
     return token;
 }
 
@@ -323,20 +416,27 @@ async function exchangeCode(code, req) {
 async function fetchProfile(accessToken) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    let res;
     try {
-        const res = await fetch(ME, {
+        res = await fetch(ME, {
             headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
             signal: ctl.signal,
         });
-        if (!res.ok) throw new Error(`discord profile lookup failed (${res.status})`);
-        const profile = profileFrom(await res.json());
-        if (!profile) throw new Error('discord profile lookup returned no id');
-        return profile;
+    } catch (err) {
+        throw unreachable('profile lookup', err);
     } finally { clearTimeout(timer); }
+    if (!res.ok) throw failed('profile lookup', res, await res.text().catch(() => ''));
+    const profile = profileFrom(await res.json());
+    if (!profile) {
+        throw new DiscordError('discord profile lookup returned no id', {
+            code: 'discord_refused', status: 200, detail: 'profile lookup → 200 with no id',
+        });
+    }
+    return profile;
 }
 
 module.exports = {
-    SCOPE, STATE_TTL, HANDOFF_TTL,
+    SCOPE, STATE_TTL, HANDOFF_TTL, DiscordError,
     configured, redirectUri, authorizeUrl,
     signState, readState, signHandoff, readHandoff,
     profileFrom, avatarUrl, displayName,
