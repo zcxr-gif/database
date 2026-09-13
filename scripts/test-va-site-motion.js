@@ -350,12 +350,14 @@ async function run() {
     }
 
     /* ======================================================================
-     * 4. THE THREE NEW DESIGNS render and lay out, on a phone and on a desktop.
-     * A design whose page scrolls sideways on a phone is a design nobody can
-     * use, and two of these three draw outside the text measure on purpose.
+     * 4. THE DESIGNS THAT DRAW OUTSIDE THE TEXT MEASURE render and lay out, on
+     * a phone and on a desktop. A design whose page scrolls sideways on a phone
+     * is a design nobody can use, and every one of these puts something —
+     * a punched ticket edge, a route spine, a floating panel — past the box the
+     * words are held in.
      * ==================================================================== */
     console.log('\nThe new designs');
-    for (const id of ['boardingpass', 'flightdeck', 'atlas']) {
+    for (const id of ['boardingpass', 'flightdeck', 'atlas', 'aurora']) {
         const files = templates.renderTemplate(id, VA);
         const server = await serve(files);
         for (const vp of [PHONE, { width: 1280, height: 900 }]) {
@@ -388,6 +390,81 @@ async function run() {
             await page.close();
         }
         server.close();
+    }
+
+    /* ======================================================================
+     * 5. THE SHOWREEL'S FILM.
+     *
+     * Everything worth testing here is about what is NOT downloaded. The
+     * section is finished without a film — a sky, two contrails and the
+     * airline's own aeroplane — so the only way to get this wrong is to fetch
+     * a video for somebody who should not have been given one, and that is
+     * invisible from the rendered page. So it is measured at the REQUEST: what
+     * the browser actually asked the server for.
+     *
+     * The address is served as a 404 on purpose. A real .mp4 would test a
+     * decoder; the four cases below are about the decision to ask for it at
+     * all, and the 404 doubles as the dead-address case — the film must stay
+     * hidden rather than becoming a black rectangle over the aircraft.
+     * ==================================================================== */
+    console.log('\nThe showreel');
+    {
+        // The film's address is same-origin so blockExternal lets it through —
+        // and it is a path the little server above does not serve, which is
+        // exactly the rotted address a VA ends up with two years on.
+        const withFilm = (theme) => templates.renderTemplate('aurora', VA, { theme }).map(f => (
+            f.path === 'index.html'
+                ? { ...f, content: f.content.replace('data-reel-film data-src=""', 'data-reel-film data-src="film.mp4"') }
+                : f
+        ));
+
+        const asked = async (files, opts) => {
+            const server = await serve(files);
+            const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, ...opts });
+            await blockExternal(page);
+            const wanted = [];
+            page.on('request', (r) => { if (r.url().endsWith('film.mp4')) wanted.push(r.url()); });
+            await page.goto('http://127.0.0.1:' + server.address().port + '/', { waitUntil: 'load' });
+            await page.waitForTimeout(700);
+            const state = await page.evaluate(() => {
+                const film = document.querySelector('[data-reel-film]');
+                return {
+                    film: !!film,
+                    hidden: !film || film.hasAttribute('hidden'),
+                    holds: document.querySelectorAll('.reel__hold').length,
+                    ship: !!document.querySelector('.reel__ship'),
+                    sky: !!document.querySelector('.reel__sky'),
+                };
+            });
+            await page.close();
+            server.close();
+            return { wanted, ...state };
+        };
+
+        // A: the design as it ships. No address, so nothing to fetch — and the
+        // stage still has every layer that does not depend on the VA.
+        const plain = await asked(templates.renderTemplate('aurora', VA), {});
+        ok('with no film, nothing is requested', plain.wanted.length === 0, plain.wanted.join(' '));
+        ok('with no film, the video stays hidden', plain.hidden);
+        ok('with no film, there is no pause button', plain.holds === 0);
+        ok('the stage is drawn either way', plain.sky && plain.ship);
+
+        // B: an address, and it rots. Asked for once, and the failure costs the
+        // page nothing.
+        const dead = await asked(withFilm(), {});
+        ok('a film is fetched when there is one', dead.wanted.length === 1, dead.wanted.join(' '));
+        ok('an address that 404s leaves the film hidden', dead.hidden);
+        ok('and leaves no pause button over the aeroplane', dead.holds === 0);
+
+        // C: the airline chose Still. An ambient loop is the thing that choice
+        // is about, so the film is never asked for.
+        const still = await asked(withFilm({ motion: 'none' }), {});
+        ok('a Still site never fetches the film', still.wanted.length === 0, still.wanted.join(' '));
+
+        // D: the visitor asked their system for less movement. Not the
+        // airline's decision to overrule.
+        const quiet = await asked(withFilm(), { reducedMotion: 'reduce' });
+        ok('reduced motion never fetches the film', quiet.wanted.length === 0, quiet.wanted.join(' '));
     }
 
     await browser.close();

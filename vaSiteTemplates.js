@@ -13,16 +13,16 @@
  * blank file. What a VA actually wants is the thing every site builder sells:
  * pick a look, see your own airline in it, then change the words.
  *
- * THE ONE INVARIANT ACROSS ALL SIX
- * --------------------------------
+ * THE ONE INVARIANT ACROSS EVERY LAST ONE OF THEM
+ * -----------------------------------------------
  * Every template is a different design and NONE of them is a different data
  * wiring. The 'data-crew-*' markup that pulls an airline's real figures out of
  * its crew centre is written ONCE, in BLOCKS below, and every template composes
  * the same blocks. That is the whole reason this file is arranged this way.
  *
  * If each template carried its own copy of the markup, then the day
- * 'data-crew-stat' gains a field or 'activity' changes shape, five of the six
- * would quietly stop showing a number and nobody would find out until a VA
+ * 'data-crew-stat' gains a field or 'activity' changes shape, all but one of
+ * them would quietly stop showing a number and nobody would find out until a VA
  * asked why their pilot count was missing. The variety belongs in the CSS,
  * where being wrong is visible; the wiring belongs in one place, where being
  * wrong is not.
@@ -40,7 +40,8 @@
  *
  * A template is NOT a colour swap. Concourse is a departure board and Terminal
  * is a page of rules and monospace; swapping their accents leaves two designs
- * that are still nothing like each other. That is the bar for adding a seventh.
+ * that are still nothing like each other. That is the bar every design in here
+ * cleared, and the bar the next one has to.
  */
 
 /* ===========================================================================
@@ -352,7 +353,8 @@ function hex(v, fallback) {
  * its own version of one, so the data wiring is in exactly one place.
  *
  * Class names are semantic and shared ('.hero', '.figures', '.rows', '.wall'),
- * which is what lets six stylesheets produce six designs over identical markup
+ * which is what lets a dozen stylesheets produce a dozen designs over identical
+ * markup
  * — and what lets a VA lift a block out of the library and paste it into a page
  * from a different template and have it look right.
  *
@@ -447,6 +449,78 @@ ${navLinks(c)}
         <a class="cta" href="${c.crew}/join">Apply to fly</a>
         <a class="cta cta--ghost" href="${c.crew}">Visit the crew centre</a>
       </div>
+    </div>
+  </section>`,
+
+    /* THE SHOWREEL — the top of the page with an AEROPLANE in it.
+     *
+     * The hero above puts a photograph behind the words. This one puts the
+     * aircraft beside them, on a stage of its own, and it is the answer to the
+     * complaint every virtual airline's homepage earns: it is a page about
+     * flying with nothing flying on it.
+     *
+     * FOUR LAYERS, AND ONLY THE TOP ONE OF THEM IS EVER MISSING
+     *
+     *   .reel__sky    a wash and the airline's own motif. Costs no request,
+     *                 cannot fail, and is what a VA with no pictures and no
+     *                 fleet still gets.
+     *   .reel__trail  two contrails drawn in CSS, drifting. The movement in
+     *                 the section when there is no film — and switched off
+     *                 with everything else when the site is set to Still or
+     *                 the visitor asked for less movement.
+     *   .reel__ship   THEIR aeroplane. One row of the fleet the crew centre
+     *                 already holds, so it is the airline's own livery shot
+     *                 where they uploaded one and a silhouette crew-feed.js
+     *                 DRAWS in the airline's accent where they did not. Either
+     *                 way it is a real aircraft of theirs and neither costs
+     *                 anybody a stock photograph.
+     *   .reel__film   the short film, if they have one. See below.
+     *
+     * THE FILM'S ADDRESS IS IN data-src AND NOT IN src, ON PURPOSE.
+     *
+     * A <video> with a src is a download, and there are three people who must
+     * not be given one: the visitor who has asked their system for less
+     * movement, the visitor whose phone is on Save-Data, and the visitor of an
+     * airline that chose Still. site.js checks all three and only then moves
+     * the address across — so the film is an enhancement of a section that is
+     * already finished without it, which is the same bar every other job in
+     * that file had to pass.
+     *
+     * It also means a dead address costs the page nothing: the <video> stays
+     * hidden and the aircraft underneath is what shows, rather than a black
+     * rectangle where a film used to be.
+     */
+    showreel: (c) => `
+  <section class="reel" data-motif>
+    <div class="reel__in">
+      <p class="eyebrow">${esc(c.callsign || 'Virtual airline')} &middot; Infinite Flight</p>
+      <h1>${esc(c.name)}, in the air.</h1>
+      <p class="lede">One sentence about what your airline is for. The aircraft
+         beside it is your own — it comes from the fleet in your crew centre, so
+         it changes when your fleet does.</p>
+      <div class="actions">
+        <a class="cta" href="${c.crew}/join">Apply to fly</a>
+        <a class="cta cta--ghost" href="${c.crew}">Visit the crew centre</a>
+      </div>
+    </div>
+
+    <div class="reel__stage">
+      <span class="reel__sky" aria-hidden="true"></span>
+      <span class="reel__trail" aria-hidden="true"></span>
+      <!-- Your aircraft. Nothing to fill in: this is the first aircraft in your
+           crew centre's fleet editor, with its livery picture if you uploaded
+           one and a drawn outline of the type if you did not. -->
+      <ul class="reel__ship" data-crew-list="fleet" data-crew-limit="1" aria-hidden="true">
+        <template><li><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="" decoding="async"></li></template>
+      </ul>
+      <!-- YOUR SHORT FILM. Put an https address to an .mp4 or .webm in
+           data-src and a still from it in poster, and it plays here, silently,
+           on a loop, with a pause button. Leave them empty and this line does
+           nothing at all — the aircraft above is the picture.
+
+           Ten to twenty seconds. A minute of cruise is a minute nobody
+           watches, and it is the first thing your page downloads. -->
+      <video class="reel__film" data-reel-film data-src="" poster="" muted loop playsinline preload="none" hidden></video>
     </div>
   </section>`,
 
@@ -681,6 +755,65 @@ ${navLinks(c)}
     <p class="more"><a href="${c.crew}/join">Start an application &rarr;</a></p>
   </section>`,
 
+    /* THE EXPLANATIONS.
+     *
+     * Everything above this is the airline saying what it is. This is the
+     * airline answering what it was actually asked — and the two are not the
+     * same page. An applicant deciding between three virtual airlines has five
+     * questions and gets them answered in none of the three, because every
+     * homepage is written by somebody who already knows the answers.
+     *
+     * <details> rather than a script, for four reasons and not one of them is
+     * that it saves bytes: the browser already has open-and-shut behaviour and
+     * it is keyboard-operable for free; it prints open; the browser's own
+     * in-page search finds text inside a collapsed one; and the page is
+     * correct before site.js runs. An accordion written in JavaScript is worse
+     * on all four.
+     *
+     * The first one ships OPEN, so the control explains itself rather than
+     * looking like a list of headings somebody forgot to write under.
+     *
+     * The id is 'faq' and not 'questions' because the builder's counterpart is
+     * called that, and starterDoc maps a design's block list onto the builder's
+     * vocabulary BY ID. A design naming a block the builder does not have loses
+     * that section the moment a VA opens it in the visual editor — silently,
+     * which is the worst way for these two files to disagree.
+     */
+    faq: () => `
+  <section class="block">
+    <div class="block__head">
+      <h2>Before you apply</h2>
+      <p>The questions everybody actually has. Answer them the way you would in
+         a message &mdash; honestly, and with the real number.</p>
+    </div>
+    <div class="faq">
+      <details open>
+        <summary>How many hours do I need?</summary>
+        <p class="prose">Say the real number, or say there isn't one. An airline
+           that says "none" and means it gets more applications than one that
+           says "experience preferred" and means nothing.</p>
+      </details>
+      <details>
+        <summary>Do I have to fly a set amount?</summary>
+        <p class="prose">Say what the minimum is, and say what happens to
+           somebody who misses it. The second half is the part people are
+           actually asking about.</p>
+      </details>
+      <details>
+        <summary>What do I fly, and where?</summary>
+        <p class="prose">Say whether pilots pick their own sectors off the
+           schedule or are given them, and whether they may fly anything in the
+           fleet from day one.</p>
+      </details>
+      <details>
+        <summary>How long does an application take?</summary>
+        <p class="prose">Say how long it really takes and who reads it. "Usually
+           a day or two, read by a person" is worth more than any paragraph
+           above it on this page.</p>
+      </details>
+    </div>
+  </section>`,
+
     /* A QUOTE. What one of your pilots said, or what the airline believes.
      * The only place on the page where the type gets larger without being a
      * heading, which is what makes one of these worth having and two of them
@@ -783,6 +916,7 @@ ${navLinks(c, '      ')}
 // template, so offering them is offering a way to end up with two.
 const INSERTABLE = [
     { id: 'hero', label: 'Hero', note: 'Headline, one sentence, and the apply button.' },
+    { id: 'showreel', label: 'Hero with your aircraft', note: 'The top of the page with one of your aeroplanes beside it, and room for a short film.' },
     { id: 'figures', label: 'Live figures', note: 'Pilots, hours, destinations, routes — from your crew centre.' },
     { id: 'network', label: 'Network', note: 'Your published sectors, as a list.' },
     { id: 'hubs', label: 'Hubs', note: 'The airports you fly most out of, worked out from your route map.' },
@@ -797,6 +931,7 @@ const INSERTABLE = [
     { id: 'partners', label: 'Codeshares', note: 'The airlines you share sectors with, from your route map.' },
     { id: 'ranks', label: 'Ranks', note: 'Your rank ladder, from the crew centre.' },
     { id: 'joining', label: 'What happens when you apply', note: 'Four numbered steps. The question every applicant has.' },
+    { id: 'faq', label: 'Questions', note: 'The five things every applicant asks, each opening to your answer.' },
     { id: 'quote', label: 'A quote', note: 'One line, set large. Worth having once and nothing twice.' },
     { id: 'contact', label: 'Talk to us', note: 'Discord, the crew centre and the application, in three tiles.' },
     { id: 'split', label: 'Words beside a picture', note: 'Two columns on a screen, one on a phone.' },
@@ -810,7 +945,8 @@ const INSERTABLE = [
  *
  * Reset, the shared block shapes, and nothing with a personality. Everything
  * that makes a template look like itself is in that template's own 'css', so
- * this file is the same in all six and a VA who edits it is editing plumbing
+ * this file is byte for byte the same under every one of them, and a VA who
+ * edits it is editing plumbing
  * rather than design.
  *
  * Every colour and every family is a var() defined in theme.css. That is what
@@ -860,6 +996,20 @@ a { color: var(--accent); transition: color .15s ease, opacity .15s ease; }
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
   outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--radius-sm);
 }
+/* THE SKIP LINK. Off the top of the page until it is focused, and then a real
+   button in the corner — not hidden with display:none, which would take it out
+   of the tab order and leave the page with a control nobody can reach. */
+.skip {
+  position: fixed; top: .6rem; left: .6rem; z-index: 100;
+  transform: translateY(-200%);
+  padding: .6rem 1rem; border-radius: var(--radius-sm);
+  background: var(--accent); color: var(--on-accent);
+  text-decoration: none; font-weight: 600; font-size: .9rem;
+  box-shadow: var(--shadow-2);
+  transition: transform .18s ease;
+}
+.skip:focus-visible { transform: translateY(0); }
+
 h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; letter-spacing: -.02em; }
 h1 { font-size: clamp(2.1rem, 6vw, 3.8rem); margin: 0 0 1rem; }
 h2 { font-size: clamp(1.2rem, 2.6vw, 1.6rem); margin: 0 0 1.4rem; }
@@ -1187,6 +1337,133 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
 .actions .cta { margin-top: 0; }
 
 /* ---------------------------------------------------------------------------
+   THE SHOWREEL — the hero with an aeroplane in it.
+
+   The aircraft is on a STAGE IN THE FLOW rather than full-bleed behind the
+   words, and that is the whole difference between this and the hero above it.
+   A photograph behind text has to be dimmed until it is a texture, because
+   nobody checked the airline's picture against the sentence that would sit on
+   it. A photograph in a panel beside the text needs no scrim at all: the words
+   are on the page's own background, at the page's own contrast, and the
+   picture is allowed to be a picture.
+
+   THE STAGE IS FOUR LAYERS DEEP AND NEVER EMPTY. See BLOCKS.showreel for what
+   each one is. The rule that matters here is the order: every layer is painted
+   whether or not the one above it arrives, so an airline with no film shows an
+   aircraft, an airline with no fleet shows a sky, and neither of them shows a
+   hole where something was meant to be.
+   ------------------------------------------------------------------------ */
+.reel { position: relative; isolation: isolate; padding-block: var(--gap); }
+/* Two columns once there is room for two — words on the left, aeroplane on the
+   right. Below that they stack and the words come first, because a phone
+   screen full of aircraft with the airline's name underneath is a picture, not
+   a homepage. */
+@media (min-width: 60rem) {
+  .reel {
+    display: grid; align-items: center;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+    gap: clamp(2rem, 4vw, 3.5rem);
+  }
+}
+.reel__in { position: relative; min-width: 0; }
+.reel__in .lede { max-width: 42ch; }
+.reel__stage {
+  position: relative; isolation: isolate; overflow: hidden;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow-2);
+}
+/* THE SKY. A wash of the airline's own accent, not a grey. It is the bottom of
+   the stack and the only layer that is always exactly itself — everything
+   above it depends on what the VA has uploaded. */
+.reel__sky {
+  position: absolute; inset: 0; z-index: 0;
+  background:
+    radial-gradient(120% 90% at 22% 8%, color-mix(in srgb, var(--accent) 26%, transparent) 0%, transparent 62%),
+    linear-gradient(165deg, var(--surface-2) 0%, var(--surface) 58%, color-mix(in srgb, var(--accent) 9%, var(--surface)) 100%);
+}
+@supports not (background: color-mix(in srgb, red 50%, transparent)) {
+  .reel__sky { background: var(--surface-2); }
+}
+/* THE CONTRAILS. Two hairlines, drawn rather than fetched, drifting slowly
+   across the stage. This is the movement in the section for an airline with no
+   film — and it is the airline's own ink, mixed from currentColor, so it is
+   visible on a light stage and on a dark one without being told which it is.
+
+   The element is far wider than the stage and both lines fade out at their
+   ends, so the drift has nowhere to show a seam. */
+.reel__trail {
+  position: absolute; inset: 6% -55% 26% -55%; z-index: 1; pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent 0%, color-mix(in srgb, currentColor 20%, transparent) 45%, transparent 100%) left 24% / 62% 1px no-repeat,
+    linear-gradient(90deg, transparent 0%, color-mix(in srgb, currentColor 12%, transparent) 50%, transparent 100%) left 71% / 46% 1px no-repeat;
+}
+@supports not (background: color-mix(in srgb, red 50%, transparent)) {
+  .reel__trail { display: none; }
+}
+/* THEIR AEROPLANE. One row of their own fleet, so this is a livery photograph
+   where they have uploaded one and a silhouette drawn in their accent where
+   they have not.
+
+   object-fit is CONTAIN and not cover, without exception: the drawn outline is
+   artwork on a flat field and cropping it to fill the stage cuts the wingtips
+   off. A photograph shown whole in a 16:9 panel is no loss; a wing cut in half
+   is. */
+.reel__ship {
+  position: absolute; inset: 0; z-index: 2; margin: 0; padding: 6% 7%;
+  list-style: none; display: grid; place-items: center;
+}
+.reel__ship li { display: contents; }
+.reel__ship img {
+  max-width: 100%; max-height: 100%; width: auto; height: auto;
+  object-fit: contain; display: block;
+  filter: drop-shadow(0 18px 26px rgba(9, 12, 18, .22));
+}
+/* THE FILM, once site.js has decided it may be downloaded at all. Covering,
+   because a film is a moving photograph rather than artwork on a field, and it
+   was shot to fill a frame. */
+.reel__film {
+  position: absolute; inset: 0; z-index: 3;
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
+/* THE PAUSE BUTTON, added by site.js at the same moment the film is.
+
+   Not a flourish and not optional: a loop that runs for longer than five
+   seconds with no way to stop it is a page some people cannot use. It exists
+   only when the film does, which is why it is script rather than markup. */
+.reel__hold {
+  position: absolute; z-index: 4; right: .7rem; bottom: .7rem;
+  display: inline-flex; align-items: center; gap: .4rem;
+  padding: .38rem .72rem; border-radius: var(--radius-pill);
+  border: 1px solid rgba(255, 255, 255, .28);
+  background: rgba(12, 14, 19, .55); color: #fff;
+  font: inherit; font-size: .76rem; font-weight: 600; cursor: pointer;
+  transition: background-color .15s ease, border-color .15s ease;
+}
+@supports (backdrop-filter: blur(6px)) {
+  .reel__hold { background: rgba(12, 14, 19, .38); backdrop-filter: blur(8px); }
+}
+.reel__hold:hover { background: rgba(12, 14, 19, .72); border-color: rgba(255, 255, 255, .5); }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* The aircraft holds a slow climb. Hung on html[data-motion], which site.js
+     writes only when the airline has NOT chosen Still — so "nothing moves"
+     means nothing moves, ambient drift included. */
+  @keyframes reelFloat {
+    from { transform: translate3d(0, 1%, 0) rotate(-.4deg); }
+    to   { transform: translate3d(0, -1.8%, 0) rotate(.4deg); }
+  }
+  @keyframes reelDrift {
+    from { transform: translate3d(-4%, 0, 0); }
+    to   { transform: translate3d(4%, 0, 0); }
+  }
+  html[data-motion] .reel__ship img { animation: reelFloat 7.5s var(--motion-ease, ease) infinite alternate; }
+  html[data-motion] .reel__trail { animation: reelDrift 30s linear infinite alternate; }
+}
+
+/* ---------------------------------------------------------------------------
    BUTTONS
    ------------------------------------------------------------------------ */
 .cta {
@@ -1409,13 +1686,24 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
 .faq summary {
   cursor: pointer; list-style: none; padding: 1rem 2rem 1rem 0; position: relative;
   font-weight: 600; font-size: .98rem;
+  transition: color .15s ease;
 }
+.faq summary:hover { color: var(--accent); }
 .faq summary::-webkit-details-marker { display: none; }
 .faq summary::after {
   content: '+'; position: absolute; right: .4rem; top: 50%; transform: translateY(-50%);
   font-family: var(--font-mono); color: var(--accent); font-size: 1.1rem;
 }
 .faq details[open] summary::after { content: '−'; }
+/* The answer slides down rather than appearing. <details> cannot transition its
+   own height in every engine that matters yet, so the ANSWER is animated
+   instead of the box — which needs no height to be known and cannot leave a
+   panel stuck half open if the animation never runs. */
+@keyframes faqOpen {
+  from { opacity: 0; transform: translateY(-.35rem); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.faq details[open] > .prose { animation: faqOpen var(--motion-in, .35s) var(--motion-ease, ease) both; }
 .faq .prose { padding-bottom: 1.1rem; margin-top: 0; }
 
 /* ---------------------------------------------------------------------------
@@ -1690,14 +1978,18 @@ footer p { margin: .3rem 0; max-width: 62ch; }
     from { opacity: 0; transform: translateY(var(--motion-rise, 14px)); }
     to   { opacity: 1; transform: translateY(0); }
   }
-  .hero__in > * {
+  .hero__in > *, .reel__in > * {
     animation: heroIn var(--motion-in, .55s) var(--motion-ease, ease) both;
   }
-  .hero__in > *:nth-child(1) { animation-delay: 0ms; }
-  .hero__in > *:nth-child(2) { animation-delay: calc(var(--motion-stagger, 0ms) * 1.2); }
-  .hero__in > *:nth-child(3) { animation-delay: calc(var(--motion-stagger, 0ms) * 2.4); }
-  .hero__in > *:nth-child(4) { animation-delay: calc(var(--motion-stagger, 0ms) * 3.6); }
-  .hero__in > *:nth-child(n + 5) { animation-delay: calc(var(--motion-stagger, 0ms) * 4.8); }
+  .hero__in > *:nth-child(1), .reel__in > *:nth-child(1) { animation-delay: 0ms; }
+  .hero__in > *:nth-child(2), .reel__in > *:nth-child(2) { animation-delay: calc(var(--motion-stagger, 0ms) * 1.2); }
+  .hero__in > *:nth-child(3), .reel__in > *:nth-child(3) { animation-delay: calc(var(--motion-stagger, 0ms) * 2.4); }
+  .hero__in > *:nth-child(4), .reel__in > *:nth-child(4) { animation-delay: calc(var(--motion-stagger, 0ms) * 3.6); }
+  .hero__in > *:nth-child(n + 5), .reel__in > *:nth-child(n + 5) { animation-delay: calc(var(--motion-stagger, 0ms) * 4.8); }
+  /* The stage arrives WITH the words rather than after them: it is the other
+     half of the same opening, and one delayed behind the other reads as the
+     picture loading late. */
+  .reel__stage { animation: heroIn var(--motion-in, .55s) var(--motion-ease, ease) both; animation-delay: calc(var(--motion-stagger, 0ms) * 1.2); }
 
   /* THE FIGURE THAT COUNTS UP.
      site.js marks a number while it is running so a design can do something
@@ -1713,6 +2005,10 @@ footer p { margin: .3rem 0; max-width: 62ch; }
    ------------------------------------------------------------------------ */
 @media print {
   .bar, .band, .wall, .bar__scrim { display: none !important; }
+  /* A film does not print, and a contrail printed is a grey smear across the
+     one picture on the page. The aircraft and the sky stay. */
+  .reel__film, .reel__trail, .reel__hold { display: none !important; }
+  .reel__stage { box-shadow: none !important; border-color: #ccc !important; break-inside: avoid; }
   /* A section waiting to be scrolled to has never been scrolled to on paper.
      Printing must never hand somebody a page of blanks. */
   [data-reveal] { opacity: 1 !important; transform: none !important; }
@@ -1769,9 +2065,11 @@ const SITE_JS = `/* Your site's own script.
                            reached, a row at a time
      5. the figures        counting up to the numbers the feed wrote
      6. the lightbox       a gallery picture, opened larger
-     7. the Instagram wall and clearing away a section that came back empty
+     7. the showreel       the short film, IF the airline has one and the
+                           visitor has not asked for less movement or less data
+     8. the Instagram wall and clearing away a section that came back empty
 
-   Jobs 1 to 6 are pure DOM. Only 7 needs the feed. */
+   Jobs 1 to 7 are pure DOM. Only 8 needs the feed. */
 (function () {
   'use strict';
 
@@ -2304,7 +2602,123 @@ const SITE_JS = `/* Your site's own script.
   })();
 
   /* -------------------------------------------------------------------------
-     7. THE FEED'S TWO LEFTOVERS
+     7. THE SHOWREEL'S FILM.
+
+        The one job in this file that can decide NOT to run and still be
+        finished. The section it belongs to is complete before this executes —
+        a sky, two contrails and the airline's own aircraft — so everything
+        below is about whether a visitor should be made to download a video on
+        top of that, and the answer is no more often than people expect.
+
+        THREE REFUSALS, AND NONE OF THEM IS RECOVERABLE BY THE AIRLINE
+
+          the airline chose Still     'moves' is already false, and an ambient
+                                      loop is exactly the thing that choice is
+                                      about
+          the visitor asked their     same flag. A system preference is not
+          system for less movement    overruled by somebody else's homepage
+          the visitor is on Save-Data their phone has been told to stop
+                                      fetching things like this, by them
+
+        And a fourth that is nobody's decision: an address that does not play.
+        The film stays hidden and the aeroplane underneath is what shows, which
+        is the same section the other three refusals leave behind.
+
+        WHY THE ADDRESS LIVES IN data-src. A src is a download the moment the
+        markup parses, and by then none of the three checks above has run. The
+        attribute is moved across here or it is never moved at all.
+     --------------------------------------------------------------------- */
+  (function showreel() {
+    var film = document.querySelector('[data-reel-film]');
+    if (!film) return;
+
+    var src = (film.getAttribute('data-src') || '').trim();
+    if (!src) return;
+    if (!moves) return;
+    var link = navigator.connection;
+    if (link && link.saveData) return;
+
+    var hold = null;          // the pause button, built once the film is real
+    var wanted = true;        // false once the visitor has stopped it by hand
+    var onScreen = true;
+
+    function label() {
+      if (!hold) return;
+      hold.textContent = film.paused ? 'Play' : 'Pause';
+    }
+
+    function resume() {
+      if (!wanted || !onScreen || document.hidden) return;
+      var p = film.play();
+      // A browser may refuse to start it — low power mode is the usual reason.
+      // Nothing is broken by that: the button is already on the stage and it
+      // now reads "Play", which is the truth.
+      if (p && p.catch) p.catch(label);
+    }
+
+    /* A LOOP WITH NO WAY TO STOP IT IS A PAGE SOME PEOPLE CANNOT USE. The
+       button is built here rather than shipped in the markup for the same
+       reason the burger is: a control that does nothing is worse than no
+       control, and until this moment there is no film for it to act on. */
+    function build() {
+      hold = document.createElement('button');
+      hold.type = 'button';
+      hold.className = 'reel__hold';
+      hold.addEventListener('click', function () {
+        wanted = film.paused;
+        if (wanted) resume(); else film.pause();
+      });
+      film.parentNode.appendChild(hold);
+      label();
+    }
+
+    film.addEventListener('play', label);
+    film.addEventListener('pause', label);
+
+    // The film never appears until the browser has confirmed it is one. A dead
+    // address, a file that is not a video, a host that has gone away: all of
+    // them land here and leave the aircraft on the stage.
+    film.addEventListener('error', function () {
+      film.hidden = true;
+      film.removeAttribute('src');
+      if (hold) { hold.remove(); hold = null; }
+    });
+
+    film.addEventListener('loadedmetadata', function () {
+      film.hidden = false;
+      if (!hold) build();
+      resume();
+    }, { once: true });
+
+    /* Off the screen, it stops. A video playing behind four sections nobody is
+       looking at is a battery being spent on nothing, and on a phone that is
+       the difference between a site that feels expensive and one that gets
+       closed. */
+    if ('IntersectionObserver' in window) {
+      new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) {
+          onScreen = en.isIntersecting;
+          if (onScreen) resume(); else film.pause();
+        });
+      }, { threshold: 0.15 }).observe(film);
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) film.pause(); else resume();
+    });
+
+    /* An EMPTY poster attribute is not the same as no poster. The block ships
+       poster="" as a blank for a VA to fill in, and an empty URL resolves to
+       the PAGE — so a film left without a still would have the browser fetch
+       this HTML document and try to decode it as an image. */
+    if (!(film.getAttribute('poster') || '').trim()) film.removeAttribute('poster');
+
+    film.preload = 'auto';
+    film.src = src;
+    film.load();
+  })();
+
+  /* -------------------------------------------------------------------------
+     8. THE FEED'S TWO LEFTOVERS
 
         crew-feed.js fills in figures and lists by itself. It deliberately does
         NOT remove a list that came back empty, because on most pages an empty
@@ -2421,8 +2835,12 @@ const SITE_JS = `/* Your site's own script.
 /* ===========================================================================
  * THE TEMPLATES
  *
- * Six. Each is its own design, not a recolour: swap any two accents and you
+ * Twelve. Each is its own design, not a recolour: swap any two accents and you
  * still have two pages nothing like each other.
+ *
+ * They are declared oldest first, and the picker renders them in that order —
+ * so a VA scrolling the gallery is reading the catalogue as it grew rather
+ * than as somebody ranked it.
  * ======================================================================== */
 const TEMPLATES = {
 
@@ -3377,6 +3795,228 @@ footer { border-top: 1px dashed var(--line); }
 <rect x="34" y="84" width="36" height="7" rx="1" fill="#241d22"/>
 <g fill="#f0e7ed"><rect x="34" y="97" width="34" height="16" rx="3"/><rect x="72" y="97" width="34" height="16" rx="3"/><rect x="110" y="97" width="34" height="16" rx="3"/></g>`,
     },
+
+    /* AURORA — the islands.
+     *
+     * The one design in this file whose structural idea is DEPTH rather than
+     * layout. Every other template here is a stack of sections that share the
+     * page's own background and are told apart by rules, spacing or colour.
+     * This one gives each section a panel of its own: a large corner, a
+     * hairline, and the full three-layer shadow, floating clear of everything
+     * around it. Nothing touches anything.
+     *
+     * WHY THE FIELD BEHIND THEM IS NOT WHITE, AND WHY THAT IS THE WHOLE TRICK
+     *
+     * White panels on a white ground is the look of a settings screen. A panel
+     * only reads as floating if there is something for it to float ON, so the
+     * page carries one wash of the airline's own accent, top-lit like a
+     * horizon, and the panels are mixed a few percent of the same accent
+     * warmer than it. Two colours, both derived from the one the VA picked,
+     * and no ornament anywhere: on this design the depth IS the decoration,
+     * which is why its motif is turned down rather than up.
+     *
+     * IT IS THE DESIGN THE SHOWREEL WAS DRAWN FOR. Its homepage opens on the
+     * airline's own aeroplane in a panel beside the words — with room for a
+     * short film over it — rather than on a photograph behind a headline, and
+     * the two panels reading as a pair is the reason that hero exists.
+     *
+     * AND IT ANSWERS QUESTIONS. The one design that puts the explanations on
+     * the HOMEPAGE rather than behind a link. An applicant choosing between
+     * three airlines has five questions; this is the design that assumes they
+     * are the most persuasive thing the airline has to say.
+     */
+    aurora: {
+        name: 'Aurora',
+        blurb: 'Islands. Soft panels floating on a wash of your own colour, with your aircraft at the top.',
+        tags: ['Soft', 'Premium', 'Panels'],
+        font: 'grotesk',
+        mode: 'auto',
+        accent: '#3a5bd9',
+        pattern: 'contrail',
+        radius: 26,
+        motion: 'cinematic',
+        css: `/* Aurora — islands. One idea, applied without exception: nothing on this page
+   touches the edge of anything else.
+
+   Read the four rules below and you have read the design. Everything after
+   them is those four rules applied to one more element. */
+:root {
+  --measure: 70rem;
+  --gap: clamp(2.2rem, 5vw, 3.4rem);
+  /* Turned DOWN, not up. The depth is the decoration here; a motif at full
+     strength inside a panel that already has a shadow and a corner is the
+     third thing competing for the same square inch. */
+  --motif-opacity: .4;
+  /* The full-width layer behind the header is turned off — see THE BAR. */
+  --bar-bg: transparent;
+  /* THE ISLAND'S OWN FILL. A few percent of the airline's accent warmer than
+     the field it sits on, because a panel the same colour as its background is
+     not a panel. Both are mixed from the accent the VA picked rather than
+     written as colours, so the whole design recolours with one control. */
+  --island: color-mix(in srgb, var(--accent) 4%, var(--surface));
+  --island-line: color-mix(in srgb, var(--accent) 16%, var(--line));
+}
+/* Where color-mix is missing the design is flat rather than wrong: plain
+   surfaces, plain lines, and every shape and shadow below still correct. */
+@supports not (background: color-mix(in srgb, red 50%, transparent)) {
+  :root { --island: var(--surface); --island-line: var(--line); }
+}
+
+/* 1. THE FIELD. One wash, one hue, lit from above the fold like a horizon
+      rather than a gradient somebody liked the look of. It does not repeat and
+      it does not scroll with a second layer: it is the sky the panels are on. */
+body {
+  background:
+    radial-gradient(120rem 48rem at 50% -24rem, color-mix(in srgb, var(--accent) 22%, transparent) 0%, transparent 68%),
+    var(--bg);
+  background-repeat: no-repeat;
+}
+/* Smaller than the base headline, and that is a consequence of the layout
+   rather than a taste. The showreel puts the words in a column roughly half the
+   measure wide; the base h1 is sized for a headline that has the whole of it,
+   and at that size an airline with a four-word name gets four lines of type
+   against a panel that is three deep. */
+h1 { font-weight: 600; letter-spacing: -.035em; font-size: clamp(1.95rem, 4vw, 3rem); }
+h2 { font-weight: 600; letter-spacing: -.022em; }
+.lede { font-size: 1.14rem; }
+
+/* 2. THE BAR IS AN ISLAND TOO, and that is why --bar-bg is transparent above:
+      the strip painted across the whole window is switched off and the inner
+      box — the one already held to the text measure — carries the fill. It
+      floats a few pixels clear of the top of the window rather than being
+      stuck to it.
+
+      Nothing here may take a transform, a filter or a backdrop-filter: the
+      menu panel is position:fixed INSIDE this element, and any of the three
+      would make this box its containing block and cut the menu off. See THE
+      BAR'S OWN BACKGROUND in the base stylesheet. */
+.bar { padding-top: .55rem; }
+.bar__in {
+  background: var(--island);
+  border: 1px solid var(--island-line);
+  border-radius: var(--radius-pill);
+  padding-inline: 1.15rem;
+  box-shadow: var(--shadow-1);
+  transition: box-shadow .3s var(--motion-ease, ease), border-color .3s var(--motion-ease, ease);
+}
+.bar[data-scrolled] { box-shadow: none; }
+.bar[data-scrolled] .bar__in { box-shadow: var(--shadow-2); border-color: var(--accent-line); }
+.bar__nav a:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+/* 3. EVERY SECTION IS AN ISLAND.
+      One selector list, because "every section" is the design and writing it
+      per block is how a design ends up with one section that is not.
+
+      .band is deliberately absent: it is a block of the accent and keeping the
+      shape while overwriting the colour would turn the page's one loud moment
+      into another quiet panel. It gets the shape below, on its own terms. */
+.hero, .reel__in, .reel__stage, .block, .figures {
+  background: var(--island);
+  border: 1px solid var(--island-line);
+  border-radius: var(--radius-lg);
+  padding: clamp(1.5rem, 3.8vw, 2.6rem);
+  box-shadow: var(--shadow-2);
+}
+main > section { margin-bottom: clamp(1rem, 2.4vw, 1.7rem); }
+/* Clear of the floating header. The bar is pinned and its panel is a pill with
+   its own margin, so a first section that only clears the page's own padding
+   has its top corner tucked under it. */
+main > section:first-child { margin-top: clamp(1rem, 2.6vw, 1.8rem); }
+main > section:last-child { margin-bottom: 0; }
+/* The hero's photograph bleeds to the window on every other design. Here the
+   hero IS the panel, so the bleed is clipped back to the panel's own corner —
+   a picture running out from under a rounded card is the one thing that would
+   give the whole idea away. */
+.hero { overflow: hidden; }
+/* The showreel is the PAIR of islands, so the section holding them is not one
+   itself: no fill, no border, no padding of its own.
+
+   And the two are the SAME HEIGHT rather than centred against each other. Two
+   panels of different depths floating side by side read as a layout that did
+   not quite fit; two that line up top and bottom read as a pair.
+
+   Only where there ARE two columns, and the stage gives up its 16:9 to do it:
+   a fixed ratio and a stretched height are two answers to the same question,
+   and the one that wins is the one that makes the box WIDER than its column. */
+.reel { padding-block: 0; }
+.reel__stage { padding: 0; }
+@media (min-width: 60rem) {
+  .reel { align-items: stretch; }
+  .reel__stage { aspect-ratio: auto; }
+}
+
+/* 4. A CARD INSIDE AN ISLAND TAKES THE PAGE'S OWN COLOUR. Two panels of the
+      same fill, one inside the other, is a nesting nobody can see. */
+.card, .tile, .pill, .wall__tile, .frame, .split__media, .shot {
+  background: var(--bg);
+  border-color: var(--line);
+}
+.card, .tile {
+  border-radius: var(--radius);
+  transition:
+    transform .32s var(--motion-ease, ease),
+    box-shadow .32s var(--motion-ease, ease),
+    border-color .32s var(--motion-ease, ease);
+}
+/* Further than the base card lifts, because on this design a card has
+   somewhere to lift OFF — but still a multiple of the motion preset's own
+   figure rather than a number of its own, so an airline that chose Still gets
+   a card that does not move. */
+.card:hover, .tile:hover {
+  transform: translateY(calc(var(--motion-hover, 2px) * -2));
+  box-shadow: var(--shadow-2);
+  border-color: var(--accent-line);
+}
+
+/* A row lit as it is pointed at. The padding is pulled out to the panel's edge
+   and given back as a margin, so the lit strip is wider than the text and the
+   corner matches everything else. */
+.rows li, .steps li {
+  border-color: var(--line-soft);
+  padding-inline: .7rem;
+  margin-inline: -.7rem;
+  border-radius: var(--radius-sm);
+  transition: background-color .2s ease;
+}
+.rows li:hover, .steps li:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.rows li:last-child, .steps li:last-child { border-bottom: 0; }
+
+.figures b { color: var(--accent); font-weight: 600; }
+.quote p { font-style: normal; }
+.faq details { border-color: var(--line-soft); }
+
+/* THE APPLY BAND keeps its block of accent and gains the island's shape and
+   depth — the one panel on the page that is a colour rather than a surface. */
+.band {
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--on-accent) 20%, transparent);
+  box-shadow: var(--shadow-2);
+  padding: clamp(2rem, 5vw, 3.2rem) clamp(1.5rem, 4vw, 2.6rem);
+  margin-top: 0;
+}
+footer { margin-top: var(--gap); border-top: 1px solid var(--line); }
+`,
+        pages: [
+            { path: 'index.html', title: null, blocks: ['showreel', 'figures', 'values', 'network', 'hubs', 'activity', 'events', 'faq', 'wall', 'cta'] },
+            { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'contact'] },
+        ],
+        thumb: `<rect width="160" height="120" fill="#f6f7fd"/>
+<ellipse cx="80" cy="-8" rx="96" ry="44" fill="#dfe4fb"/>
+<rect x="12" y="7" width="136" height="13" rx="6.5" fill="#fff" stroke="#dde1f6"/>
+<g fill="#c9d0ef"><rect x="104" y="12" width="14" height="3" rx="1.5"/><rect x="122" y="12" width="18" height="3" rx="1.5"/></g>
+<rect x="18" y="11" width="26" height="5" rx="2" fill="#1b2033"/>
+<rect x="12" y="26" width="64" height="44" rx="9" fill="#fff" stroke="#dde1f6"/>
+<rect x="20" y="34" width="38" height="6" rx="2" fill="#1b2033"/>
+<g fill="#cfd5f0"><rect x="20" y="45" width="46" height="3" rx="1.5"/><rect x="20" y="52" width="34" height="3" rx="1.5"/></g>
+<rect x="20" y="59" width="24" height="7" rx="3.5" fill="#3a5bd9"/>
+<rect x="82" y="26" width="66" height="44" rx="9" fill="#eef1fc" stroke="#dde1f6"/>
+<g stroke="#cdd5f2" stroke-width="1"><path d="M86 38 H120"/><path d="M98 58 H140"/></g>
+<path d="M100 52 l22-6 6-7 4 2 -3 6 9-2 4 3 -14 6 -9 4z" fill="#3a5bd9"/>
+<rect x="12" y="76" width="136" height="34" rx="9" fill="#fff" stroke="#dde1f6"/>
+<g fill="#eef1fc" stroke="#e2e6f7"><rect x="20" y="84" width="38" height="18" rx="6"/><rect x="62" y="84" width="38" height="18" rx="6"/><rect x="104" y="84" width="36" height="18" rx="6"/></g>
+<g fill="#3a5bd9"><rect x="26" y="90" width="16" height="5" rx="2"/><rect x="68" y="90" width="16" height="5" rx="2"/><rect x="110" y="90" width="14" height="5" rx="2"/></g>`,
+    },
 };
 
 const DEFAULT_TEMPLATE = 'flightline';
@@ -3422,6 +4062,16 @@ const contrast = (a, b) => {
 };
 
 const INK_ON_ACCENT = '#16181d';
+
+/* THE PAGE'S OWN GROUND, in each scheme.
+ *
+ * Named rather than written twice because two things need the same answer and
+ * they are four hundred lines apart: the --bg the palette declares, and the
+ * <meta name="theme-color"> that tells a phone's browser what to paint its own
+ * chrome. When those two disagree the site opens with a white strip above a
+ * dark page, which is the most visible way a site can look unfinished and the
+ * hardest to notice on a desktop. */
+const PAGE_GROUND = { light: '#ffffff', dark: '#0c0e13' };
 
 /**
  * What text on a block of the accent should be.
@@ -3532,9 +4182,20 @@ function renderThemeCss(theme) {
      * --accent-soft is mixed from the VA's own accent at run time rather than
      * written as a fixed colour, so it is right for every accent instead of
      * right for the one this file was written against.
+     *
+     * AND THE SHADOWS ARE THREE LAYERS, ALL OF THEM WEAKER THAN THE TWO THEY
+     * REPLACED. This is the single change that does most of the work on how
+     * expensive a hosted site looks, and it is not "a bigger shadow".
+     *
+     * One soft shadow strong enough to be SEEN reads as a drop shadow: the card
+     * looks stuck to the page with a smudge under it. Stacked, each layer has a
+     * different job — a hairline contact shadow that keeps the edge crisp, a
+     * short one that gives the object thickness, and a long diffuse one that
+     * puts it in a room. Nothing in the stack is dark enough to notice on its
+     * own, and together they read as more solid than the heavier pair did.
      */
     const light = [
-        `  --bg: #ffffff;`,
+        `  --bg: ${PAGE_GROUND.light};`,
         `  --surface: #f7f8fb;`,
         `  --surface-2: #eef1f6;`,
         `  --ink: #14161b;`,
@@ -3542,11 +4203,11 @@ function renderThemeCss(theme) {
         `  --faint: #8b94a3;`,
         `  --line: #e3e7ee;`,
         `  --line-soft: #eef1f5;`,
-        `  --shadow-1: 0 1px 2px rgba(16, 20, 28, .05), 0 1px 3px rgba(16, 20, 28, .05);`,
-        `  --shadow-2: 0 10px 30px -12px rgba(16, 20, 28, .22), 0 2px 6px rgba(16, 20, 28, .05);`,
+        `  --shadow-1: 0 1px 1px rgba(16, 20, 28, .035), 0 3px 8px -3px rgba(16, 20, 28, .05), 0 12px 28px -16px rgba(16, 20, 28, .09);`,
+        `  --shadow-2: 0 1px 1px rgba(16, 20, 28, .04), 0 10px 24px -10px rgba(16, 20, 28, .09), 0 34px 70px -28px rgba(16, 20, 28, .18);`,
     ].join('\n');
     const dark = [
-        `  --bg: #0c0e13;`,
+        `  --bg: ${PAGE_GROUND.dark};`,
         `  --surface: #14171e;`,
         `  --surface-2: #1b1f28;`,
         `  --ink: #eef1f6;`,
@@ -3554,8 +4215,8 @@ function renderThemeCss(theme) {
         `  --faint: #6c7684;`,
         `  --line: #262b35;`,
         `  --line-soft: #1d222b;`,
-        `  --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);`,
-        `  --shadow-2: 0 14px 34px -14px rgba(0, 0, 0, .7), 0 2px 8px rgba(0, 0, 0, .35);`,
+        `  --shadow-1: 0 1px 1px rgba(0, 0, 0, .22), 0 3px 8px -3px rgba(0, 0, 0, .3), 0 12px 28px -16px rgba(0, 0, 0, .45);`,
+        `  --shadow-2: 0 1px 1px rgba(0, 0, 0, .26), 0 10px 24px -10px rgba(0, 0, 0, .42), 0 34px 70px -28px rgba(0, 0, 0, .64);`,
     ].join('\n');
 
     let palette;
@@ -3641,6 +4302,64 @@ ${palette}
  * RENDERING
  * ======================================================================== */
 
+/**
+ * The half of <head> that is not the title, and the same on both renderers.
+ *
+ * WHY A HOSTED SITE CARRIES THIS AT ALL
+ *
+ * These airlines live on Discord. A link to a website with no Open Graph tags
+ * is posted into a channel as a bare grey URL, and the VA reads that as their
+ * new site looking broken — which is fair, because every other link in that
+ * channel has a card. Four tags is the difference.
+ *
+ *   theme-color   what a phone browser paints its own chrome. Without it a dark
+ *                 site opens with a white strip above it. Two of them, one per
+ *                 scheme, because the site's mode can follow the visitor's.
+ *   og:*          the card. site_name, title and description; NO og:image,
+ *                 which is the one tag that is missing on purpose — see below.
+ *   twitter:card  'summary' rather than 'summary_large_image' for the same
+ *                 reason: the large card is a large EMPTY card when there is no
+ *                 image, which looks worse than the small one.
+ *
+ * AND WHY THERE IS NO og:image. The obvious candidate is the airline's banner,
+ * and it is not in this file's reach: these renderers are pure — no database,
+ * no clock, no network — and the banner lives behind a request. A tag pointing
+ * at an address we guessed is a broken picture on every link the VA ever posts,
+ * which is worse than the plain card they get now.
+ */
+function headMeta({ name, title, mode }) {
+    const scheme = MODES[mode] ? mode : 'auto';
+    const ground = scheme === 'dark'
+        ? [`<meta name="theme-color" content="${PAGE_GROUND.dark}">`]
+        : scheme === 'light'
+            ? [`<meta name="theme-color" content="${PAGE_GROUND.light}">`]
+            : [
+                `<meta name="theme-color" content="${PAGE_GROUND.light}" media="(prefers-color-scheme: light)">`,
+                `<meta name="theme-color" content="${PAGE_GROUND.dark}" media="(prefers-color-scheme: dark)">`,
+            ];
+    const about = `${name} — a virtual airline on Infinite Flight.`;
+    return [
+        `<meta name="description" content="${esc(about)}">`,
+        ...ground,
+        `<meta property="og:type" content="website">`,
+        `<meta property="og:site_name" content="${esc(name)}">`,
+        `<meta property="og:title" content="${esc(title)}">`,
+        `<meta property="og:description" content="${esc(about)}">`,
+        `<meta name="twitter:card" content="summary">`,
+    ].join('\n');
+}
+
+/* THE SKIP LINK.
+ *
+ * The first thing in the body and the first thing a keyboard reaches, so that
+ * getting to the words does not mean tabbing through a header on every page.
+ * It is invisible until it is focused, which is why it is one line of markup
+ * and four of CSS rather than a component.
+ *
+ * It has a target because <main> carries the id — a skip link pointing at
+ * nothing is the most common way this control is shipped broken. */
+const SKIP = '<a class="skip" href="#main">Skip to content</a>';
+
 function pageHtml(tpl, page, ctx) {
     const title = page.title ? `${page.title} — ${ctx.name}` : ctx.name;
     const body = page.blocks.map((id) => {
@@ -3656,14 +4375,15 @@ function pageHtml(tpl, page, ctx) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="${esc(ctx.name)} — a virtual airline on Infinite Flight.">
+${headMeta({ name: ctx.name, title, mode: ctx.mode })}
 <link rel="stylesheet" href="theme.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+${SKIP}
 ${BLOCKS.nav(ctx)}
 
-<main>
+<main id="main">
 ${body}
 </main>
 
@@ -3690,7 +4410,8 @@ Design: **${tpl.name}**. ${tpl.blurb}
 ${tpl.pages.map(p => `- \`${p.path}\` — ${p.title || 'the homepage'}`).join('\n')}
 - \`theme.css\` — colours and type. The theme controls in the Website tab rewrite this.
 - \`style.css\` — the layout and personality of this design.
-- \`site.js\` — hangs the Instagram wall and removes a section with nothing in it.
+- \`site.js\` — the menu, the arrivals, the lightbox, the showreel's film, the
+  Instagram wall, and removing a section with nothing in it.
 
 Add a page in the editor. \`index.html\` is what a visitor gets at \`/\`, and a
 folder's \`index.html\` is what they get at that folder.
@@ -3728,6 +4449,38 @@ The lists that read from your crew centre: \`routes\`, \`events\`,
 \`hubs\` and \`partners\` are worked out from your route map rather than typed
 anywhere — the airports you fly most out of, and the airlines you codeshare
 with. Publish a sector and they follow.
+
+### Your aircraft at the top of the page, and a short film over it
+
+The **Hero with your aircraft** section (\`class="reel"\`) opens the page with
+one of your own aeroplanes beside the words. There is nothing to fill in: it
+reads the first aircraft in your crew centre's fleet editor, and shows your
+livery picture if you uploaded one or an outline we draw of that type if you
+did not.
+
+If you have a short film of the airline, put its address in \`data-src\` and a
+still from it in \`poster\`:
+
+\`\`\`html
+<video class="reel__film" data-reel-film
+       data-src="https://…/takeoff.mp4" poster="https://…/takeoff.jpg"
+       muted loop playsinline preload="none" hidden></video>
+\`\`\`
+
+Both are ordinary \`https\` addresses — the pictures you upload in the Website
+tab already are, and a film has to be hosted somewhere you can link to.
+
+Three things to know, because they are decisions the page makes without asking:
+
+- **It plays silently, on a loop, with a pause button** that \`site.js\` adds.
+- **It is not downloaded at all** for a visitor whose system asks for less
+  movement, a visitor on Save-Data, or an airline whose Motion is set to Still.
+  Your aircraft is what they see, and the page is finished either way.
+- **A film that will not play is left hidden** rather than shown as a black
+  rectangle. An address that rots costs you nothing.
+
+Ten to twenty seconds. A minute of cruise is a minute nobody watches, and it is
+the first thing your page downloads.
 
 ### Putting a picture behind a section
 
@@ -3874,6 +4627,10 @@ function renderTemplate(templateId, va, { feedSrc, crewBase, theme } = {}) {
     };
 
     const th = normaliseTheme(theme, id);
+    // The only thing the <head> needs from the theme: which ground a phone
+    // browser should paint its chrome. Set after normalising, so a site stored
+    // before a mode was ever chosen gets the design's own answer.
+    ctx.mode = th.mode;
     const files = tpl.pages.map(p => ({ path: p.path, content: pageHtml(tpl, p, ctx) }));
     files.push({ path: 'theme.css', content: renderThemeCss(th) });
     files.push({ path: 'style.css', content: `${BASE_CSS}\n/* ---- ${tpl.name} ---------------------------------------------------- */\n${tpl.css}` });
@@ -3950,6 +4707,12 @@ module.exports = {
     // the Instagram wall. Exported so vaSiteBuilder.js emits the same style.css
     // and site.js rather than a second copy that drifts.
     BASE_CSS, SITE_JS,
+    // And the two pieces of every page that are not a block: the <head> tags
+    // below the title, and the skip link above the header. Exported for the
+    // same reason — vaSiteBuilder.js writes pages too, and a builder page whose
+    // head differs from a template page's is the thing "eject to the files"
+    // must never turn out to mean.
+    SKIP, headMeta,
     renderTemplate, renderBlock, renderThemeCss, renderMotionCss, normaliseTheme, catalogue,
     luminance, relativeLuminance, contrast, onAccentFor, hex,
 };

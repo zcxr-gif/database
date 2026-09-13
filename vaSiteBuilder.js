@@ -313,6 +313,92 @@ ${prose(p.lede, 'lede')}` : ''}${buttons.length ? `
         },
     },
 
+    /* THE SHOWREEL. The hero's counterpart for an airline that would rather
+     * open on its aeroplane than on a photograph behind a headline.
+     *
+     * Its markup is BLOCKS.showreel in vaSiteTemplates.js, class for class —
+     * rule 2 at the top of this file. The only thing that differs is where the
+     * words and the film's address come from: there they are placeholder text
+     * a VA edits in the file editor, here they are fields.
+     *
+     * THE FILM IS A url FIELD AND IT LANDS IN data-src, NOT src. That is not a
+     * detail of this block; it is the whole reason a film is offered at all.
+     * site.js moves the address across only after checking that the visitor
+     * has not asked for less movement, is not on Save-Data, and that the
+     * airline has not set its Motion to Still — and a <video> carrying a real
+     * src has already started downloading by the time any of that could run.
+     */
+    showreel: {
+        label: 'Hero with your aircraft',
+        note: 'The top of the page with one of your aeroplanes beside it, and room for a short film.',
+        icon: 'plane-takeoff',
+        live: true,
+        // No "picture behind this section". The stage IS the picture, and a
+        // photograph behind the whole thing would put white words over an
+        // unknown image AND a panel over the top of it — two backgrounds
+        // arguing about the same square of page. See fieldsOf.
+        ownBackground: true,
+        fields: [
+            { key: 'eyebrow', label: 'Small line above', type: 'line', placeholder: 'BAW · Infinite Flight' },
+            { key: 'headline', label: 'Headline', type: 'line', placeholder: 'Fly with us.' },
+            { key: 'lede', label: 'One sentence', type: 'text', help: 'What your airline is for, in your own words.' },
+            { key: 'ctaLabel', label: 'Button', type: 'line', placeholder: 'Apply to fly' },
+            { key: 'ctaHref', label: 'Button goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
+            { key: 'ctaLabel2', label: 'Second button', type: 'line', help: 'Optional. A quieter one beside the first.' },
+            { key: 'ctaHref2', label: 'That one goes to', type: 'url', help: 'Left empty, it goes to your crew centre.' },
+            {
+                key: 'film', label: 'A short film', type: 'url',
+                help: 'Optional. The address of an .mp4 or .webm. It plays silently on a loop, with a pause button — and is not downloaded at all for anyone who has asked their device for less movement or less data.',
+            },
+            {
+                key: 'poster', label: 'A still from the film', type: 'image',
+                help: 'Shown while the film loads. Ignored when there is no film.',
+            },
+        ],
+        defaults: (c) => ({
+            eyebrow: `${c.callsign || 'Virtual airline'} · Infinite Flight`,
+            headline: `${c.name}, in the air.`,
+            lede: 'One sentence about what your airline is for. The aircraft beside it is your own — it comes from the fleet in your crew centre, so it changes when your fleet does.',
+            ctaLabel: 'Apply to fly',
+            ctaHref: '',
+            ctaLabel2: 'Visit the crew centre',
+            ctaHref2: '',
+            film: '',
+            poster: '',
+        }),
+        render: (p, c) => {
+            const buttons = [
+                p.ctaLabel ? `<a class="cta" href="${esc(linkUrl(p.ctaHref, c.join))}">${esc(p.ctaLabel)}</a>` : '',
+                p.ctaLabel2 ? `<a class="cta cta--ghost" href="${esc(linkUrl(p.ctaHref2, c.crew))}">${esc(p.ctaLabel2)}</a>` : '',
+            ].filter(Boolean);
+            // No film, no <video>. An empty one costs nothing to a visitor and
+            // it costs a VA reading their own page a line they cannot explain.
+            // An EMPTY poster attribute is not the same as no poster: an
+            // empty URL resolves to the page itself, so the browser fetches the
+            // HTML and tries to decode it as an image. Omitted, not blanked.
+            const poster = p.poster ? ` poster="${esc(p.poster)}"` : '';
+            const film = p.film ? `
+      <video class="reel__film" data-reel-film data-src="${esc(p.film)}"${poster} muted loop playsinline preload="none" hidden></video>` : '';
+            return `
+  <section class="reel" data-motif>
+    <div class="reel__in">${p.eyebrow ? `
+      <p class="eyebrow">${esc(p.eyebrow)}</p>` : ''}
+      <h1>${esc(p.headline)}</h1>${p.lede ? `
+${prose(p.lede, 'lede')}` : ''}${buttons.length ? `
+      <div class="actions">${buttons.map(b => `\n        ${b}`).join('')}
+      </div>` : ''}
+    </div>
+    <div class="reel__stage">
+      <span class="reel__sky" aria-hidden="true"></span>
+      <span class="reel__trail" aria-hidden="true"></span>
+      <ul class="reel__ship" data-crew-list="fleet" data-crew-limit="1" aria-hidden="true">
+        <template><li><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="" decoding="async"></li></template>
+      </ul>${film}
+    </div>
+  </section>`;
+        },
+    },
+
     figures: {
         label: 'Live figures',
         note: 'Pilots, hours, destinations — read from your crew centre, never typed.',
@@ -902,16 +988,33 @@ ${tiles}
                 { q: 'Do I have to fly a minimum?', a: 'Say what happens if somebody does not.' },
             ],
         }),
+        /* AN ACCORDION, NOT A LIST OF ROWS.
+         *
+         * This used to render '.rows', which is the shape the network and the
+         * noticeboard use — every answer open at once, in the type size those
+         * lists give a secondary line. Five paragraphs stacked that way is a
+         * wall nobody reads, and it was also the one block in the vocabulary
+         * whose counterpart shape already existed in the base stylesheet and
+         * went unused: '.faq' has been in there the whole time.
+         *
+         * <details> rather than a script — the browser's own open-and-shut
+         * behaviour is keyboard-operable, prints open, and is findable by the
+         * browser's in-page search even while collapsed. The FIRST one ships
+         * open so the control explains itself instead of looking like a list
+         * of headings somebody forgot to write under.
+         */
         render: (p) => {
-            const rows = (p.items || []).filter(i => i.q)
-                .map(i => `      <li><b>${esc(i.q)}</b> <span>${esc(i.a).replace(/\n/g, '<br>')}</span></li>`).join('\n');
+            const rows = (p.items || []).filter(i => i.q).map((i, n) => `      <details${n === 0 ? ' open' : ''}>
+        <summary>${esc(i.q)}</summary>
+${prose(i.a, 'prose').replace(/^ {4}/gm, '        ')}
+      </details>`).join('\n');
             if (!rows) return '';
             return `
   <section class="block">
     <h2>${esc(p.heading)}</h2>
-    <ul class="rows">
+    <div class="faq">
 ${rows}
-    </ul>
+    </div>
   </section>`;
         },
     },
@@ -1221,14 +1324,15 @@ function pageHtml(doc, page, ctx) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="${esc(ctx.name)} — a virtual airline on Infinite Flight.">
+${templates.headMeta({ name: ctx.name, title, mode: ctx.mode })}
 <link rel="stylesheet" href="theme.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+${templates.SKIP}
 ${navHtml(doc, ctx)}
 
-<main>
+<main id="main">
 ${body}
 </main>
 
@@ -1260,6 +1364,10 @@ function renderSite(doc, { va, templateId, theme, feedSrc, crewBase } = {}) {
     });
     const clean = normaliseDoc(doc, ctx);
     const th = templates.normaliseTheme(theme, id);
+    // What the <head> needs from the theme — see headMeta. Set after
+    // normalising so a document stored before a mode was chosen gets the
+    // design's own answer rather than none.
+    ctx.mode = th.mode;
 
     const files = clean.pages.map(p => ({ path: p.path, content: pageHtml(clean, p, ctx) }));
     files.push({ path: 'theme.css', content: templates.renderThemeCss(th) });
