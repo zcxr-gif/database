@@ -119,6 +119,9 @@ const crewRetention = require('./crewRetention');
 // document (and strips the content when they may not), crewInbox decides who a
 // send reaches. The routes below hold the I/O and nothing else.
 const crewDocs = require('./crewDocs');
+// The starter pilot handbook a VA can drop into its own library. Content only;
+// the route that files it is beside the other document routes.
+const crewHandbook = require('./crewHandbook');
 const crewInbox = require('./crewInbox');
 
 // The quick-links board — where the crew is sent, and the one place a staff
@@ -5004,6 +5007,52 @@ app.post('/api/crew/:slug/documents', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'document add error', message: 'Could not save the document.' }); }
 });
 
+/* The starter handbook. v17.
+ *
+ * Adds crewHandbook's draft to this VA's library — the mechanical half of a
+ * pilot handbook (how signing in works, what ranks mean, how a flight becomes
+ * hours), written once by us because it describes software we wrote and change.
+ * The half that is actually the airline's is left in [brackets] for staff.
+ *
+ * A DRAFT, and never anything else: `status` is taken from the module and not
+ * from the request, because publishing it for them would put a document in
+ * their crew's hands, under their airline's name, that nobody at the airline
+ * has read.
+ *
+ * Refuses to add a second one. Staff who want to start over delete the first —
+ * a button that quietly makes duplicates is a button that gets pressed twice.
+ */
+app.post('/api/crew/:slug/documents/starter-handbook', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const starter = crewHandbook.starterHandbook({ vaName: va.name || '', slug: va.slug || '' });
+
+        const existing = (await store.listDocuments({ limit: 500 }) || [])
+            .find((d) => String(d.title || '').toLowerCase() === starter.title.toLowerCase());
+        if (existing) {
+            return res.status(409).json({
+                error: 'This library already has a document called “Pilot Handbook”. Open it, or delete it first if you want a fresh copy.',
+                code: 'already_added',
+                document: publicDocument(existing),
+            });
+        }
+
+        const doc = crewDocs.normalizeDocument(starter);
+        const saved = await store.createDocument({
+            ...doc,
+            revisedAt: new Date().toISOString(),
+            // Whose words these are. Not the staff member who pressed the
+            // button — they did not write it, and a manual attributed to
+            // somebody who has not read it is how a wrong answer gets quoted
+            // back at them.
+            authorName: 'Inflight (starter draft)',
+        });
+        res.status(201).json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'starter handbook error', message: 'Could not add the handbook.' }); }
+});
+
 app.patch('/api/crew/:slug/documents/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'documents.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -5176,10 +5225,17 @@ const publicNotification = (n) => ({
  */
 async function inboxOwner(req, store) {
     const p = verifyCrewRequest(req);
-    if (!p || p.kind !== 'crew') return null;
+    if (!p || (p.kind !== 'crew' && p.kind !== 'va')) return null;
     if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) return null;
     try {
-        const account = await store.getAccount(p.sub);
+        // v17. A staff member's inbox is their pilot side's inbox. Before they
+        // have one there is nothing addressed to them and nothing to read —
+        // which is still the answer here, not an error.
+        const account = p.kind === 'crew'
+            ? await store.getAccount(p.sub)
+            : (typeof store.getAccountByPortal === 'function'
+                ? await store.getAccountByPortal(String(p.sub))
+                : null);
         if (!account) return null;
         return { accountId: account._id, memberId: account.memberId || '' };
     } catch { return null; }
@@ -7612,11 +7668,24 @@ async function crewPilot(req, store) {
         if (p.kind === 'va') {
             const VaPortalAccount = mongoose.model('VaPortalAccount');
             const acct = await VaPortalAccount.findById(p.sub).select('crewMemberId displayName username active').lean();
-            if (!acct || acct.active === false || !acct.crewMemberId) return null;
-            const member = await store.getMember(acct.crewMemberId);
+            if (!acct || acct.active === false) return null;
+            // v17. Their own pilot row, when they have set one up. It carries
+            // the roster link as well, so a staff member who has a pilot side
+            // needs no separate claim — and one who claimed a roster row the
+            // old way and never provisioned a login still resolves below,
+            // exactly as before.
+            const own = typeof store.getAccountByPortal === 'function'
+                ? await store.getAccountByPortal(String(p.sub)).catch(() => null)
+                : null;
+            const memberId = (own && own.memberId) || acct.crewMemberId;
+            if (!memberId) return null;
+            const member = await store.getMember(memberId);
             if (!member) return null;         // the roster row has since gone
             return {
-                accountId: null,
+                // Null until they have a pilot side, and theirs once they do.
+                // Everything keyed on a crew_accounts id — the inbox, a booking
+                // made in their own name — follows this one field.
+                accountId: (own && own.active !== false) ? own._id : null,
                 memberId: member._id,
                 name: member.name || acct.displayName || acct.username || 'A pilot',
                 callsign: member.callsign || '',
@@ -7652,12 +7721,40 @@ app.get('/api/crew/:slug/me/pilot', async (req, res) => {
         // Only a central account can be re-pointed here; a store-backed pilot's
         // link belongs to their account row and is not theirs to swap.
         const linkable = p.kind === 'va';
+
+        /* THE PILOT SIDE. v17.
+         *
+         * Answered here rather than from a second endpoint because the panel
+         * that asks "which pilot am I" is the panel that offers to make one —
+         * and two round trips would let it draw "you are nobody" for a moment
+         * before finding out they have an account after all.
+         *
+         * `applies` is about the KIND of account (only our central staff logins
+         * can gain one; a pilot signed in with their own already is one), and
+         * `ready` is about this person. Both, because the button to draw
+         * differs: "set one up" for a staff member who has none, nothing at all
+         * for a pilot who cannot need one.
+         */
+        let pilotSide = { applies: linkable, ready: !linkable, discord: null };
+        if (linkable) {
+            const own = typeof store.getAccountByPortal === 'function'
+                ? await store.getAccountByPortal(String(p.sub)).catch(() => null)
+                : null;
+            pilotSide.ready = !!own;
+            pilotSide.discord = {
+                available: crewDiscord.configured(),
+                linked: !!(own && own.discordId),
+                name: (own && own.discordUsername) || '',
+            };
+        }
+
         res.json({
             linkable,
             linked: !!(me && me.memberId),
             pilot: me && me.memberId
                 ? { memberId: me.memberId, name: me.name, callsign: me.callsign, hours: me.hours }
                 : null,
+            pilotSide,
         });
     } catch (err) { crewFail(res, err, { log: 'me/pilot read error', message: 'Could not read your pilot record.' }); }
 });
@@ -16899,6 +16996,29 @@ app.get('/api/va-terms', (req, res) => {
         changelog: TOS_CHANGELOG,
         summary: TOS_SUMMARY,
         warningLevels: WARNING_LEVELS.map(l => ({ key: l.key, label: l.label, meaning: l.meaning })),
+    });
+});
+
+// The pilot-facing privacy notice + conditions for the Crew Center. Public and
+// unauthenticated on purpose: somebody deciding whether to press "Continue with
+// Discord" has not signed in, and a consent document you must already be inside
+// the product to read is one nobody has read.
+//
+// Separate from /api/va-terms because they are separate documents for separate
+// people — that one is a contract with an AIRLINE about a listing, and no pilot
+// signing in to fly has agreed to it or should be shown it.
+app.get('/api/crew-terms', (req, res) => {
+    const terms = require('./crewTermsContent');
+    const { CREW_TERMS_SUMMARY, CREW_TERMS_CONTACT_EMAIL } = require('./crewTerms');
+    res.json({
+        title: terms.TITLE,
+        subtitle: terms.SUBTITLE,
+        version: terms.VERSION,
+        effectiveDate: terms.EFFECTIVE_DATE,
+        intro: terms.INTRO,
+        clauses: terms.CLAUSES,
+        summary: CREW_TERMS_SUMMARY,
+        contact: CREW_TERMS_CONTACT_EMAIL,
     });
 });
 

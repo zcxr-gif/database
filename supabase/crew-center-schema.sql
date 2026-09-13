@@ -261,6 +261,53 @@ alter table crew_accounts add column if not exists discord_linked_at timestamptz
 create unique index if not exists crew_accounts_discord_idx
     on crew_accounts (va_slug, discord_id) where discord_id <> '';
 
+-- v17. A staff member's own pilot side.
+--
+-- THE PROBLEM. A VA's owner and staff sign in with a CENTRAL account — ours,
+-- not a row in their project — because that is the account that administers the
+-- partnership. It works for managing, and it runs out the moment the same
+-- person wants to fly: there is no crew_accounts row, so there is nothing to
+-- hang a Discord link on, nothing to address an inbox message to, and nothing
+-- that is theirs in the way every pilot's login is theirs.
+--
+-- What they had instead was claiming a roster row (VaPortalAccount.crewMemberId)
+-- — enough to be booked onto a departure, and no more. The alternative staff
+-- actually reached for was being handed a SECOND, ordinary pilot login by
+-- somebody with roster.manage: two usernames, two passwords, and a pilot
+-- account that is only theirs by convention.
+--
+-- SO: one row, bound to the central account that owns it. The staff member
+-- provisions it themselves, it is a normal crew_accounts row in every other
+-- respect, and it is what makes signing in with Discord available to the people
+-- who run the airline as well as to the people who fly for it.
+--
+-- IT CARRIES NO AUTHORITY. The role stays 'pilot' and the capabilities a staff
+-- session gets are still resolved from the central account it is bound to (see
+-- effectiveCaps in crewAuth.js) — never from this row. A row in a project the
+-- VA's own people can write to must not be able to promote anybody, which is
+-- exactly what a row with role 'owner' in here would do.
+alter table crew_accounts add column if not exists portal_account_id text not null default '';
+
+-- ONE central account, ONE bound row, per crew center. Partial for the same
+-- reason the Discord index is: every ordinary pilot's row holds '' here.
+create unique index if not exists crew_accounts_portal_idx
+    on crew_accounts (va_slug, portal_account_id) where portal_account_id <> '';
+
+-- v17. Which version of the Crew Center pilot terms this account has agreed to.
+--
+-- The version STRING rather than a boolean, because the question is not "have
+-- they ever agreed" but "have they agreed to what is in front of them now" —
+-- and a privacy notice that changes without anybody being asked again is a
+-- notice nobody has agreed to. Empty means never asked or never answered; the
+-- crew center asks again whenever this differs from the current version.
+--
+-- Deliberately NOT a gate on the door. A pilot who has not agreed can still
+-- sign in and read their own hours; what they get is the notice, once, until
+-- they answer it. Locking a roster out of its own crew center over a consent
+-- prompt would punish the pilot for a change their VA and we made.
+alter table crew_accounts add column if not exists terms_version     text not null default '';
+alter table crew_accounts add column if not exists terms_accepted_at timestamptz;
+
 -- ----------------------------------------------------------------------------
 -- Membership applications submitted through the crew center's join form.
 --
@@ -2012,5 +2059,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 16)
+insert into crew_schema_info (id, version) values (1, 17)
 on conflict (id) do update set version = excluded.version, updated_at = now();

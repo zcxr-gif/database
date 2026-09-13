@@ -11,7 +11,8 @@
     "test:sites:browser": "node scripts/test-va-site-motion.js",
     "test:schema": "node scripts/test-schema-typekey.js",
     "test:crew": "node scripts/test-crew-shop-awards.js",
-    "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js"
+    "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js",
+    "test:staff-pilot": "node scripts/test-crew-staff-pilot.js"
   },
   "keywords": [],
   "author": "Antony",

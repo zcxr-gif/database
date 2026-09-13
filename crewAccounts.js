@@ -145,6 +145,107 @@ async function provisionPilotAccount(store, opts = {}) {
     return { account, created: true, username, password };
 }
 
+/**
+ * A staff member's OWN pilot account. v17.
+ *
+ * WHAT THIS IS FOR
+ * ----------------
+ * A VA's owner and staff sign in with a central account of ours, and that
+ * account has no row in the VA's project. Everything that is keyed on a
+ * crew_accounts id therefore passes them by: an inbox message has nowhere to
+ * land, a Discord link has nothing to be written against, and the crew center
+ * has no record that is theirs in the way every pilot's login is theirs. What
+ * they had instead was claiming a ROSTER row, which is enough to be booked onto
+ * a departure and no more — or being handed a second, ordinary pilot login by
+ * somebody with roster.manage, which is two credentials for one person and an
+ * account that is only theirs by convention.
+ *
+ * So: one row, bound to the central account that owns it by
+ * `portalAccountId`, and provisioned by that person themselves.
+ *
+ * THERE IS NO PASSWORD, AND THAT IS THE POINT
+ * -------------------------------------------
+ * The row is created with a hash of a value nobody has and nobody can ask for —
+ * random bytes, hashed and dropped on the floor in the same expression. bcrypt
+ * cannot be satisfied by any input, so the password door can never open this
+ * row, and the cascade in the login route falls through it to the central
+ * account the way it always did.
+ *
+ * That is deliberate. A second password for a person who already has one is a
+ * second thing to lose, a second thing to phish and a second thing to rotate,
+ * and it would exist only to open a door their central password already opens.
+ * The ways in stay what they were: their staff password, or Discord once they
+ * have linked it — which is the whole reason this row exists.
+ *
+ * IT CARRIES NO AUTHORITY
+ * -----------------------
+ * `role` is 'pilot' and must stay 'pilot'. A staff session's capabilities are
+ * resolved from the central account (effectiveCaps in crewAuth.js), never from
+ * here, and a row with role 'owner' in a project the VA's own people can write
+ * to would be a way to grant capabilities by editing a database. The binding
+ * says WHOSE pilot side this is; it never says what that person may do.
+ *
+ * Idempotent: called again by the same staff account it returns the row they
+ * already have, rather than minting a second one.
+ *
+ * @param {Object} store             a crewStore adapter
+ * @param {Object} opts
+ * @param {string} opts.portalAccountId  the central account this belongs to
+ * @param {string} opts.displayName      their name, as the roster should read it
+ * @param {string} [opts.username]       preferred username; derived when absent
+ * @param {string} [opts.memberId]       a roster row they have already claimed
+ * @param {string} [opts.email]
+ * @returns {{account: Object, created: boolean}}
+ */
+async function provisionStaffAccount(store, opts = {}) {
+    if (!store) throw new Error('provisionStaffAccount requires a crew store.');
+    const portalAccountId = clean(opts.portalAccountId, 40);
+    if (!/^[a-f0-9]{24}$/i.test(portalAccountId)) {
+        throw new Error('provisionStaffAccount requires the staff account it belongs to.');
+    }
+    const displayName = clean(opts.displayName, 80) || 'Staff';
+
+    // Already has one. Re-point it at the roster row they have claimed since,
+    // for the same reason provisionPilotAccount does: the next lookup should be
+    // by id rather than by a name somebody may rename.
+    const existing = typeof store.getAccountByPortal === 'function'
+        ? await store.getAccountByPortal(portalAccountId)
+        : null;
+    if (existing) {
+        if (opts.memberId && !existing.memberId) {
+            await store.updateAccount(existing._id, { memberId: opts.memberId }).catch(() => {});
+            existing.memberId = opts.memberId;
+        }
+        return { account: existing, created: false };
+    }
+
+    // A username is still required — it is what the roster, the account list and
+    // every "who filed this" line reads — but it opens nothing on its own.
+    const wanted = clean(opts.username, 60).toLowerCase();
+    const username = wanted && !await store.getAccountByUsername(wanted)
+        ? wanted
+        : await usernameFor(store, wanted || displayName);
+
+    const account = await store.createAccount({
+        username,
+        displayName,
+        // Unopenable, by construction. See the note above.
+        passwordHash: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
+        role: 'pilot',
+        memberId: opts.memberId || null,
+        email: clean(opts.email, 120).toLowerCase(),
+        active: true,
+        // There is no password to change, so nagging them to change it would be
+        // asking for something they cannot do.
+        mustChangePassword: false,
+        createdVia: 'staff-pilot-side',
+        createdByName: displayName,
+        portalAccountId,
+        vaName: opts.vaName || '',
+    });
+    return { account, created: true };
+}
+
 // The name match is done in JS over the account list rather than as a query:
 // the store interface has no case-insensitive name filter, rosters are small
 // (hundreds, not millions), and this runs once per acceptance.
@@ -229,12 +330,21 @@ const publicAccount = (a) => a && {
     memberId: a.memberId || null,
     active: a.active !== false,
     mustChangePassword: !!a.mustChangePassword,
+    // v16/v17, as booleans. Whether a login has Discord on it and whether it is
+    // a staff member's own pilot side are both things the account list has to
+    // show — a reset-password button on a row with no password is a button that
+    // cannot work, and staff need to know which row is theirs. Neither the
+    // Discord id nor the central account id goes out: what the list needs is
+    // the fact, not the identifier.
+    discordLinked: !!a.discordId,
+    staffOwned: !!a.portalAccountId,
     lastLoginAt: a.lastLoginAt || null,
     createdAt: a.createdAt || null,
 };
 
 module.exports = {
     provisionPilotAccount,
+    provisionStaffAccount,
     authenticate,
     changePassword,
     resetPassword,

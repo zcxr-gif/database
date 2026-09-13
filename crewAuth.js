@@ -32,12 +32,32 @@ const crewAccounts = require('./crewAccounts');
 // live there; the routes that use them are at the bottom of this file.
 const crewDiscord = require('./crewDiscord');
 const crewInvite = require('./crewInvite');
+// The pilot-facing privacy notice. Only the version and where to read it are
+// needed here — the words live in crewTermsContent.js and are served by their
+// own public route, because a document you have to be signed in to read is one
+// nobody has read.
+const { CREW_TERMS_VERSION, CREW_TERMS_PAGE_PATH } = require('./crewTerms');
 // The schedule's rules are normalised by the module that enforces them, so the
 // bounds a VA can save and the bounds the endpoints apply are one definition.
 const crewSchedules = require('./crewSchedules');
 const crewRetention = require('./crewRetention');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
+
+/**
+ * The pilot row belonging to one of our central staff accounts, or null. v17.
+ *
+ * Swallows everything, and every caller depends on that: a staff member signs
+ * in to MANAGE an airline, and a project that is unreachable, on an older
+ * schema, or has no such row must cost them the pilot side and never the
+ * session. "No pilot row" and "could not ask" are the same answer here — in
+ * both cases there is nothing to hang a Discord link or an inbox on, and in
+ * both cases the dashboard they came for works.
+ */
+async function boundPilotRow(store, portalAccountId) {
+    if (!store || typeof store.getAccountByPortal !== 'function') return null;
+    try { return await store.getAccountByPortal(portalAccountId); } catch { return null; }
+}
 
 /**
  * Retire the invitation that let a pilot in, the moment they use it.
@@ -777,6 +797,28 @@ async function resolveVa(slug) {
  * capability, or handing out a token with a field the other has. The doors
  * differ in how they decide WHO; they must not differ in what they hand over.
  */
+/**
+ * Where this session stands with the pilot terms.
+ *
+ * `applies` is the interesting field. An account is asked only when there is
+ * somewhere to record the answer — a crew_accounts row, which an ordinary pilot
+ * always has and a staff member has only once they have set up their pilot
+ * side. Inflight oversight never has one and is never asked: they are not a
+ * pilot at anybody's airline and there is no row to write it on.
+ *
+ * When it does not apply, `accepted` is true rather than false. The consumer of
+ * this is a prompt, and a prompt that fires for somebody who cannot answer it
+ * is a prompt with no button.
+ */
+function crewTermsState(acceptedVersion, applies) {
+    return {
+        version: CREW_TERMS_VERSION,
+        url: CREW_TERMS_PAGE_PATH,
+        applies: !!applies,
+        accepted: applies ? String(acceptedVersion || '') === CREW_TERMS_VERSION : true,
+    };
+}
+
 function crewSession(va, identity, username, slugFallback) {
     const view = viewForRole(identity.role);
     const token = signCrewToken({
@@ -797,6 +839,10 @@ function crewSession(va, identity, username, slugFallback) {
         // told to use the portal.
         mustChangePassword: !!identity.mustChangePassword,
         canChangePassword: identity.kind === 'crew',
+        // The notice, and whether this account has answered the current version
+        // of it. Never a gate — see crewTerms.js — so this rides along with
+        // every session and the page decides when to ask.
+        terms: crewTermsState(identity.termsVersion, identity.termsApplies),
         caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
         va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
     };
@@ -835,6 +881,8 @@ function registerCrewAuthRoutes(app) {
                         sub: String(pilot._id), kind: 'crew', role: pilot.role || 'pilot',
                         name: pilot.displayName || pilot.username,
                         mustChangePassword: !!pilot.mustChangePassword,
+                        termsVersion: pilot.termsVersion || '',
+                        termsApplies: true,
                     };
                     // The invitation has done its job. Clearing it here rather
                     // than on the password change is on purpose: arriving is the
@@ -866,6 +914,15 @@ function registerCrewAuthRoutes(app) {
                         mustChangePassword: !!acct.mustChangePassword,
                     };
                 }
+            }
+
+            // A staff member who has set up a pilot side is asked about the
+            // terms like any other pilot, because they now have a row that can
+            // record the answer. One who has not is not asked about a notice
+            // that has nowhere to be written down.
+            if (identity && identity.kind === 'va') {
+                const row = await boundPilotRow(await crewStore.forVa(va).catch(() => null), identity.sub);
+                if (row) { identity.termsVersion = row.termsVersion || ''; identity.termsApplies = true; }
             }
 
             // 3) Otherwise an Inflight staff member (oversight into any crew center).
@@ -1501,14 +1558,33 @@ function registerCrewAuthRoutes(app) {
      * itself. Without it, a pilot who signed in inside the app was answered with
      * the standalone page in the overlay's frame.
      */
-    const crewPageFor = (slug, embed) => {
+    const crewPageFor = (slug, embed, where) => {
         const base = String(process.env.CREW_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL || '')
             .replace(/\/+$/, '');
-        const path = `${base}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
-        return embed ? `${path}?embed=1&` : `${path}?`;
+        const s = encodeURIComponent(String(slug || '').toLowerCase());
+        /* WHERE THEY CAME FROM, AND THEREFORE WHERE THEY GO BACK TO.
+         *
+         * A SIGN-IN always lands on the crew center's front door: they were not
+         * signed in when they left, and the page has to spend the handoff for a
+         * session before anything else can be drawn.
+         *
+         * A LINK is the opposite. That person was already signed in, standing on
+         * their account page or their dashboard, and sending them to the sign-in
+         * page — which is what this did before `where` existed — answered "link
+         * Discord" with a login form and no word about whether it worked. The
+         * confirmation lives on the page they started from, so that is the page
+         * they come back to.
+         *
+         * A FIXED SET of three, chosen here from the sealed state. Never a URL
+         * or a path from the request: a redirect whose destination a caller can
+         * influence is an open redirect with a login attached to it. */
+        const path = where === 'pilot' ? `${base}/crew-pilot.html?va=${s}&`
+            : where === 'dashboard' ? `${base}/crew-dashboard.html?va=${s}&`
+                : `${base}/crew/${s}?`;
+        return embed ? `${path}embed=1&` : path;
     };
-    const backToCrew = (res, slug, reason, embed) =>
-        res.redirect(`${crewPageFor(slug, embed)}discord=${encodeURIComponent(reason)}`);
+    const backToCrew = (res, slug, reason, embed, where) =>
+        res.redirect(`${crewPageFor(slug, embed, where)}discord=${encodeURIComponent(reason)}`);
 
     /* --- 1a. Leaving for Discord, to SIGN IN -----------------------------
      *
@@ -1550,10 +1626,14 @@ function registerCrewAuthRoutes(app) {
     app.post('/api/crew/:slug/auth/discord/link', async (req, res) => {
         const slug = String(req.params.slug || '').toLowerCase();
         const p = verifyCrewRequest(req);
-        // Only a store-backed pilot account has anywhere to keep a link. A VA
-        // staff or Inflight login is a central account, and is told so rather
-        // than handed a button that would fail on the way back.
-        if (!p || p.kind !== 'crew') return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        // A link has to be written on a row, so the caller needs one. A pilot
+        // IS one. A staff member has one once they have set up their pilot side
+        // (v17) — and is told to do that rather than handed a button that would
+        // fail on the way back. Inflight oversight has none at anybody's
+        // airline and is not offered the button at all.
+        if (!p || (p.kind !== 'crew' && p.kind !== 'va')) {
+            return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        }
         if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
         if (!p.sub) return res.status(401).json({ error: 'Sign in to your crew center first.' });
         if (!crewDiscord.configured()) {
@@ -1561,11 +1641,37 @@ function registerCrewAuthRoutes(app) {
         }
         const va = await resolveVa(slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+        /* WHICH ROW THE LINK LANDS ON.
+           Always a crew_accounts id, whichever kind of session asked, so the
+           callback that comes back has exactly one shape to handle and cannot
+           be made to write a Discord id somewhere that is not a pilot row. For
+           a staff session that is their bound pilot side, looked up here rather
+           than taken from anything the browser sent. */
+        let sub = String(p.sub);
+        if (p.kind === 'va') {
+            let row = null;
+            try { row = await boundPilotRow(await crewStore.forVa(va), String(p.sub)); }
+            catch { row = null; }
+            if (!row) {
+                return res.status(409).json({
+                    error: 'Set up your pilot side first — then you can link Discord to it.',
+                    code: 'no_pilot_side',
+                });
+            }
+            sub = String(row._id);
+        }
+
         res.set('Cache-Control', 'no-store');
         res.json({
             url: crewDiscord.authorizeUrl(crewDiscord.signState({
-                slug: va.slug || slug, intent: 'link', sub: String(p.sub),
+                slug: va.slug || slug, intent: 'link', sub,
                 embed: String((req.body && req.body.embed) || '') === '1',
+                // Taken from the SESSION, not from the request: a pilot links
+                // from their account page and a staff member from their
+                // dashboard, and which of the two this is has already been
+                // established by the token above.
+                back: p.kind === 'va' ? 'dashboard' : 'pilot',
             }), req),
         });
     });
@@ -1580,13 +1686,16 @@ function registerCrewAuthRoutes(app) {
 
         const slug = state.slug;
         const embed = state.embed;
+        // Only a link has somewhere else to go back to; a sign-in has to land
+        // on the front door to spend its handoff.
+        const back = state.intent === 'link' ? state.back : '';
         // The pilot pressed Cancel on the consent screen, which is a decision
         // rather than a fault.
-        if (req.query.error || !req.query.code) return backToCrew(res, slug, 'cancelled', embed);
+        if (req.query.error || !req.query.code) return backToCrew(res, slug, 'cancelled', embed, back);
 
         try {
             const va = await resolveVa(slug);
-            if (!va) return backToCrew(res, slug, 'unknown', embed);
+            if (!va) return backToCrew(res, slug, 'unknown', embed, back);
 
             const profile = await crewDiscord.fetchProfile(await crewDiscord.exchangeCode(req.query.code, req));
             const store = await crewStore.forVa(va);
@@ -1597,7 +1706,7 @@ function registerCrewAuthRoutes(app) {
                back. */
             if (state.intent === 'link') {
                 const account = await store.getAccount(state.sub);
-                if (!account || !account.active) return backToCrew(res, slug, 'link_denied', embed);
+                if (!account || !account.active) return backToCrew(res, slug, 'link_denied', embed, back);
 
                 // One Discord identity, one login, per crew center. The unique
                 // index is the thing that actually enforces this; the check is
@@ -1605,7 +1714,7 @@ function registerCrewAuthRoutes(app) {
                 // violation.
                 const taken = await store.getAccountByDiscord(profile.id);
                 if (taken && String(taken._id) !== String(account._id)) {
-                    return backToCrew(res, slug, 'link_taken', embed);
+                    return backToCrew(res, slug, 'link_taken', embed, back);
                 }
 
                 await store.updateAccount(account._id, {
@@ -1614,7 +1723,7 @@ function registerCrewAuthRoutes(app) {
                     discordAvatar: profile.avatar,
                     discordLinkedAt: new Date(),
                 });
-                return backToCrew(res, slug, 'linked', embed);
+                return backToCrew(res, slug, 'linked', embed, back);
             }
 
             /* --- SIGNING IN ---
@@ -1636,11 +1745,21 @@ function registerCrewAuthRoutes(app) {
             // project has not had the v16 SQL run, where the column does not
             // exist. Nothing is broken for them — every pilot still has a
             // password — so they are told, and not with a stack trace.
-            if (err && (err.code === 'store_schema_missing' || err.code === 'store_accounts_missing')) {
-                return backToCrew(res, slug, 'needs_update', embed);
+            // `store_schema_outdated` belongs here too, and is in fact the
+            // likelier of the three: a project that ran the SQL before v16 has
+            // the crew_accounts TABLE and not the discord_id COLUMN, and a
+            // filter naming a column that does not exist comes back as
+            // outdated, not missing. Without it that VA was told "Discord
+            // sign-in didn't work, try again" — advice that cannot ever work —
+            // instead of "your database needs updating", which is the one thing
+            // that fixes it.
+            if (err && (err.code === 'store_schema_missing'
+                || err.code === 'store_accounts_missing'
+                || err.code === 'store_schema_outdated')) {
+                return backToCrew(res, slug, 'needs_update', embed, back);
             }
             console.error('Crew Discord callback error:', err && err.message ? err.message : err);
-            return backToCrew(res, slug, 'failed', embed);
+            return backToCrew(res, slug, 'failed', embed, back);
         }
     });
 
@@ -1666,11 +1785,48 @@ function registerCrewAuthRoutes(app) {
             if (!account || !account.active) {
                 return res.status(401).json({ error: 'That sign-in has expired. Please try again.' });
             }
+
+            /* --- A STAFF MEMBER'S PILOT SIDE. v17. ---
+               The row says which central account it belongs to, and that
+               account — not this row — decides what the session can do. Read
+               fresh, for the same reason the row above is: the ninety seconds
+               since the callback are ninety seconds in which the person could
+               have been removed from the team, and the session this produces
+               has to be the one the password door would produce right now.
+
+               A role is never taken from the row. The row's role is 'pilot' and
+               is written into a project the VA's own people can edit; if it
+               were consulted here, editing a database would be a way to grant
+               capabilities. */
+            if (account.portalAccountId) {
+                const acct = await mongoose.model('VaPortalAccount')
+                    .findById(account.portalAccountId)
+                    .select('username displayName role active vaAdId mustChangePassword').lean();
+                // Gone, switched off, or moved to another airline. Refused
+                // rather than quietly downgraded to a pilot session: somebody
+                // whose staff account has been taken away should be told their
+                // sign-in no longer works, not handed a lesser one and left to
+                // work out what changed.
+                if (!acct || acct.active === false || String(acct.vaAdId) !== String(va._id)) {
+                    return res.status(401).json({ error: 'That sign-in has expired. Please try again.' });
+                }
+                res.set('Cache-Control', 'no-store');
+                return res.json(crewSession(va, {
+                    sub: String(acct._id), kind: 'va', role: acct.role,
+                    name: acct.displayName || acct.username,
+                    mustChangePassword: !!acct.mustChangePassword,
+                    termsVersion: account.termsVersion || '',
+                    termsApplies: true,
+                }, acct.username, slug));
+            }
+
             res.set('Cache-Control', 'no-store');
             res.json(crewSession(va, {
                 sub: String(account._id), kind: 'crew', role: account.role || 'pilot',
                 name: account.displayName || account.username,
                 mustChangePassword: !!account.mustChangePassword,
+                termsVersion: account.termsVersion || '',
+                termsApplies: true,
             }, account.username, slug));
         } catch (err) {
             console.error('Crew Discord exchange error:', err && err.message ? err.message : err);
@@ -1688,19 +1844,223 @@ function registerCrewAuthRoutes(app) {
     app.delete('/api/crew/:slug/account/discord', async (req, res) => {
         const p = verifyCrewRequest(req);
         const slug = String(req.params.slug || '').toLowerCase();
-        if (!p || p.kind !== 'crew') return res.status(401).json({ error: 'Not authenticated.' });
+        if (!p || (p.kind !== 'crew' && p.kind !== 'va')) return res.status(401).json({ error: 'Not authenticated.' });
         if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
         try {
             const va = await resolveVa(slug);
             if (!va) return res.status(404).json({ error: 'Crew center not found.' });
             const store = await crewStore.forVa(va);
-            await store.updateAccount(p.sub, {
+            // Whichever row the link was written on is the row it is cleared
+            // from — the caller's own, never one named in the request.
+            const rowId = p.kind === 'crew'
+                ? String(p.sub)
+                : String((await boundPilotRow(store, String(p.sub)) || {})._id || '');
+            if (!rowId) return res.json({ ok: true, discord: { available: crewDiscord.configured(), linked: false, name: '', avatar: '' } });
+            await store.updateAccount(rowId, {
                 discordId: '', discordUsername: '', discordAvatar: '', discordLinkedAt: null,
             });
             res.json({ ok: true, discord: { available: crewDiscord.configured(), linked: false, name: '', avatar: '' } });
         } catch (err) {
             console.error('Crew Discord unlink error:', err && err.message ? err.message : err);
             res.status(500).json({ error: 'That could not be unlinked.' });
+        }
+    });
+
+    /* =====================================================================
+     * A STAFF MEMBER'S OWN PILOT SIDE. v17.
+     *
+     * THE PROBLEM THIS SOLVES. A VA's owner and staff sign in with one of OUR
+     * central accounts, which has no row in the VA's project. So the people who
+     * run the airline could manage everything about it and be nobody in it:
+     * nothing to link Discord to, nothing to address a message to, no login of
+     * their own on the roster they administer.
+     *
+     * What existed instead was claiming a ROSTER row (POST /me/pilot, in
+     * server.js) — which makes them bookable and no more — or being handed a
+     * second, ordinary pilot login by somebody with roster.manage. The second
+     * is two credentials for one person and an account that is theirs only by
+     * convention; it is what this replaces.
+     *
+     * WHAT THIS DOES NOT DO. It does not take, claim or merge anybody else's
+     * pilot account. It creates a row that belongs to the caller's own central
+     * account, and it will only ever create one — called twice, it returns the
+     * one they already have.
+     *
+     * WHAT IT CANNOT DO. Grant anything. The row's role is 'pilot' and the
+     * session's capabilities are still resolved from the central account (see
+     * effectiveCaps); a row in a project the VA's own people can write to must
+     * never be able to promote anybody.
+     * =================================================================== */
+    app.post('/api/crew/:slug/me/pilot-side', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+        // A pilot already has one: it is the account they signed in with.
+        if (p.kind === 'crew') {
+            return res.status(400).json({
+                error: 'You already have a pilot account — this is it.',
+                code: 'already_a_pilot',
+            });
+        }
+        // Inflight oversight is not a pilot at anybody's airline, and must not
+        // be able to put itself on a VA's roster.
+        if (p.kind !== 'va') {
+            return res.status(403).json({
+                error: 'An Inflight staff login cannot fly for a VA.',
+                code: 'not_a_va_account',
+            });
+        }
+        if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const acct = await VaPortalAccount.findById(p.sub)
+                .select('username displayName active vaAdId crewMemberId').lean();
+            if (!acct || acct.active === false || String(acct.vaAdId) !== String(va._id)) {
+                return res.status(403).json({ error: 'That account does not belong to this crew center.' });
+            }
+            const store = await crewStore.forVa(va);
+            if (typeof store.getAccountByPortal !== 'function') {
+                return res.status(409).json({
+                    error: 'This crew center’s data store cannot hold a staff pilot account yet.',
+                    code: 'unsupported_store',
+                });
+            }
+
+            const name = String(acct.displayName || acct.username || 'Staff').trim();
+
+            /* THE ROSTER ROW.
+               In order of preference: one they asked for, the one they have
+               already claimed, or a new one in their own name. The third is the
+               point of the whole route — a staff member should not have to pick
+               somebody else's row off the roster to be a pilot — and it is why
+               this creates rather than only links. */
+            let member = null;
+            const wanted = String((req.body && req.body.memberId) || '').trim();
+            if (wanted) {
+                member = await store.getMember(wanted);
+                if (!member) return res.status(404).json({ error: 'That pilot isn’t on this roster.' });
+            } else if (acct.crewMemberId) {
+                member = await store.getMember(acct.crewMemberId);
+            }
+            if (!member) {
+                member = await store.createMember({
+                    name,
+                    // Left for them to fill in on the roster: a callsign is the
+                    // VA's to issue in their own numbering, and guessing one
+                    // risks handing out a number another pilot already flies.
+                    callsign: '',
+                    hours: 0,
+                    status: 'active',
+                });
+            }
+
+            const r = await crewAccounts.provisionStaffAccount(store, {
+                portalAccountId: String(acct._id),
+                displayName: name,
+                username: acct.username || '',
+                memberId: member ? member._id : null,
+                vaName: va.name || '',
+            });
+
+            // Keep the central account's own pointer in step, so the roster
+            // link staff already had (POST /me/pilot) and this agree about who
+            // they are rather than each holding half an answer.
+            if (member && String(acct.crewMemberId || '') !== String(member._id)) {
+                await VaPortalAccount.findByIdAndUpdate(acct._id, { crewMemberId: String(member._id) }).catch(() => {});
+            }
+
+            res.set('Cache-Control', 'no-store');
+            res.status(r.created ? 201 : 200).json({
+                created: r.created,
+                account: crewAccounts.publicAccount(r.account),
+                pilot: member
+                    ? { memberId: member._id, name: member.name, callsign: member.callsign || '', hours: Number(member.hours) || 0 }
+                    : null,
+                discord: {
+                    available: crewDiscord.configured(),
+                    linked: !!(r.account && r.account.discordId),
+                    name: (r.account && r.account.discordUsername) || '',
+                    avatar: crewDiscord.avatarUrl({
+                        id: (r.account && r.account.discordId) || '',
+                        avatar: (r.account && r.account.discordAvatar) || '',
+                    }),
+                },
+            });
+        } catch (err) {
+            // A project that has not run the v17 SQL has no portal_account_id
+            // column, so the lookup that finds an existing row fails before
+            // anything is written. Named, with the fix attached, rather than
+            // reported as a fault on our side.
+            if (err && (err.code === 'store_schema_outdated' || err.code === 'store_accounts_missing'
+                || err.code === 'store_schema_missing')) {
+                return res.status(409).json({
+                    error: 'This crew center’s database needs updating before staff can have a pilot account. Re-run the setup SQL in Settings → Data store.',
+                    code: 'needs_update',
+                });
+            }
+            console.error('Crew pilot-side error:', err && err.message ? err.message : err);
+            res.status(500).json({ error: 'Could not set up your pilot account.' });
+        }
+    });
+
+    /* =====================================================================
+     * AGREEING TO THE PILOT TERMS
+     *
+     * Records a version against the caller's own account row and nothing else:
+     * no name, no address, no copy of what they were shown. The version IS the
+     * record — it says which words were on the screen, because the words for a
+     * version do not change (a change is what a new version is).
+     *
+     * It refuses a version that is not the current one. The only reason to send
+     * an old version is a page that has been open since before a change, and
+     * accepting that would record an agreement to a document nobody had in
+     * front of them.
+     * =================================================================== */
+    app.post('/api/crew/:slug/account/terms', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (!p || (p.kind !== 'crew' && p.kind !== 'va')) return res.status(401).json({ error: 'Not authenticated.' });
+        if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        const sent = String((req.body && req.body.version) || '');
+        if (sent && sent !== CREW_TERMS_VERSION) {
+            return res.status(409).json({
+                error: 'This notice has been updated since that page was opened. Reload and read it again.',
+                code: 'version_moved',
+                terms: crewTermsState('', true),
+            });
+        }
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const store = await crewStore.forVa(va);
+            const row = p.kind === 'crew'
+                ? await store.getAccount(p.sub)
+                : await boundPilotRow(store, String(p.sub));
+            // Nothing to write it on. Answered as the truth rather than as an
+            // error: a staff member with no pilot side was never asked.
+            if (!row) return res.json({ ok: true, terms: crewTermsState('', false) });
+            await store.updateAccount(row._id, {
+                termsVersion: CREW_TERMS_VERSION,
+                termsAcceptedAt: new Date(),
+            });
+            res.set('Cache-Control', 'no-store');
+            res.json({ ok: true, terms: crewTermsState(CREW_TERMS_VERSION, true) });
+        } catch (err) {
+            if (err && (err.code === 'store_schema_outdated' || err.code === 'store_accounts_missing'
+                || err.code === 'store_schema_missing')) {
+                // The notice was still read; it is the RECORD that cannot be
+                // kept. Not an error in the pilot's face — they did their part —
+                // so the prompt is told the answer did not stick and will ask
+                // again, and the VA's database banner is where the fix lives.
+                return res.status(409).json({
+                    error: 'Your crew center’s database needs updating before this can be recorded. Ask your staff to re-run the setup SQL.',
+                    code: 'needs_update',
+                });
+            }
+            console.error('Crew terms accept error:', err && err.message ? err.message : err);
+            res.status(500).json({ error: 'That could not be recorded.' });
         }
     });
 
@@ -1732,15 +2092,33 @@ function registerCrewAuthRoutes(app) {
            Inflight login is told it is unavailable rather than shown a button
            that would refuse them. */
         let discord = { available: false, linked: false, name: '', avatar: '' };
-        if (p.kind === 'crew' && va) {
+        /* THE PILOT SIDE. v17.
+           For a pilot it is their own account and always there. For a staff
+           member it is the bound row, which exists only once they have set one
+           up — so `pilotSide` reports both facts: whether they CAN have one
+           (only our central accounts can; a pilot already is one) and whether
+           they have. The account page draws a "set up your pilot side" button
+           off the first and the Discord controls off the second. */
+        let pilotSide = { applies: p.kind === 'va', ready: p.kind === 'crew', memberId: null };
+        let terms = crewTermsState('', false);
+        if ((p.kind === 'crew' || p.kind === 'va') && va) {
             discord.available = crewDiscord.configured();
             try {
-                const account = await (await crewStore.forVa(va)).getAccount(p.sub);
-                mustChangePassword = !!(account && account.mustChangePassword);
-                if (account && account.discordId) {
-                    discord.linked = true;
-                    discord.name = account.discordUsername || '';
-                    discord.avatar = crewDiscord.avatarUrl({ id: account.discordId, avatar: account.discordAvatar });
+                const store = await crewStore.forVa(va);
+                const account = p.kind === 'crew'
+                    ? await store.getAccount(p.sub)
+                    : await boundPilotRow(store, String(p.sub));
+                if (account) {
+                    // A staff member's bound row has no password to change, so
+                    // the nag is a pilot's alone — see provisionStaffAccount.
+                    mustChangePassword = p.kind === 'crew' && !!account.mustChangePassword;
+                    terms = crewTermsState(account.termsVersion, true);
+                    if (p.kind === 'va') { pilotSide.ready = true; pilotSide.memberId = account.memberId || null; }
+                    if (account.discordId) {
+                        discord.linked = true;
+                        discord.name = account.discordUsername || '';
+                        discord.avatar = crewDiscord.avatarUrl({ id: account.discordId, avatar: account.discordAvatar });
+                    }
                 }
             } catch { /* unreachable store — don't block "who am I" on it */ }
         }
@@ -1751,6 +2129,8 @@ function registerCrewAuthRoutes(app) {
             mustChangePassword,
             canChangePassword: p.kind === 'crew',
             discord,
+            pilotSide,
+            terms,
             caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
             // Keyed on the capability rather than on being the owner, or a
             // chief of staff would be told they may manage the team and then

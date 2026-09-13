@@ -147,14 +147,22 @@ function redirectUri(req) {
  *   sub     on a link, the account doing the linking — taken from the caller's
  *           own bearer token at the start of the flow and never from anything
  *           the browser sends back afterwards.
+ *   back    on a link, which page they started from ('pilot' | 'dashboard'),
+ *           so the confirmation lands there. A word, not an address — see
+ *           crewPageFor in crewAuth.js.
  *   nonce   so two states are never the same string.
  * ------------------------------------------------------------------------ */
-function signState({ slug, intent, sub, embed }) {
+function signState({ slug, intent, sub, embed, back }) {
     return jwt.sign({
         typ: 'crew-discord-state',
         slug: str(slug, 80).toLowerCase(),
         intent: intent === 'link' ? 'link' : 'login',
         sub: str(sub, 80) || undefined,
+        // Which page started a LINK, so the confirmation lands where the person
+        // is standing rather than on the sign-in page. One of two words, sealed
+        // with the rest: it chooses between fixed paths the callback already
+        // knows and can never become a destination of its own.
+        back: back === 'dashboard' ? 'dashboard' : back === 'pilot' ? 'pilot' : undefined,
         // Whether the pilot started this inside the app's crew-center overlay.
         // A BOOLEAN, and sealed with everything else — it decides one query
         // flag on the way back and can never influence WHERE that is.
@@ -168,7 +176,13 @@ function readState(token) {
     try {
         const d = jwt.verify(String(token || ''), JWT_SECRET);
         if (!d || d.typ !== 'crew-discord-state' || !d.slug) return null;
-        return { slug: d.slug, intent: d.intent === 'link' ? 'link' : 'login', sub: d.sub || '', embed: d.embed === 1 };
+        return {
+            slug: d.slug,
+            intent: d.intent === 'link' ? 'link' : 'login',
+            sub: d.sub || '',
+            embed: d.embed === 1,
+            back: d.back === 'dashboard' ? 'dashboard' : d.back === 'pilot' ? 'pilot' : '',
+        };
     } catch (err) { return null; }
 }
 
