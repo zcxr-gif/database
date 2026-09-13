@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 16;
+const EXPECTED_SCHEMA_VERSION = 17;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -143,6 +143,15 @@ const SHOP_SCHEMA_VERSION = 15;
 // database needs updating first" instead of taking the login with it.
 const DISCORD_SCHEMA_VERSION = 16;
 
+// The version that gave a staff member's central account a pilot row of its own
+// (crew_accounts.portal_account_id) and gave every account a record of which
+// version of the pilot terms it has agreed to. Same shape as Discord above and
+// for the same reason: a v16 project signs in, flies and manages exactly as it
+// did — what it cannot do is REMEMBER either fact, so both sit in LATE_COLUMNS
+// and the two features that need them say the database is behind instead of
+// taking anything else down with them.
+const STAFF_PILOT_SCHEMA_VERSION = 17;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -174,7 +183,10 @@ const LATE_COLUMNS = {
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
     crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
-    crew_accounts: new Set(['discord_id', 'discord_username', 'discord_avatar', 'discord_linked_at']),
+    crew_accounts: new Set([
+        'discord_id', 'discord_username', 'discord_avatar', 'discord_linked_at',
+        'portal_account_id', 'terms_version', 'terms_accepted_at',
+    ]),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -200,6 +212,9 @@ const DRIFT_LABELS = {
     'crew_accounts.discord_username': 'signing in with Discord',
     'crew_accounts.discord_avatar': 'signing in with Discord',
     'crew_accounts.discord_linked_at': 'signing in with Discord',
+    'crew_accounts.portal_account_id': 'a staff member’s own pilot account',
+    'crew_accounts.terms_version': 'the pilot terms a pilot has agreed to',
+    'crew_accounts.terms_accepted_at': 'the pilot terms a pilot has agreed to',
     'crew_applications.discord_invite': 'Discord invites on acceptances',
     'crew_applications.invite_username': 'saved pilot invitations',
     'crew_applications.invite_password': 'saved pilot invitations',
@@ -377,6 +392,15 @@ const accountFromRow = (r) => r && {
     discordUsername: r.discord_username || '',
     discordAvatar: r.discord_avatar || '',
     discordLinkedAt: date(r.discord_linked_at),
+    // v17. The central staff account this row belongs to, when it belongs to
+    // one. Empty on every ordinary pilot's row, which is all of them until a
+    // staff member provisions their own pilot side.
+    portalAccountId: r.portal_account_id || '',
+    // v17. Which version of the pilot terms this account has agreed to, and
+    // when. Empty means they have not been asked, or were asked and have not
+    // answered — the crew center cannot tell those apart and does not need to.
+    termsVersion: r.terms_version || '',
+    termsAcceptedAt: date(r.terms_accepted_at),
     lastLoginAt: date(r.last_login_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -401,6 +425,12 @@ const accountToRow = (a) => {
     pick(a, out, 'discordUsername', 'discord_username', (v) => str(v, 40));
     pick(a, out, 'discordAvatar', 'discord_avatar', (v) => str(v, 64));
     pick(a, out, 'discordLinkedAt', 'discord_linked_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // A Mongo ObjectId, as a string. Bounded here for the same reason the
+    // Discord id is: this is the last thing between a value and a unique index
+    // that decides whose session a sign-in produces.
+    pick(a, out, 'portalAccountId', 'portal_account_id', (v) => (/^[a-f0-9]{24}$/i.test(String(v || '')) ? String(v) : ''));
+    pick(a, out, 'termsVersion', 'terms_version', (v) => str(v, 20));
+    pick(a, out, 'termsAcceptedAt', 'terms_accepted_at', (v) => (date(v) ? date(v).toISOString() : null));
     return out;
 };
 
@@ -1320,6 +1350,18 @@ class SupabaseStore {
     getAccountByMember(memberId) {
         if (!memberId) return Promise.resolve(null);
         return this.accounts(() => this.one('crew_accounts', { ...this.scope, member_id: `eq.${memberId}` }, accountFromRow));
+    }
+    /**
+     * The pilot row belonging to one of OUR central staff accounts. v17.
+     *
+     * Scoped by va_slug like every other read here, so a staff account that
+     * administers two airlines has a separate pilot side in each and neither
+     * can be found from the other.
+     */
+    getAccountByPortal(portalAccountId) {
+        const id = String(portalAccountId || '');
+        if (!/^[a-f0-9]{24}$/i.test(id)) return Promise.resolve(null);
+        return this.accounts(() => this.one('crew_accounts', { ...this.scope, portal_account_id: `eq.${id}` }, accountFromRow));
     }
     createAccount(data) {
         return this.accounts(async () => {
@@ -2287,6 +2329,13 @@ class SupabaseStore {
                 // panel that needs one can offer the update button itself.
                 leave: version >= LEAVE_SCHEMA_VERSION,
                 shop: version >= SHOP_SCHEMA_VERSION,
+                // v17. Whether a staff member can have a pilot row of their own
+                // — which is also what Discord sign-in for staff rests on — and
+                // whether an account can record the pilot terms it agreed to.
+                // One flag: the same ALTER adds both, so a project has neither
+                // or both, and two flags would only invite a panel to imply
+                // otherwise.
+                staffPilot: version >= STAFF_PILOT_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -2520,6 +2569,15 @@ class LegacyStore {
         return this.portalToAccount(await models.VaPortalAccount.findOne({ ...this.accountQ(), username: u }).lean());
     }
     async getAccountByMember() { return null; }
+    // Neither of these exists on the legacy store, and both answer null rather
+    // than being absent. A caller that has to check whether the method is there
+    // before calling it ends up with the check in some places and not others;
+    // "no such account" is the true answer here anyway, because a VA on the
+    // legacy store has no project for a pilot row to live in — their crew
+    // accounts ARE our central accounts, which is the arrangement v17's binding
+    // exists to replace.
+    async getAccountByDiscord() { return null; }
+    async getAccountByPortal() { return null; }
     async createAccount(data) {
         const doc = await models.VaPortalAccount.create({
             username: str(data.username, 60).toLowerCase(),
@@ -2962,6 +3020,7 @@ module.exports = {
     SELECT,
     EXPECTED_SCHEMA_VERSION,
     DISCORD_SCHEMA_VERSION,
+    STAFF_PILOT_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,
     EVENTS_SCHEMA_VERSION,
     SCHEDULES_SCHEMA_VERSION,

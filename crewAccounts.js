@@ -145,6 +145,185 @@ async function provisionPilotAccount(store, opts = {}) {
     return { account, created: true, username, password };
 }
 
+/**
+ * A staff member's OWN pilot account. v17.
+ *
+ * WHAT THIS IS FOR
+ * ----------------
+ * A VA's owner and staff sign in with a central account of ours, and that
+ * account has no row in the VA's project. Everything that is keyed on a
+ * crew_accounts id therefore passes them by: an inbox message has nowhere to
+ * land, a Discord link has nothing to be written against, and the crew center
+ * has no record that is theirs in the way every pilot's login is theirs. What
+ * they had instead was claiming a ROSTER row, which is enough to be booked onto
+ * a departure and no more — or being handed a second, ordinary pilot login by
+ * somebody with roster.manage, which is two credentials for one person and an
+ * account that is only theirs by convention.
+ *
+ * So: one row, bound to the central account that owns it by
+ * `portalAccountId`, and provisioned by that person themselves.
+ *
+ * THERE IS NO PASSWORD, AND THAT IS THE POINT
+ * -------------------------------------------
+ * The row is created with a hash of a value nobody has and nobody can ask for —
+ * random bytes, hashed and dropped on the floor in the same expression. bcrypt
+ * cannot be satisfied by any input, so the password door can never open this
+ * row, and the cascade in the login route falls through it to the central
+ * account the way it always did.
+ *
+ * That is deliberate. A second password for a person who already has one is a
+ * second thing to lose, a second thing to phish and a second thing to rotate,
+ * and it would exist only to open a door their central password already opens.
+ * The ways in stay what they were: their staff password, or Discord once they
+ * have linked it — which is the whole reason this row exists.
+ *
+ * IT CARRIES NO AUTHORITY
+ * -----------------------
+ * `role` is 'pilot' and must stay 'pilot'. A staff session's capabilities are
+ * resolved from the central account (effectiveCaps in crewAuth.js), never from
+ * here, and a row with role 'owner' in a project the VA's own people can write
+ * to would be a way to grant capabilities by editing a database. The binding
+ * says WHOSE pilot side this is; it never says what that person may do.
+ *
+ * Idempotent: called again by the same staff account it returns the row they
+ * already have, rather than minting a second one.
+ *
+ * @param {Object} store             a crewStore adapter
+ * @param {Object} opts
+ * @param {string} opts.portalAccountId  the central account this belongs to
+ * @param {string} opts.displayName      their name, as the roster should read it
+ * @param {string} [opts.username]       preferred username; derived when absent
+ * @param {string} [opts.memberId]       a roster row they have already claimed
+ * @param {string} [opts.email]
+ * @returns {{account: Object, created: boolean}}
+ */
+async function provisionStaffAccount(store, opts = {}) {
+    if (!store) throw new Error('provisionStaffAccount requires a crew store.');
+    const portalAccountId = clean(opts.portalAccountId, 40);
+    if (!/^[a-f0-9]{24}$/i.test(portalAccountId)) {
+        throw new Error('provisionStaffAccount requires the staff account it belongs to.');
+    }
+    const displayName = clean(opts.displayName, 80) || 'Staff';
+
+    // Already has one. Re-point it at the roster row they have claimed since,
+    // for the same reason provisionPilotAccount does: the next lookup should be
+    // by id rather than by a name somebody may rename.
+    const existing = typeof store.getAccountByPortal === 'function'
+        ? await store.getAccountByPortal(portalAccountId)
+        : null;
+    if (existing) {
+        if (opts.memberId && !existing.memberId) {
+            await store.updateAccount(existing._id, { memberId: opts.memberId }).catch(() => {});
+            existing.memberId = opts.memberId;
+        }
+        return { account: existing, created: false };
+    }
+
+    // A username is still required — it is what the roster, the account list and
+    // every "who filed this" line reads — but it opens nothing on its own.
+    const wanted = clean(opts.username, 60).toLowerCase();
+    const username = wanted && !await store.getAccountByUsername(wanted)
+        ? wanted
+        : await usernameFor(store, wanted || displayName);
+
+    const account = await store.createAccount({
+        username,
+        displayName,
+        // Unopenable, by construction. See the note above.
+        passwordHash: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS),
+        role: 'pilot',
+        memberId: opts.memberId || null,
+        email: clean(opts.email, 120).toLowerCase(),
+        active: true,
+        // There is no password to change, so nagging them to change it would be
+        // asking for something they cannot do.
+        mustChangePassword: false,
+        createdVia: 'staff-pilot-side',
+        createdByName: displayName,
+        portalAccountId,
+        vaName: opts.vaName || '',
+    });
+    return { account, created: true };
+}
+
+/**
+ * A roster row that is this person, and is nobody else's. v17.
+ *
+ * THE HAZARD IT AVOIDS. A VA's owner is very often already on their own roster,
+ * with hours on it, from before they ever had a reason to press "set up my
+ * pilot account". Creating them a fresh row would leave two of them on the
+ * roster — the one their crew knows with the hours, and a new empty one that
+ * their bookings and reports would credit from then on. The hours are not lost,
+ * which is somehow worse: they are visibly there, on the wrong person.
+ *
+ * So a namesake is ADOPTED rather than duplicated, on two conditions:
+ *
+ *   1. the name matches exactly (case aside) — a fuzzy match that adopted the
+ *      wrong pilot would hand somebody another pilot's hours, which is a far
+ *      worse failure than one duplicate row a staff member can merge by hand;
+ *   2. nobody else's login is already against it. A row with a pilot's own
+ *      account on it is a person who signs in as themselves, and two identities
+ *      on one record can each cancel the other's flying.
+ *
+ * Matched in JS over the list for the reason provisionPilotAccount does the
+ * same: the store interface has no case-insensitive name filter, rosters are
+ * hundreds and not millions, and this runs once per staff member ever.
+ */
+async function findUnclaimedNamesake(store, displayName, portalAccountId) {
+    const wanted = clean(displayName, 80).toLowerCase();
+    if (!store || !wanted || typeof store.listMembers !== 'function') return null;
+    const mine = clean(portalAccountId, 40);
+    try {
+        const members = await store.listMembers({ limit: 5000 });
+        const named = (members || []).filter((m) => String(m.name || '').trim().toLowerCase() === wanted);
+        // Two pilots of the same name and no way to tell which is meant: leave
+        // it alone and let them pick, rather than guess between two people.
+        if (named.length !== 1) return null;
+        const m = named[0];
+        if (typeof store.getAccountByMember !== 'function') return m;
+        const owner = await store.getAccountByMember(m._id);
+        if (!owner) return m;
+        // Their own binding, from a previous go at this. Theirs to take back.
+        return String(owner.portalAccountId || '') === mine ? m : null;
+    } catch (err) {
+        // A roster we cannot read is not a reason to refuse somebody a pilot
+        // account — it only means we cannot spot a namesake, so one gets made.
+        return null;
+    }
+}
+
+/**
+ * Point a staff member's pilot side at a different roster row — or at none. v17.
+ *
+ * WHY THIS EXISTS AS A FUNCTION. Two things record which pilot a staff member
+ * is: the pointer on their central account (`VaPortalAccount.crewMemberId`) and
+ * the `member_id` on their bound row. The bound row is the one read FIRST once
+ * it exists, so writing only the central pointer leaves "I don't fly for this
+ * airline" looking like it worked and changing nothing at all.
+ *
+ * Best-effort by contract. Every caller has already done the half that cannot
+ * fail — the write to our own account — and a VA's project being unreachable,
+ * or on a schema without the binding column, must not turn that into an error
+ * the staff member has to make sense of. Returns whether it actually moved.
+ */
+async function repointStaffPilotSide(store, portalAccountId, memberId) {
+    if (!store || typeof store.getAccountByPortal !== 'function') return false;
+    const id = clean(portalAccountId, 40);
+    if (!/^[a-f0-9]{24}$/i.test(id)) return false;
+    const next = memberId ? String(memberId) : null;
+    try {
+        const own = await store.getAccountByPortal(id);
+        if (!own) return false;
+        // Nothing to do is not a failure, and re-writing the same value would
+        // move `updated_at` on a row nobody changed.
+        if (String(own.memberId || '') === String(next || '')) return false;
+        await store.updateAccount(own._id, { memberId: next });
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
 // The name match is done in JS over the account list rather than as a query:
 // the store interface has no case-insensitive name filter, rosters are small
 // (hundreds, not millions), and this runs once per acceptance.
@@ -229,12 +408,23 @@ const publicAccount = (a) => a && {
     memberId: a.memberId || null,
     active: a.active !== false,
     mustChangePassword: !!a.mustChangePassword,
+    // v16/v17, as booleans. Whether a login has Discord on it and whether it is
+    // a staff member's own pilot side are both things the account list has to
+    // show — a reset-password button on a row with no password is a button that
+    // cannot work, and staff need to know which row is theirs. Neither the
+    // Discord id nor the central account id goes out: what the list needs is
+    // the fact, not the identifier.
+    discordLinked: !!a.discordId,
+    staffOwned: !!a.portalAccountId,
     lastLoginAt: a.lastLoginAt || null,
     createdAt: a.createdAt || null,
 };
 
 module.exports = {
     provisionPilotAccount,
+    provisionStaffAccount,
+    repointStaffPilotSide,
+    findUnclaimedNamesake,
     authenticate,
     changePassword,
     resetPassword,

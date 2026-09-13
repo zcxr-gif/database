@@ -248,6 +248,55 @@ treated as "not this identity" rather than an error, so a VA mid-setup — or on
 whose project is briefly unreachable — can still get into the dashboard they
 would use to fix it.
 
+### A staff member's own pilot side (v17)
+
+A VA's owner and staff sign in with a **central** account of ours, not a row in
+their project — that is how they administer the partnership, and it is why the
+crew center could give them everything about running an airline and nothing
+about flying for one. No `crew_accounts` row meant nothing to hang a Discord
+link on, nothing to address an inbox message to, and no login of their own on a
+roster they administer. What they had instead was claiming a roster row
+(`VaPortalAccount.crewMemberId`), which makes them bookable and no more, or
+being handed a second ordinary pilot login by somebody with `roster.manage`.
+
+`crew_accounts.portal_account_id` is the fix: one row, bound to the central
+account that owns it, provisioned by that person themselves through
+`POST /api/crew/:slug/me/pilot-side`. It creates their roster row too when they
+have not got one, so a staff member never has to pick somebody else's record off
+the roster to become a pilot.
+
+Two properties hold it together:
+
+- **It carries no authority.** `role` is `'pilot'` and stays `'pilot'`. A staff
+  session's capabilities are still resolved from the central account
+  (`effectiveCaps` in `crewAuth.js`), never from this row — a row in a project
+  the VA's own people can write to must not be a way to grant capabilities by
+  editing a database.
+- **It has no password.** The row is created with a hash of random bytes nobody
+  keeps, so the password door can never open it and the login cascade falls
+  through to the central account exactly as before. Their ways in are unchanged:
+  their staff password, or Discord once they have linked it.
+
+Signing in with Discord against a bound row re-reads the central account at
+exchange time and issues the **staff** session — same capabilities, same view as
+the password door. A central account that has been switched off, deleted, or
+moved to another VA in those ninety seconds gets no session at all rather than a
+quietly downgraded one.
+
+### What a pilot has agreed to (v17)
+
+`crew_accounts.terms_version` and `terms_accepted_at` record which version of the
+Crew Center pilot notice an account has agreed to — the version string, and
+nothing else about the agreement. The words live in `crewTermsContent.js` and
+are public at `GET /api/crew-terms`; bumping `CREW_TERMS_VERSION` asks everybody
+again.
+
+It is **not a gate**. An account that has not answered signs in and works
+normally; it is asked once per version and can put it off. Locking a roster out
+of its own crew center over a consent prompt would punish pilots for a change
+their VA and we made between us — and somebody who cannot get in cannot read
+what they are being asked to agree to either.
+
 ### Migrating existing pilot accounts
 
 `store/migrate` brings them across with everything else, copying the bcrypt
@@ -1020,6 +1069,15 @@ plaintext never lands in a row, that provisioning twice yields one account,
 that usernames are unique per crew center and only per crew center, that wrong
 password / unknown user / disabled account are indistinguishable, and that a
 pre-v3 project fails with something the VA can act on.
+
+`node scripts/test-crew-staff-pilot.js` drives a staff member's pilot side, the
+pilot terms and the starter handbook through the real routes: that the bound row
+is always role `'pilot'` and opens no password door, that one central account
+gets one row however many times the button is pressed, that Inflight oversight
+cannot put itself on a VA's roster, that signing in with Discord against a bound
+row produces the STAFF session and that a switched-off staff account produces
+none, and that agreeing to the notice records the current version and refuses an
+older one.
 
 `node scratchpad/test-supabase-setup.js` drives the guided setup against a
 Management API impersonator — that the access token reaches Supabase and
