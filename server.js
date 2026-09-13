@@ -7775,10 +7775,27 @@ app.post('/api/crew/:slug/me/pilot', async (req, res) => {
         const { store } = await resolveCrewStore(req.params.slug);
         const wanted = String((req.body && req.body.memberId) || '').trim();
 
+        /* THE PILOT SIDE MOVES WITH IT. v17.
+         *
+         * Since a bound row exists, IT is what crewPilot reads first — so
+         * writing only the central account's pointer would leave this endpoint
+         * looking like it worked and changing nothing: a staff member who said
+         * "I don't fly for this airline" would still be resolved as a pilot,
+         * and one who switched records would still be the old one.
+         *
+         * Best-effort, and after the central write rather than instead of it:
+         * the pointer on our own account is the half we can always keep, and a
+         * project that is unreachable must not fail a request whose real work
+         * has already been done.
+         */
+        const syncPilotSide = (memberId) =>
+            crewAccounts.repointStaffPilotSide(store, String(p.sub), memberId);
+
         // Clearing it is a legitimate thing to want: a staff member who has
         // stopped flying should be able to stop being offered a seat.
         if (!wanted) {
             await mongoose.model('VaPortalAccount').findByIdAndUpdate(p.sub, { crewMemberId: null });
+            await syncPilotSide(null);
             return res.json({ linked: false, pilot: null });
         }
 
@@ -7801,7 +7818,32 @@ app.post('/api/crew/:slug/me/pilot', async (req, res) => {
             });
         }
 
+        /* AND ONE ROSTER ROW, ONE LOGIN. v17.
+         *
+         * The same rule, applied to the other kind of account. A roster row
+         * that already has a pilot login against it is somebody who signs in as
+         * themselves — and a staff account pointed at it would be a second
+         * identity on one record: both could book and cancel the other's legs,
+         * and staff trying to issue that pilot a login would be told they
+         * already had one, because the lookup by roster row would find the
+         * STAFF member's binding instead of the pilot's account.
+         *
+         * Their own bound row is the exception, and has to be: it is the row
+         * this very endpoint points at once a staff member has a pilot side.
+         */
+        if (typeof store.getAccountByMember === 'function') {
+            const owner = await store.getAccountByMember(member._id).catch(() => null);
+            if (owner && String(owner.portalAccountId || '') !== String(p.sub)) {
+                return res.status(409).json({
+                    error: 'That pilot has their own crew center login, so they are already somebody. '
+                        + 'Sign in as them to fly as them — or set up your own pilot account and fly as yourself.',
+                    code: 'pilot_has_login',
+                });
+            }
+        }
+
         await mongoose.model('VaPortalAccount').findByIdAndUpdate(p.sub, { crewMemberId: String(member._id) });
+        await syncPilotSide(String(member._id));
         res.json({
             linked: true,
             pilot: {
@@ -11506,6 +11548,28 @@ app.post('/api/crew/:slug/accounts/:id/reset-password', async (req, res) => {
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
+
+        /* NOT A STAFF MEMBER'S PILOT SIDE. v17.
+         *
+         * That row has no password by construction, and minting one here would
+         * do more than restore access — it would CREATE a way in that did not
+         * exist, to a colleague's pilot identity, handed to whoever pressed the
+         * button. Resetting a pilot's password is staff helping somebody back
+         * into their own account; this would be one staff member being handed a
+         * login to another's, able to book, file and be recorded as them.
+         *
+         * The people who can already do this legitimately are the person
+         * themselves (their staff password, or Discord) and nobody else, which
+         * is the whole point of the row being passwordless.
+         */
+        const target = await store.getAccount(req.params.id);
+        if (target && target.portalAccountId) {
+            return res.status(409).json({
+                error: 'That login belongs to a staff member’s own pilot account. It has no password to reset — they sign in with their staff account, or with Discord.',
+                code: 'staff_owned',
+            });
+        }
+
         const out = await crewAccounts.resetPassword(store, req.params.id);
         if (!out) return res.status(404).json({ error: 'Login not found.' });
         res.json({ username: out.username, password: out.password });

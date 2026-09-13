@@ -54,6 +54,25 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('he
  * both cases there is nothing to hang a Discord link or an inbox on, and in
  * both cases the dashboard they came for works.
  */
+/**
+ * A store that could not answer, said in the store's own words.
+ *
+ * The adapter already knows the difference between "this VA has not connected a
+ * project", "the project is read-only because it ran out of room", and "the
+ * schema is older than this code, and here is the column" — each with its own
+ * status and a fix the VA can act on. Re-deriving a shorter list of those here
+ * is how a route ends up answering "something went wrong" to a problem the
+ * store had already diagnosed.
+ */
+function storeFail(res, err, log, fallback) {
+    if (err instanceof crewStore.CrewStoreError) {
+        if (err.detail) console.warn(`crew store [${err.code}]:`, err.detail);
+        return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    console.error(`${log}:`, err && err.message ? err.message : err);
+    return res.status(500).json({ error: fallback });
+}
+
 async function boundPilotRow(store, portalAccountId) {
     if (!store || typeof store.getAccountByPortal !== 'function') return null;
     try { return await store.getAccountByPortal(portalAccountId); } catch { return null; }
@@ -1941,8 +1960,32 @@ function registerCrewAuthRoutes(app) {
             if (wanted) {
                 member = await store.getMember(wanted);
                 if (!member) return res.status(404).json({ error: 'That pilot isn’t on this roster.' });
+                /* NOT SOMEBODY ELSE'S. The request may name any roster row, so
+                   this is the check that stops a staff member binding their
+                   pilot side to a pilot who signs in as themselves — two
+                   identities on one record, each able to cancel the other's
+                   flying, and the pilot's own login no longer findable by their
+                   roster row. The same rule POST /me/pilot applies; this is the
+                   other door into it.
+                   Their own binding passes, because re-running this route with
+                   the row they already hold has to be a no-op and not a refusal. */
+                if (typeof store.getAccountByMember === 'function') {
+                    const owner = await store.getAccountByMember(member._id).catch(() => null);
+                    if (owner && String(owner.portalAccountId || '') !== String(acct._id)) {
+                        return res.status(409).json({
+                            error: 'That pilot already has their own crew center login.',
+                            code: 'pilot_has_login',
+                        });
+                    }
+                }
             } else if (acct.crewMemberId) {
                 member = await store.getMember(acct.crewMemberId);
+            }
+            /* Already on the roster under their own name? Take that row rather
+               than adding a second of them — see findUnclaimedNamesake for why
+               a duplicate is worse than it looks. */
+            if (!member) {
+                member = await crewAccounts.findUnclaimedNamesake(store, name, String(acct._id));
             }
             if (!member) {
                 member = await store.createMember({
@@ -1989,19 +2032,14 @@ function registerCrewAuthRoutes(app) {
                 },
             });
         } catch (err) {
-            // A project that has not run the v17 SQL has no portal_account_id
-            // column, so the lookup that finds an existing row fails before
-            // anything is written. Named, with the fix attached, rather than
-            // reported as a fault on our side.
-            if (err && (err.code === 'store_schema_outdated' || err.code === 'store_accounts_missing'
-                || err.code === 'store_schema_missing')) {
-                return res.status(409).json({
-                    error: 'This crew center’s database needs updating before staff can have a pilot account. Re-run the setup SQL in Settings → Data store.',
-                    code: 'needs_update',
-                });
-            }
-            console.error('Crew pilot-side error:', err && err.message ? err.message : err);
-            res.status(500).json({ error: 'Could not set up your pilot account.' });
+            /* A project that has not run the v17 SQL has no portal_account_id
+               column, so the lookup that finds an existing row fails before
+               anything is written — and the store says exactly that, with the
+               column named and the button to press. A VA that has connected no
+               project at all, or one that has gone read-only, each get their
+               own sentence for the same reason. This is staff reading it, and
+               staff are the people who can act on every one of them. */
+            storeFail(res, err, 'Crew pilot-side error', 'Could not set up your pilot account.');
         }
     });
 
@@ -2048,12 +2086,14 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({ ok: true, terms: crewTermsState(CREW_TERMS_VERSION, true) });
         } catch (err) {
-            if (err && (err.code === 'store_schema_outdated' || err.code === 'store_accounts_missing'
-                || err.code === 'store_schema_missing')) {
-                // The notice was still read; it is the RECORD that cannot be
-                // kept. Not an error in the pilot's face — they did their part —
-                // so the prompt is told the answer did not stick and will ask
-                // again, and the VA's database banner is where the fix lives.
+            /* Deliberately NOT storeFail here, which is the one place that
+               distinction matters: this is a PILOT reading the answer, and the
+               store's own sentences name columns and point at Settings → Data
+               store, which is a screen they cannot open. The notice was read
+               either way; it is the RECORD that could not be kept, so they are
+               told plainly and pointed at the people who can fix it. */
+            if (err instanceof crewStore.CrewStoreError) {
+                if (err.detail) console.warn(`crew store [${err.code}]:`, err.detail);
                 return res.status(409).json({
                     error: 'Your crew center’s database needs updating before this can be recorded. Ask your staff to re-run the setup SQL.',
                     code: 'needs_update',

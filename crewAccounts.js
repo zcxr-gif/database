@@ -246,6 +246,84 @@ async function provisionStaffAccount(store, opts = {}) {
     return { account, created: true };
 }
 
+/**
+ * A roster row that is this person, and is nobody else's. v17.
+ *
+ * THE HAZARD IT AVOIDS. A VA's owner is very often already on their own roster,
+ * with hours on it, from before they ever had a reason to press "set up my
+ * pilot account". Creating them a fresh row would leave two of them on the
+ * roster — the one their crew knows with the hours, and a new empty one that
+ * their bookings and reports would credit from then on. The hours are not lost,
+ * which is somehow worse: they are visibly there, on the wrong person.
+ *
+ * So a namesake is ADOPTED rather than duplicated, on two conditions:
+ *
+ *   1. the name matches exactly (case aside) — a fuzzy match that adopted the
+ *      wrong pilot would hand somebody another pilot's hours, which is a far
+ *      worse failure than one duplicate row a staff member can merge by hand;
+ *   2. nobody else's login is already against it. A row with a pilot's own
+ *      account on it is a person who signs in as themselves, and two identities
+ *      on one record can each cancel the other's flying.
+ *
+ * Matched in JS over the list for the reason provisionPilotAccount does the
+ * same: the store interface has no case-insensitive name filter, rosters are
+ * hundreds and not millions, and this runs once per staff member ever.
+ */
+async function findUnclaimedNamesake(store, displayName, portalAccountId) {
+    const wanted = clean(displayName, 80).toLowerCase();
+    if (!store || !wanted || typeof store.listMembers !== 'function') return null;
+    const mine = clean(portalAccountId, 40);
+    try {
+        const members = await store.listMembers({ limit: 5000 });
+        const named = (members || []).filter((m) => String(m.name || '').trim().toLowerCase() === wanted);
+        // Two pilots of the same name and no way to tell which is meant: leave
+        // it alone and let them pick, rather than guess between two people.
+        if (named.length !== 1) return null;
+        const m = named[0];
+        if (typeof store.getAccountByMember !== 'function') return m;
+        const owner = await store.getAccountByMember(m._id);
+        if (!owner) return m;
+        // Their own binding, from a previous go at this. Theirs to take back.
+        return String(owner.portalAccountId || '') === mine ? m : null;
+    } catch (err) {
+        // A roster we cannot read is not a reason to refuse somebody a pilot
+        // account — it only means we cannot spot a namesake, so one gets made.
+        return null;
+    }
+}
+
+/**
+ * Point a staff member's pilot side at a different roster row — or at none. v17.
+ *
+ * WHY THIS EXISTS AS A FUNCTION. Two things record which pilot a staff member
+ * is: the pointer on their central account (`VaPortalAccount.crewMemberId`) and
+ * the `member_id` on their bound row. The bound row is the one read FIRST once
+ * it exists, so writing only the central pointer leaves "I don't fly for this
+ * airline" looking like it worked and changing nothing at all.
+ *
+ * Best-effort by contract. Every caller has already done the half that cannot
+ * fail — the write to our own account — and a VA's project being unreachable,
+ * or on a schema without the binding column, must not turn that into an error
+ * the staff member has to make sense of. Returns whether it actually moved.
+ */
+async function repointStaffPilotSide(store, portalAccountId, memberId) {
+    if (!store || typeof store.getAccountByPortal !== 'function') return false;
+    const id = clean(portalAccountId, 40);
+    if (!/^[a-f0-9]{24}$/i.test(id)) return false;
+    const next = memberId ? String(memberId) : null;
+    try {
+        const own = await store.getAccountByPortal(id);
+        if (!own) return false;
+        // Nothing to do is not a failure, and re-writing the same value would
+        // move `updated_at` on a row nobody changed.
+        if (String(own.memberId || '') === String(next || '')) return false;
+        await store.updateAccount(own._id, { memberId: next });
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
 // The name match is done in JS over the account list rather than as a query:
 // the store interface has no case-insensitive name filter, rosters are small
 // (hundreds, not millions), and this runs once per acceptance.
@@ -345,6 +423,8 @@ const publicAccount = (a) => a && {
 module.exports = {
     provisionPilotAccount,
     provisionStaffAccount,
+    repointStaffPilotSide,
+    findUnclaimedNamesake,
     authenticate,
     changePassword,
     resetPassword,

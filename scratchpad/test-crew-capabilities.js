@@ -33,8 +33,35 @@ const Module = require('module');
 // nothing under test touches either. Stub the resolver rather than installing
 // a database driver to read a pure function.
 const realResolve = Module._resolveFilename;
+/* The mongoose stub has to be shaped like the parts the modules crewAuth pulls
+ * in actually USE at require time — schemas are declared at module scope, so
+ * `new mongoose.Schema({...})` and `mongoose.Schema.Types.ObjectId` both run
+ * before a single line under test does.
+ *
+ * It was a bare empty function, and the day crewAuth started requiring vaSites
+ * (which declares a schema with an ObjectId ref) this whole file stopped
+ * running — not failing, THROWING, which is worse: a suite that cannot start
+ * reports nothing, and this is the suite that decides what a VA's staff can do
+ * to a VA's airline. Keep the stub honest about the surface it stands in for.
+ */
+function SchemaStub(def, opts) { this.def = def; this.opts = opts; }
+SchemaStub.prototype.index = function () { return this; };
+SchemaStub.prototype.pre = function () { return this; };
+SchemaStub.prototype.post = function () { return this; };
+SchemaStub.prototype.set = function () { return this; };
+SchemaStub.prototype.virtual = function () { return { get: () => this, set: () => this }; };
+SchemaStub.prototype.method = function () { return this; };
+SchemaStub.prototype.static = function () { return this; };
+SchemaStub.prototype.plugin = function () { return this; };
+SchemaStub.Types = { ObjectId: String, Mixed: Object, Decimal128: Number, Map };
+
 const STUBS = {
-    mongoose: { model: () => ({}), models: {}, Schema: function Schema() {} },
+    mongoose: {
+        model: () => ({}),
+        models: {},
+        Schema: SchemaStub,
+        Types: { ObjectId: (v) => v },
+    },
     // crewAuth pulls these in at require time and crewStore adds axios. None is
     // touched by anything under test, and stubbing them means this file runs
     // without node_modules installed — which is the difference between a check

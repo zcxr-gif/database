@@ -71,6 +71,8 @@ const store = {
         return a || null;
     },
     getMember: async (id) => MEMBERS.find((m) => String(m._id) === String(id)) || null,
+    listMembers: async () => MEMBERS.slice(),
+    getAccountByMember: async (mid) => ACCOUNTS.find((a) => String(a.memberId || '') === String(mid)) || null,
     createMember: async (data) => {
         const m = { _id: `mm${++SEQ}`, hours: 0, callsign: '', ...data };
         MEMBERS.push(m);
@@ -221,6 +223,17 @@ const server = app.listen(0, async () => {
                hash either. `mustChangePassword` is a flag and is allowed. */
             check('…and no credential of any kind leaves in the reply',
                 b.password === undefined && !JSON.stringify(b).includes(row.passwordHash), Object.keys(b.account || {}));
+        }
+
+        /* ---- and never onto somebody else's record ---------------------------- */
+        {
+            // 'a1' is Rae's login, and 'm1' is Rae. A staff member naming her
+            // roster row would be two identities on one pilot.
+            const res = await post('/api/crew/ba/me/pilot-side', { memberId: 'm1' }, auth(staffSession));
+            const b = await res.json();
+            check('a staff member cannot bind their pilot side to a pilot who has a login',
+                res.status === 409 && b.code === 'pilot_has_login', b);
+            check('…and Rae\'s row is untouched', ACCOUNTS.find((a) => a._id === 'a1').memberId === 'm1');
         }
 
         /* ---- pressing the button twice --------------------------------------- */
@@ -382,6 +395,36 @@ function offline() {
         check('…with a hash that the empty password does not open',
             !(await bcrypt.compare('', a.account.passwordHash)));
 
+        /* Re-pointing the pilot side.
+         *
+         * The bug this is here to stop coming back: once a bound row exists it
+         * is what decides which pilot a staff member is, so the endpoint that
+         * says "I fly as this one" / "I don't fly here" has to move the ROW and
+         * not only the pointer on our central account. Writing one of the two
+         * leaves the control looking like it worked and changing nothing. */
+        {
+            const bound = await store.getAccountByPortal(PORTAL._id);
+            const moved = await crewAccounts.repointStaffPilotSide(store, PORTAL._id, 'm1');
+            check('re-pointing moves the bound row to the roster row named', moved === true
+                && (await store.getAccountByPortal(PORTAL._id)).memberId === 'm1');
+
+            const cleared = await crewAccounts.repointStaffPilotSide(store, PORTAL._id, null);
+            check('…and clearing it really clears it', cleared === true
+                && (await store.getAccountByPortal(PORTAL._id)).memberId === null);
+
+            const again = await crewAccounts.repointStaffPilotSide(store, PORTAL._id, null);
+            check('…and a no-op write is not made at all', again === false);
+
+            const nobody = await crewAccounts.repointStaffPilotSide(store, 'bbbbbbbbbbbbbbbbbbbbbbbb', 'm1');
+            check('…and a central account with no pilot side is left alone', nobody === false);
+
+            const legacy = await crewAccounts.repointStaffPilotSide({}, PORTAL._id, 'm1');
+            check('…and a store that cannot hold one answers rather than throwing', legacy === false);
+
+            // Put it back so later checks read the state they expect.
+            await store.updateAccount(bound._id, { memberId: bound.memberId });
+        }
+
         // The handbook.
         const h = crewHandbook.starterHandbook({ vaName: 'British Airways Virtual' });
         check('the starter handbook is a draft', h.status === 'draft');
@@ -403,6 +446,35 @@ function offline() {
            pilot's account actually lives. */
         check('…and says which Discord permission is asked for', words.includes('identify'));
         check('…and that the data is the VA\'s, not ours', words.includes('own database'));
+
+        /* Adopting a roster row instead of duplicating a person.
+         *
+         * The hazard: a VA's owner is usually already on their own roster with
+         * hours on it, long before they press the button. A second, empty row
+         * would leave two of them on the roster — and the hours visibly on the
+         * wrong one, which is worse than losing them. */
+        {
+            freshStore();
+            MEMBERS.push({ _id: 'm2', name: 'Chris', callsign: 'BAW001', hours: 240 });
+            const adopted = await crewAccounts.findUnclaimedNamesake(store, 'chris', PORTAL._id);
+            check('a staff member already on the roster is adopted, not duplicated',
+                adopted && adopted._id === 'm2' && adopted.hours === 240, adopted);
+
+            // The same row, but it belongs to a pilot who signs in as themselves.
+            ACCOUNTS.push({ _id: 'p9', username: 'chris.p', displayName: 'Chris', role: 'pilot',
+                active: true, memberId: 'm2', portalAccountId: '' });
+            const taken = await crewAccounts.findUnclaimedNamesake(store, 'Chris', PORTAL._id);
+            check('…but never one that already has a pilot\'s own login on it', taken === null, taken);
+
+            // Two people of that name: no way to tell which is meant.
+            ACCOUNTS.pop();
+            MEMBERS.push({ _id: 'm3', name: 'chris', callsign: 'BAW002', hours: 5 });
+            const ambiguous = await crewAccounts.findUnclaimedNamesake(store, 'Chris', PORTAL._id);
+            check('…and two of that name are left for a human to choose between', ambiguous === null, ambiguous);
+
+            freshStore();
+        }
+
     })();
 }
 
