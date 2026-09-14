@@ -242,6 +242,12 @@ function sanitizeFleet(arr) {
          * Stored beside the address it belongs to, so it travels with the
          * picture into the crew centre, the feed and the hosted website — and
          * so a VA who has a photographer of their own can type one. */
+        /* Whether the picture came from the community library or from the
+         * airline. It decides whether the fleet editor may replace it when the
+         * aircraft or the livery changes — an upload is theirs and is never
+         * overwritten, a library photo of the aeroplane the row used to name is
+         * not a photo of the one it names now. */
+        imageAuto: !!(a && a.imageAuto),
         photographer: clampStr(a && a.photographer, 80),
         // A page to credit back to, not a picture — cleanImageUrl is the wrong
         // check for it. https only, because this ends up in an href on a public

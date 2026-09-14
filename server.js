@@ -522,7 +522,7 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     crewFleet: {
         type: [{
             _id: false, type: { type: String }, name: String, image: String,
-            photographer: String, photoLink: String,
+            imageAuto: Boolean, photographer: String, photoLink: String,
         }],
         default: [],
     },
