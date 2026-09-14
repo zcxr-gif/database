@@ -484,7 +484,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         }],
         default: [],
     },
-    roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
+    // `message` is a short word from whoever holds the role — the CEO's
+    // welcome, in practice. It lives on the ROLE rather than on the person so
+    // it survives a handover: the airline's message is the airline's, and the
+    // pilot who takes the chair inherits it rather than an empty box.
+    roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean, message: String }], default: [] },
     // Owner-defined STAFF roles (permissions) + which staff account (by login
     // username) holds each. Distinct from the display `roles` above: these gate
     // what a signed-in staff member can do. See crewAuth CREW_CAPABILITIES.
@@ -837,6 +841,13 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // and picking an aircraft at random is worse than asking.
     ifSyncAircraftId: { type: String, trim: true, default: '' },
     ifSyncedAt: { type: Date, default: null },
+
+    // Where the airline is FROM, as an ISO 3166-1 alpha-2 code ("IN", "MX").
+    // Two letters and nothing else: every consumer derives the flag and the
+    // country's name from the code (a regional-indicator pair, and
+    // Intl.DisplayNames) rather than storing either, so there is one spelling
+    // of "Mexico" on the platform and no image to go missing.
+    country: { type: String, trim: true, uppercase: true, maxlength: 2, default: '' },
 
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
@@ -3249,6 +3260,105 @@ async function crewViewer(req, store) {
         return { hours: member ? Number(member.hours) || 0 : 0, memberId: member ? member._id : null };
     } catch { return null; }
 }
+
+/* ===========================================================================
+ * WHO RUNS THE AIRLINE
+ *
+ * GET /api/crew/:slug/staff  — public, and deliberately narrower than the
+ * roster above.
+ *
+ * A VA's website wants to introduce the people behind the airline: who they
+ * are, what they are called on the Community, what rank they hold and what
+ * the person in the chair has to say. The roster endpoint answers a different
+ * question — every pilot, for the crew centre's own roster screen — and it
+ * withholds the Community handle for everybody, which is right for a list of
+ * two hundred pilots and wrong for the five people who chose to be the public
+ * face of the airline.
+ *
+ * So this is the opt-in half. A pilot appears here only because staff gave
+ * them a ROLE the airline declared, and the Community handle that goes out
+ * with them is the one that is already on the airline's own forum thread.
+ * Nobody's e-mail, nobody's login, and no pilot who was never given a role.
+ *
+ * The order is the airline's own: the roles are listed in the order the crew
+ * centre's role editor holds them, so the chief executive is first because
+ * the airline put them first, not because this file went looking for the word.
+ * ======================================================================== */
+
+/* An Infinite Flight Community profile, from a handle.
+ *
+ * Built from a CLOSED alphabet rather than escaped: the handle is typed by a
+ * staff member into the roster editor, and a link is the one place where a
+ * wrong string stops being a wrong name and starts being somewhere else
+ * entirely. A handle that is not a handle gets no link — the name still
+ * shows. */
+const ifcProfileUrl = (handle) => {
+    const h = String(handle || '').trim().replace(/^@/, '');
+    return /^[A-Za-z0-9][A-Za-z0-9_.-]{1,58}$/.test(h)
+        ? `https://community.infiniteflight.com/u/${h}/summary`
+        : '';
+};
+
+app.get('/api/crew/:slug/staff', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        // `roles` is not in crewStore.SELECT — that list is what the store
+        // needs, and this is the only route that needs the display roles.
+        const defs = await VirtualAirlineAd.findById(va._id).select('roles').lean();
+        const declared = Array.isArray(defs && defs.roles) ? defs.roles : [];
+        // The roles the airline marked as staff. A VA that has never ticked
+        // the box still gets a staff list — every role it declared — because
+        // the alternative is a section that is empty for no visible reason.
+        const flagged = declared.filter((r) => r && r.staff);
+        const shown = (flagged.length ? flagged : declared).filter((r) => r && String(r.name || '').trim());
+        if (!shown.length) return res.json({ staff: [] });
+
+        const index = new Map(shown.map((r, i) => [String(r.name).trim().toLowerCase(), i]));
+        const members = await store.listMembers();
+
+        const rows = members
+            .filter((m) => m && m.status !== 'inactive' && index.has(String(m.role || '').trim().toLowerCase()))
+            .map((m) => {
+                const at = index.get(String(m.role).trim().toLowerCase());
+                const role = shown[at];
+                const rank = crewRanks.memberRank(va.ranks, m.hours, m.checksPassed);
+                return {
+                    name: String(m.name || '').trim(),
+                    callsign: String(m.callsign || '').trim(),
+                    role: String(role.name || '').trim(),
+                    roleColor: role.color || '',
+                    roleIcon: role.icon || '',
+                    roleImage: role.image || '',
+                    // The role's own short word — the CEO's welcome, in
+                    // practice. On the role rather than the person, so it
+                    // survives a handover. See the schema.
+                    message: String(role.message || '').trim(),
+                    rank: rank ? rank.name : '',
+                    rankColor: (rank && rank.color) || '',
+                    rankImage: (rank && rank.image) || '',
+                    hours: Math.round(Number(m.hours) || 0),
+                    status: m.status || 'active',
+                    ifc: String(m.ifcName || '').trim().replace(/^@/, ''),
+                    ifcUrl: ifcProfileUrl(m.ifcName),
+                    // The holders of the FIRST role the airline listed. What a
+                    // website features at the top of the section, so it does
+                    // not have to guess which of these people is in charge.
+                    lead: at === 0,
+                    order: at,
+                };
+            })
+            .sort((a, b) => (a.order - b.order)
+                || (b.hours - a.hours)
+                || a.name.localeCompare(b.name))
+            .slice(0, 40)
+            .map(({ order, ...row }) => row);
+
+        // Same five minutes the rest of the public crew surface uses. A staff
+        // list changes a few times a year.
+        res.set('Cache-Control', 'public, max-age=300');
+        res.json({ staff: rows });
+    } catch (err) { crewFail(res, err, { log: 'staff list error', message: 'Could not load the staff list.' }); }
+});
 
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {
@@ -13461,7 +13571,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -13489,6 +13599,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             code: ad.callsign || null,
             name: ad.name,
             tagline: ad.tagline || '',
+            // The country the airline flies out of, as an ISO alpha-2 code.
+            // The flag and the country's name are DERIVED from it by whoever
+            // draws them — see the schema.
+            country: /^[A-Z]{2}$/.test(String(ad.country || '')) ? ad.country : '',
             logo: ad.logoUrl || '',
             banner: ad.bannerUrl || '',
             website: ad.websiteUrl || '',

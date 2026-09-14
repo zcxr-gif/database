@@ -335,6 +335,11 @@ const PATTERNS = {
 
 const DEFAULT_PATTERN = 'none';
 
+/* The route map's own script. Its own file, and its own module, because it is
+ * mostly a projected coastline and only the pages that draw a map fetch it —
+ * see vaSiteMap.js. */
+const { MAP_JS } = require('./vaSiteMap');
+
 const esc = (s) => String(s == null ? '' : s)
     .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -645,7 +650,13 @@ ${navLinks(c)}
     <ul class="cards" data-crew-list="fleet" data-crew-limit="24">
       <template>
         <li class="card">
-          <span class="card__media"><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async"></span>
+          <span class="card__media">
+            <!-- The well's ground: the same picture, blurred past recognition.
+                 aria-hidden and alt="" because it is the same aeroplane as the
+                 one below it, said twice. -->
+            <img class="card__media-bg" src="{{image}}" alt="" aria-hidden="true" loading="lazy" decoding="async">
+            <img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async">
+          </span>
           <span class="card__body">
             <b>{{aircraft}}</b>
             <span>{{livery}}</span>
@@ -691,21 +702,171 @@ ${navLinks(c)}
     </ul>
   </section>`,
 
-    /* THE PEOPLE WHO RUN IT, as roles rather than names.
+    /* THE CREW.
      *
-     * Roles come from the crew centre and names deliberately do not: a staff
-     * list on a public page goes out of date the week somebody steps down, and
-     * it puts real people's handles on a page anybody can scrape. The
-     * departments are the useful half and they are the half that stays true. */
+     * Not the staff — the pilots. An applicant reading a VA's website wants to
+     * know how many people are actually there and what the ladder looks like
+     * once somebody is on it, and "62 pilots" as a statistic is a number while
+     * sixty-two names with their hours against them is an airline.
+     *
+     * Same table, search and pager as the route table, for the same reason: a
+     * roster of two hundred is a list nobody reads to the end of, and the
+     * question a visitor has at it — "is there anybody flying at my rank" — is
+     * a search.
+     *
+     * What is on it is what the crew centre's own roster screen already shows a
+     * signed-out visitor: a name, a callsign, a rank and hours. Not a Community
+     * handle — a line pilot has not opted into being findable, which is the
+     * deliberate difference between this and the staff section below. A pilot
+     * marked inactive is off it entirely.
+     */
+    roster: (c) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>The crew</h2>
+      <p>Everybody flying for us, and where they are on the ladder.</p>
+    </div>
+    <div class="routes" data-crew-table="roster" data-crew-page="12">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search the crew</span>
+          <input type="search" autocomplete="off" placeholder="Search a name, a callsign, a rank" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Pilot</th><th scope="col">Callsign</th><th scope="col">Rank</th><th scope="col" class="routes__num">Hours</th></tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="4">Your pilots appear here as soon as they are on the crew centre&rsquo;s roster.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of pilots" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
+  </section>`,
+
+    /* THE PEOPLE WHO RUN IT.
+     *
+     * This used to be a row of DEPARTMENT LABELS with no names on it, on the
+     * reasoning that a staff list goes out of date the week somebody steps
+     * down. That reasoning was about a list typed into a page by hand. This
+     * one is not typed anywhere: it is the airline's own roster, filtered to
+     * the people staff gave a role to, and it goes out of date the moment the
+     * roster does — which is to say, never.
+     *
+     * What each card carries is what an applicant actually wants to know:
+     * who this is, what they are called on the Community and where to find
+     * them, what rank they fly at, and what the person in the chair has to
+     * say. The Community handle is a LINK to their profile, because a handle
+     * nobody can click is a handle nobody can act on.
+     *
+     * The role's short word — the chief executive's welcome, in practice — is
+     * held on the role rather than on the person, so it survives a handover.
+     * Whoever holds the first role the airline listed is marked is-lead and
+     * given the width to say it. */
     staff: () => `
   <section class="block" data-crew-section>
     <div class="block__head">
       <h2>Who runs the airline</h2>
-      <p>The teams behind the operation. Ask for any of them in the crew centre.</p>
+      <p>The people behind the operation, and where to find them.</p>
     </div>
-    <ul class="pills" data-crew-list="roles" data-crew-limit="14">
-      <template><li class="pill"><span class="dot" style="background:{{color}}"></span>{{name}}</li></template>
+    <ul class="crew" data-crew-list="staff" data-crew-limit="12">
+      <template>
+        <li class="person {{leadClass}}">
+          <span class="person__mark" aria-hidden="true">{{initials}}</span>
+          <span class="person__body">
+            <b class="person__name">{{name}}</b>
+            <span class="person__role" style="--role: {{roleColor}}">{{role}}</span>
+            <span class="person__rank">{{rank}}</span>
+            <a class="person__ifc" href="{{ifcUrl}}" rel="noopener" target="_blank">{{ifc}}</a>
+            <span class="person__word">{{message}}</span>
+          </span>
+        </li>
+      </template>
+      <li class="person"><span class="person__body"><b class="person__name">Give your staff a role</b><span class="person__word">Anybody on your roster with one of your airline&rsquo;s roles appears here, with their rank and their Community profile.</span></span></li>
     </ul>
+  </section>`,
+
+    /* THE NETWORK, DRAWN.
+     *
+     * Every reviewer who looked at a VA's network page asked for one of these
+     * and they were right: twenty sectors listed one under another is a table
+     * of airports, not a network. This is the airline's own route map — real
+     * great circles between real aerodrome reference points, on Natural
+     * Earth's coastlines — and it needs nothing typed into it: publish a
+     * sector in the crew centre and it appears.
+     *
+     * The section writes its own script tag. map.js is mostly a projected
+     * coastline and is worth thirty kilobytes on the page that draws a map and
+     * nothing at all on the pages that do not, which is what keeps it out of
+     * site.js. Deferred, so it neither blocks the parser nor runs before the
+     * element it is looking for exists. */
+    routemap: (c) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>Where we fly</h2>
+      <p>Every sector we publish, as a great circle. Drag the map sideways to follow it.</p>
+    </div>
+    <div class="netmap" data-crew-map>
+      <div class="netmap__scroll"><svg class="netmap__svg" aria-hidden="true"></svg></div>
+    </div>
+    <p class="netmap__note" data-crew-map-note></p>
+    <script src="map.js" defer></script>
+  </section>`,
+
+    /* EVERY ROUTE, AS A TABLE YOU CAN ACTUALLY USE.
+     *
+     * The network block above is a LIST, capped at a dozen rows, and it is the
+     * right thing on a homepage. It is the wrong thing on the network page of
+     * an airline with two hundred sectors: a visitor there has a question —
+     * "do you fly to Delhi", "what goes out on the A350" — and a list of two
+     * hundred rows answers it by making them read two hundred rows.
+     *
+     * So: a table with a search box over it and a pager under it. The search
+     * runs in the page over rows already fetched, which is why it is instant
+     * and why it costs the crew centre nothing.
+     *
+     * WITHOUT JAVASCRIPT it is still a table of every sector — the rows are
+     * written by the feed, not by the pager. The search box ships DISABLED and
+     * site.js enables it, so the one control that would not work is the one
+     * control that is not offered. */
+    routetable: (c) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>Every route we fly</h2>
+      <p>Search by airport, flight number or aircraft.</p>
+    </div>
+    <div class="routes" data-crew-table="routes" data-crew-page="12">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search these routes</span>
+          <input type="search" autocomplete="off" placeholder="Search an airport, a flight number, an aircraft" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Flight</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Aircraft</th><th scope="col" class="routes__num">Distance</th></tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="5">Your sectors appear here as soon as they are in the crew centre&rsquo;s route editor.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of routes" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
   </section>`,
 
     /* CODESHARES. Read off the route map, where a sector already knows whether
@@ -895,18 +1056,48 @@ ${navLinks(c)}
     </div>
   </section>`,
 
+    /* THE FOOTER.
+     *
+     * The last thing on every page and, for a long time, the least considered:
+     * one sentence of small print beside a wrapping row of every link on the
+     * site. This is the version an airline is happy to be seen with — the mark
+     * and a line about the airline on the left, the links SORTED INTO COLUMNS
+     * on the right, the flag of the country it flies out of, and the legal
+     * line and the copyright on their own baseline under a rule.
+     *
+     * Everything that can be absent is wrapped in [data-crew-figure], which is
+     * the contract with crew-feed.js: a field the airline has not set takes its
+     * holder out of the page rather than leaving a broken image or a label with
+     * nothing after it. An airline with no logo gets a footer with no logo, not
+     * a footer with a gap in it.
+     *
+     * The year is written by site.js. A year rendered at publish time is right
+     * until the 1st of January and quietly wrong for the twelve months after,
+     * and nobody republishes a website to correct a number nobody looks at. */
     footer: (c) => `
 <footer>
   <div class="foot__in">
-    <div>
-      <p>${esc(c.name)} is a virtual airline on Infinite Flight. Not affiliated with any real-world carrier.</p>
-      <p>Crew centre hosted by <a href="${c.crewBase}">Inflight</a>.</p>
+    <div class="foot__brand">
+      <span class="foot__logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
+      <p class="foot__blurb"><span data-crew-brand="tagline">${esc(c.name)} flies on Infinite Flight.</span></p>
+      <p class="foot__origin" data-crew-figure hidden><span data-crew-brand="origin"></span></p>
     </div>
-    <div class="foot__links">
-${navLinks(c, '      ')}
-      <a href="${c.crew}">Crew centre</a>
-      <a href="${c.crew}/join">Apply</a>
-    </div>
+    <nav class="foot__cols" aria-label="More of this site">
+      <div class="foot__col">
+        <h2>The airline</h2>
+${navLinks(c, '        ')}
+      </div>
+      <div class="foot__col">
+        <h2>Pilots</h2>
+        <a href="${c.crew}/join">Apply to fly</a>
+        <a href="${c.crew}">Crew centre</a>
+        <span data-crew-figure hidden><a data-crew-brand="discord" href="#">Discord</a></span>
+      </div>
+    </nav>
+  </div>
+  <div class="foot__base">
+    <p class="foot__legal">${esc(c.name)} is a virtual airline operating inside the flight simulator Infinite Flight. It is not affiliated with, endorsed by, or connected to any real-world airline, and no real tickets, flights or services are sold.</p>
+    <p class="foot__copy">&copy; <span data-year>${new Date().getFullYear()}</span> ${esc(c.name)} &middot; Crew centre hosted by <a href="${c.crewBase}">Inflight</a></p>
   </div>
 </footer>`,
 };
@@ -919,6 +1110,8 @@ const INSERTABLE = [
     { id: 'showreel', label: 'Hero with your aircraft', note: 'The top of the page with one of your aeroplanes beside it, and room for a short film.' },
     { id: 'figures', label: 'Live figures', note: 'Pilots, hours, destinations, routes — from your crew centre.' },
     { id: 'network', label: 'Network', note: 'Your published sectors, as a list.' },
+    { id: 'routemap', label: 'Route map', note: 'Your network drawn as great circles, cropped to what you actually fly.' },
+    { id: 'routetable', label: 'Route table', note: 'Every sector you publish, with a search box and pages.' },
     { id: 'hubs', label: 'Hubs', note: 'The airports you fly most out of, worked out from your route map.' },
     { id: 'activity', label: 'Lately', note: 'Joins, promotions and published events, written by your crew centre.' },
     { id: 'notices', label: 'Notices', note: 'What your staff have written on the noticeboard.' },
@@ -927,7 +1120,8 @@ const INSERTABLE = [
     { id: 'fleet', label: 'Fleet', note: 'Your aircraft as picture cards. Every one gets an image, credited.' },
     { id: 'about', label: 'About', note: 'Two paragraphs about the airline.' },
     { id: 'values', label: 'How we fly', note: 'The three or four things that make your airline itself.' },
-    { id: 'staff', label: 'Who runs it', note: 'Your crew centre roles, as a row of labels. No names.' },
+    { id: 'staff', label: 'Who runs it', note: 'Your staff: name, rank, Community profile and the role\u2019s own message.' },
+    { id: 'roster', label: 'The crew', note: 'Your pilots with their rank and hours, searchable and paged.' },
     { id: 'partners', label: 'Codeshares', note: 'The airlines you share sectors with, from your route map.' },
     { id: 'ranks', label: 'Ranks', note: 'Your rank ladder, from the crew centre.' },
     { id: 'joining', label: 'What happens when you apply', note: 'Four numbered steps. The question every applicant has.' },
@@ -1580,12 +1774,35 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
   position: relative; aspect-ratio: 16 / 10; background: var(--surface-2);
   display: block; overflow: hidden;
 }
-.card__media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* NOTHING IS CROPPED, INCLUDING THE AEROPLANE.
+
+   This used to be 'cover', and cover is wrong for the one subject every card
+   on this platform holds. A livery render is a side-on aeroplane — three or
+   four times as wide as it is tall — and filling a 16:10 well with one cuts
+   the nose and the tail off it, which is precisely the picture the airline
+   uploaded it for. So the picture is CONTAINED: the whole aeroplane, every
+   time, whatever shape the file turned out to be.
+
+   Contained pictures leave bars, and bars in a flat grey read as a broken
+   image. The bars are filled with the picture itself — over-scaled, blurred
+   past recognition and dimmed — so the well has the livery's own colours in
+   it and the aeroplane sits on its own field rather than in a letterbox. */
+.card__media img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; padding: 6% 5%; }
 /* A drawn outline is a MARK, not a photograph: it has no field of its own — the
-   well's surface is its ground — and cropping it to fill would cut the wingtips
-   off. So it is contained, centred, and given room to be a mark rather than a
-   picture that not quite fits. crew-feed.js says which kind each one is. */
-.card__media img[data-fit="contain"] { object-fit: contain; padding: 14% 12%; }
+   well's surface is its ground — and it is given more room than a photograph so
+   it reads as a mark rather than as a picture that not quite fits.
+   crew-feed.js says which kind each one is. */
+.card__media img[data-fit="contain"] { padding: 14% 12%; }
+.card__media-bg {
+  position: absolute; inset: 0; padding: 0;
+  object-fit: cover; transform: scale(1.3);
+  filter: blur(20px) saturate(1.4); opacity: .45;
+}
+/* A drawn mark has no field to make one out of — the card's surface IS its
+   ground, and a blurred copy of an outline is a grey smudge behind a grey
+   outline. Browsers without :has() get the smudge, which is survivable; every
+   one that has it gets what the design asks for. */
+.card__media:has(img[data-fit="contain"]) .card__media-bg { display: none; }
 .card__body { padding: .95rem 1.05rem 1.1rem; display: flex; flex-direction: column; gap: .2rem; flex: 1; }
 .card__body b { font-size: .98rem; letter-spacing: -.01em; }
 .card__body span { color: var(--muted); font-size: .88rem; }
@@ -1653,6 +1870,75 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
 }
 .pill img { width: 1.1rem; height: 1.1rem; object-fit: contain; border-radius: 3px; }
 .pill .dot { width: .55rem; height: .55rem; border-radius: 50%; background: var(--accent); flex: none; }
+
+/* ---------------------------------------------------------------------------
+   THE CREW — who runs the airline, as people.
+
+   A card per staff member: a disc with their initials, their name, the role
+   they hold, the rank they fly at, and the Community profile to find them on.
+   Every one of those except the disc can be MISSING — a staff member who has
+   not linked a Community account, a rank ladder the airline has not written —
+   so every one of them collapses out of the card rather than leaving a gap
+   where a fact should be. That is what the :empty rules below are for, and
+   they are not optional: the feed writes an empty element rather than no
+   element, because it is filling a template it did not author.
+
+   THE LEAD CARD. Whoever holds the first role the airline listed — the chief
+   executive, in practice — takes the full width of the grid, so the airline's
+   own word to a visitor is read as a paragraph rather than as a caption.
+   ------------------------------------------------------------------------ */
+.crew {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(17rem, 100%), 1fr));
+}
+.person {
+  display: flex; gap: .9rem; min-width: 0;
+  padding: 1.05rem 1.15rem;
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.person:hover { border-color: var(--accent-line); }
+/* The disc. Initials rather than a portrait: the crew centre holds no
+   photograph of anybody, and a grid of identical grey avatars says less than
+   a grid of initials does. */
+.person__mark {
+  flex: none; width: 2.6rem; height: 2.6rem; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--accent-soft, var(--surface-2)); color: var(--accent);
+  font-weight: 700; font-size: .92rem; letter-spacing: .02em;
+}
+.person__mark:empty { display: none; }
+.person__body { display: flex; flex-direction: column; gap: .15rem; min-width: 0; }
+.person__name { font-size: 1rem; letter-spacing: -.01em; }
+/* The role, in the colour the airline gave it. --role arrives from the feed
+   and is a validated hex or nothing at all; the fallback is the accent, so a
+   role with no colour is still the airline's colour rather than none. */
+/* Set in the airline's own spelling rather than in capitals. "Chief Executive
+   Officer" shouted at .82rem is a label competing with the name above it, and
+   a VA that writes its roles a particular way did not ask us to rewrite them. */
+.person__role {
+  font-size: .84rem; font-weight: 600; letter-spacing: .01em;
+  color: var(--role, var(--accent));
+}
+.person__rank { font-size: .86rem; color: var(--muted); }
+.person__ifc {
+  font-size: .86rem; color: var(--muted); text-decoration: none;
+  font-family: var(--font-mono); width: max-content; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.person__ifc:hover { color: var(--accent); text-decoration: underline; }
+.person__word { font-size: .9rem; color: var(--muted); margin-top: .35rem; }
+.person__role:empty, .person__rank:empty, .person__ifc:empty, .person__word:empty { display: none; }
+/* The airline's own word, from whoever is in the chair. */
+.person.is-lead { grid-column: 1 / -1; border-color: var(--accent-line); }
+.person.is-lead .person__mark { width: 3.2rem; height: 3.2rem; font-size: 1.05rem; }
+.person.is-lead .person__name { font-size: 1.15rem; }
+.person.is-lead .person__word {
+  font-size: 1rem; color: var(--ink); max-width: 62ch;
+  border-left: 2px solid var(--accent-line); padding-left: .9rem; margin-top: .55rem;
+}
 
 /* ---------------------------------------------------------------------------
    SPLIT — words beside a picture. The one layout an airline always wants for
@@ -1859,6 +2145,132 @@ button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
 .wall__tile iframe { position: absolute; top: 0; left: 0; width: 326px; height: 470px; border: 0; transform-origin: top left; }
 
 /* ---------------------------------------------------------------------------
+   THE ROUTE MAP.
+
+   Sized by HEIGHT, with the width falling out of the crop. A map cropped to
+   the network can be any shape at all — an airline flying Delhi to Mumbai is a
+   wide, shallow box; one flying Delhi to Auckland is nearly square — and a
+   fixed aspect ratio would letterbox one of them badly. Fixing the height and
+   letting the box scroll sideways is what an atlas does with a fold-out.
+
+   EVERY COLOUR IS THE DESIGN'S. Land is a flat surface tone, the arcs and the
+   dots are the airline's accent, and the labels are drawn with a halo of the
+   page's own background so a name crossing an arc stays readable. Nothing here
+   is a colour this stylesheet invented.
+   ------------------------------------------------------------------------ */
+.netmap {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); overflow: hidden;
+}
+.netmap__scroll {
+  overflow-x: auto; overflow-y: hidden;
+  height: clamp(15rem, 42vw, 26rem);
+  cursor: grab;
+}
+.netmap__scroll.is-dragging { cursor: grabbing; user-select: none; }
+.netmap__scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.netmap__svg { display: block; height: 100%; width: auto; min-width: 100%; }
+.netmap__land { fill: var(--surface-2); stroke: var(--line); stroke-width: 1; }
+.netmap__arc { fill: none; stroke: var(--accent); stroke-width: 2; stroke-opacity: .55; stroke-linecap: round; }
+/* Somebody else's metal, drawn as somebody else's: dashed and quieter, so a
+   codeshare is not read as a sector the airline flies itself. */
+.netmap__arc.is-share { stroke: var(--muted); stroke-dasharray: 7 6; stroke-opacity: .5; }
+.netmap__halo { fill: var(--accent); opacity: .16; }
+.netmap__dot { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; }
+.netmap__pt.is-hub .netmap__dot { stroke-width: 2.5; }
+/* The halo under the type is the page's own background, painted behind the
+   letters rather than in a box around them — a label crossing an arc stays
+   readable and the arc still reads as continuous. */
+.netmap__label {
+  fill: var(--ink); font-family: var(--font-mono); font-weight: 600;
+  paint-order: stroke; stroke: var(--bg); stroke-linejoin: round;
+}
+.netmap__pt.is-hub .netmap__label { fill: var(--accent); }
+/* Said under the map rather than on it: how much of the network is drawn, and
+   how much of it we could not place. An airline whose site quietly draws a
+   smaller network than the one listed under it looks like it lost routes. */
+.netmap__note { margin: .6rem 0 0; font-size: .82rem; color: var(--muted); }
+.netmap__note:empty { display: none; }
+/* THE EDGE FADE, and only where there is something past the edge. map.js adds
+   the class once it has measured the slack, so a map that fits its box gets no
+   hint that it does not — a gradient promising more map where there is none is
+   worse than no gradient. */
+.netmap.has-pan, .netmap:has(.has-pan) {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 2.5rem, #000 calc(100% - 2.5rem), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 2.5rem, #000 calc(100% - 2.5rem), transparent 100%);
+}
+
+/* ---------------------------------------------------------------------------
+   THE ROUTE TABLE — every sector, searchable and paged.
+
+   A table rather than a list of cards, because five short facts per row across
+   two hundred rows is what a table is FOR, and because a visitor comparing two
+   sectors is comparing two columns.
+
+   It scrolls sideways inside its own box rather than widening the page: five
+   columns do not fit a phone, and a page that scrolls horizontally as a whole
+   is a page whose every paragraph has moved. On a phone the aircraft and the
+   distance step out of the way entirely — they are the two facts nobody is
+   searching a timetable for on a 390px screen.
+   ------------------------------------------------------------------------ */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.routes { display: grid; gap: .9rem; }
+.routes__bar { display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: center; justify-content: space-between; }
+.routes__find { flex: 1 1 16rem; min-width: 0; }
+.routes__find input {
+  width: 100%; font: inherit; font-size: .92rem; color: var(--ink);
+  padding: .6rem .9rem; border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--line);
+}
+.routes__find input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent-line); }
+/* The box that does nothing until site.js has wired it. Saying so is the
+   point: a search field that swallows what is typed is worse than none. */
+.routes__find input[disabled] { opacity: .55; cursor: not-allowed; }
+.routes__count { margin: 0; font-size: .84rem; color: var(--muted); }
+.routes__wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.routes__table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+.routes__table th, .routes__table td {
+  text-align: left; padding: .7rem .9rem; white-space: nowrap;
+  border-bottom: 1px solid var(--line-soft, var(--line));
+}
+.routes__table thead th {
+  font-size: .72rem; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700; background: var(--surface-2);
+  position: sticky; top: 0; z-index: 1;
+}
+.routes__table tbody tr:last-child td { border-bottom: 0; }
+.routes__table tbody tr:hover td { background: var(--surface-2); }
+.routes__code { font-family: var(--font-mono); font-size: .95em; color: var(--accent); letter-spacing: .02em; }
+.routes__num { text-align: right; font-variant-numeric: tabular-nums; }
+.routes__table td.routes__num { text-align: right; color: var(--muted); }
+/* A sector flown on somebody else's metal, said out loud. An airline drawing a
+   partner's flight as its own overstates the airline. */
+/* The partner's name, spelled the way the partner spells it — an airline's
+   name put through text-transform is somebody else's brand rewritten. */
+.routes__share {
+  display: inline-block; margin-left: .45rem; padding: .05rem .45rem;
+  border-radius: var(--radius-pill); border: 1px solid var(--line);
+  font-size: .72rem; letter-spacing: .02em; color: var(--muted);
+}
+.routes__none td { color: var(--muted); white-space: normal; }
+.routes__pager { display: flex; align-items: center; justify-content: center; gap: 1rem; }
+.routes__page {
+  font: inherit; font-size: .85rem; color: var(--ink); cursor: pointer;
+  padding: .45rem .9rem; border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--line);
+}
+.routes__page:hover:not([disabled]) { border-color: var(--accent-line); color: var(--accent); }
+.routes__page[disabled] { opacity: .4; cursor: default; }
+.routes__at { font-size: .84rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 32rem) {
+  .routes__table th:nth-child(4), .routes__table td:nth-child(4),
+  .routes__table th:nth-child(5), .routes__table td:nth-child(5) { display: none; }
+}
+
+/* ---------------------------------------------------------------------------
    FOOTER
    ------------------------------------------------------------------------ */
 footer {
@@ -1868,16 +2280,57 @@ footer {
 }
 .foot__in {
   max-width: var(--measure); margin: 0 auto;
-  padding: 2.5rem var(--pad) 3.5rem;
-  display: grid; gap: 1.2rem;
+  padding: 3rem var(--pad) 2rem;
+  display: grid; gap: 2.2rem;
 }
-@media (min-width: 42rem) {
-  .foot__in { grid-template-columns: 1fr auto; align-items: start; }
+/* The airline on the left and its links on the right — but only once there is
+   a screen wide enough for two of anything. Narrower than this the whole thing
+   is one column, which is the shape a footer is read in on a phone anyway. */
+@media (min-width: 46rem) {
+  .foot__in { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 3rem; align-items: start; }
 }
 footer p { margin: .3rem 0; max-width: 62ch; }
-.foot__links { display: flex; flex-wrap: wrap; gap: .4rem 1.1rem; }
-.foot__links a { color: var(--muted); text-decoration: none; }
-.foot__links a:hover { color: var(--accent); }
+
+/* THE MARK AND THE LINE UNDER IT. */
+.foot__brand { display: grid; gap: .55rem; justify-items: start; }
+.foot__logo img { display: block; height: 2.4rem; width: auto; max-width: 11rem; object-fit: contain; }
+.foot__blurb { font-size: .9rem; }
+/* WHERE THE AIRLINE IS FROM. The flag and the country's name arrive as one
+   string from the feed — see 'origin' in crew-feed.js — so an airline that has
+   not said where it flies from loses this line rather than showing an empty
+   one, and one whose browser cannot draw a flag still reads the country. */
+.foot__origin {
+  display: inline-flex; align-items: center; gap: .45rem;
+  font-size: .86rem; letter-spacing: .02em;
+  padding: .3rem .7rem; border-radius: var(--radius-pill);
+  background: var(--surface); border: 1px solid var(--line);
+}
+
+/* THE LINKS, IN COLUMNS.
+   A wrapping row of every link on the site is a row nobody reads to the end
+   of. Sorted under two headings it is a list of two short lists, which is the
+   same links and a tenth of the work to use. */
+.foot__cols { display: grid; gap: 1.6rem 2rem; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); }
+.foot__col { display: grid; gap: .5rem; align-content: start; }
+.foot__col h2 {
+  margin: 0; font-size: .72rem; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--ink);
+}
+.foot__col a { color: var(--muted); text-decoration: none; font-size: .88rem; width: max-content; max-width: 100%; }
+.foot__col a:hover { color: var(--accent); }
+
+/* THE BASELINE. The small print and the copyright, under a rule of their own,
+   so the legal sentence is not mistaken for part of the airline's own copy. */
+.foot__base {
+  max-width: var(--measure); margin: 0 auto;
+  padding: 1.4rem var(--pad) 2.6rem;
+  border-top: 1px solid var(--line-soft, var(--line));
+  display: grid; gap: .5rem;
+}
+.foot__legal { font-size: .78rem; color: var(--faint, var(--muted)); max-width: 78ch; }
+.foot__copy { font-size: .8rem; }
+.foot__copy a { color: inherit; }
+.foot__copy a:hover { color: var(--accent); }
 
 /* ---------------------------------------------------------------------------
    MOTION
@@ -2088,6 +2541,17 @@ const SITE_JS = `/* Your site's own script.
      a page whose script never loads is never left with a hidden nav or a
      section stuck at opacity 0. */
   root.setAttribute('data-js', '');
+
+  /* THE YEAR IN THE FOOTER.
+
+     Written here rather than at publish time, because a year baked into a file
+     is right until the 1st of January and quietly wrong for the twelve months
+     after — and nobody republishes a website to correct a number nobody looks
+     at. The markup still SHIPS with the year it was built in, so a visitor
+     with no JavaScript reads a year rather than a gap. */
+  document.querySelectorAll('[data-year]').forEach(function (el) {
+    el.textContent = String(new Date().getFullYear());
+  });
 
   /* -------------------------------------------------------------------------
      HOW MUCH THIS SITE MOVES.
@@ -2744,6 +3208,192 @@ const SITE_JS = `/* Your site's own script.
      rather than waiting for a feed that is not coming. */
   if (!window.CrewFeed) { pruneEmpty(); return; }
 
+  /* -------------------------------------------------------------------------
+     THE ROUTE TABLE.
+
+     Every sector the crew centre publishes, searched and paged IN THE PAGE.
+     The whole network arrives in one request — a VA's is tens of rows, not
+     tens of thousands — so filtering is a string compare over an array we
+     already hold, and typing into the box is instant rather than a request per
+     keystroke that the crew centre would have to answer.
+
+     THE MARKUP IS THE TRUTH UNTIL THIS RUNS. The table ships with a row saying
+     where the sectors come from, the search box ships disabled, and the pager
+     ships hidden. A visitor with no JavaScript reads whatever crew-feed.js put
+     in the table and nothing offers them a control that cannot work.
+     --------------------------------------------------------------------- */
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  /* WHAT EACH KIND OF TABLE IS MADE OF.
+
+     Two tables on this platform and they differ in three things: where the
+     rows come from, what a row looks like, and what a visitor is likely to
+     type at it. Everything else — the search, the pager, the counting, the
+     empty state, keeping the reader at the top of a new page — is the same
+     job, so it is written once and these three are the difference.
+
+     The HEADINGS are not here. They are in the page's own markup, because a
+     VA who opens style.css and renames a column should get a renamed column
+     rather than a table whose headings and cells disagree. */
+  var TABLES = {
+    routes: {
+      read: function () { return CrewFeed.routes(); },
+      // Where they leave from, then where they go. A timetable in the order
+      // rows happened to be typed into an editor is not a timetable.
+      sort: function (a, b) {
+        return (a.from || '').localeCompare(b.from || '')
+            || (a.to || '').localeCompare(b.to || '');
+      },
+      find: function (r) { return [r.from, r.to, r.flight, r.aircraft, r.partner]; },
+      row: function (r) {
+        var share = r.codeshare
+          ? '<span class="routes__share">' + (r.partner ? esc(r.partner) : 'Codeshare') + '</span>' : '';
+        return '<td><span class="routes__code">' + esc(r.flight || '—') + '</span>' + share + '</td>'
+          + '<td><span class="routes__code">' + esc(r.from) + '</span></td>'
+          + '<td><span class="routes__code">' + esc(r.to) + '</span></td>'
+          + '<td>' + esc(r.aircraft || '') + '</td>'
+          + '<td class="routes__num">' + (r.distanceNm ? esc(Math.round(r.distanceNm).toLocaleString()) + ' nm' : '') + '</td>';
+      },
+      none: 'Nothing matches that. Try an airport code, a flight number or an aircraft.',
+      one: 'route', many: 'routes',
+    },
+    roster: {
+      read: function () { return CrewFeed.roster(); },
+      // Already ordered by hours when it arrives — see crew-feed.js — and
+      // left that way here rather than re-sorted into an order the feed does
+      // not know it is being read in.
+      sort: null,
+      find: function (r) { return [r.name, r.callsign, r.rank, r.role]; },
+      // 'cols' is how many headings the page actually wrote. An airline can
+      // build this section without the hours column — see the builder — and a
+      // row that emitted a cell anyway would push every table row one wider
+      // than its own header.
+      row: function (r, cols) {
+        var note = r.note ? ' <span class="routes__share">' + esc(r.note) + '</span>' : '';
+        return '<td>' + esc(r.name) + note + '</td>'
+          + '<td><span class="routes__code">' + esc(r.callsign || '') + '</span></td>'
+          + '<td>' + esc(r.rank || '') + '</td>'
+          + (cols > 3 ? '<td class="routes__num">' + esc(r.hoursText || '') + '</td>' : '');
+      },
+      none: 'Nobody matches that. Try a name, a callsign or a rank.',
+      one: 'pilot', many: 'pilots',
+    },
+  };
+
+  function mountTable(host, rows, spec) {
+    var body = host.querySelector('[data-routes-body]');
+    var find = host.querySelector('[data-routes-find]');
+    var count = host.querySelector('[data-routes-count]');
+    var pager = host.querySelector('[data-routes-pager]');
+    var prev = host.querySelector('[data-routes-prev]');
+    var next = host.querySelector('[data-routes-next]');
+    var at = host.querySelector('[data-routes-at]');
+    if (!body) return;
+
+    var per = parseInt(host.getAttribute('data-crew-page'), 10);
+    if (!(per > 0)) per = 12;
+    // The colspan of the empty row, taken from the headings the PAGE wrote
+    // rather than assumed: a VA who removes a column from their own copy of
+    // the markup should not get a stray cell on the no-matches row.
+    var cols = host.querySelectorAll('thead th').length || 5;
+
+    var all = spec.sort ? rows.slice().sort(spec.sort) : rows.slice();
+    // One lower-cased haystack per row, built once rather than on every
+    // keystroke. Everything a visitor might plausibly type at this table is in
+    // it — see the spec's own 'find' above.
+    all.forEach(function (r) { r.__find = spec.find(r).join(' ').toLowerCase(); });
+
+    var shown = all, page = 0;
+
+    function rowHtml(r) { return '<tr>' + spec.row(r, cols) + '</tr>'; }
+
+    function draw() {
+      var pages = Math.max(1, Math.ceil(shown.length / per));
+      if (page >= pages) page = pages - 1;
+      if (page < 0) page = 0;
+      var slice = shown.slice(page * per, page * per + per);
+
+      body.innerHTML = slice.length
+        ? slice.map(rowHtml).join('')
+        : '<tr class="routes__none"><td colspan="' + cols + '">' + esc(spec.none) + '</td></tr>';
+
+      if (count) {
+        count.textContent = shown.length === all.length
+          ? all.length + ' ' + (all.length === 1 ? spec.one : spec.many)
+          : shown.length + ' of ' + all.length + ' ' + spec.many;
+      }
+      if (pager) {
+        // A pager over one page of results is a pair of dead buttons.
+        pager.hidden = pages < 2;
+        if (at) at.textContent = 'Page ' + (page + 1) + ' of ' + pages;
+        if (prev) prev.disabled = page === 0;
+        if (next) next.disabled = page >= pages - 1;
+      }
+    }
+
+    if (find) {
+      find.disabled = false;
+      var timer = null;
+      find.addEventListener('input', function () {
+        // A beat of quiet before filtering. Not for the cost — the filter is a
+        // few hundred string compares — but for the screen reader on the count
+        // beside it, which would otherwise be interrupted on every keystroke.
+        clearTimeout(timer);
+        timer = setTimeout(function () {
+          var q = find.value.trim().toLowerCase();
+          shown = q ? all.filter(function (r) { return r.__find.indexOf(q) > -1; }) : all;
+          page = 0;
+          draw();
+        }, 120);
+      });
+    }
+    if (prev) prev.addEventListener('click', function () { page--; draw(); scrollTo(); });
+    if (next) next.addEventListener('click', function () { page++; draw(); scrollTo(); });
+
+    // Turning a page puts the reader at the top of the table rather than
+    // wherever they were in the previous one — usually its last row, which on a
+    // full page means a new page they start halfway down.
+    function scrollTo() {
+      var wrap = host.querySelector('.routes__wrap');
+      if (!wrap || typeof wrap.getBoundingClientRect !== 'function') return;
+      if (wrap.getBoundingClientRect().top < 0) {
+        wrap.scrollIntoView({ block: 'start', behavior: reduced ? 'auto' : 'smooth' });
+      }
+    }
+
+    draw();
+  }
+
+  function paintTables() {
+    var jobs = [];
+    Object.keys(TABLES).forEach(function (kind) {
+      var hosts = document.querySelectorAll('[data-crew-table="' + kind + '"]');
+      if (!hosts.length) return;
+      var spec = TABLES[kind];
+      jobs.push(spec.read().then(function (rows) {
+        Array.prototype.forEach.call(hosts, function (host) {
+          // A quiet crew centre takes the whole section with it where the
+          // section said it only makes sense with rows in it — same contract
+          // as [data-crew-list], and the same reason: a heading over an empty
+          // table reads as a fault in the site rather than as an airline that
+          // has not published its network yet.
+          if (!rows || !rows.length) {
+            var section = host.closest ? host.closest('[data-crew-section]') : null;
+            if (section) section.remove();
+            return;
+          }
+          mountTable(host, rows, spec);
+        });
+        return rows;
+      }).catch(function () { return null; }));
+    });
+    return Promise.all(jobs);
+  }
+
   /* THE INSTAGRAM WALL.
 
      THE ADDRESS IS BUILT HERE, from the shortcode, after checking it against
@@ -2825,6 +3475,11 @@ const SITE_JS = `/* Your site's own script.
   // lists it filled resolve on the network. Wait for its pass to settle.
   CrewFeed.mount().then(function () {
     pruneEmpty();
+    // The route table is its own request and does not hold up the wall. A page
+    // with no table on it makes no call at all — paintTables returns straight
+    // away when its markup is not there. (The MAP is not here: it is drawn by
+    // map.js, which only the pages that have one ever load.)
+    paintTables();
     return CrewFeed.posts().then(function (posts) {
       return posts ? { posts: posts, handle: posts[0] && posts[0].handle } : null;
     });
@@ -2873,8 +3528,9 @@ h2 { padding-bottom: .7rem; border-bottom: 2px solid var(--ink); display: inline
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <rect x="0" y="0" width="160" height="14" fill="#f3f4f7"/>
@@ -2922,8 +3578,9 @@ h2 {
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'activity', 'network', 'hubs', 'events', 'notices', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#12141a"/>
 <rect x="0" y="0" width="160" height="12" fill="#1b1e26"/>
@@ -2970,8 +3627,9 @@ h2 { text-align: center; color: var(--muted); font-weight: 500; }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'about', 'values', 'network', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <circle cx="14" cy="10" r="3" fill="#1b5fc1"/>
@@ -3028,8 +3686,9 @@ h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .1em; color: 
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'activity', 'notices', 'events', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks'] },
-            { path: 'about.html', title: 'About', blocks: ['about', 'values', 'joining', 'contact'] },
+            { path: 'about.html', title: 'About', blocks: ['about', 'values', 'joining', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fbfbfa"/>
 <rect x="14" y="14" width="132" height="2" fill="#1a1c1e"/>
@@ -3080,8 +3739,9 @@ h1 { font-weight: 700; letter-spacing: -.025em; }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'about', 'values', 'activity', 'network', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fdf8f4"/>
 <rect x="10" y="8" width="140" height="16" rx="8" fill="#fff" stroke="#eadfd6"/>
@@ -3166,8 +3826,9 @@ footer { border-top: 4px solid var(--ink); }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <rect x="0" y="0" width="160" height="12" fill="#d8102f"/>
@@ -3241,8 +3902,9 @@ footer { border-top: 2px solid var(--accent); }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'values', 'about', 'network', 'hubs', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'partners', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'partners', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fbf9f4"/>
 <rect x="0" y="0" width="160" height="13" fill="#fff"/>
@@ -3317,8 +3979,9 @@ footer { border-top-color: var(--line-soft); }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'fleet', 'network', 'hubs', 'wall', 'events', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#0c0e13"/>
 <rect x="0" y="0" width="160" height="56" fill="#1a2230"/>
@@ -3485,8 +4148,9 @@ footer::before {
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#eef1f6"/>
 <rect x="8" y="6" width="144" height="108" rx="6" fill="#fff" stroke="#d8dee8"/>
@@ -3626,8 +4290,9 @@ footer { border-top: 1px solid var(--line); font-family: var(--font-mono); font-
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'activity', 'network', 'hubs', 'notices', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#0a0d11"/>
 <rect x="0" y="0" width="160" height="12" fill="#111720"/>
@@ -3778,8 +4443,9 @@ footer { border-top: 1px dashed var(--line); }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'partners', 'activity', 'events', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fdfbfd"/>
 <rect x="0" y="0" width="160" height="13" fill="#fff"/>
@@ -3998,8 +4664,9 @@ footer { margin-top: var(--gap); border-top: 1px solid var(--line); }
 `,
         pages: [
             { path: 'index.html', title: null, blocks: ['showreel', 'figures', 'values', 'network', 'hubs', 'activity', 'events', 'faq', 'wall', 'cta'] },
+            { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#f6f7fd"/>
 <ellipse cx="80" cy="-8" rx="96" ry="44" fill="#dfe4fb"/>
@@ -4411,7 +5078,11 @@ ${tpl.pages.map(p => `- \`${p.path}\` — ${p.title || 'the homepage'}`).join('\
 - \`theme.css\` — colours and type. The theme controls in the Website tab rewrite this.
 - \`style.css\` — the layout and personality of this design.
 - \`site.js\` — the menu, the arrivals, the lightbox, the showreel's film, the
-  Instagram wall, and removing a section with nothing in it.
+  route table's search and pages, the Instagram wall, and removing a section
+  with nothing in it.
+- \`map.js\` — the route map. Only a page with a map section on it loads this
+  one; it is mostly a projected coastline and is not worth its weight anywhere
+  else. There is no map service behind it and no key in it.
 
 Add a page in the editor. \`index.html\` is what a visitor gets at \`/\`, and a
 folder's \`index.html\` is what they get at that folder.
@@ -4430,7 +5101,9 @@ anything marked up with \`data-crew-*\`:
 - \`data-crew-limit\` caps the rows. \`data-crew-written="on"\` narrows
   \`notices\` to what a person actually typed.
 - \`<img data-crew-brand="logo">\` — your identity. \`logo\`, \`banner\`,
-  \`name\`, \`tagline\`, \`code\`. On an image it fills the \`src\`; on
+  \`name\`, \`tagline\`, \`code\`, and where you fly from: \`flag\`,
+  \`countryName\`, \`country\`, or \`origin\` for the flag and the country as
+  one line (the footer uses that one). On an image it fills the \`src\`; on
   anything else it fills the text. **A field you have not set removes the
   element** rather than leaving a broken image, so wrap one in
   \`data-crew-figure\` when the frame around it should go too.
@@ -4444,11 +5117,46 @@ to keep in step by hand.
 
 The lists that read from your crew centre: \`routes\`, \`events\`,
 \`schedule\`, \`notices\`, \`activity\`, \`posts\`, \`ranks\`,
-\`fleet\`, \`roles\`, \`hubs\`, \`partners\`.
+\`fleet\`, \`roles\`, \`staff\`, \`roster\`, \`hubs\`, \`partners\`.
+
+\`roles\` is your airline's departments and \`staff\` is the PEOPLE in them —
+name, rank, Community profile, and the short word the role carries. Somebody
+appears in \`staff\` because you gave them one of your roles in the roster
+editor, never because they are on the roster. The order of your roles decides
+the order of the cards, and whoever holds the first one is featured.
 
 \`hubs\` and \`partners\` are worked out from your route map rather than typed
 anywhere — the airports you fly most out of, and the airlines you codeshare
 with. Publish a sector and they follow.
+
+### Your crew, on the page
+
+The **crew** section lists your pilots with their rank and their hours, with the
+same search box and pages as the route table. Nothing is typed into it: it is
+your roster, so somebody joining appears on your website the moment staff add
+them.
+
+A pilot marked **inactive** is left off it — a website that lists pilots who
+have left is overstating the airline. Somebody on leave stays, and is said to
+be. What goes out is what your crew centre's own roster screen already shows a
+signed-out visitor: a name, a callsign, a rank and hours, and nothing else.
+
+### Your network, on a map and in a table
+
+\`network.html\` carries both, and neither has anything to fill in.
+
+The **route map** (\`class="netmap"\`) draws every sector you publish as a real
+great circle between the two airports' reference points, on Natural Earth's
+coastlines, cropped to what you actually fly. It writes its own
+\`<script src="map.js" defer>\`; keep that line if you move the section.
+
+The **route table** (\`class="routes"\`) lists every sector with a search box and
+pages. Set \`data-crew-page\` to change how many rows a page holds. Both the
+search and the pager are \`site.js\`'s; with JavaScript off the table is still a
+table of every sector you publish.
+
+A sector we have no coordinates for is left OFF the map and said under it,
+rather than quietly drawn as a smaller network than the table lists.
 
 ### Your aircraft at the top of the page, and a short film over it
 
@@ -4635,6 +5343,10 @@ function renderTemplate(templateId, va, { feedSrc, crewBase, theme } = {}) {
     files.push({ path: 'theme.css', content: renderThemeCss(th) });
     files.push({ path: 'style.css', content: `${BASE_CSS}\n/* ---- ${tpl.name} ---------------------------------------------------- */\n${tpl.css}` });
     files.push({ path: 'site.js', content: SITE_JS });
+    // The map's script, written whether or not this design has a map section:
+    // a VA who adds one by hand, or in the builder, must not have to know that
+    // a file is missing. Only the pages carrying a map ever request it.
+    files.push({ path: 'map.js', content: MAP_JS });
     files.push({ path: 'README.md', content: readme(tpl, ctx) });
 
     return files.map(f => ({
@@ -4706,7 +5418,7 @@ module.exports = {
     // the base stylesheet every design is layered on, and the script that hangs
     // the Instagram wall. Exported so vaSiteBuilder.js emits the same style.css
     // and site.js rather than a second copy that drifts.
-    BASE_CSS, SITE_JS,
+    BASE_CSS, SITE_JS, MAP_JS,
     // And the two pieces of every page that are not a block: the <head> tags
     // below the title, and the skip link above the header. Exported for the
     // same reason — vaSiteBuilder.js writes pages too, and a builder page whose

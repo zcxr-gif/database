@@ -459,6 +459,102 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
   </section>`,
     },
 
+    /* THE NETWORK, DRAWN.
+     *
+     * Twenty sectors listed one under another is a table of airports, not a
+     * network. This is the airline's own route map: real great circles between
+     * the aerodrome reference points the crew centre already holds, on Natural
+     * Earth's coastlines, cropped to what the airline actually flies. Nothing
+     * is typed into it — publish a sector and it appears.
+     *
+     * The section writes its own script tag, because map.js is mostly a
+     * coastline and is worth its weight only on a page that draws one.
+     */
+    routemap: {
+        label: 'Route map',
+        note: 'Your network, drawn as great circles. From the crew centre.',
+        icon: 'map',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+        ],
+        defaults: () => ({
+            heading: 'Where we fly',
+            note: 'Every sector we publish, as a great circle. Drag the map sideways to follow it.',
+        }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="netmap" data-crew-map>
+      <div class="netmap__scroll"><svg class="netmap__svg" aria-hidden="true"></svg></div>
+    </div>
+    <p class="netmap__note" data-crew-map-note></p>
+    <script src="map.js" defer></script>
+  </section>`,
+    },
+
+    /* EVERY SECTOR, AS A TABLE A VISITOR CAN SEARCH.
+     *
+     * `network` above is the homepage answer: a dozen rows and a heading. This
+     * is the network PAGE — every sector the crew centre publishes, with a
+     * search box over it and a pager under it, because an airline with two
+     * hundred sectors has a visitor with a question rather than a visitor with
+     * an afternoon. Both the search and the pager are site.js's; the rows are
+     * the feed's, so the table is a table of every sector with JavaScript off.
+     */
+    routetable: {
+        label: 'Route table',
+        note: 'Every sector you publish, with a search box and pages. From the crew centre.',
+        icon: 'table',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'perPage', label: 'Rows per page', type: 'number', min: 5, max: 50,
+                help: 'How many sectors a visitor sees before the pager.',
+            },
+        ],
+        defaults: () => ({
+            heading: 'Every route we fly',
+            note: 'Search by airport, flight number or aircraft.',
+            perPage: 12,
+        }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="routes" data-crew-table="routes" data-crew-page="${p.perPage}">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search these routes</span>
+          <input type="search" autocomplete="off" placeholder="Search an airport, a flight number, an aircraft" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Flight</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Aircraft</th><th scope="col" class="routes__num">Distance</th></tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="5">Your sectors appear here as soon as they are in the crew centre&rsquo;s route editor.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of routes" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
+  </section>`,
+    },
+
     fleet: {
         label: 'Fleet',
         note: 'The aircraft and liveries you declared in the crew centre.',
@@ -486,7 +582,13 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
     <ul class="cards" data-crew-list="fleet" data-crew-limit="${p.limit}">
       <template>
         <li class="card">
-          <span class="card__media"><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async"></span>
+          <span class="card__media">
+            <!-- The well's ground: the same picture, blurred past recognition.
+                 aria-hidden and alt="" because it is the same aeroplane as the
+                 one below it, said twice. -->
+            <img class="card__media-bg" src="{{image}}" alt="" aria-hidden="true" loading="lazy" decoding="async">
+            <img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async">
+          </span>
           <span class="card__body">
             <b>{{aircraft}}</b>
             <span>{{livery}}</span>
@@ -578,22 +680,98 @@ ${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>$
   </section>`,
     },
 
-    /* Roles, never names. A staff list on a public page goes out of date the
-     * week somebody steps down, and it puts real people's handles somewhere
-     * anybody can scrape. The departments are the useful half and the half that
-     * stays true. */
+    /* THE CREW — the pilots, not the staff.
+     *
+     * "62 pilots" as a statistic is a number; sixty-two names with their hours
+     * against them is an airline. Same table, search and pager as the route
+     * table, because a roster of two hundred is a list nobody reads to the end
+     * of and the question a visitor has at it is a search.
+     *
+     * A name, a callsign, a rank and hours — what the crew centre's own roster
+     * screen already shows a signed-out visitor, and no more. No Community
+     * handle: a line pilot has not opted into being findable the way somebody
+     * holding a public role has.
+     */
+    roster: {
+        label: 'The crew',
+        note: 'Your pilots with their rank and hours. Searchable and paged, from the crew centre.',
+        icon: 'users-round',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'hours', label: 'Show how many hours each pilot has flown', type: 'bool',
+                help: 'Off, the list is names, callsigns and ranks.',
+            },
+            { key: 'perPage', label: 'Rows per page', type: 'number', min: 5, max: 50 },
+        ],
+        defaults: () => ({
+            heading: 'The crew',
+            note: 'Everybody flying for us, and where they are on the ladder.',
+            hours: true,
+            perPage: 12,
+        }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="routes${p.hours ? '' : ' routes--nohours'}" data-crew-table="roster" data-crew-page="${p.perPage}">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search the crew</span>
+          <input type="search" autocomplete="off" placeholder="Search a name, a callsign, a rank" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Pilot</th><th scope="col">Callsign</th><th scope="col">Rank</th>${p.hours ? '<th scope="col" class="routes__num">Hours</th>' : ''}</tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="${p.hours ? 4 : 3}">Your pilots appear here as soon as they are on the crew centre&rsquo;s roster.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of pilots" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
+  </section>`,
+    },
+
+    /* THE PEOPLE, not the departments.
+     *
+     * Nothing here is typed: it is the airline's own roster, filtered to
+     * whoever staff gave one of the airline's roles to, so it cannot go stale
+     * the way a hand-written staff list does. Each card carries the name, the
+     * rank they fly at, the Community profile to find them on, and the short
+     * word the ROLE carries — the chief executive's welcome, held on the chair
+     * rather than on the person sitting in it so a handover keeps it.
+     *
+     * `departments` turns the whole thing back into the old row of role
+     * labels, with no names on it, for an airline that would rather not put
+     * its people on a public page. */
     staff: {
         label: 'Who runs it',
-        note: 'Your crew centre roles, as a row of labels. Roles only — never who holds one.',
+        note: 'Your staff, from the crew centre: name, rank, Community profile and the role\u2019s own message.',
         icon: 'users',
         live: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
             { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'departments', label: 'Show departments instead of people', type: 'bool',
+                help: 'Off, each staff member gets a card. On, it is a row of role labels with nobody named — what this section used to be.',
+            },
             { key: 'limit', label: 'How many', type: 'number', min: 1, max: 20 },
         ],
-        defaults: () => ({ heading: 'Who runs the airline', note: 'The teams behind the operation.', limit: 14 }),
-        render: (p) => `
+        defaults: () => ({ heading: 'Who runs the airline', note: 'The people behind the operation, and where to find them.', limit: 12, departments: false }),
+        render: (p) => (p.departments ? `
   <section class="block" data-crew-section>
     <div class="block__head">
       <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
@@ -601,7 +779,27 @@ ${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>$
     <ul class="pills" data-crew-list="roles" data-crew-limit="${p.limit}">
       <template><li class="pill"><span class="dot" style="background:{{color}}"></span>{{name}}</li></template>
     </ul>
-  </section>`,
+  </section>` : `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="crew" data-crew-list="staff" data-crew-limit="${p.limit}">
+      <template>
+        <li class="person {{leadClass}}">
+          <span class="person__mark" aria-hidden="true">{{initials}}</span>
+          <span class="person__body">
+            <b class="person__name">{{name}}</b>
+            <span class="person__role" style="--role: {{roleColor}}">{{role}}</span>
+            <span class="person__rank">{{rank}}</span>
+            <a class="person__ifc" href="{{ifcUrl}}" rel="noopener" target="_blank">{{ifc}}</a>
+            <span class="person__word">{{message}}</span>
+          </span>
+        </li>
+      </template>
+      <li class="person"><span class="person__body"><b class="person__name">Give your staff a role</b><span class="person__word">Anybody on your roster with one of your airline&rsquo;s roles appears here, with their rank and their Community profile.</span></span></li>
+    </ul>
+  </section>`),
     },
 
     partners: {
@@ -1284,24 +1482,45 @@ ${links.join('\n')}${apply}
 <button class="bar__scrim" type="button" tabindex="-1" aria-label="Close the menu" hidden></button>`;
 }
 
+/* THE FOOTER — the same one vaSiteTemplates.js writes, down to the class names.
+ *
+ * See BLOCKS.footer there for why it is shaped this way. The only difference is
+ * where the small print comes from: a builder site's is a field the VA typed,
+ * and a template site's is the sentence the template ships with.
+ *
+ * Everything optional is wrapped in [data-crew-figure] so crew-feed.js takes
+ * the holder out for an airline that has not set the field — no broken logo,
+ * and no flag line for an airline that has not said where it flies from. */
 function footerHtml(doc, ctx) {
     const note = doc.footer.note
-        || `${ctx.name} is a virtual airline on Infinite Flight. Not affiliated with any real-world carrier.`;
+        || `${ctx.name} is a virtual airline operating inside the flight simulator Infinite Flight. It is not affiliated with, endorsed by, or connected to any real-world airline, and no real tickets, flights or services are sold.`;
     const links = doc.pages.filter(p => p.nav).map((p) => {
         const label = p.navLabel || p.title || (p.path === 'index.html' ? 'Home' : p.path.replace(/\.html$/, ''));
-        return `      <a href="${p.path === 'index.html' ? './' : esc(p.path)}">${esc(label)}</a>`;
+        return `        <a href="${p.path === 'index.html' ? './' : esc(p.path)}">${esc(label)}</a>`;
     });
-    links.push(`      <a href="${esc(ctx.crew)}">Crew centre</a>`);
-    links.push(`      <a href="${esc(ctx.join)}">Apply</a>`);
     return `<footer>
   <div class="foot__in">
-    <div>
-      <p>${esc(note)}</p>
-      <p>Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a>.</p>
+    <div class="foot__brand">
+      <span class="foot__logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
+      <p class="foot__blurb"><span data-crew-brand="tagline">${esc(ctx.name)} flies on Infinite Flight.</span></p>
+      <p class="foot__origin" data-crew-figure hidden><span data-crew-brand="origin"></span></p>
     </div>
-    <div class="foot__links">
+    <nav class="foot__cols" aria-label="More of this site">
+      <div class="foot__col">
+        <h2>The airline</h2>
 ${links.join('\n')}
-    </div>
+      </div>
+      <div class="foot__col">
+        <h2>Pilots</h2>
+        <a href="${esc(ctx.join)}">Apply to fly</a>
+        <a href="${esc(ctx.crew)}">Crew centre</a>
+        <span data-crew-figure hidden><a data-crew-brand="discord" href="#">Discord</a></span>
+      </div>
+    </nav>
+  </div>
+  <div class="foot__base">
+    <p class="foot__legal">${esc(note)}</p>
+    <p class="foot__copy">&copy; <span data-year>${new Date().getFullYear()}</span> ${esc(ctx.name)} &middot; Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a></p>
   </div>
 </footer>`;
 }
@@ -1376,6 +1595,11 @@ function renderSite(doc, { va, templateId, theme, feedSrc, crewBase } = {}) {
         content: `${templates.BASE_CSS}\n/* ---- ${tpl.name} ---------------------------------------------------- */\n${tpl.css}${BUILDER_CSS}`,
     });
     files.push({ path: 'site.js', content: templates.SITE_JS });
+    // And the map's script. Written on every site rather than only on the ones
+    // whose pages have a map today, because adding the section later must not
+    // also mean noticing that a file is missing. Only a page carrying a map
+    // ever asks for it — the section writes its own script tag.
+    files.push({ path: 'map.js', content: templates.MAP_JS });
 
     return files.map(f => ({
         path: f.path,
