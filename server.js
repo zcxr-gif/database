@@ -95,6 +95,7 @@ const crewInvite = require('./crewInvite');
 // Roster and route network in and out as CSV — the same columns both ways, so a
 // VA can take their data to a spreadsheet and bring it back. See crewCsv.js.
 const crewCsv = require('./crewCsv');
+const routeLibrary = require('./routeLibrary');
 
 // The VA's rank ladder. Rank is DERIVED from hours rather than stored, and it
 // is derived here so the server, the dashboard and the pilot view cannot
@@ -4899,6 +4900,202 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
             onDone: (summary) => postRouteImportNotice(va, summary, gate.p),
         });
     } catch (err) { crewFail(res, err, { log: 'routes import error', message: 'Could not import the routes.' }); }
+});
+
+/* ---------------------------------------------------------------------------
+ * Filling a network from the real world.
+ *
+ * The problem this solves is the empty Routes screen. A VA arrives modelled on
+ * a real airline and has to type its network in by hand; most stop at twenty
+ * legs, and twenty legs is not a network anyone keeps flying. So: pick the
+ * airline, look at what it flies, tick what you want.
+ *
+ * NOTHING HERE IS TREATED AS TRUE.
+ * The bulk source is a 2014 snapshot (see routeLibrary.js). It lists routes that
+ * have since died, misses every route opened since, and frequently names an
+ * aeroplane the airline no longer flies the leg on. That is not a defect to be
+ * apologised for in a comment — it is the reason the flow is built the way it
+ * is:
+ *
+ *   - Nothing is written without a preview. The dry run reports exactly what
+ *     would change, the same planner the CSV path uses, and the VA confirms it.
+ *   - Imported legs land as DRAFTS unless the VA explicitly says otherwise, so
+ *     a public network never gains a route nobody looked at.
+ *   - The rows are re-validated here rather than trusted. They travelled through
+ *     a browser, which is reason enough, but also a VA is MEANT to edit them in
+ *     the confirm table — a row arriving different from what we offered is the
+ *     feature working, not an attack.
+ *   - Every response carries its attribution and its age, and the dashboard
+ *     prints both.
+ * ------------------------------------------------------------------------- */
+
+// The airline picker. Public reference data, exactly like aircraft-metadata
+// above: it is a list of real airlines and their route counts, it is the same
+// for everybody, and requiring a session to search it would mean the picker
+// could not render until the crew center had booted.
+app.get('/api/crew/route-library/airlines', (req, res) => {
+    try {
+        const out = routeLibrary.airlines(String(req.query.q || '').slice(0, 60), 40);
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.json({ ok: true, ...out });
+    } catch (err) {
+        console.error('route library search error:', err?.message || err);
+        res.status(503).json({ ok: false, error: 'The route library is unavailable.', airlines: [] });
+    }
+});
+
+// One airline's network, annotated against THIS VA's fleet so the confirm table
+// can show what each leg would add. Gated on routes.manage: the annotation reads
+// the VA's fleet, and this is a staff tool rather than something a pilot browses.
+app.get('/api/crew/:slug/route-library/airline/:key', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va } = await resolveCrewStore(req.params.slug);
+        const found = routeLibrary.airline(req.params.key, { fleet: va.crewFleet || [] });
+        if (!found) return res.status(404).json({ error: 'No airline in the library with that code.' });
+        res.json(found);
+    } catch (err) { crewFail(res, err, { log: 'route library airline error', message: 'Could not load that airline.' }); }
+});
+
+// The live half — one flight number, current. Answers where a real callsign
+// flies today, which is the question the 2014 snapshot cannot answer at all.
+// It does NOT answer what aircraft flies it; the reply says so rather than
+// guessing, and the dashboard asks the VA to pick from their own fleet.
+app.get('/api/crew/:slug/route-library/callsign/:callsign', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        // AIRPORT_COORDS is initialized further down this file and read at
+        // request time, the same way the route map above reads it.
+        const hit = await routeLibrary.lookupCallsign(req.params.callsign, { coords: AIRPORT_COORDS });
+        if (!hit) {
+            return res.status(404).json({
+                error: 'No current route found for that flight number.',
+                // Said plainly, because the honest reason matters to someone
+                // deciding whether to retype it: the live lookup is a free
+                // third-party service and "not found" and "not answering" are
+                // the same answer from here.
+                hint: 'The live lookup only knows flight numbers that are actually filed. Check the spelling, or add the leg by hand.',
+            });
+        }
+        res.json({ ok: true, route: hit });
+    } catch (err) { crewFail(res, err, { log: 'route library callsign error', message: 'Could not look that flight number up.' }); }
+});
+
+// How many legs one import may carry. A real airline's whole network is well
+// under this; anything above it is a mistake, and the answer to a mistake is to
+// refuse it rather than to spend two minutes discovering it.
+const MAX_LIBRARY_IMPORT = 1000;
+
+app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const incoming = Array.isArray(req.body?.routes) ? req.body.routes : [];
+        if (!incoming.length) return res.status(400).json({ error: 'Pick at least one route to import.' });
+        if (incoming.length > MAX_LIBRARY_IMPORT) {
+            return res.status(400).json({ error: `That is more than ${MAX_LIBRARY_IMPORT} routes. Import it in parts.` });
+        }
+
+        const { va, store } = await resolveCrewStore(req.params.slug);
+
+        // Drafts unless asked otherwise. The whole point of the flow is that a
+        // human checks these before pilots see them, and a default that
+        // published them would quietly undo that.
+        const publish = req.body?.publish === true;
+
+        // Re-validated through the SAME cleaner the hand editor and the CSV path
+        // use, so a library route cannot reach the database in a shape a typed
+        // one could not.
+        const rows = incoming.map((r, i) => {
+            const values = cleanRoute({ ...r, active: publish });
+            return {
+                line: i + 1,
+                id: '',
+                values,
+                error: (!values.origin || !values.destination)
+                    ? 'this route is missing an airport'
+                    : (values.origin === values.destination ? 'this route starts and ends at the same airport' : null),
+            };
+        });
+
+        const existing = (await store.listRoutes() || []).map((r) => ({
+            id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+            aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+            kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
+        }));
+
+        // `present` names every field the library actually has an opinion about.
+        // Leaving minRank and partnerLogo out of it is deliberate: the library
+        // knows nothing about either, and a row that claimed to know would blank
+        // a rank gate the VA had set on a leg they are re-importing.
+        const plan = crewCsv.planRows(crewCsv.ROUTES_SPEC, rows, existing, {
+            present: new Set(['flightNumber', 'origin', 'destination', 'aircraft',
+                'distanceNm', 'notes', 'active', 'kind', 'partnerName']),
+        });
+        if (plan.error) return res.status(400).json({ error: plan.error });
+
+        /* PUBLISHED STAYS PUBLISHED.
+         *
+         * `active` is set on rows we CREATE — that is the draft default above,
+         * and it is the whole safety property of this flow. It must not be set
+         * on rows that already exist. A VA who imported a network in March,
+         * reviewed it, published it, and comes back in June to pick up a few
+         * more legs would otherwise have their entire live network silently
+         * returned to draft by an import they ran to ADD two routes.
+         *
+         * The preview would have shown it, which is exactly the excuse not to
+         * rely on: nobody reads four hundred diff rows. So the import simply has
+         * no opinion about the published state of a route that is already there.
+         * Publishing and un-publishing an existing leg is the routes editor's
+         * job, where it is one deliberate click on one route. */
+        let unchanged = plan.unchanged;
+        const updates = [];
+        for (const row of plan.update) {
+            const { active, ...rest } = row.values;
+            if (!Object.keys(rest).length) { unchanged++; continue; }
+            updates.push({ ...row, values: rest });
+        }
+        plan.update = updates;
+
+        const summary = {
+            kind: 'routes',
+            create: plan.create.length,
+            update: plan.update.length,
+            unchanged,
+            errors: plan.errors.slice(0, 50),
+            errorCount: plan.errors.length,
+            matchedOn: plan.matchedOn,
+            publish,
+            sample: {
+                create: plan.create.slice(0, 5).map((r) => r.values),
+                update: plan.update.slice(0, 5).map((r) => ({ id: r.id, before: r.before, values: r.values })),
+            },
+        };
+
+        // Same contract as the CSV import: dry by default, and a caller has to
+        // say `dryRun: false` on purpose to change anything.
+        if (req.body?.dryRun !== false) return res.json({ dryRun: true, ...summary });
+
+        let created = 0; let updated = 0;
+        const failures = [];
+        for (const row of plan.create) {
+            try { await store.createRoute(row.values); created++; } catch (err) {
+                failures.push({ line: row.line, message: err?.message || 'Could not add this route.' });
+            }
+        }
+        for (const row of plan.update) {
+            try { await store.updateRoute(row.id, cleanRoute({ ...row.before, ...row.values })); updated++; } catch (err) {
+                failures.push({ line: row.line, message: err?.message || 'Could not update this route.' });
+            }
+        }
+        // One notice for the whole import, like the CSV path — a VA pulling in
+        // four hundred legs must not post four hundred announcements.
+        try { postRouteImportNotice(va, { ...summary, created, updated }, gate.p); } catch { /* never fail an import over a notice */ }
+
+        res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures }));
+    } catch (err) { crewFail(res, err, { log: 'route library import error', message: 'Could not import those routes.' }); }
 });
 
 // ---- The noticeboard ----

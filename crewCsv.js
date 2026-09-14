@@ -236,6 +236,56 @@ function planImport(spec, csvText, existing) {
         return { error: `That file has more than ${MAX_ROWS} rows. Split it and import in parts.` };
     }
 
+    // Coerce each file row into our own field names, then hand the result to the
+    // shared planner. Everything past this point is identical whether the rows
+    // came out of a spreadsheet or out of the route library, which is the point
+    // of the split: there is one implementation of "what would this change".
+    const rows = (parsed.data || []).map((raw, i) => {
+        const values = {};
+        let error = null;
+        for (const col of spec.columns) {
+            if (col.readOnly) continue;
+            if (!headers.has(col.key)) continue;
+            const got = coerce(col, raw[headers.get(col.key)]);
+            if (got.error) { error = got.error; break; }
+            values[col.key] = got.value;
+        }
+        return {
+            line: i + 2,   // +1 for zero-index, +1 for the header row
+            id: headers.has('id') ? trim(raw[headers.get('id')], 64) : '',
+            values,
+            error,
+        };
+    });
+
+    return planRows(spec, rows, existing, {
+        present: new Set(headers.keys()),
+        columns: [...headers.keys()],
+    });
+}
+
+/**
+ * The half of an import that does not care where the rows came from.
+ *
+ * Takes rows that have ALREADY been coerced into our field names and decides,
+ * against what the VA currently has, which are new, which change something, and
+ * which change nothing — the same answer for a spreadsheet upload and for a
+ * selection ticked out of the real-world route library.
+ *
+ * @param rows    [{ line, id, values, error }]
+ * @param present the set of field keys these rows carry an opinion about. A key
+ *                that is absent is not "blank", it is "unmentioned", and the
+ *                distinction is what stops a six-column file blanking the other
+ *                three (see the required-field rule below).
+ */
+function planRows(spec, rows, existing, { present, columns } = {}) {
+    const headers = present || new Set(
+        rows.flatMap((r) => Object.keys(r.values || {})),
+    );
+    if (rows.length > MAX_ROWS) {
+        return { error: `That is more than ${MAX_ROWS} rows. Split it and import in parts.` };
+    }
+
     // Index what is already there, by id and by each fallback rule.
     const byId = new Map();
     const byRule = new Map(spec.matchOn.map((r) => [r, new Map()]));
@@ -255,31 +305,22 @@ function planImport(spec, csvText, existing) {
     const errors = [];
     let unchanged = 0;
     let matchedOn = 'id';
-    // Rows created earlier in this same file, so a file that lists the same
+    // Rows created earlier in this same batch, so a batch that lists the same
     // pilot twice updates them rather than inserting a second copy.
     const staged = new Map(spec.matchOn.map((r) => [r, new Map()]));
 
-    (parsed.data || []).forEach((raw, i) => {
-        const line = i + 2;   // +1 for zero-index, +1 for the header row
-        const values = {};
-        let bad = null;
-        for (const col of spec.columns) {
-            if (col.readOnly) continue;
-            if (!headers.has(col.key)) continue;
-            const got = coerce(col, raw[headers.get(col.key)]);
-            if (got.error) { bad = got.error; break; }
-            values[col.key] = got.value;
-        }
-        if (bad) { errors.push({ line, message: bad }); return; }
+    rows.forEach((row) => {
+        const { line, values } = row;
+        if (row.error) { errors.push({ line, message: row.error }); return; }
 
-        // Find it: by id if the file carried one, else by each rule in turn.
-        const id = headers.has('id') ? trim(raw[headers.get('id')], 64) : '';
+        // Find it: by id if the row carried one, else by each rule in turn.
+        const id = String(row.id || '');
         let target = id ? byId.get(id) : null;
         if (id && !target) {
             errors.push({ line, message: `No pilot or route here with id ${id}. Clear the id column to add it as new.` });
             return;
         }
-        // A row this same file already asked us to create. It has no id yet —
+        // A row this same batch already asked us to create. It has no id yet —
         // it does not exist — so it cannot be an update; fold the later line's
         // values into the pending create instead. Emitting an update against an
         // empty id was the old behaviour, and it failed at commit time and
@@ -351,12 +392,13 @@ function planImport(spec, csvText, existing) {
 
     return {
         create, update, unchanged, errors, matchedOn,
-        columns: [...headers.keys()],
+        columns: columns || [...headers],
         missing: spec.columns.filter((c) => !c.readOnly && !headers.has(c.key)).map((c) => c.header),
     };
 }
 
 module.exports = {
+    planRows,
     ROSTER_SPEC,
     ROUTES_SPEC,
     toCsv,
