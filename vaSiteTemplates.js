@@ -5247,6 +5247,21 @@ anything marked up with \`data-crew-*\`:
   element** rather than leaving a broken image, so wrap one in
   \`data-crew-figure\` when the frame around it should go too.
 
+## The tab
+
+Your logo also becomes the little icon the browser puts on the tab, instead of
+the grey globe it draws for a page that has none. There is nothing to add: it
+is painted from the same record as the header. An airline that has not uploaded
+a logo gets its initials on its accent rather than the globe.
+
+If you would rather choose the icon yourself, write your own into any page's
+\`<head>\`:
+
+    <link rel="icon" href="favicon.png">
+
+An icon you declared is always left alone — yours wins, on every page that
+carries it.
+
 ## What is already yours, without typing it again
 
 Your **logo** and **banner** are the ones on your Inflight VA profile. Your
