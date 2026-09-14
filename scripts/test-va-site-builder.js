@@ -111,6 +111,35 @@ const server = app.listen(0, async () => {
         read.json && read.json.url);
     check('a fresh site is in design mode', read.json && read.json.mode === 'design');
 
+    /* The other half of the editor's first screen: a VA who would rather put
+       their own sections on an empty page than edit a written one. Same design,
+       same colours — no words. */
+    console.log('“let me build my own”');
+    const blank = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'concourse', blank: true } });
+    check('a blank start is laid out', blank.status === 200, blank.json);
+    check('one page, and nothing on it',
+        blank.json && blank.json.builder.pages.length === 1 && blank.json.builder.pages[0].blocks.length === 0,
+        blank.json && blank.json.builder && blank.json.builder.pages.map(p => p.path + ':' + p.blocks.length));
+    check('it still renders a homepage to preview',
+        blank.json && blank.json.draft.files.some(f => f.path === 'index.html'));
+    check('and it still wears the design that was picked', blank.json && blank.json.template === 'concourse');
+
+    const own = blank.json.builder;
+    own.pages[0].blocks.push({ type: 'text', props: { heading: 'Mine', body: 'My words.' } });
+    const mine = await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc: own } });
+    check('a section added to the empty page sticks',
+        mine.status === 200 && mine.json.builder.pages[0].blocks.length === 1, mine.json);
+    /* `blank` is only ever an answer to "how should this site START". A VA
+       trying designs on a site they have written must never lose it. */
+    const keepWords = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'livery', blank: true } });
+    check('blank never empties a site that already has words in it',
+        keepWords.status === 200
+            && keepWords.json.draft.files.find(f => f.path === 'index.html').content.includes('My words.'),
+        keepWords.json && keepWords.json.error);
+
+    // A fresh, untouched site again for everything below.
+    SITE = fakeSite();
+
     console.log('picking a design');
     const design = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'concourse' } });
     check('design applied', design.status === 200, design.json);

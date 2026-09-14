@@ -1440,9 +1440,24 @@ function registerVaSiteRoutes(app, {
                 templateId,
             );
 
-            const doc = site.builder && Array.isArray(site.builder.pages) && site.builder.pages.length
+            /* A SITE WITH NOTHING ON IT YET GETS TO SAY WHICH IT WANTS.
+             *
+             * `blank:true` is the "let me build my own" half of the editor's
+             * first screen: the design's colours, type and shapes, and one empty
+             * homepage to put your own sections on. Without it a first design
+             * brings its own written pages, which is the other half and the
+             * default.
+             *
+             * It is only ever read here, where there is no document. A VA
+             * changing design later keeps every word they have written — an
+             * emptied site would be an unrecoverable answer to "what does this
+             * one look like?" */
+            const hasDoc = site.builder && Array.isArray(site.builder.pages) && site.builder.pages.length;
+            const doc = hasDoc
                 ? builder.normaliseDoc(site.builder, builder.contextFor(r.va, { crewBase: CREW_BASE }))
-                : builder.starterDoc(templateId, r.va, { crewBase: CREW_BASE });
+                : body.blank === true
+                    ? builder.blankDoc(r.va, { crewBase: CREW_BASE })
+                    : builder.starterDoc(templateId, r.va, { crewBase: CREW_BASE });
 
             const applied = applyBuilder(site, r.va, doc);
             if (applied.error) return res.status(applied.error).json({ error: applied.message });
