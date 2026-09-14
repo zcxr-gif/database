@@ -71,12 +71,28 @@ console.log('\n what it refuses to guess');
     T('…and by IATA', routeLibrary.airline('BA').airline.name, 'British Airways');
     T('…and an unknown code is null, not an empty network', routeLibrary.airline('ZZZZ'), null);
 
-    const cs = ba.routes.filter((r) => r.kind === 'codeshare');
-    T('codeshares are marked', cs.length > 0, true);
-    // The source records THAT a leg is a codeshare, never who flies it. An
-    // invented partner name is the one field a VA would trust blindly.
-    T('…and none of them names an operator we do not know',
-        cs.every((r) => r.partnerName === ''), true);
+    // A REAL-WORLD CODESHARE IS NOT THIS PLATFORM'S CODESHARE.
+    // `kind: 'codeshare'` here means a named partner VA flies the leg for us.
+    // The source means "a real airline sold a seat on someone else's aeroplane
+    // in 2014" and does not say whose. Importing one as the other invents a
+    // partnership, and — the operator being unknown — lands every leg with an
+    // empty partnerName, which is precisely what the routes screen refuses when
+    // it is typed by hand and what codesharePartners folds into one tile reading
+    // "Partner airline".
+    const cs = ba.routes.filter((r) => r.realCodeshare);
+    T('legs the airline sold but did not fly are flagged', cs.length > 0, true);
+    T('…but nothing is imported as a codeshare on its own',
+        ba.routes.every((r) => r.kind === 'own'), true);
+    T('…and no partner name is ever invented',
+        ba.routes.every((r) => r.partnerName === ''), true);
+    // Iberia is the case that made this obvious: 79% of its listed network.
+    {
+        const ibe = routeLibrary.airline('IBE');
+        const n = ibe.routes.filter((r) => r.realCodeshare).length;
+        T('the worst case is flagged rather than imported blind', n > 500, true);
+        T('…with none of it landing as an unnamed codeshare',
+            ibe.routes.every((r) => !(r.kind === 'codeshare' && !r.partnerName)), true);
+    }
 
     // A flight number is not in the source. Inventing "BA001" would be putting
     // a confident fabrication in the field pilots read first.
@@ -168,6 +184,19 @@ console.log('\n importing it');
     T('a genuine change still updates', still ? still.values.aircraft : null, 'Boeing 787-9 Dreamliner');
     T('…without carrying the published state with it',
         still ? Object.prototype.hasOwnProperty.call(still.values, 'active') : true, false);
+}
+
+console.log('\n the codeshare rule');
+{
+    // The guard the endpoint applies before planning: the same rule the routes
+    // screen enforces on a hand-typed leg.
+    const guard = (v) => (v.kind === 'codeshare' && !v.partnerName)
+        ? 'a codeshare needs the partner airline named — or import it as your own metal' : null;
+    T('a codeshare with no partner is refused',
+        guard({ kind: 'codeshare', partnerName: '' }),
+        'a codeshare needs the partner airline named — or import it as your own metal');
+    T('…and one with a partner is fine', guard({ kind: 'codeshare', partnerName: 'Iberia Virtual' }), null);
+    T('…while own metal never needs one', guard({ kind: 'own', partnerName: '' }), null);
 }
 
 console.log('\n rows it will not accept');

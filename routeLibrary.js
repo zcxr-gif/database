@@ -134,14 +134,38 @@ function airline(key, { fleet = [] } = {}) {
             distanceNm: r.nm,
             aircraft: r.ac[0] || '',
             aircraftOptions: r.ac,
-            kind: r.cs ? 'codeshare' : 'own',
-            // Left EMPTY on a codeshare, on purpose. The source records THAT a
-            // leg is a codeshare but not who operates it, and `partnerName` means
-            // the operating partner — filling it with the marketing airline's own
-            // name would put a confident wrong answer in the one field the whole
-            // codeshare split exists to carry. The confirm table flags these so
-            // the VA names the partner, or flips the row to own metal.
+            /* ALWAYS 'own'. A REAL-WORLD CODESHARE IS NOT THIS PLATFORM'S.
+             *
+             * `crew_routes.kind = 'codeshare'` means "another VIRTUAL airline on
+             * this platform flies this leg for us" — a relationship the VA has
+             * actually agreed with somebody, whose name goes on a partner tile
+             * and a public website. The source's codeshare flag means something
+             * else entirely: a real airline sold a seat on another real airline's
+             * aeroplane, in 2014, and the source does not record which one.
+             *
+             * Importing one as the other invents a partnership with an airline
+             * that is not on the platform at all, and — because the operator is
+             * unknown — every such leg lands with an empty partnerName. The
+             * routes screen refuses that combination when it is typed by hand
+             * ("Name the partner airline for a codeshare"), and codesharePartners
+             * in server.js folds every unnamed one into a single tile reading
+             * "Partner airline". Importing Iberia this way produced 632 legs in
+             * one meaningless tile.
+             *
+             * We do not guess, either: asking which other airline flies the pair
+             * on its own metal yields exactly one candidate 36% of the time, and
+             * a 64%-wrong airline name on a public partner tile is worse than no
+             * tile at all.
+             *
+             * So every imported leg is the VA's own metal, and `realCodeshare`
+             * below is CONTEXT rather than a decision — the confirm step tells
+             * the VA which legs the real airline did not fly itself and lets
+             * them name a partner, take them as their own, or leave them out. */
+            kind: 'own',
             partnerName: '',
+            // Informational only, never persisted: "the real airline sold this
+            // leg but did not operate it".
+            realCodeshare: !!r.cs,
             flightNumber: '',
             notes: '',
             // Not persisted — the confirm table reads them.

@@ -5016,7 +5016,19 @@ app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
                 values,
                 error: (!values.origin || !values.destination)
                     ? 'this route is missing an airport'
-                    : (values.origin === values.destination ? 'this route starts and ends at the same airport' : null),
+                    : (values.origin === values.destination ? 'this route starts and ends at the same airport'
+                        // The same rule the routes screen enforces when a leg is
+                        // typed by hand. A codeshare's whole purpose is to say
+                        // WHOSE aeroplane it is, so one without a partner is not
+                        // a codeshare, it is a route with a broken label —
+                        // codesharePartners folds every unnamed one into a single
+                        // tile reading "Partner airline", and a VA importing a
+                        // network of them gets one meaningless tile instead of a
+                        // partner list. Refused here rather than in the browser
+                        // so no caller can produce the state the editor forbids.
+                        : (values.kind === 'codeshare' && !values.partnerName
+                            ? 'a codeshare needs the partner airline named — or import it as your own metal'
+                            : null)),
             };
         });
 
