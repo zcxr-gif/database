@@ -702,6 +702,56 @@ ${navLinks(c)}
     </ul>
   </section>`,
 
+    /* THE CREW.
+     *
+     * Not the staff — the pilots. An applicant reading a VA's website wants to
+     * know how many people are actually there and what the ladder looks like
+     * once somebody is on it, and "62 pilots" as a statistic is a number while
+     * sixty-two names with their hours against them is an airline.
+     *
+     * Same table, search and pager as the route table, for the same reason: a
+     * roster of two hundred is a list nobody reads to the end of, and the
+     * question a visitor has at it — "is there anybody flying at my rank" — is
+     * a search.
+     *
+     * What is on it is what the crew centre's own roster screen already shows a
+     * signed-out visitor: a name, a callsign, a rank and hours. Not a Community
+     * handle — a line pilot has not opted into being findable, which is the
+     * deliberate difference between this and the staff section below. A pilot
+     * marked inactive is off it entirely.
+     */
+    roster: (c) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>The crew</h2>
+      <p>Everybody flying for us, and where they are on the ladder.</p>
+    </div>
+    <div class="routes" data-crew-table="roster" data-crew-page="12">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search the crew</span>
+          <input type="search" autocomplete="off" placeholder="Search a name, a callsign, a rank" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Pilot</th><th scope="col">Callsign</th><th scope="col">Rank</th><th scope="col" class="routes__num">Hours</th></tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="4">Your pilots appear here as soon as they are on the crew centre&rsquo;s roster.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of pilots" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
+  </section>`,
+
     /* THE PEOPLE WHO RUN IT.
      *
      * This used to be a row of DEPARTMENT LABELS with no names on it, on the
@@ -1071,6 +1121,7 @@ const INSERTABLE = [
     { id: 'about', label: 'About', note: 'Two paragraphs about the airline.' },
     { id: 'values', label: 'How we fly', note: 'The three or four things that make your airline itself.' },
     { id: 'staff', label: 'Who runs it', note: 'Your staff: name, rank, Community profile and the role\u2019s own message.' },
+    { id: 'roster', label: 'The crew', note: 'Your pilots with their rank and hours, searchable and paged.' },
     { id: 'partners', label: 'Codeshares', note: 'The airlines you share sectors with, from your route map.' },
     { id: 'ranks', label: 'Ranks', note: 'Your rank ladder, from the crew centre.' },
     { id: 'joining', label: 'What happens when you apply', note: 'Four numbered steps. The question every applicant has.' },
@@ -3177,7 +3228,63 @@ const SITE_JS = `/* Your site's own script.
     });
   }
 
-  function mountTable(host, rows) {
+  /* WHAT EACH KIND OF TABLE IS MADE OF.
+
+     Two tables on this platform and they differ in three things: where the
+     rows come from, what a row looks like, and what a visitor is likely to
+     type at it. Everything else — the search, the pager, the counting, the
+     empty state, keeping the reader at the top of a new page — is the same
+     job, so it is written once and these three are the difference.
+
+     The HEADINGS are not here. They are in the page's own markup, because a
+     VA who opens style.css and renames a column should get a renamed column
+     rather than a table whose headings and cells disagree. */
+  var TABLES = {
+    routes: {
+      read: function () { return CrewFeed.routes(); },
+      // Where they leave from, then where they go. A timetable in the order
+      // rows happened to be typed into an editor is not a timetable.
+      sort: function (a, b) {
+        return (a.from || '').localeCompare(b.from || '')
+            || (a.to || '').localeCompare(b.to || '');
+      },
+      find: function (r) { return [r.from, r.to, r.flight, r.aircraft, r.partner]; },
+      row: function (r) {
+        var share = r.codeshare
+          ? '<span class="routes__share">' + (r.partner ? esc(r.partner) : 'Codeshare') + '</span>' : '';
+        return '<td><span class="routes__code">' + esc(r.flight || '—') + '</span>' + share + '</td>'
+          + '<td><span class="routes__code">' + esc(r.from) + '</span></td>'
+          + '<td><span class="routes__code">' + esc(r.to) + '</span></td>'
+          + '<td>' + esc(r.aircraft || '') + '</td>'
+          + '<td class="routes__num">' + (r.distanceNm ? esc(Math.round(r.distanceNm).toLocaleString()) + ' nm' : '') + '</td>';
+      },
+      none: 'Nothing matches that. Try an airport code, a flight number or an aircraft.',
+      one: 'route', many: 'routes',
+    },
+    roster: {
+      read: function () { return CrewFeed.roster(); },
+      // Already ordered by hours when it arrives — see crew-feed.js — and
+      // left that way here rather than re-sorted into an order the feed does
+      // not know it is being read in.
+      sort: null,
+      find: function (r) { return [r.name, r.callsign, r.rank, r.role]; },
+      // 'cols' is how many headings the page actually wrote. An airline can
+      // build this section without the hours column — see the builder — and a
+      // row that emitted a cell anyway would push every table row one wider
+      // than its own header.
+      row: function (r, cols) {
+        var note = r.note ? ' <span class="routes__share">' + esc(r.note) + '</span>' : '';
+        return '<td>' + esc(r.name) + note + '</td>'
+          + '<td><span class="routes__code">' + esc(r.callsign || '') + '</span></td>'
+          + '<td>' + esc(r.rank || '') + '</td>'
+          + (cols > 3 ? '<td class="routes__num">' + esc(r.hoursText || '') + '</td>' : '');
+      },
+      none: 'Nobody matches that. Try a name, a callsign or a rank.',
+      one: 'pilot', many: 'pilots',
+    },
+  };
+
+  function mountTable(host, rows, spec) {
     var body = host.querySelector('[data-routes-body]');
     var find = host.querySelector('[data-routes-find]');
     var count = host.querySelector('[data-routes-count]');
@@ -3189,34 +3296,20 @@ const SITE_JS = `/* Your site's own script.
 
     var per = parseInt(host.getAttribute('data-crew-page'), 10);
     if (!(per > 0)) per = 12;
+    // The colspan of the empty row, taken from the headings the PAGE wrote
+    // rather than assumed: a VA who removes a column from their own copy of
+    // the markup should not get a stray cell on the no-matches row.
+    var cols = host.querySelectorAll('thead th').length || 5;
 
-    // Sorted by where they leave from, then by where they go. A timetable in
-    // the order rows happened to be typed into an editor is not a timetable.
-    var all = rows.slice().sort(function (a, b) {
-      return (a.from || '').localeCompare(b.from || '')
-          || (a.to || '').localeCompare(b.to || '');
-    });
+    var all = spec.sort ? rows.slice().sort(spec.sort) : rows.slice();
     // One lower-cased haystack per row, built once rather than on every
     // keystroke. Everything a visitor might plausibly type at this table is in
-    // it: both airports, the flight number, the aircraft, and the partner on a
-    // codeshare.
-    all.forEach(function (r) {
-      r.__find = [r.from, r.to, r.flight, r.aircraft, r.partner].join(' ').toLowerCase();
-    });
+    // it — see the spec's own 'find' above.
+    all.forEach(function (r) { r.__find = spec.find(r).join(' ').toLowerCase(); });
 
     var shown = all, page = 0;
 
-    function rowHtml(r) {
-      var share = r.codeshare
-        ? '<span class="routes__share">' + (r.partner ? esc(r.partner) : 'Codeshare') + '</span>' : '';
-      return '<tr>'
-        + '<td><span class="routes__code">' + esc(r.flight || '—') + '</span>' + share + '</td>'
-        + '<td><span class="routes__code">' + esc(r.from) + '</span></td>'
-        + '<td><span class="routes__code">' + esc(r.to) + '</span></td>'
-        + '<td>' + esc(r.aircraft || '') + '</td>'
-        + '<td class="routes__num">' + (r.distanceNm ? esc(Math.round(r.distanceNm).toLocaleString()) + ' nm' : '') + '</td>'
-        + '</tr>';
-    }
+    function rowHtml(r) { return '<tr>' + spec.row(r, cols) + '</tr>'; }
 
     function draw() {
       var pages = Math.max(1, Math.ceil(shown.length / per));
@@ -3226,12 +3319,12 @@ const SITE_JS = `/* Your site's own script.
 
       body.innerHTML = slice.length
         ? slice.map(rowHtml).join('')
-        : '<tr class="routes__none"><td colspan="5">Nothing matches that. Try an airport code, a flight number or an aircraft.</td></tr>';
+        : '<tr class="routes__none"><td colspan="' + cols + '">' + esc(spec.none) + '</td></tr>';
 
       if (count) {
         count.textContent = shown.length === all.length
-          ? all.length + (all.length === 1 ? ' route' : ' routes')
-          : shown.length + ' of ' + all.length + ' routes';
+          ? all.length + ' ' + (all.length === 1 ? spec.one : spec.many)
+          : shown.length + ' of ' + all.length + ' ' + spec.many;
       }
       if (pager) {
         // A pager over one page of results is a pair of dead buttons.
@@ -3276,24 +3369,29 @@ const SITE_JS = `/* Your site's own script.
   }
 
   function paintTables() {
-    var hosts = document.querySelectorAll('[data-crew-table="routes"]');
-    if (!hosts.length) return Promise.resolve(null);
-    return CrewFeed.routes().then(function (rows) {
-      hosts.forEach(function (host) {
-        // A quiet crew centre takes the whole section with it where the section
-        // said it only makes sense with rows in it — same contract as
-        // [data-crew-list], and the same reason: a heading over an empty table
-        // reads as a fault in the site rather than as an airline that has not
-        // published its network yet.
-        if (!rows || !rows.length) {
-          var section = host.closest ? host.closest('[data-crew-section]') : null;
-          if (section) section.remove();
-          return;
-        }
-        mountTable(host, rows);
-      });
-      return rows;
-    }).catch(function () { return null; });
+    var jobs = [];
+    Object.keys(TABLES).forEach(function (kind) {
+      var hosts = document.querySelectorAll('[data-crew-table="' + kind + '"]');
+      if (!hosts.length) return;
+      var spec = TABLES[kind];
+      jobs.push(spec.read().then(function (rows) {
+        Array.prototype.forEach.call(hosts, function (host) {
+          // A quiet crew centre takes the whole section with it where the
+          // section said it only makes sense with rows in it — same contract
+          // as [data-crew-list], and the same reason: a heading over an empty
+          // table reads as a fault in the site rather than as an airline that
+          // has not published its network yet.
+          if (!rows || !rows.length) {
+            var section = host.closest ? host.closest('[data-crew-section]') : null;
+            if (section) section.remove();
+            return;
+          }
+          mountTable(host, rows, spec);
+        });
+        return rows;
+      }).catch(function () { return null; }));
+    });
+    return Promise.all(jobs);
   }
 
   /* THE INSTAGRAM WALL.
@@ -3432,7 +3530,7 @@ h2 { padding-bottom: .7rem; border-bottom: 2px solid var(--ink); display: inline
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <rect x="0" y="0" width="160" height="14" fill="#f3f4f7"/>
@@ -3482,7 +3580,7 @@ h2 {
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'activity', 'network', 'hubs', 'events', 'notices', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#12141a"/>
 <rect x="0" y="0" width="160" height="12" fill="#1b1e26"/>
@@ -3531,7 +3629,7 @@ h2 { text-align: center; color: var(--muted); font-weight: 500; }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'about', 'values', 'network', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <circle cx="14" cy="10" r="3" fill="#1b5fc1"/>
@@ -3590,7 +3688,7 @@ h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .1em; color: 
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'activity', 'notices', 'events', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks'] },
-            { path: 'about.html', title: 'About', blocks: ['about', 'values', 'joining', 'staff', 'contact'] },
+            { path: 'about.html', title: 'About', blocks: ['about', 'values', 'joining', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fbfbfa"/>
 <rect x="14" y="14" width="132" height="2" fill="#1a1c1e"/>
@@ -3643,7 +3741,7 @@ h1 { font-weight: 700; letter-spacing: -.025em; }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'about', 'values', 'activity', 'network', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fdf8f4"/>
 <rect x="10" y="8" width="140" height="16" rx="8" fill="#fff" stroke="#eadfd6"/>
@@ -3730,7 +3828,7 @@ footer { border-top: 4px solid var(--ink); }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'values', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fff"/>
 <rect x="0" y="0" width="160" height="12" fill="#d8102f"/>
@@ -3806,7 +3904,7 @@ footer { border-top: 2px solid var(--accent); }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'values', 'about', 'network', 'hubs', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'partners', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'partners', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fbf9f4"/>
 <rect x="0" y="0" width="160" height="13" fill="#fff"/>
@@ -3883,7 +3981,7 @@ footer { border-top-color: var(--line-soft); }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'fleet', 'network', 'hubs', 'wall', 'events', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#0c0e13"/>
 <rect x="0" y="0" width="160" height="56" fill="#1a2230"/>
@@ -4052,7 +4150,7 @@ footer::before {
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'activity', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'values', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#eef1f6"/>
 <rect x="8" y="6" width="144" height="108" rx="6" fill="#fff" stroke="#d8dee8"/>
@@ -4194,7 +4292,7 @@ footer { border-top: 1px solid var(--line); font-family: var(--font-mono); font-
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'activity', 'network', 'hubs', 'notices', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'values', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#0a0d11"/>
 <rect x="0" y="0" width="160" height="12" fill="#111720"/>
@@ -4347,7 +4445,7 @@ footer { border-top: 1px dashed var(--line); }
             { path: 'index.html', title: null, blocks: ['hero', 'figures', 'network', 'hubs', 'partners', 'activity', 'events', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'values', 'quote', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'staff', 'roster', 'values', 'quote', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#fdfbfd"/>
 <rect x="0" y="0" width="160" height="13" fill="#fff"/>
@@ -4568,7 +4666,7 @@ footer { margin-top: var(--gap); border-top: 1px solid var(--line); }
             { path: 'index.html', title: null, blocks: ['showreel', 'figures', 'values', 'network', 'hubs', 'activity', 'events', 'faq', 'wall', 'cta'] },
             { path: 'network.html', title: 'Network', blocks: ['routemap', 'routetable', 'hubs', 'partners', 'cta'] },
             { path: 'fleet.html', title: 'Fleet', blocks: ['fleet', 'ranks', 'cta'] },
-            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'contact'] },
+            { path: 'join.html', title: 'Join', blocks: ['joining', 'quote', 'staff', 'roster', 'contact'] },
         ],
         thumb: `<rect width="160" height="120" fill="#f6f7fd"/>
 <ellipse cx="80" cy="-8" rx="96" ry="44" fill="#dfe4fb"/>
@@ -5019,7 +5117,7 @@ to keep in step by hand.
 
 The lists that read from your crew centre: \`routes\`, \`events\`,
 \`schedule\`, \`notices\`, \`activity\`, \`posts\`, \`ranks\`,
-\`fleet\`, \`roles\`, \`staff\`, \`hubs\`, \`partners\`.
+\`fleet\`, \`roles\`, \`staff\`, \`roster\`, \`hubs\`, \`partners\`.
 
 \`roles\` is your airline's departments and \`staff\` is the PEOPLE in them —
 name, rank, Community profile, and the short word the role carries. Somebody
@@ -5030,6 +5128,18 @@ the order of the cards, and whoever holds the first one is featured.
 \`hubs\` and \`partners\` are worked out from your route map rather than typed
 anywhere — the airports you fly most out of, and the airlines you codeshare
 with. Publish a sector and they follow.
+
+### Your crew, on the page
+
+The **crew** section lists your pilots with their rank and their hours, with the
+same search box and pages as the route table. Nothing is typed into it: it is
+your roster, so somebody joining appears on your website the moment staff add
+them.
+
+A pilot marked **inactive** is left off it — a website that lists pilots who
+have left is overstating the airline. Somebody on leave stays, and is said to
+be. What goes out is what your crew centre's own roster screen already shows a
+signed-out visitor: a name, a callsign, a rank and hours, and nothing else.
 
 ### Your network, on a map and in a table
 

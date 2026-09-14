@@ -680,6 +680,70 @@ ${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>$
   </section>`,
     },
 
+    /* THE CREW — the pilots, not the staff.
+     *
+     * "62 pilots" as a statistic is a number; sixty-two names with their hours
+     * against them is an airline. Same table, search and pager as the route
+     * table, because a roster of two hundred is a list nobody reads to the end
+     * of and the question a visitor has at it is a search.
+     *
+     * A name, a callsign, a rank and hours — what the crew centre's own roster
+     * screen already shows a signed-out visitor, and no more. No Community
+     * handle: a line pilot has not opted into being findable the way somebody
+     * holding a public role has.
+     */
+    roster: {
+        label: 'The crew',
+        note: 'Your pilots with their rank and hours. Searchable and paged, from the crew centre.',
+        icon: 'users-round',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'hours', label: 'Show how many hours each pilot has flown', type: 'bool',
+                help: 'Off, the list is names, callsigns and ranks.',
+            },
+            { key: 'perPage', label: 'Rows per page', type: 'number', min: 5, max: 50 },
+        ],
+        defaults: () => ({
+            heading: 'The crew',
+            note: 'Everybody flying for us, and where they are on the ladder.',
+            hours: true,
+            perPage: 12,
+        }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <div class="routes${p.hours ? '' : ' routes--nohours'}" data-crew-table="roster" data-crew-page="${p.perPage}">
+      <div class="routes__bar">
+        <label class="routes__find">
+          <span class="sr-only">Search the crew</span>
+          <input type="search" autocomplete="off" placeholder="Search a name, a callsign, a rank" data-routes-find disabled>
+        </label>
+        <p class="routes__count" data-routes-count role="status"></p>
+      </div>
+      <div class="routes__wrap">
+        <table class="routes__table">
+          <thead>
+            <tr><th scope="col">Pilot</th><th scope="col">Callsign</th><th scope="col">Rank</th>${p.hours ? '<th scope="col" class="routes__num">Hours</th>' : ''}</tr>
+          </thead>
+          <tbody data-routes-body>
+            <tr class="routes__none"><td colspan="${p.hours ? 4 : 3}">Your pilots appear here as soon as they are on the crew centre&rsquo;s roster.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="routes__pager" data-routes-pager aria-label="Pages of pilots" hidden>
+        <button class="routes__page" type="button" data-routes-prev>&larr; Previous</button>
+        <span class="routes__at" data-routes-at></span>
+        <button class="routes__page" type="button" data-routes-next>Next &rarr;</button>
+      </nav>
+    </div>
+  </section>`,
+    },
+
     /* THE PEOPLE, not the departments.
      *
      * Nothing here is typed: it is the airline's own roster, filtered to

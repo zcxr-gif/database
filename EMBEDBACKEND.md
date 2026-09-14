@@ -909,9 +909,12 @@ GET /api/crew/<slug>/routes        GET /api/crew/<slug>/events
 GET /api/crew/<slug>/route-map     GET /api/crew/<slug>/schedules
 GET /api/crew/<slug>/stats         GET /api/crew/<slug>/announcements
 GET /api/crew/<slug>/social        GET /api/crew/<slug>/staff
+GET /api/crew/<slug>/roster
 ```
 
-`staff` is the opt-in half of the roster and nothing more: the pilots who hold
+`roster` is the crew as the crew centre's own roster screen shows a signed-out
+visitor — a name, a callsign, a rank and hours — and `staff` is the opt-in half
+of it, which is where the Community handle is and why a line pilot's is not: the pilots who hold
 one of the **roles the airline declared**, with the rank they fly at, the
 Community handle that is already on the airline's own forum thread, and the
 role's own short message. A pilot with no role is not on it. Nobody's e-mail,
@@ -1147,6 +1150,7 @@ Readers, all of which resolve to `null` rather than throwing — and `null` mean
 | `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
 | `CrewFeed.roles()` | same | Role definitions (never who holds one) |
 | `CrewFeed.staff()` | `/staff` | The people holding those roles: name, rank, Community profile, the role's message |
+| `CrewFeed.roster()` | `/roster` | The crew: name, callsign, rank and hours. Pilots marked inactive are left off |
 | `CrewFeed.hubs()` | `/route-map` | The airports the airline flies most sectors out of |
 | `CrewFeed.partners()` | `/route-map` | The airlines it codeshares with, deduplicated |
 

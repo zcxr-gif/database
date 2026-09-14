@@ -162,6 +162,20 @@ const STUB = {
         ],
     },
     '/api/crew/demo/stats': { pilots: 62, hours: 9400, routes: SECTORS.length, destinations: 8 },
+    /* The roster, as the crew centre serves it. Awkward on purpose: somebody on
+     * leave (who stays, and is said to be), somebody inactive (who does not
+     * appear at all), and a pilot at zero hours whose hours cell must be empty
+     * rather than "0 h". */
+    '/api/crew/demo/roster': {
+        roster: [
+            { id: '1', name: 'Ravi Bhatia', callsign: 'MR001', hours: 812, role: 'Chief Executive Officer', status: 'active', rank: { name: 'Captain', color: '#d97706' } },
+            { id: '2', name: 'Aisha Khan', callsign: 'MR002', hours: 604, role: 'Chief Operating Officer', status: 'active', rank: { name: 'Captain', color: '#d97706' } },
+            { id: '3', name: 'Tom Reyes', callsign: 'MR014', hours: 180, role: 'Head of Events', status: 'active', rank: { name: 'First Officer', color: '#4f46e5' } },
+            { id: '4', name: 'Lena Ortiz', callsign: 'MR031', hours: 96, role: '', status: 'loa', rank: { name: 'First Officer', color: '#4f46e5' } },
+            { id: '5', name: 'Sam Park', callsign: 'MR040', hours: 0, role: '', status: 'active', rank: { name: 'Cadet', color: '#64748b' } },
+            { id: '6', name: 'Gone Away', callsign: 'MR099', hours: 300, role: '', status: 'inactive', rank: { name: 'Captain', color: '#d97706' } },
+        ],
+    },
 };
 
 function serve(files) {
@@ -411,6 +425,59 @@ async function run() {
             return els.some(el => !el.textContent.trim() && el.getBoundingClientRect().height > 0);
         });
         ok('nothing empty is taking up room on a card', hasEmptyWord === false);
+
+        ok('nothing threw', errors.length === 0, errors.join('\n        '));
+        await page.close();
+    }
+
+    /* ======================================================================
+     * 3b. THE CREW
+     *
+     * The same table machinery as the routes, pointed at the roster — so what
+     * is worth asserting here is not the paging (already proven) but what the
+     * roster is allowed to say: who is on it, who is not, and what an empty
+     * figure looks like.
+     * ==================================================================== */
+    console.log('\nThe crew table');
+    {
+        const page = await browser.newPage({ viewport: DESK });
+        const errors = [];
+        page.on('pageerror', e => errors.push(String(e)));
+        await wire(page);
+        await page.goto(base + 'join.html', { waitUntil: 'load' });
+        await page.waitForFunction(() => document.querySelectorAll('[data-crew-table="roster"] [data-routes-body] tr').length > 1, null, { timeout: 5000 }).catch(() => {});
+
+        const host = page.locator('[data-crew-table="roster"]');
+        const rows = await host.locator('[data-routes-body] tr').count();
+        ok('the pilots are listed', rows === 5, rows + ' rows, expected the 5 who are still flying');
+
+        const count = (await host.locator('[data-routes-count]').innerText()).trim();
+        ok('and counted as pilots, not as routes', count === '5 pilots', 'said: "' + count + '"');
+
+        const first = (await host.locator('[data-routes-body] tr').first().innerText()).replace(/\s+/g, ' ').trim();
+        ok('most hours first', /^Ravi Bhatia/.test(first), 'first row: ' + first);
+        ok('with their rank', /Captain/.test(first), 'first row: ' + first);
+        ok('and their hours', /812 h/.test(first), 'first row: ' + first);
+
+        const all = (await host.locator('[data-routes-body]').innerText()).replace(/\s+/g, ' ');
+        ok('a pilot who has left is not on the list', !/Gone Away/.test(all), all);
+        ok('a pilot on leave is, and is said to be', /Lena Ortiz On leave/.test(all), all);
+        // Zero hours is a true figure and an unhelpful one to print: crew-feed
+        // leaves it empty rather than writing "0 h" against somebody's name.
+        // Read off that pilot's own row — "180 h" ends in the same three
+        // characters, so a search of the whole table would pass either way.
+        const newcomer = await page.evaluate(() => {
+            const tr = [...document.querySelectorAll('[data-crew-table="roster"] [data-routes-body] tr')]
+                .find(r => /Sam Park/.test(r.textContent));
+            return tr ? [...tr.cells].map(c => c.textContent.trim()) : null;
+        });
+        ok('a pilot with no hours yet has an empty cell, not a nought',
+            !!newcomer && newcomer[3] === '', newcomer ? JSON.stringify(newcomer) : 'that pilot is not on the list');
+
+        await host.locator('[data-routes-find]').fill('captain');
+        await page.waitForTimeout(300);
+        ok('searching a rank narrows the crew',
+            (await host.locator('[data-routes-body] tr').count()) === 2);
 
         ok('nothing threw', errors.length === 0, errors.join('\n        '));
         await page.close();
