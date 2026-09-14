@@ -815,7 +815,10 @@ ${navLinks(c)}
       <p>Every sector we publish, as a great circle. Drag the map sideways to follow it.</p>
     </div>
     <div class="netmap" data-crew-map>
-      <div class="netmap__scroll"><svg class="netmap__svg" aria-hidden="true"></svg></div>
+      <div class="netmap__scroll" tabindex="0" role="region"
+           aria-label="Route map — drag to pan, and use the buttons or ctrl and the wheel to zoom">
+        <svg class="netmap__svg" aria-hidden="true"></svg>
+      </div>
     </div>
     <p class="netmap__note" data-crew-map-note></p>
     <script src="map.js" defer></script>
@@ -1481,6 +1484,53 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
    bottom AND a top: a full --gap each puts eleven rems between two headings,
    which reads as a missing section rather than as space. */
 .block { padding-block: calc(var(--gap) * .56); }
+
+/* ---------------------------------------------------------------------------
+   CONTAINERS, WHICH ARE NOT COMPULSORY
+
+   Three classes the builder folds onto a section when the VA asks for them.
+   None of them is a default: a page that says nothing here renders exactly as
+   it always did, which is words on the page and pictures in frames.
+
+   .panel      the whole section sits in a container
+   .pics-plain the pictures in it lose theirs
+   .pics-whole a picture that is not the shape of its frame is shown whole
+               rather than cropped to fill it
+   ------------------------------------------------------------------------ */
+.panel {
+  padding: clamp(1.2rem, 3.5vw, 2.4rem);
+  border-radius: var(--radius-lg);
+  margin-block: calc(var(--gap) * .18);
+}
+.panel--soft { background: var(--surface-2); }
+.panel--boxed { background: var(--surface); border: 1px solid var(--line); }
+/* A panel and a full-bleed background picture are two containers arguing about
+   the same square of page. The picture wins: it is the one somebody chose. */
+.panel.has-bg { background: none; border-color: transparent; }
+
+/* PICTURES WITHOUT A FRAME. The card, the tile and the well all stop being
+   drawn; the picture is the whole of what is left, which is the point. */
+.pics-plain .card,
+.pics-plain .shot {
+  background: none; border-color: transparent; border-radius: 0; box-shadow: none;
+}
+.pics-plain .card:hover,
+.pics-plain .shot:hover { border-color: transparent; box-shadow: none; transform: none; }
+.pics-plain .card__media,
+.pics-plain .split__media { background: none; border-radius: 0; }
+.pics-plain .card__media img:not(.card__media-bg) { padding: 0; }
+.pics-plain .card__media-bg { display: none; }
+.pics-plain .card__body { padding-left: 0; padding-right: 0; }
+.pics-plain .shot figcaption, .pics-plain .shot > span { padding-left: 0; padding-right: 0; }
+
+/* THE WHOLE PICTURE. object-fit does the work; the ratio of the frame stays,
+   so the grid still lines up. A contained picture leaves bars, and the surface
+   tone under it is a deliberate field rather than a gap. */
+.pics-whole .shot img,
+.pics-whole .split__media img { object-fit: contain; background: var(--surface-2); }
+.pics-whole .card__media img:not(.card__media-bg) { object-fit: contain; }
+.pics-plain.pics-whole .shot img,
+.pics-plain.pics-whole .split__media img { background: none; }
 /* A heading and the line under it are one unit; separating them here means no
    block has to re-state the spacing between them. */
 .block__head { margin-bottom: 1.4rem; }
@@ -1787,14 +1837,30 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
    image. The bars are filled with the picture itself — over-scaled, blurred
    past recognition and dimmed — so the well has the livery's own colours in
    it and the aeroplane sits on its own field rather than in a letterbox. */
-.card__media img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; padding: 6% 5%; }
+/* :not(.card__media-bg) IS THE POINT OF THIS SELECTOR.
+
+   Without it this rule reads ".card__media img", which is a class and a type —
+   and that out-specifies the single class the blurred backdrop below is written
+   with. So the backdrop took "position: relative" from here instead of its own
+   "absolute", left the flow it was supposed to be lifted out of, and pushed the
+   actual aeroplane a full well-height down and out of an "overflow: hidden"
+   box. The card showed a blurred ghost and no aircraft: the nose and the tail
+   were not cropped, the whole photograph was gone.
+
+   Two rules that style the same element from the same ancestor must not be left
+   to win on specificity by accident. Each one names who it is for. */
+.card__media img:not(.card__media-bg) {
+  position: relative; width: 100%; height: 100%;
+  object-fit: contain; display: block; padding: 6% 5%;
+}
 /* A drawn outline is a MARK, not a photograph: it has no field of its own — the
    well's surface is its ground — and it is given more room than a photograph so
    it reads as a mark rather than as a picture that not quite fits.
    crew-feed.js says which kind each one is. */
-.card__media img[data-fit="contain"] { padding: 14% 12%; }
-.card__media-bg {
+.card__media img[data-fit="contain"]:not(.card__media-bg) { padding: 14% 12%; }
+.card__media img.card__media-bg {
   position: absolute; inset: 0; padding: 0;
+  width: 100%; height: 100%;
   object-fit: cover; transform: scale(1.3);
   filter: blur(20px) saturate(1.4); opacity: .45;
 }
@@ -1803,9 +1869,39 @@ main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
    outline. Browsers without :has() get the smudge, which is survivable; every
    one that has it gets what the design asks for. */
 .card__media:has(img[data-fit="contain"]) .card__media-bg { display: none; }
+/* WHOSE PICTURE THIS IS, ON THE PICTURE.
+
+   A chip in the corner of the well. Small, quiet and never in the way of the
+   aeroplane — but attached to the picture rather than to the card, because the
+   picture is the part that travels. The feed puts the photographer's name here
+   for a photograph and ours only on the outlines we drew ourselves; an
+   airline's own upload gets nothing, and an empty chip is no chip. */
+.card__mark {
+  position: absolute; right: .4rem; bottom: .4rem; z-index: 2;
+  max-width: calc(100% - .8rem); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: .12rem .4rem; border-radius: var(--radius-pill, 999px);
+  font-size: .62rem; font-weight: 600; letter-spacing: .02em; line-height: 1.5;
+  color: #fff; background: rgba(10, 13, 18, .5);
+}
+@supports (backdrop-filter: blur(4px)) {
+  .card__mark { background: rgba(10, 13, 18, .34); backdrop-filter: blur(6px); }
+}
+.card__mark:empty { display: none; }
 .card__body { padding: .95rem 1.05rem 1.1rem; display: flex; flex-direction: column; gap: .2rem; flex: 1; }
 .card__body b { font-size: .98rem; letter-spacing: -.01em; }
 .card__body span { color: var(--muted); font-size: .88rem; }
+/* WHAT IT CARRIES AND HOW FAR IT GOES.
+
+   Seats · range · cruise, in the mono face the rest of the site uses for
+   figures, so it reads as data rather than as a second subtitle competing with
+   the livery name above it. A type the feed does not recognise prints nothing
+   at all rather than a guess, and an empty line takes its own space back. */
+.card__specs, .row__specs {
+  font-family: var(--font-mono); font-size: .74rem; letter-spacing: .01em;
+  color: var(--faint);
+}
+.card__specs:empty, .row__specs:empty { display: none; }
+.rows .row__specs { display: block; }
 /* THE CREDIT LINE.
 
    Small, and never optional. A photograph of a real airframe belongs to the
@@ -2159,17 +2255,56 @@ button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
    is a colour this stylesheet invented.
    ------------------------------------------------------------------------ */
 .netmap {
+  position: relative;
   border: 1px solid var(--line); border-radius: var(--radius);
   background: var(--surface); overflow: hidden;
 }
+/* TALLER THAN IT WAS. A route map is the one picture on an airline's site that
+   is worth looking AT rather than glancing past, and the old ceiling of 26rem
+   left a worldwide network as a thin band of dots. */
 .netmap__scroll {
-  overflow-x: auto; overflow-y: hidden;
-  height: clamp(15rem, 42vw, 26rem);
+  overflow: auto;
+  height: clamp(19rem, 54vw, 34rem);
   cursor: grab;
+  /* One finger pans; two fingers are the map's own pinch, handled in map.js.
+     Without this the browser's page zoom eats the gesture, so zooming into the
+     map means zooming out of the site. */
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
 }
 .netmap__scroll.is-dragging { cursor: grabbing; user-select: none; }
 .netmap__scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.netmap__svg { display: block; height: 100%; width: auto; min-width: 100%; }
+/* --netmap-z is the zoom, set on .netmap by map.js. At 1 this is exactly what
+   it always was: as tall as the box and as wide as it needs to be. Above 1 the
+   drawn map grows inside the box and the box scrolls both ways — the picture
+   gets bigger, the section does not, so a zoomed map never pushes the rest of
+   the page around. */
+.netmap__svg {
+  display: block;
+  height: calc(100% * var(--netmap-z, 1));
+  width: auto;
+  min-width: calc(100% * var(--netmap-z, 1));
+}
+/* THE ZOOM CONTROLS.
+
+   Buttons, and not only a gesture. Ctrl-and-wheel is not discoverable, a pinch
+   does not exist on a desktop, and "it looks small" is a complaint from
+   somebody who did not find either. */
+.netmap__zoom {
+  position: absolute; right: .55rem; bottom: .55rem; z-index: 2;
+  display: flex; gap: .3rem;
+}
+.netmap__zoom button {
+  min-width: 2rem; height: 2rem; padding: 0 .5rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink);
+  font: inherit; font-size: .85rem; font-weight: 600; line-height: 1;
+  cursor: pointer; box-shadow: var(--shadow-1);
+  transition: border-color .15s ease, color .15s ease;
+}
+.netmap__zoom button:hover:not(:disabled) { border-color: var(--accent-line); color: var(--accent); }
+.netmap__zoom button:disabled { opacity: .4; cursor: default; }
 .netmap__land { fill: var(--surface-2); stroke: var(--line); stroke-width: 1; }
 .netmap__arc { fill: none; stroke: var(--accent); stroke-width: 2; stroke-opacity: .55; stroke-linecap: round; }
 /* Somebody else's metal, drawn as somebody else's: dashed and quieter, so a
@@ -2194,8 +2329,12 @@ button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
 /* THE EDGE FADE, and only where there is something past the edge. map.js adds
    the class once it has measured the slack, so a map that fits its box gets no
    hint that it does not — a gradient promising more map where there is none is
-   worse than no gradient. */
-.netmap.has-pan, .netmap:has(.has-pan) {
+   worse than no gradient.
+
+   On the SCROLLER and not on the whole map: the zoom buttons are the map's
+   siblings, they sit within a couple of rem of the right-hand edge, and a fade
+   applied to their parent takes the controls out with the coastline. */
+.netmap__scroll.has-pan {
   -webkit-mask-image: linear-gradient(to right, transparent 0, #000 2.5rem, #000 calc(100% - 2.5rem), transparent 100%);
   mask-image: linear-gradient(to right, transparent 0, #000 2.5rem, #000 calc(100% - 2.5rem), transparent 100%);
 }

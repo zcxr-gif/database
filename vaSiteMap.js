@@ -163,7 +163,8 @@ const MAP_JS = `/* map.js — your network, drawn.
     var shell = host.querySelector('.netmap__scroll');
     if (!shell) {
       host.innerHTML = '<div class="netmap__scroll" tabindex="0" role="region"'
-        + ' aria-label="Route map — drag or scroll sideways to pan"><svg class="netmap__svg"></svg></div>';
+        + ' aria-label="Route map — drag to pan, and use the buttons or ctrl and the wheel to zoom">'
+        + '<svg class="netmap__svg"></svg></div>';
       shell = host.querySelector('.netmap__scroll');
     }
     var svg = shell.querySelector('.netmap__svg');
@@ -279,34 +280,197 @@ const MAP_JS = `/* map.js — your network, drawn.
       + '<g class="netmap__arcs">' + arcs + '</g>'
       + '<g class="netmap__pts">' + dots + '</g>';
 
-    wirePan(shell);
+    wirePan(host, shell);
+    wireZoom(host, shell);
     return legs.length;
   }
 
-  /* The map can be wider than the page, so it is pannable — by the scrollbar,
-     by a swipe, and by dragging, because on a desktop there is no other
-     obvious way to move a picture that has no handle on it. */
-  function wirePan(scroller) {
+  /* -------------------------------------------------------------------------
+     ZOOM.
+
+     The map crops itself to the network, which is what stops a VA flying six
+     sectors in Norway from getting a picture of the Atlantic. It is also why
+     the map READS small for an airline that flies everywhere: fit the world
+     into a band the height of a paragraph and every base is a dot two pixels
+     across with no room for its name.
+
+     So the fitted crop is the floor, not the ceiling. Zoom scales the drawn
+     map inside its box and the box scrolls in both directions — it is the
+     picture that gets bigger, not the section, so a zoomed map never shoves
+     the rest of the page around.
+
+     AND A REDRAW, not just a magnification. Labels are placed by collision
+     against every other label and dot, so the reason most airports on a busy
+     map have no name is that there was no room for one. Zooming in makes room.
+     Redrawing at the new size therefore puts NAMES on the airports that just
+     gained space, and keeps the type at a readable size instead of blowing it
+     up with everything else — which is what zooming into a map is for.
+     --------------------------------------------------------------------- */
+  var Z_MIN = 1, Z_MAX = 8;
+  var clampZ = function (z) { return Math.min(Z_MAX, Math.max(Z_MIN, z)); };
+  var zoomOf = function (host) { return Number(host.__z) || 1; };
+
+  /**
+   * Set the zoom, keeping one point of the map under the place it is already
+   * on the screen — the cursor for a wheel or a pinch, the middle for a button.
+   * Without that, zooming walks the map out from under whoever is reading it.
+   */
+  function setZoom(host, scroller, next, clientX, clientY) {
+    var z = clampZ(next);
+    if (z === zoomOf(host)) return;
+    var r = scroller.getBoundingClientRect();
+    var cx = clientX == null ? r.width / 2 : clientX - r.left;
+    var cy = clientY == null ? r.height / 2 : clientY - r.top;
+    // Where that point sits in the whole map, 0..1, before the change.
+    var fx = (scroller.scrollLeft + cx) / Math.max(1, scroller.scrollWidth);
+    var fy = (scroller.scrollTop + cy) / Math.max(1, scroller.scrollHeight);
+
+    host.__z = z;
+    host.style.setProperty('--netmap-z', String(z));
+    host.classList.toggle('is-zoomed', z > 1);
+
+    // Reading scrollWidth here forces the layout the line above asked for, so
+    // the numbers below are the new ones rather than the old.
+    scroller.scrollLeft = fx * scroller.scrollWidth - cx;
+    scroller.scrollTop = fy * scroller.scrollHeight - cy;
+
+    paintZoomButtons(host);
+    redrawSoon(host);
+  }
+
+  /* A button that cannot do anything says so. "Fit" at the fitted size and
+     "zoom out" at the floor are both the same press twice with no result, and
+     the reader's conclusion is that the map is broken rather than that it is
+     already showing everything. */
+  function paintZoomButtons(host) {
+    var z = zoomOf(host);
+    var btns = host.querySelectorAll('[data-map-zoom]');
+    for (var i = 0; i < btns.length; i++) {
+      var k = btns[i].getAttribute('data-map-zoom');
+      btns[i].disabled = (k === 'in' && z >= Z_MAX)
+        || ((k === 'out' || k === 'reset') && z <= Z_MIN);
+    }
+  }
+
+  /* Re-placing the labels is the expensive half, so it waits for the pinch or
+     the run of clicks to stop. The magnified map is on screen in the meantime;
+     this only sharpens it. */
+  var redrawTimers = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function redrawSoon(host) {
+    var m = null;
+    for (var i = 0; i < mounted.length; i++) if (mounted[i].host === host) m = mounted[i];
+    if (!m) return;
+    if (redrawTimers) clearTimeout(redrawTimers.get(host));
+    var t = setTimeout(function () {
+      if (m.host.isConnected) draw(m.host, m.net);
+    }, 150);
+    if (redrawTimers) redrawTimers.set(host, t);
+  }
+
+  function wireZoom(host, scroller) {
+    var bar = host.querySelector('.netmap__zoom');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'netmap__zoom';
+      bar.innerHTML = '<button type="button" data-map-zoom="out" aria-label="Zoom out" title="Zoom out">&minus;</button>'
+        + '<button type="button" data-map-zoom="in" aria-label="Zoom in" title="Zoom in">+</button>'
+        + '<button type="button" data-map-zoom="reset" aria-label="Fit the whole network" title="Fit the whole network">Fit</button>';
+      host.appendChild(bar);
+    }
+    paintZoomButtons(host);
+    if (host.__zoomWired) return;
+    host.__zoomWired = true;
+
+    bar.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-map-zoom]') : null;
+      if (!b) return;
+      var k = b.getAttribute('data-map-zoom');
+      if (k === 'reset') return setZoom(host, scroller, 1);
+      setZoom(host, scroller, zoomOf(host) * (k === 'in' ? 1.5 : 1 / 1.5));
+    });
+
+    /* Ctrl (or ⌘) and the wheel, which is also what a trackpad pinch sends.
+       A BARE wheel is left alone on purpose: a map that swallows the scroll
+       gesture is a map you cannot scroll past on a laptop. */
+    scroller.addEventListener('wheel', function (e) {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      setZoom(host, scroller, zoomOf(host) * Math.exp(-e.deltaY * 0.0025), e.clientX, e.clientY);
+    }, { passive: false });
+
+    // Double-click in, and shift-double-click out — the convention every map
+    // on the web keeps.
+    scroller.addEventListener('dblclick', function (e) {
+      e.preventDefault();
+      setZoom(host, scroller, zoomOf(host) * (e.shiftKey ? 1 / 2 : 2), e.clientX, e.clientY);
+    });
+
+    /* PINCH. Two fingers, tracked by hand: the browser's own pinch zooms the
+       whole page, which on a phone means zooming into a map by zooming out of
+       the site. touch-action on the scroller keeps one finger panning. */
+    var pts = {}, base = 0, baseZ = 1;
+    var span = function () {
+      var k = Object.keys(pts);
+      if (k.length < 2) return 0;
+      var a = pts[k[0]], b = pts[k[1]];
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+    var mid = function () {
+      var k = Object.keys(pts);
+      var a = pts[k[0]], b = pts[k[1]];
+      return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    };
+    scroller.addEventListener('pointerdown', function (e) {
+      if (e.pointerType !== 'touch') return;
+      pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+      if (Object.keys(pts).length === 2) { base = span(); baseZ = zoomOf(host); }
+    });
+    scroller.addEventListener('pointermove', function (e) {
+      if (e.pointerType !== 'touch' || !pts[e.pointerId]) return;
+      pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+      if (Object.keys(pts).length !== 2 || !base) return;
+      e.preventDefault();
+      var m = mid();
+      setZoom(host, scroller, baseZ * (span() / base), m.x, m.y);
+    }, { passive: false });
+    var drop = function (e) { delete pts[e.pointerId]; base = 0; };
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (t) {
+      scroller.addEventListener(t, drop);
+    });
+  }
+
+  /* The map can be wider and — once zoomed — taller than the page, so it is
+     pannable: by the scrollbars, by a swipe, and by dragging, because on a
+     desktop there is no other obvious way to move a picture that has no handle
+     on it. */
+  function wirePan(host, scroller) {
     var settle = function () {
       var slack = scroller.scrollWidth - scroller.clientWidth;
       // Only ADVERTISE panning when there is enough of it to be worth saying.
       // "Drag to pan" under a map that moves thirty pixels is an instruction
       // to do nothing.
       scroller.classList.toggle('has-pan', slack > 64);
-      if (slack > 4) scroller.scrollLeft = slack / 2;
+      // Centre only a map nobody has moved yet. Re-centring after a zoom or a
+      // resize throws away the part of the network the reader went looking for.
+      if (slack > 4 && zoomOf(host) === 1 && !scroller.__moved) scroller.scrollLeft = slack / 2;
     };
     if (window.requestAnimationFrame) requestAnimationFrame(settle); else settle();
 
     if (scroller.__pan) return;
     scroller.__pan = true;
-    var down = false, startX = 0, startLeft = 0;
+    scroller.addEventListener('scroll', function () { scroller.__moved = true; }, { passive: true });
+    var down = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
     scroller.addEventListener('pointerdown', function (e) {
       if (e.pointerType === 'touch') return;      // native scrolling is better
-      down = true; startX = e.clientX; startLeft = scroller.scrollLeft;
+      down = true;
+      startX = e.clientX; startY = e.clientY;
+      startLeft = scroller.scrollLeft; startTop = scroller.scrollTop;
       scroller.classList.add('is-dragging');
     });
     scroller.addEventListener('pointermove', function (e) {
-      if (down) scroller.scrollLeft = startLeft - (e.clientX - startX);
+      if (!down) return;
+      scroller.scrollLeft = startLeft - (e.clientX - startX);
+      scroller.scrollTop = startTop - (e.clientY - startY);
     });
     var release = function () { down = false; scroller.classList.remove('is-dragging'); };
     ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (t) {

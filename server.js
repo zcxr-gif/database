@@ -513,7 +513,19 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // The nested form below is the documented way to name a field `type`; the
     // sibling staffRoles/staffAssignments arrays avoid it only by luck (no field
     // of theirs is called `type`).
-    crewFleet: { type: [{ _id: false, type: { type: String }, name: String, image: String }], default: [] },
+    //
+    // photographer/photoLink: who the picture belongs to. Most fleet pictures
+    // come from the community aircraft library, which records a contributor for
+    // every one of them; without somewhere to keep that name it was dropped the
+    // moment a VA used the picture, and their public fleet page credited nobody.
+    // See sanitizeFleet in crewAuth.js.
+    crewFleet: {
+        type: [{
+            _id: false, type: { type: String }, name: String, image: String,
+            imageAuto: Boolean, photographer: String, photoLink: String,
+        }],
+        default: [],
+    },
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
     // capture and its hours roll straight onto the roster.

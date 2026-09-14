@@ -111,6 +111,35 @@ const server = app.listen(0, async () => {
         read.json && read.json.url);
     check('a fresh site is in design mode', read.json && read.json.mode === 'design');
 
+    /* The other half of the editor's first screen: a VA who would rather put
+       their own sections on an empty page than edit a written one. Same design,
+       same colours — no words. */
+    console.log('“let me build my own”');
+    const blank = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'concourse', blank: true } });
+    check('a blank start is laid out', blank.status === 200, blank.json);
+    check('one page, and nothing on it',
+        blank.json && blank.json.builder.pages.length === 1 && blank.json.builder.pages[0].blocks.length === 0,
+        blank.json && blank.json.builder && blank.json.builder.pages.map(p => p.path + ':' + p.blocks.length));
+    check('it still renders a homepage to preview',
+        blank.json && blank.json.draft.files.some(f => f.path === 'index.html'));
+    check('and it still wears the design that was picked', blank.json && blank.json.template === 'concourse');
+
+    const own = blank.json.builder;
+    own.pages[0].blocks.push({ type: 'text', props: { heading: 'Mine', body: 'My words.' } });
+    const mine = await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc: own } });
+    check('a section added to the empty page sticks',
+        mine.status === 200 && mine.json.builder.pages[0].blocks.length === 1, mine.json);
+    /* `blank` is only ever an answer to "how should this site START". A VA
+       trying designs on a site they have written must never lose it. */
+    const keepWords = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'livery', blank: true } });
+    check('blank never empties a site that already has words in it',
+        keepWords.status === 200
+            && keepWords.json.draft.files.find(f => f.path === 'index.html').content.includes('My words.'),
+        keepWords.json && keepWords.json.error);
+
+    // A fresh, untouched site again for everything below.
+    SITE = fakeSite();
+
     console.log('picking a design');
     const design = await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'concourse' } });
     check('design applied', design.status === 200, design.json);
@@ -128,6 +157,69 @@ const server = app.listen(0, async () => {
     const index = saved.json.draft.files.find(f => f.path === 'index.html');
     check('the headline is on the page', index.content.includes('Fly the flag.'));
     check('the added section is on the page', index.content.includes('<h2>Us</h2>') && index.content.includes('<p class="prose">And another.</p>'));
+
+    /* CONTAINERS ARE A CHOICE, NOT THE HOUSE STYLE.
+       Every designed site drifts the same way: things live in boxes, so
+       everything ends up in one and the page reads as a filing system. The
+       defaults here are exactly what the sites rendered before, so nothing
+       already built moves — and a VA who wants words on the page, or a
+       photograph shown whole, can now say so. */
+    console.log('containers, and whether a section is in one');
+    {
+        const words = doc.pages[0].blocks.find(b => b.type === 'text');
+        const sectionOf = (html, cls) => new RegExp('<section class="[^"]*' + cls).test(html);
+
+        const page0 = () => saved.json.draft.files.find(f => f.path === 'index.html').content;
+        check('by default a section is in no container at all',
+            !sectionOf(page0(), 'panel'), (page0().match(/<section[^>]*>/g) || []).slice(0, 3));
+
+        words.props.panel = 'boxed';
+        doc.pages[0].blocks.push({
+            type: 'gallery',
+            props: { heading: 'Shots', items: [{ url: 'https://cdn.test/a.jpg', caption: '', href: '' }], frame: 'off', crop: 'whole' },
+        });
+        const laid = await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc } });
+        const html = laid.json.draft.files.find(f => f.path === 'index.html').content;
+        check('a section asked to sit in a card does',
+            /<section class="block panel panel--boxed"/.test(html), (html.match(/<section[^>]*panel[^>]*>/g) || []));
+        check('pictures can be taken out of their frames',
+            /<section class="block[^"]*pics-plain/.test(html), (html.match(/<section[^>]*pics-[^>]*>/g) || []));
+        check('…and shown whole rather than cropped to fill one',
+            /<section class="block[^"]*pics-whole/.test(html), (html.match(/<section[^>]*pics-[^>]*>/g) || []));
+        // The settings are the document's, so they survive the round trip and
+        // the design swap below like every other word on the page.
+        const back = laid.json.builder.pages[0].blocks.find(b => b.type === 'text');
+        check('the choice is stored on the section', back && back.props.panel === 'boxed', back && back.props);
+
+        // A hero IS the container — offering a card round the top of the page
+        // is offering a box round a box.
+        const cat0 = builder.catalogue().blocks;
+        const keys = (t) => cat0.find(b => b.type === t).fields.map(f => f.key);
+        check('the picture controls only reach blocks that draw pictures',
+            keys('gallery').includes('frame') && keys('gallery').includes('crop')
+            && !keys('text').includes('frame'), { gallery: keys('gallery'), text: keys('text') });
+        check('and a full-bleed hero is not offered a container round itself',
+            !keys('hero').includes('panel') && keys('text').includes('panel'), keys('hero'));
+
+        // Put it back, so the assertions after this read the page they expect.
+        words.props.panel = 'none';
+        doc.pages[0].blocks = doc.pages[0].blocks.filter(b => b.type !== 'gallery');
+        await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc } });
+    }
+
+    /* The fleet page's whole job: which aeroplanes, and what they are. */
+    console.log('the fleet says what each aircraft is');
+    {
+        const ctx = builder.contextFor({ name: 'BA', slug: 'ba' }, {});
+        const on = builder.BLOCKS.fleet.render({ ...builder.BLOCKS.fleet.defaults(ctx), cards: true, specs: true, limit: 8 }, ctx);
+        const off = builder.BLOCKS.fleet.render({ ...builder.BLOCKS.fleet.defaults(ctx), cards: true, specs: false, limit: 8 }, ctx);
+        check('a fleet card asks the feed for the specification line', /\{\{specs\}\}/.test(on));
+        check('…and leaves it out when the VA turns it off', !/\{\{specs\}\}/.test(off));
+        check('every card carries the mark naming whose picture it is', /card__mark[^>]*>\{\{mark\}\}/.test(on));
+        check('and the credit under it can be a link', /href="\{\{creditHref\}\}">\{\{credit\}\}/.test(on));
+        check('the compact list says it too', /row__specs/.test(
+            builder.BLOCKS.fleet.render({ ...builder.BLOCKS.fleet.defaults(ctx), cards: false, specs: true, limit: 8 }, ctx)));
+    }
 
     console.log('what a VA cannot type into a page');
     doc.pages[0].blocks.find(b => b.type === 'text').props.heading = '<script>alert(1)</script>';
