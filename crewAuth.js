@@ -231,6 +231,22 @@ function sanitizeFleet(arr) {
         type: clampStr(a && a.type, 60),
         name: clampStr(a && a.name, 80),
         image: cleanImageUrl(a && a.image),
+        /* WHO THE PICTURE BELONGS TO.
+         *
+         * Most fleet photographs on this platform are not the airline's: the
+         * fleet editor pulls them from the community aircraft library, where
+         * every picture already carries the name of the person who supplied it.
+         * That name was being thrown away at the point of use, so a VA's public
+         * fleet page showed a dozen photographs and credited none of them.
+         *
+         * Stored beside the address it belongs to, so it travels with the
+         * picture into the crew centre, the feed and the hosted website — and
+         * so a VA who has a photographer of their own can type one. */
+        photographer: clampStr(a && a.photographer, 80),
+        // A page to credit back to, not a picture — cleanImageUrl is the wrong
+        // check for it. https only, because this ends up in an href on a public
+        // site that is not ours.
+        photoLink: /^https:\/\//i.test(clampStr(a && a.photoLink, 300)) ? clampStr(a.photoLink, 300) : '',
     })).filter(a => a.type || a.name);
 }
 // The Instagram wall. A handle, and up to MAX_SOCIAL_POSTS posts.

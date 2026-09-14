@@ -203,6 +203,94 @@ const BG_FIELDS = [
 
 const BG_DEFAULTS = { bgImage: '', bgDim: 55, bgFocus: 'center', bgFull: false };
 
+/* ===========================================================================
+ * CONTAINERS, WHICH ARE NOT COMPULSORY
+ *
+ * Every designed site has the same failure mode: it decides that things live in
+ * boxes, and then everything is in a box. A paragraph in a card, beside a
+ * picture in a card, above a list of cards — and the page reads as a filing
+ * system rather than as an airline, because nothing on it is allowed to simply
+ * be on the page.
+ *
+ * These three are the way out, and the defaults are exactly what the sites did
+ * before, so nothing anybody has already built moves:
+ *
+ *   panel  — does this section sit in a container at all. `none` is the
+ *            default: words on the page, which is what words want.
+ *   frame  — do the PICTURES in it get a card round them. On by default,
+ *            because a grid of framed thumbnails is right for a fleet; off for
+ *            an airline whose photographs should run as photographs.
+ *   crop   — fill the frame, or show the whole picture. The existing behaviour
+ *            is fill, and fill cuts the ends off anything wider than its box,
+ *            which is every side-on aeroplane ever photographed.
+ *
+ * Only the blocks that actually draw pictures are offered the last two. A
+ * "frame the pictures" control on a block with no picture in it is a control
+ * that does nothing, which is worse than one that is not there.
+ * ======================================================================== */
+const LAYOUT_FIELDS = [
+    {
+        key: 'panel', label: 'This section sits in', type: 'select', group: 'layout',
+        options: [
+            { value: 'none', label: 'Nothing — straight on the page' },
+            { value: 'soft', label: 'A tinted panel' },
+            { value: 'boxed', label: 'A bordered card' },
+        ],
+        help: 'A container round the whole section. Most sections read better without one.',
+    },
+];
+
+const PICTURE_FIELDS = [
+    {
+        key: 'frame', label: 'Pictures in this section', type: 'select', group: 'layout',
+        options: [
+            { value: 'on', label: 'Sit in a frame' },
+            { value: 'off', label: 'Sit straight on the page' },
+        ],
+    },
+    {
+        key: 'crop', label: 'Pictures that are not the shape of their frame', type: 'select', group: 'layout',
+        options: [
+            { value: 'fill', label: 'Fill it — the edges are cropped off' },
+            { value: 'whole', label: 'Show the whole picture' },
+        ],
+        help: 'A side-on aeroplane is three times as wide as it is tall. Filling a square with '
+            + 'one cuts the nose and the tail off it.',
+    },
+];
+
+const LAYOUT_DEFAULTS = { panel: 'none' };
+const PICTURE_DEFAULTS = { frame: 'on', crop: 'fill' };
+
+/**
+ * The section, in or out of its container.
+ *
+ * The same trick as withBackground below and for the same reason: the classes
+ * are folded into the opening tag the block already returned, so no block has
+ * to know that any of this exists. A block that returned nothing, or something
+ * that is not a section, is handed back untouched.
+ */
+function withLayout(html, p, def) {
+    if (!html) return html;
+    const classes = [];
+    const panel = p && p.panel;
+    if (panel === 'soft' || panel === 'boxed') classes.push('panel', 'panel--' + panel);
+    if (def && def.pictures) {
+        if (p && p.frame === 'off') classes.push('pics-plain');
+        if (p && p.crop === 'whole') classes.push('pics-whole');
+    }
+    if (!classes.length) return html;
+
+    const open = /^(\s*)<section\b([^>]*)>/.exec(html);
+    if (!open) return html;
+    const attrs = open[2];
+    const extra = classes.join(' ');
+    const withClass = /class="([^"]*)"/.test(attrs)
+        ? attrs.replace(/class="([^"]*)"/, (_, c) => `class="${c} ${extra}"`)
+        : `${attrs} class="${extra}"`;
+    return open[1] + `<section${withClass}>` + html.slice(open[0].length);
+}
+
 const FOCUS_POS = {
     center: '50% 50%', top: '50% 0%', bottom: '50% 100%', left: '0% 50%', right: '100% 50%',
 };
@@ -481,7 +569,7 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
         ],
         defaults: () => ({
             heading: 'Where we fly',
-            note: 'Every sector we publish, as a great circle. Drag the map sideways to follow it.',
+            note: 'Every sector we publish, as a great circle. Zoom in, and drag the map to follow it.',
         }),
         render: (p) => `
   <section class="block" data-crew-section>
@@ -489,7 +577,10 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
       <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
     </div>
     <div class="netmap" data-crew-map>
-      <div class="netmap__scroll"><svg class="netmap__svg" aria-hidden="true"></svg></div>
+      <div class="netmap__scroll" tabindex="0" role="region"
+           aria-label="Route map — drag to pan, and use the buttons or ctrl and the wheel to zoom">
+        <svg class="netmap__svg" aria-hidden="true"></svg>
+      </div>
     </div>
     <p class="netmap__note" data-crew-map-note></p>
     <script src="map.js" defer></script>
@@ -560,13 +651,20 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
         note: 'The aircraft and liveries you declared in the crew centre.',
         icon: 'plane',
         live: true,
+        // Draws pictures, so it is offered the frame and crop controls.
+        pictures: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
             { key: 'note', label: 'Under the heading', type: 'line' },
             { key: 'cards', label: 'Show each aircraft as a picture card', type: 'bool', help: 'Off, it is a compact list. Every card gets an image even where you have not uploaded one.' },
+            {
+                key: 'specs', label: 'Say what each aircraft carries and how far it flies', type: 'bool',
+                help: 'Seats, range and cruise, from the manufacturer’s published figures for a typical '
+                    + 'two-class layout — not your own cabin. A type we do not recognise simply says nothing.',
+            },
             { key: 'limit', label: 'How many', type: 'number', min: 1, max: 40 },
         ],
-        defaults: () => ({ heading: 'The fleet', note: '', limit: 16, cards: true }),
+        defaults: () => ({ heading: 'The fleet', note: '', limit: 16, cards: true, specs: true }),
         /* Two shapes, because a fleet of four and a fleet of forty want
          * different pages. Cards give every airframe a picture — the VA's own
          * livery shot, or the silhouette crew-feed.js draws for the type, so
@@ -588,11 +686,21 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
                  one below it, said twice. -->
             <img class="card__media-bg" src="{{image}}" alt="" aria-hidden="true" loading="lazy" decoding="async">
             <img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async">
+            <!-- WHOSE PICTURE THIS IS, ON THE PICTURE.
+
+                 The line under the card is the full credit; this is the same
+                 fact where it cannot be separated from the thing it is about,
+                 because the picture is what gets screenshotted and reposted.
+                 The feed decides the name: the photographer for a photograph,
+                 Inflight for an outline we drew, and nothing at all for an
+                 airline's own upload — which is theirs. Empty, it disappears. -->
+            <span class="card__mark">{{mark}}</span>
           </span>
           <span class="card__body">
             <b>{{aircraft}}</b>
-            <span>{{livery}}</span>
-            <span class="card__credit">{{credit}}</span>
+            <span>{{livery}}</span>${p.specs ? `
+            <span class="card__specs">{{specs}}</span>` : ''}
+            <span class="card__credit"><a href="{{creditHref}}">{{credit}}</a></span>
           </span>
         </li>
       </template>
@@ -604,7 +712,7 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
       <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
     </div>
     <ul class="rows" data-crew-list="fleet" data-crew-limit="${p.limit}">
-      <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{aircraft}}</b> <span>{{livery}}</span></li></template>
+      <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{aircraft}}</b> <span>{{livery}}</span>${p.specs ? '<span class="row__specs">{{specs}}</span>' : ''}</li></template>
       <li><b>Add your fleet in the crew centre</b> <span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></li>
     </ul>
   </section>`),
@@ -1051,6 +1159,7 @@ ${prose(p.body)}
         label: 'Words beside a picture',
         note: 'Two columns on a screen, one on a phone. The layout every airline wants for "who we are".',
         icon: 'columns-2',
+        pictures: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
             { key: 'body', label: 'Words', type: 'text', help: 'Leave a blank line between paragraphs.' },
@@ -1114,6 +1223,7 @@ ${prose(p.body, 'prose')}${cta}
         label: 'Pictures',
         note: 'A grid of photographs. Choose them from your pictures, or paste an address.',
         icon: 'image',
+        pictures: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
             { key: 'note', label: 'Under the heading', type: 'line' },
@@ -1368,7 +1478,12 @@ function cleanBlock(raw, ctx) {
     const type = raw && String(raw.type || '');
     const def = BLOCKS[type];
     if (!def) return null;
-    const defaults = { ...BG_DEFAULTS, ...def.defaults(ctx) };
+    const defaults = {
+        ...BG_DEFAULTS,
+        ...LAYOUT_DEFAULTS,
+        ...(def.pictures ? PICTURE_DEFAULTS : null),
+        ...def.defaults(ctx),
+    };
     const props = {};
     // The background fields belong to every block and are declared on none of
     // them — see A PICTURE BEHIND ANY SECTION above.
@@ -1386,7 +1501,13 @@ function cleanBlock(raw, ctx) {
  *  Inflight banner — offering it a SECOND picture underneath all that is two
  *  photographs fetched to show one, stacked, with no way to tell from the form
  *  which is on top. */
-const fieldsOf = (def) => (def.fields || []).concat(def.ownBackground ? [] : BG_FIELDS);
+const fieldsOf = (def) => (def.fields || [])
+    .concat(def.ownBackground ? [] : BG_FIELDS)
+    // A hero and the showreel are full-bleed stages — they ARE the container,
+    // so offering to put one in a card is offering a card round the top of the
+    // page. The picture controls only go to blocks that draw pictures.
+    .concat(def.ownBackground ? [] : LAYOUT_FIELDS)
+    .concat(def.pictures ? PICTURE_FIELDS : []);
 
 /**
  * A whole document, cleaned.
@@ -1534,7 +1655,10 @@ function pageHtml(doc, page, ctx) {
     const body = page.blocks.map((b) => {
         const def = BLOCKS[b.type];
         if (!def) return '';
-        return withBackground(def.render(b.props, ctx), b.props, def);
+        // Layout first, background second: the background wrapper reads the
+        // section's opening tag and adds its own layer inside it, so it has to
+        // see the classes the layout put there rather than the other way round.
+        return withBackground(withLayout(def.render(b.props, ctx), b.props, def), b.props, def);
     }).filter(Boolean).join('\n');
 
     return `<!DOCTYPE html>
@@ -1646,7 +1770,16 @@ function newBlock(type, va, { crewBase } = {}) {
     // BG_DEFAULTS first, so a freshly inserted section has the background
     // fields the editor is about to draw a form for — without them the picture
     // controls open empty and the first change writes an incomplete block.
-    return { id: newId(), type, props: { ...BG_DEFAULTS, ...def.defaults(contextFor(va, { crewBase })) } };
+    return {
+        id: newId(),
+        type,
+        props: {
+            ...BG_DEFAULTS,
+            ...LAYOUT_DEFAULTS,
+            ...(def.pictures ? PICTURE_DEFAULTS : null),
+            ...def.defaults(contextFor(va, { crewBase })),
+        },
+    };
 }
 
 /** What the editor draws its palette and its forms from. Content-free. */

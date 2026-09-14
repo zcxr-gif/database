@@ -545,18 +545,46 @@ async function run() {
         const fit = await page.evaluate(() => {
             const art = document.querySelector('.card__media img:not(.card__media-bg)');
             if (!art) return null;
-            const well = art.closest('.card__media').getBoundingClientRect();
+            const wellEl = art.closest('.card__media');
+            const well = wellEl.getBoundingClientRect();
+            const box = art.getBoundingClientRect();
+            const bg = wellEl.querySelector('.card__media-bg');
             const cs = getComputedStyle(art);
-            return { objectFit: cs.objectFit, wellW: well.width, wellH: well.height,
-                     natW: art.naturalWidth, natH: art.naturalHeight };
+            return {
+                objectFit: cs.objectFit, wellW: well.width, wellH: well.height,
+                natW: art.naturalWidth, natH: art.naturalHeight,
+                // Where the picture actually LANDED, and how the ground behind
+                // it is laid out.
+                art: { top: box.top, bottom: box.bottom, left: box.left, right: box.right },
+                well: { top: well.top, bottom: well.bottom, left: well.left, right: well.right },
+                bg: bg ? { position: getComputedStyle(bg).position, objectFit: getComputedStyle(bg).objectFit } : null,
+            };
         });
         ok('the picture is contained, not cropped', fit && fit.objectFit === 'contain',
             fit ? 'object-fit: ' + fit.objectFit : 'no fleet picture drawn');
         ok('a wide livery keeps both its ends',
             !!fit && fit.natW / fit.natH > 2 && fit.wellW / fit.wellH < 2,
             fit ? 'picture ' + fit.natW + 'x' + fit.natH + ' in a well ' + Math.round(fit.wellW) + 'x' + Math.round(fit.wellH) : '');
+        /* THE MEASUREMENT THE COMMENT ABOVE HAS ALWAYS PROMISED.
+         *
+         * object-fit alone was never enough, and the gap let a real bug through:
+         * `.card__media img` out-specified `.card__media-bg`, so the blurred
+         * ground never got its `position: absolute`, stayed in the flow, and
+         * pushed the aeroplane a full well-height down and out of an
+         * `overflow: hidden` box. Every assertion above still passed — the
+         * picture was contained and the ratios were right — while the card
+         * showed a blurred ghost and no aircraft at all.
+         *
+         * So: the drawn picture is inside its well, on both axes. */
+        ok('…and the picture is actually in the well, not pushed out of it',
+            !!fit && fit.art.top >= fit.well.top - 1 && fit.art.bottom <= fit.well.bottom + 1
+                && fit.art.left >= fit.well.left - 1 && fit.art.right <= fit.well.right + 1,
+            fit ? 'picture ' + JSON.stringify(fit.art) + ' in well ' + JSON.stringify(fit.well) : '');
         ok('the well has a ground made of the picture itself',
             (await page.locator('.card__media-bg').count()) > 0);
+        ok('…and that ground is behind the picture rather than beside it',
+            !!fit && !!fit.bg && fit.bg.position === 'absolute' && fit.bg.objectFit === 'cover',
+            fit && fit.bg ? JSON.stringify(fit.bg) : 'no ground');
 
         await page.close();
     }
@@ -592,6 +620,82 @@ async function run() {
             await page.evaluate(() => {
                 const w = document.querySelector('.netmap__scroll');
                 return !!w && getComputedStyle(w).overflowX === 'auto';
+            }));
+        await page.close();
+    }
+
+    /* ======================================================================
+     * THE ROUTE MAP ZOOMS
+     *
+     * The map crops itself to the network, which is what stops an airline that
+     * flies six sectors in Norway getting a picture of the Atlantic. It is also
+     * why it reads SMALL for one that flies everywhere: the world fitted into a
+     * band the height of a paragraph is every base as a two-pixel dot.
+     *
+     * So the fitted crop is the floor. What is under test is that the picture
+     * grows inside its box — and that the SECTION does not, because a map that
+     * shoves the rest of the page down when you press + is worse than a small
+     * one.
+     * ==================================================================== */
+    console.log('\nThe route map zooms');
+    {
+        const page = await browser.newPage({ viewport: DESK });
+        await wire(page);
+        await page.goto(base + 'network.html', { waitUntil: 'load' });
+        await page.waitForSelector('.netmap__zoom button', { timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(250);
+
+        const read = () => page.evaluate(() => {
+            const host = document.querySelector('.netmap');
+            if (!host) return null;
+            const sc = host.querySelector('.netmap__scroll');
+            const svg = host.querySelector('.netmap__svg');
+            return {
+                svgH: svg.getBoundingClientRect().height,
+                sectionH: host.closest('section').getBoundingClientRect().height,
+                scH: sc.clientHeight, scrollH: sc.scrollHeight,
+                labels: host.querySelectorAll('.netmap__label').length,
+                outDead: host.querySelector('[data-map-zoom="out"]').disabled,
+            };
+        });
+
+        const fitted = await read();
+        ok('the map offers zoom controls', (await page.locator('.netmap__zoom button').count()) === 3);
+        ok('…which say so when there is nothing left to do', !!fitted && fitted.outDead);
+
+        await page.click('[data-map-zoom="in"]');
+        await page.waitForTimeout(350);
+        const zoomed = await read();
+        ok('pressing + makes the drawn map bigger',
+            !!zoomed && zoomed.svgH > fitted.svgH * 1.3, JSON.stringify({ was: fitted.svgH, now: zoomed.svgH }));
+        ok('…inside its own box, so the page below does not move',
+            !!zoomed && Math.abs(zoomed.sectionH - fitted.sectionH) < 2,
+            JSON.stringify({ was: fitted.sectionH, now: zoomed.sectionH }));
+        ok('…and the box now scrolls up and down as well as across',
+            !!zoomed && zoomed.scrollH > zoomed.scH + 2, JSON.stringify(zoomed));
+        /* Zooming REDRAWS rather than magnifying: labels are placed by
+           collision, so the airports with no name are the ones that had no room
+           for one. More room, more names — which is what zooming into a map is
+           for. */
+        ok('…and names at least as many airports as before',
+            !!zoomed && zoomed.labels >= fitted.labels,
+            JSON.stringify({ was: fitted.labels, now: zoomed.labels }));
+
+        await page.click('[data-map-zoom="reset"]');
+        await page.waitForTimeout(350);
+        const back = await read();
+        ok('Fit puts the whole network back',
+            !!back && Math.abs(back.svgH - fitted.svgH) < 2, JSON.stringify({ fitted: fitted.svgH, back: back.svgH }));
+
+        // The edge fade is on the scroller, not the map: on the map it took the
+        // controls out with the coastline.
+        ok('the zoom controls are not faded out by the pan hint',
+            await page.evaluate(() => {
+                const host = document.querySelector('.netmap');
+                const m = getComputedStyle(host).maskImage;
+                const b = host.querySelector('[data-map-zoom="reset"]').getBoundingClientRect();
+                const r = host.getBoundingClientRect();
+                return (m === 'none' || !m) && b.right <= r.right + 1 && b.width > 0;
             }));
         await page.close();
     }
