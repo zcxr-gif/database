@@ -908,13 +908,19 @@ the same URLs any visitor to the crew centre reads:
 GET /api/crew/<slug>/routes        GET /api/crew/<slug>/events
 GET /api/crew/<slug>/route-map     GET /api/crew/<slug>/schedules
 GET /api/crew/<slug>/stats         GET /api/crew/<slug>/announcements
-GET /api/crew/<slug>/social
+GET /api/crew/<slug>/social        GET /api/crew/<slug>/staff
 ```
 
-Rosters, applications, applicant emails, flight reports, staff logins, our
-Mongo and the VA's Supabase service key are on none of these, so none of them is
-reachable from a hosted site. There is no key in a hosted site and nothing to
-leak by publishing one.
+`staff` is the opt-in half of the roster and nothing more: the pilots who hold
+one of the **roles the airline declared**, with the rank they fly at, the
+Community handle that is already on the airline's own forum thread, and the
+role's own short message. A pilot with no role is not on it. Nobody's e-mail,
+nobody's login and nobody's hours history are on it either.
+
+The roster itself, applications, applicant emails, flight reports, staff logins,
+our Mongo and the VA's Supabase service key are on none of these, so none of
+them is reachable from a hosted site. There is no key in a hosted site and
+nothing to leak by publishing one.
 
 ### Storage and caps
 
@@ -1136,10 +1142,11 @@ Readers, all of which resolve to `null` rather than throwing — and `null` mean
 | `CrewFeed.activity()` | `/announcements` | Only what the crew centre recorded — joins, promotions, published events |
 | `CrewFeed.posts()` | `/social` | The Instagram wall |
 | `CrewFeed.handle()` | `/social` | The VA's Instagram handle |
-| `CrewFeed.brand()` | `/api/va-ads/by-slug/<slug>` | Name, callsign, tagline, **logo**, **banner**, accent, callsign prefix, Discord invite |
+| `CrewFeed.brand()` | `/api/va-ads/by-slug/<slug>` | Name, callsign, tagline, **logo**, **banner**, accent, callsign prefix, Discord invite, and where the airline flies from — `country`, `flag`, `countryName`, `origin` |
 | `CrewFeed.ranks()` | same | The **rank ladder**, sorted by the hours each rung asks for |
 | `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
 | `CrewFeed.roles()` | same | Role definitions (never who holds one) |
+| `CrewFeed.staff()` | `/staff` | The people holding those roles: name, rank, Community profile, the role's message |
 | `CrewFeed.hubs()` | `/route-map` | The airports the airline flies most sectors out of |
 | `CrewFeed.partners()` | `/route-map` | The airlines it codeshares with, deduplicated |
 

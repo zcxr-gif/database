@@ -214,6 +214,11 @@ function sanitizeRoles(arr) {
         icon: clampStr(r && r.icon, 30),
         image: cleanImageUrl(r && r.image),
         staff: !!(r && r.staff),
+        // A short word from whoever holds the role — the CEO's welcome, in
+        // practice. Clamped hard on purpose: this is a sentence beside a name
+        // on a card, not the About page, and a role whose message runs to four
+        // hundred words is a section the airline meant to write instead.
+        message: clampStr(r && r.message, 400),
     })).filter(r => r.name);
 }
 function sanitizeFleet(arr) {
@@ -1080,6 +1085,17 @@ function registerCrewAuthRoutes(app) {
                 }
                 ad.loginBackdrop = bg;
             }
+            // Where the airline is from. Two letters, upper case, or cleared —
+            // the flag and the country's name are derived from the code
+            // everywhere they are drawn, so anything else is not a country and
+            // is refused rather than stored as one.
+            if (req.body?.country !== undefined) {
+                const cc = String(req.body.country || '').trim().toUpperCase();
+                if (cc && !/^[A-Z]{2}$/.test(cc)) {
+                    return res.status(400).json({ error: 'Country must be a two-letter country code, or empty.' });
+                }
+                ad.country = cc;
+            }
             if (req.body?.ranks !== undefined) {
                 const r = sanitizeRanks(req.body.ranks);
                 if (r) ad.ranks = r;
@@ -1182,6 +1198,7 @@ function registerCrewAuthRoutes(app) {
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
                 loginLook: ad.loginLook || 'center', loginBackdrop: ad.loginBackdrop || 'auto',
                 topicMode: ad.crewTopicMode || 'sheet',
+                country: ad.country || '',
                 ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 discordInvite: ad.crewDiscordInvite || '',

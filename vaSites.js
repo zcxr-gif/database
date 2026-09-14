@@ -822,9 +822,9 @@ function mountVaSiteHost(app) {
  *   - a site whose mode is 'design'. Ejecting to files is one-way and refused
  *     entirely unless a subdomain is configured, so a hand-written site can
  *     never reach this route;
- *   - files with an extension we generate — .html and .css, plus the one
- *     site.js our own renderer writes. Anything else 404s here even if it
- *     somehow existed in the row.
+ *   - files with an extension we generate — .html and .css, plus the two
+ *     scripts our own renderer writes: site.js and the route map's map.js.
+ *     Anything else 404s here even if it somehow existed in the row.
  *
  * And the response carries a Content-Security-Policy with `script-src 'self'`,
  * where 'self' is the platform: every script that can run on this page is one
@@ -838,8 +838,13 @@ function mountVaSiteHost(app) {
  * ======================================================================== */
 
 // What our own renderer produces, and therefore all this route will hand back.
+//
+// The scripts are named ONE BY ONE rather than allowed by extension, and that
+// is the whole safety argument for serving a builder site on our own origin: a
+// .js here is a file this repo wrote, never one a VA did. Adding a name to this
+// set is adding a file we ship — see renderSite in vaSiteBuilder.js.
 const PATH_SERVABLE = new Set(['.html', '.css']);
-const PATH_SERVABLE_JS = 'site.js';
+const PATH_SERVABLE_JS = new Set(['site.js', 'map.js']);
 
 function pathSecurityHeaders(res, { preview } = {}) {
     res.set('Content-Security-Policy', [
@@ -869,7 +874,7 @@ function pathSecurityHeaders(res, { preview } = {}) {
 /** Is this a file this route is willing to hand back? */
 function pathServable(file) {
     if (!file) return false;
-    if (file.path === PATH_SERVABLE_JS) return true;
+    if (PATH_SERVABLE_JS.has(file.path)) return true;
     return PATH_SERVABLE.has(extOf(file.path));
 }
 
