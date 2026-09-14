@@ -993,8 +993,10 @@ records why.
 
 ### Designs, blocks and the theme — `vaSiteTemplates.js`
 
-A VA picks a design and sees their own airline in it. Six ship today
-(`GET /api/va-portal/site/templates` returns the catalogue):
+A VA picks a design and sees their own airline in it. Twelve ship today
+(`GET /api/va-portal/site/templates` returns the catalogue, which is the source
+of truth — this table is a reader's summary and the route is what the picker
+draws):
 
 | id | What it is |
 |---|---|
@@ -1004,6 +1006,12 @@ A VA picks a design and sees their own airline in it. Six ship today
 | `terminal` | Type and rules only. Loads instantly, ages well. |
 | `cabin` | Warm and rounded, card-based. For a smaller crew. |
 | `livery` | Colour-forward. Full-bleed blocks of the accent. |
+| `heritage` | Pattern-led. The airline's motif through the whole page. |
+| `skyline` | Photographic. Dark and cinematic, built on the banner and fleet. |
+| `boardingpass` | The page as a ticket — perforations, coupons, a barcode. |
+| `flightdeck` | A glass cockpit. Bracketed panels and tape readouts on near-black. |
+| `atlas` | Map-led. A route line down the page with a waypoint at every section. |
+| `aurora` | Islands. Soft panels on a wash of the airline's own colour, with its aircraft at the top. |
 
 **The invariant, and the reason the module is arranged as it is.** Every
 template is a different design and none of them is a different data wiring. The
@@ -1042,11 +1050,31 @@ of each, and offering them is offering a way to end up with two. The route
 returns HTML rather than writing it: where a section goes in the open file is
 the cursor's business, and a server that inserted it would be guessing.
 
-Each design also ships `site.js`, which does the two things markup cannot —
-mounting the Instagram wall lazily, and removing a `[data-crew-section]` block
-whose list came back empty. `crew-feed.js` deliberately does not remove empty
-lists, because on most pages an empty list still has a fallback row worth
-showing; a block marked `[data-crew-section]` is saying the opposite.
+Each design also ships `site.js`, which does what markup cannot — the menu
+panel, arrivals, the lightbox, mounting the Instagram wall lazily, the
+showreel's film, and removing a `[data-crew-section]` block whose list came back
+empty. `crew-feed.js` deliberately does not remove empty lists, because on most
+pages an empty list still has a fallback row worth showing; a block marked
+`[data-crew-section]` is saying the opposite.
+
+**The showreel, and the one rule worth knowing before touching it.** The
+`showreel` block opens a page with the airline's own aeroplane — one row of
+`data-crew-list="fleet"`, so it is their livery photograph where they uploaded
+one and a silhouette `crew-feed.js` draws where they did not — on a stage that
+also carries a CSS sky and two drawn contrails. Over that it can play a short
+film.
+
+**The film's address ships in `data-src`, never in `src`, and that is not a
+style choice.** A `src` is a download the moment the markup parses, and by then
+none of the three checks that decide whether the visitor should get one has run:
+the airline's Motion set to `none`, the visitor's `prefers-reduced-motion`, and
+the visitor's `Save-Data`. `site.js` moves the attribute across only after all
+three pass; it reveals the `<video>` only on `loadedmetadata`, so a rotted
+address leaves the aircraft on the stage rather than a black rectangle; and it
+adds the pause button at the same moment, because a loop running longer than
+five seconds with no way to stop it is a page some people cannot use. The
+browser suite (`npm run test:sites:browser`) asserts all four at the *request*,
+which is the only place the difference is visible.
 ---
 
 ### Pictures on a hosted site

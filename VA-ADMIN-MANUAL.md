@@ -876,11 +876,12 @@ second one for the same VA is (§7.3).
 
 ### They pick a design, they do not start from a blank file
 
-The Website tab opens on a gallery of designs — Flightline, Concourse, Horizon,
-Terminal, Cabin, Livery, Heritage, Skyline. Picking one lays out a working
-airline homepage with that VA's real figures already wired in, and they change
-the words from there. On top of the layout sit five controls: accent colour,
-typeface, light/dark, corner softness, and a **motif** — a pattern drawn in CSS
+The Website tab opens on a gallery of a dozen designs — Flightline, Concourse,
+Horizon, Terminal, Cabin, Livery, Heritage, Skyline, Boarding Pass, Flight Deck,
+Atlas and Aurora. Picking one lays out a working airline homepage with that VA's
+real figures already wired in, and they change the words from there. On top of
+the layout sit six controls: accent colour, typeface, light/dark, corner
+softness, how much the site **moves**, and a **motif** — a pattern drawn in CSS
 that runs behind the hero and the apply band. A VA can change design at any time
 without losing a word they have written, and put the previous one back by name.
 
@@ -902,6 +903,27 @@ shows one of two things per aircraft:
 Neither is a third party's photograph, so a fleet grid full of plane pictures is
 not by itself evidence of anything. The credit line under each card says which
 it is — read that before acting.
+
+### A site that plays a film
+
+Some designs open on an aircraft rather than a photograph, and that section can
+carry a **short film**. Two things are worth knowing before you read one as a §6
+problem.
+
+The aeroplane itself is never a copyright question we did not already have: it
+is one row of the VA's own fleet, so it is their upload or a silhouette we drew,
+exactly as above.
+
+**The film is different.** A VA cannot upload video — there is no pipeline for
+it and the picture library refuses anything that is not an image — so a film on
+a hosted site is an address the VA typed, pointing at a file hosted somewhere
+else. Treat it as you would any picture they linked rather than uploaded: **§6
+applies to the content, not to where it is stored.** Somebody else's cockpit
+footage or a real carrier's advertisement is the same finding on a website that
+it would be on a listing, and a clip of their own sim flight is not a finding at
+all. The film plays silently, on a loop, with a pause control; if it is not
+playing when you look, that is by design — it is not downloaded for a visitor
+whose device asks for less movement or less data.
 
 ### The two switches
 

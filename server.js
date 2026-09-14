@@ -17468,4 +17468,34 @@ app.listen(PORT, () => {
     console.log(`   Infinite Flight platform client: ${ifOAuth.PLATFORM_CLIENT.id
         ? `${ifOAuth.PLATFORM_CLIENT.id} (${ifOAuth.PLATFORM_CLIENT.type})`
         : 'none — every VA uses their own'}`);
+
+    /* AND THE SAME LINE FOR DISCORD, for the same reason and after the same
+     * cost. Crew Discord sign-in has the identical trap: Discord compares the
+     * redirect_uri on the token exchange against the one the authorize carried
+     * and refuses the code if they differ by a character — and a refusal is
+     * invisible from the outside. It arrives as a pilot saying "it says Discord
+     * didn't answer", which is the one explanation it never is.
+     *
+     * Unset is the dangerous case rather than the harmless one: the fallback
+     * derives the URI from each request's own host, so it is correct right up
+     * until the deployment gains a second hostname, and then it breaks for
+     * whichever one Discord was not registered with. Neither value here is a
+     * secret — the client id travels in every authorization URL and the
+     * redirect URI is registered in Discord's own developer portal. */
+    const DISCORD_CALLBACK_PATH = '/api/crew/auth/discord/callback';
+    if (!crewDiscord.configured()) {
+        console.log('   Crew Discord sign-in: off (no DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET)');
+    } else {
+        const dRedirect = crewDiscord.redirectUri(null);
+        if (!dRedirect) {
+            console.warn('   ⚠️  Crew Discord redirect URI: NOT SET — falling back to each request’s own host.');
+            console.warn(`       Set DISCORD_OAUTH_REDIRECT_URI to the URI registered on the Discord application, or a sign-in started on one hostname and finished on another is refused with "invalid_grant".`);
+        } else if (!dRedirect.endsWith(DISCORD_CALLBACK_PATH)) {
+            console.warn(`   ⚠️  Crew Discord redirect URI: ${dRedirect}`);
+            console.warn(`       This does not end in ${DISCORD_CALLBACK_PATH}, which is the only Discord callback route this server has.`);
+        } else {
+            console.log(`   Crew Discord redirect URI: ${dRedirect}`);
+            console.log('       This must match a redirect URI on the Discord application EXACTLY, character for character.');
+        }
+    }
 });

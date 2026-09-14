@@ -220,8 +220,19 @@ cat.templates.forEach((meta) => {
         /data-crew-brand="logo"/.test(named['index.html']), true);
     T(`${meta.id}: …inside a holder, so a VA without one gets a wordmark`,
         /data-crew-figure[^>]*>\s*<img data-crew-brand="logo"/.test(named['index.html']), true);
-    T(`${meta.id}: the banner is behind the hero, not a gap when absent`,
-        /class="hero__bg" data-crew-figure hidden/.test(named['index.html']), true);
+    /* THE TOP OF THE PAGE CARRIES A PICTURE THE VA DOES NOT HAVE TO PROVIDE,
+     * and there are two shapes of that now. A design opening on `hero` puts
+     * their Inflight banner behind the words, inside a holder so a VA without
+     * one gets a design rather than a gap. A design opening on `showreel` puts
+     * one of their own aircraft on a stage instead, which is the same promise
+     * kept by a different route — and it is read off the fleet, so it is a
+     * livery photograph or a silhouette and never nothing.
+     *
+     * Asserted as "one of the two", not as a list of which designs do which:
+     * the point is that no homepage on the platform opens on an empty box. */
+    T(`${meta.id}: the top of the page carries a picture nobody had to upload`,
+        /class="hero__bg" data-crew-figure hidden/.test(named['index.html'])
+        || /class="reel__ship" data-crew-list="fleet"/.test(named['index.html']), true);
     // The two lists that used to be three invented aircraft and three invented
     // ranks. A hard-coded fleet on a hosted site is a website that disagrees
     // with the airline from the day it is published.
@@ -470,7 +481,9 @@ const blockOf = (type, props) => {
 const renderOne = (block) => {
     const doc = { version: 1, pages: [{ path: 'index.html', title: '', nav: true, navLabel: 'Home', blocks: [block] }] };
     const html = B.renderSite(doc, { va: bva, templateId: 'horizon' }).find(f => f.path === 'index.html').content;
-    return html.split('<main>')[1].split('</main>')[0];
+    // <main> carries an id now — it is the skip link's target. Split on the
+    // tag's end rather than on a whole opening tag that can gain an attribute.
+    return html.split('<main id="main">')[1].split('</main>')[0];
 };
 
 console.log('\na picture behind any section');
@@ -514,8 +527,11 @@ console.log('\na picture behind any section');
      * a property of that block rather than a list kept somewhere else. */
     const all = B.catalogue().blocks;
     const without = all.filter(b => !b.fields.some(f => f.key === 'bgImage')).map(b => b.type);
+    /* The two openers, and nothing else. Both handle their own picture: the
+     * hero has an image field and a scrim each design tunes, the showreel has
+     * a whole stage. Everything else on the list must be able to take one. */
     T('every section can take a picture behind it, bar the ones that own theirs',
-        without, ['hero']);
+        without, ['hero', 'showreel']);
     const anyBg = all.find(b => b.fields.some(f => f.key === 'bgImage'));
     T('…and the fields are grouped, so a form does not end in four of them',
         anyBg.fields.filter(f => f.key === 'bgImage')[0].group, 'background');
@@ -614,10 +630,13 @@ console.log('\na section that handles its own picture is not given a second');
      * two photographs fetched to show one, stacked, with no way to tell from the
      * form which is on top. */
     const cat = B.catalogue();
+    const owns = ['hero', 'showreel'];
     const hero = cat.blocks.find(b => b.type === 'hero');
     T('the hero is not offered one', hero.fields.some(f => f.key === 'bgImage'), false);
+    const reel = cat.blocks.find(b => b.type === 'showreel');
+    T('nor is the showreel, whose stage is the picture', reel.fields.some(f => f.key === 'bgImage'), false);
     T('every other section still is',
-        cat.blocks.filter(b => b.type !== 'hero' && !b.fields.some(f => f.key === 'bgImage')).map(b => b.type), []);
+        cat.blocks.filter(b => !owns.includes(b.type) && !b.fields.some(f => f.key === 'bgImage')).map(b => b.type), []);
 
     // Belt and braces: even a stored document that still carries bgImage on a
     // hero — written before this, or by hand — must not grow a second layer.
