@@ -122,18 +122,62 @@ function airline(key, { fleet = [] } = {}) {
     // own metal today rather than needing the fleet to grow.
     const have = new Set((fleet || []).map((f) => fold(typeof f === 'string' ? f : f && f.type)));
 
+    /* WHICH AIRCRAFT THIS AIRLINE ACTUALLY FLIES — AND WHICH BELONG TO WHOEVER
+     * FLIES FOR IT.
+     *
+     * An aeroplane on a leg the airline SOLD BUT DID NOT FLY is not the
+     * airline's aeroplane. It belongs to whichever partner or regional operated
+     * the leg, and the source does not record who that is.
+     *
+     * AeroMéxico is the case that makes this concrete. Its listed network has 11
+     * CRJ-900 legs and it has never flown a CRJ-900 in its life — Aeroméxico
+     * Connect does. Seven of its sixteen listed types are like this (A319, A320,
+     * 717, 737-900, 757-200, CRJ-700, CRJ-900): every single appearance is on a
+     * leg somebody else operated. Taking the aircraft off those legs at face
+     * value put seven aeroplanes the airline does not own into the VA's fleet,
+     * and then offered to paint them in AeroMéxico's own livery — a combination
+     * Infinite Flight may not even have.
+     *
+     * So a type counts as this airline's only if it appears on at least one leg
+     * the airline flew ITSELF. That is a fact the data does support, unlike the
+     * identity of the operator, which it does not: matching a codeshare leg
+     * against who flies the same pair on the same type yields one candidate 48%
+     * of the time and nothing at all 37% — and for those AeroMéxico CRJ-900 legs
+     * specifically, nothing. We do not guess. We just decline to hand the VA
+     * somebody else's aeroplane. */
+    const operates = new Set();
+    for (const r of a.routes) if (!r.cs) for (const t of r.ac) operates.add(fold(t));
+    const isTheirs = (t) => operates.has(fold(t));
+
     return {
         ...attribution(),
         airline: {
             key: a.key, name: a.name, iata: a.iata, icao: a.icao,
             callsign: a.callsign, country: a.country, active: a.active,
         },
-        routes: a.routes.map((r) => ({
+        // Every type this airline is recorded flying on its own metal. The fleet
+        // step adds from HERE and nowhere else.
+        operatedTypes: [...new Set(a.routes.filter((r) => !r.cs).flatMap((r) => r.ac))].sort(),
+        routes: a.routes.map((r) => {
+            // Prefer an aeroplane the airline actually flies. On a leg it flew
+            // itself that is every option; on one it only sold, it may be none —
+            // and then the route arrives with no aircraft rather than with the
+            // partner's, so the VA picks from their own fleet.
+            const mine = r.ac.filter(isTheirs);
+            return {
             origin: r.o,
             destination: r.d,
             distanceNm: r.nm,
-            aircraft: r.ac[0] || '',
+            aircraft: mine[0] || '',
             aircraftOptions: r.ac,
+            // The subset of aircraftOptions this airline flies itself. The
+            // picker offers the rest too — a VA may well decide to fly the leg
+            // on the partner's type — but only these are ever added to a fleet.
+            ownAircraftOptions: mine,
+            // True when the only aeroplanes listed for this leg belong to
+            // somebody else. The tick list says so, and the route arrives with
+            // the aircraft left for the VA to choose.
+            partnerAircraftOnly: r.ac.length > 0 && mine.length === 0,
             /* ALWAYS 'own'. A REAL-WORLD CODESHARE IS NOT THIS PLATFORM'S.
              *
              * `crew_routes.kind = 'codeshare'` means "another VIRTUAL airline on
@@ -169,10 +213,11 @@ function airline(key, { fleet = [] } = {}) {
             flightNumber: '',
             notes: '',
             // Not persisted — the confirm table reads them.
-            inFleet: r.ac.some((t) => have.has(fold(t))),
-            // The types this leg would ADD to the fleet if taken as-is.
-            newTypes: r.ac.filter((t) => !have.has(fold(t))),
-        })),
+            inFleet: mine.some((t) => have.has(fold(t))),
+            // The types this leg would ADD to the fleet if taken as-is. Only
+            // ever the airline's own: a partner's aeroplane is never added.
+            newTypes: mine.filter((t) => !have.has(fold(t))),
+        }; }),
     };
 }
 

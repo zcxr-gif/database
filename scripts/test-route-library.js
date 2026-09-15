@@ -100,6 +100,42 @@ console.log('\n what it refuses to guess');
         ba.routes.every((r) => r.flightNumber === ''), true);
 }
 
+console.log('\n somebody else’s aeroplane');
+{
+    /* The AeroMéxico case. Its listed network carries 11 CRJ-900 legs and it has
+     * never flown a CRJ-900 — Aeroméxico Connect does. Seven of its sixteen
+     * listed types are like that. Taking the aircraft off those legs at face
+     * value put seven aeroplanes the airline does not own into a VA's fleet, and
+     * then offered to paint them in AeroMéxico's own livery. */
+    const amx = routeLibrary.airline('AMX');
+    T('the airline resolves', amx.airline.icao, 'AMX');
+    T('only what it flies itself counts as its fleet',
+        amx.operatedTypes.includes('Bombardier CRJ-900'), false);
+    T('…while what it really operates does',
+        amx.operatedTypes.includes('Boeing 737-800') && amx.operatedTypes.includes('Embraer E175'), true);
+
+    const crj = amx.routes.filter((r) => r.aircraftOptions.includes('Bombardier CRJ-900'));
+    T('the CRJ-900 legs are still offered', crj.length > 0, true);
+    T('…but arrive with no aircraft rather than the partner’s',
+        crj.every((r) => r.aircraft === ''), true);
+    T('…and are flagged as not the airline’s to fly',
+        crj.every((r) => r.partnerAircraftOnly === true), true);
+    T('…and would add nothing whatever to the fleet',
+        crj.every((r) => r.newTypes.length === 0), true);
+
+    // The whole-network property: a fleet built from this import contains only
+    // aeroplanes the airline actually flies.
+    const wouldAdd = [...new Set(amx.routes.flatMap((r) => r.newTypes))].sort();
+    T('nothing the airline does not operate can reach a fleet',
+        wouldAdd.every((t) => amx.operatedTypes.includes(t)), true);
+    T('…which for AeroMéxico is 9 types, not 16', wouldAdd.length, 9);
+
+    // A leg the airline DID fly keeps its aeroplane.
+    const own = amx.routes.filter((r) => !r.partnerAircraftOnly);
+    T('legs it flew itself still name an aircraft',
+        own.length > 0 && own.every((r) => r.aircraft !== ''), true);
+}
+
 console.log('\n fleet annotation');
 {
     const fleet = [{ type: 'Boeing 777-200ER' }, { type: 'Boeing 747-400' }];
@@ -108,10 +144,16 @@ console.log('\n fleet annotation');
     T('legs the VA can already fly are marked', flown.length > 0, true);
     T('…and they name nothing to add',
         flown.every((r) => r.aircraftOptions.some((t) => fleet.some((f) => f.type === t))), true);
-    const adds = ba.routes.filter((r) => !r.inFleet);
+    // A leg is "not in fleet" for two different reasons now, and only one of
+    // them is something to add: either the airline flies it on a type the VA
+    // lacks, or every aeroplane listed belongs to a partner and the leg carries
+    // none at all.
+    const adds = ba.routes.filter((r) => !r.inFleet && !r.partnerAircraftOnly);
     T('…while the rest name exactly what they would add',
         adds.every((r) => r.newTypes.length > 0
             && r.newTypes.every((t) => !fleet.some((f) => f.type === t))), true);
+    T('…and a leg with only a partner’s aeroplane adds nothing',
+        ba.routes.filter((r) => r.partnerAircraftOnly).every((r) => r.newTypes.length === 0), true);
     T('an empty fleet means nothing is in it',
         routeLibrary.airline('BAW').routes.some((r) => r.inFleet), false);
 }
