@@ -255,6 +255,52 @@ function sanitizeFleet(arr) {
         photoLink: /^https:\/\//i.test(clampStr(a && a.photoLink, 300)) ? clampStr(a.photoLink, 300) : '',
     })).filter(a => a.type || a.name);
 }
+/* CODESHARE PARTNERS.
+ *
+ * Same shape as a fleet row for the aeroplanes, because they ARE fleet rows —
+ * somebody else's fleet. That means the same canonical Infinite Flight names,
+ * the same photo-credit fields, and the same cleanImageUrl on the picture.
+ *
+ * Two things differ from sanitizeFleet, both because a partner is a heading
+ * rather than a row:
+ *
+ *   - a partner with no NAME is dropped entirely. The name is the key routes
+ *     match on; a nameless partner could never be pointed at, and would sit on
+ *     the public site as an untitled logo.
+ *   - the logo goes through cleanImageUrl like any other picture, because it is
+ *     rendered in an <img> on a public page the VA does not control.
+ *
+ * Bounded at 40 partners with 60 aeroplanes each: a VA that sells seats on forty
+ * airlines is already unusual, and the cap is what stops a settings save from
+ * becoming an upload.
+ */
+function sanitizePartners(arr) {
+    if (!Array.isArray(arr)) return null;
+    const seen = new Set();
+    return arr.slice(0, 40).map((p) => ({
+        name: clampStr(p && p.name, 60),
+        logo: cleanImageUrl(p && p.logo),
+        aircraft: (Array.isArray(p && p.aircraft) ? p.aircraft : []).slice(0, 60).map((a) => ({
+            type: clampStr(a && a.type, 60),
+            name: clampStr(a && a.name, 80),
+            image: cleanImageUrl(a && a.image),
+            imageAuto: !!(a && a.imageAuto),
+            photographer: clampStr(a && a.photographer, 80),
+            photoLink: /^https:\/\//i.test(clampStr(a && a.photoLink, 300)) ? clampStr(a.photoLink, 300) : '',
+        })).filter((a) => a.type || a.name),
+    })).filter((p) => {
+        if (!p.name) return false;
+        // Case-folded, because that is how routes match a partner and how
+        // codesharePartners groups them. Two rows differing only in case are one
+        // partner with two logos, and the editor would show a duplicate nobody
+        // could tell apart.
+        const k = p.name.trim().toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    });
+}
+
 // The Instagram wall. A handle, and up to MAX_SOCIAL_POSTS posts.
 //
 // THE URL IS NEVER STORED. Staff paste a share link; this parses it down to the
@@ -1130,6 +1176,12 @@ function registerCrewAuthRoutes(app) {
                 const f = sanitizeFleet(req.body.fleet);
                 if (f) ad.crewFleet = f;
             }
+            // Note the shape, as with `social` below: `partners` in and out,
+            // `crewPartners` on the document.
+            if (req.body?.partners !== undefined) {
+                const p = sanitizePartners(req.body.partners);
+                if (p) ad.crewPartners = p;
+            }
             // The Instagram wall. Note the shape: `social` in and out, `crewSocial`
             // on the document — the settings screen has always spoken the short
             // name, and the VA record prefixes crew-center fields.
@@ -1222,6 +1274,7 @@ function registerCrewAuthRoutes(app) {
                 topicMode: ad.crewTopicMode || 'sheet',
                 country: ad.country || '',
                 ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
+                partners: ad.crewPartners || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 discordInvite: ad.crewDiscordInvite || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
