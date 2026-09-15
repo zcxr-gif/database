@@ -527,6 +527,49 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         }],
         default: [],
     },
+    // ------------------------------------------------------------------------
+    // CODESHARE PARTNERS — the airlines whose metal this VA sells seats on.
+    //
+    // Until now a partner was not a thing at all. It was a NAME TYPED ON A
+    // ROUTE, so a VA with forty Iberia codeshares typed "Iberia" forty times and
+    // pasted the same logo URL forty times; a typo on the eleventh split the
+    // partner in two on the public site; and there was nowhere to say what
+    // Iberia actually flies, so the codeshare aircraft field had to offer the
+    // entire community catalogue and hope.
+    //
+    // Declared once here, a partner has somewhere to keep its logo and its
+    // aeroplanes, and a route points at it by name.
+    //
+    // WHY STILL BY NAME AND NOT BY ID. crew_routes.partner_name already holds
+    // names, on every route every VA has written since v5, in a table that lives
+    // in the VA's OWN Postgres — which this process cannot migrate. An id would
+    // mean either abandoning that data or a migration we are not in a position
+    // to run. The name is the key, matching is case-folded (codesharePartners
+    // has always folded), and a partner declared here simply enriches the routes
+    // that already name it. A route naming a partner that was never declared
+    // still works exactly as before; it just has no logo and no aircraft.
+    //
+    // `aircraft` is the same shape as crewFleet, INCLUDING the nested
+    // `type: { type: String }` — see the note above it, which is not a style
+    // preference but the difference between this saving and throwing
+    // `Cast to [string] failed`.
+    // ------------------------------------------------------------------------
+    crewPartners: {
+        type: [{
+            _id: false,
+            name: String,
+            logo: String,
+            aircraft: {
+                type: [{
+                    _id: false, type: { type: String }, name: String, image: String,
+                    imageAuto: Boolean, photographer: String, photoLink: String,
+                }],
+                default: [],
+            },
+        }],
+        default: [],
+    },
+
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
     // capture and its hours roll straight onto the roster.
@@ -4513,7 +4556,30 @@ const publicRoute = (r, ranks, viewer) => {
  * pretending all of it is available. It is 0 for staff and the public, who are
  * never marked locked — the gate is about what a pilot may fly.
  */
-function codesharePartners(routes) {
+function codesharePartners(routes, declared) {
+    /* DECLARED PARTNERS FILL IN WHAT THE ROUTES CANNOT SAY.
+     *
+     * A route carries a partner's NAME and, historically, a logo URL retyped on
+     * every single leg. Everything else a partner tile wants — the logo once,
+     * and the aeroplanes that partner flies — now lives on the VA record (see
+     * crewPartners in the schema) and is joined on here, case-folded, the same
+     * way this function has always grouped.
+     *
+     * The join is one-directional and forgiving in both directions, because both
+     * halves are real states a VA is in:
+     *
+     *   - a route naming a partner nobody declared still produces a tile, with
+     *     whatever logo the route itself carried. That is every codeshare
+     *     written before this existed, and they must not vanish.
+     *   - a partner declared but not yet flown produces a tile with 0 legs, so
+     *     somebody who has just added Iberia and its fleet can see it took, and
+     *     can find it in the picker before the first route exists.
+     */
+    const byDeclared = new Map();
+    for (const p of (declared || [])) {
+        const name = String((p && p.name) || '').trim();
+        if (name) byDeclared.set(name.toLowerCase(), p);
+    }
     const byName = new Map();
     for (const r of routes) {
         if (r.kind !== 'codeshare') continue;
@@ -4535,16 +4601,42 @@ function codesharePartners(routes) {
         if (r.destination) p.destinations.add(r.destination);
         if (r.locked) p.lockedRoutes += 1;
     }
+    // Declared partners with nothing flown yet still get a tile.
+    for (const [key, d] of byDeclared) {
+        if (byName.has(key)) continue;
+        byName.set(key, {
+            name: String(d.name).trim(), logo: '', routes: 0,
+            destinations: new Set(), lockedRoutes: 0,
+        });
+    }
     return [...byName.values()]
-        .map((p) => ({
-            name: p.name,
-            logo: p.logo,
-            routes: p.routes,
-            destinations: p.destinations.size,
-            // How much of this partner is shut to the pilot asking. Zero for
-            // staff and the public, who are never marked locked.
-            lockedRoutes: p.lockedRoutes,
-        }))
+        .map((p) => {
+            const d = byDeclared.get(p.name.toLowerCase());
+            const aircraft = (d && Array.isArray(d.aircraft) ? d.aircraft : [])
+                .filter((a) => String((a && a.type) || '').trim())
+                .map((a) => ({
+                    type: a.type, name: a.name || '', image: a.image || '',
+                    photographer: a.photographer || '', photoLink: a.photoLink || '',
+                }));
+            return {
+                name: (d && String(d.name).trim()) || p.name,
+                // The declared logo wins: it was set once, deliberately, where a
+                // route's was retyped per leg and is the likelier typo.
+                logo: (d && d.logo) || p.logo,
+                routes: p.routes,
+                destinations: p.destinations.size,
+                // How much of this partner is shut to the pilot asking. Zero for
+                // staff and the public, who are never marked locked.
+                lockedRoutes: p.lockedRoutes,
+                // What this partner flies, so the tile can show an aeroplane and
+                // the route form can offer the right ones.
+                aircraft,
+                // Whether anybody actually set this partner up, or it is only a
+                // name somebody typed on a route. The editor uses it to offer
+                // "finish setting this partner up".
+                declared: !!d,
+            };
+        })
         .sort((a, b) => b.routes - a.routes || a.name.localeCompare(b.name));
 }
 
@@ -4558,6 +4650,12 @@ function codesharePartners(routes) {
 app.get('/api/crew/:slug/routes', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
+        // crewStore.SELECT deliberately does not carry the partner list — every
+        // crew request would pay for it. Fetched here, where it is used, the same
+        // way the fleet is fetched for PIREP matching further down.
+        const declaredPartners = await VirtualAirlineAd.findById(va._id)
+            .select('crewPartners').lean()
+            .then((d) => (d && d.crewPartners) || []).catch(() => []);
         const routes = await store.listRoutes();
         const viewer = await crewViewer(req, store);
         const out = routes.map((r) => publicRoute(r, va.ranks, viewer));
@@ -4578,7 +4676,7 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
             // one airline is the question a pilot actually has ("what can I fly
             // on Delta's metal?"), and grouping it here means the front end
             // only has to draw it.
-            partners: codesharePartners(out),
+            partners: codesharePartners(out, declaredPartners),
             // So a pilot's route list can say "unlocks at First Officer" using
             // the VA's own words rather than an hours figure.
             ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
@@ -4952,7 +5050,11 @@ app.get('/api/crew/:slug/route-library/airline/:key', async (req, res) => {
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va } = await resolveCrewStore(req.params.slug);
-        const found = routeLibrary.airline(req.params.key, { fleet: va.crewFleet || [] });
+        // crewStore.SELECT does not carry crewFleet, so reading it off `va` gave
+        // an empty fleet and marked nothing as already-operated. Fetched
+        // explicitly, as the PIREP matching further down does.
+        const full = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
+        const found = routeLibrary.airline(req.params.key, { fleet: (full && full.crewFleet) || [] });
         if (!found) return res.status(404).json({ error: 'No airline in the library with that code.' });
         res.json(found);
     } catch (err) { crewFail(res, err, { log: 'route library airline error', message: 'Could not load that airline.' }); }
@@ -13792,7 +13894,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -13848,6 +13950,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
+            // The airlines this VA sells seats on: name, logo and what each of
+            // them flies. Sent with the branding because the crew centre, the
+            // public feed and a hosted site all draw partner tiles from it.
+            partners: Array.isArray(ad.crewPartners) ? ad.crewPartners : [],
             // The Instagram wall. Public because it is the one part of the crew
             // center whose entire purpose is to be looked at by people who are
             // not in the crew — and because a VA's own website should be able
