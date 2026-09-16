@@ -441,76 +441,22 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
  *
  * A card that looks the same on a pilot's first day and on their thousandth
  * hour is a card that stops being worth looking at. So the face changes as they
- * climb: five finishes, and which one somebody holds is decided by where their
- * rank sits on THEIR airline's ladder rather than by hours, because a VA with
- * four ranks and a VA with twelve are both complete ladders and an hours
- * threshold would hand one of them every finish in the first month.
+ * climb — and what it changes with is their CLUB, which lives in crewClubs.js.
  *
- * FIVE, AND NOT ONE PER RANK. A finish per rung would mean a twelve-rung
- * airline had twelve card colours, which is a palette rather than a
- * progression — nobody can tell the eighth from the ninth, and the thing people
- * actually want is to see the card change. Five steps are distinguishable at a
- * glance, and every ladder from two rungs to twenty maps onto them.
+ * WHY NOT THE RANK. The first cut of this keyed the finish to the rank ladder,
+ * and that was wrong for a reason worth writing down: a rank is something the
+ * airline GIVES you. Staff sign off a check-ride, staff edit hours, staff
+ * decide you are a Captain — so a card painted by it changes when somebody
+ * remembers to promote you. A club is a line you crossed by flying. Nobody has
+ * to apply it, nobody can forget to, and it is what the card is actually about.
  *
- * THE VA'S OWN COLOUR WINS. A rung can carry a colour the VA set (see
- * crewRanks), and where it does, that is the card — an airline that has painted
- * its ladder gold at the top has said what it wants and this must not argue.
- * The tiers below are what a VA that has set nothing gets, which is nearly all
- * of them.
- *
- * The names are sent to the client and drawn on the card. They are deliberately
- * the words an airline already uses for exactly this, because a pilot reading
- * "Gold" on their card knows what it means without being told.
+ * SO THERE IS ALMOST NOTHING LEFT HERE. The ladder, the colours, the thresholds
+ * and the benefits are all crewClubs'. This file's only remaining interest is
+ * that a wallet CARRIES one — which is why `wallet` takes a club rather than
+ * working one out. The card is drawn in four places (the pilot's home, the
+ * shop's hero, the crew list, the dashboard tile) and four copies of a rule is
+ * four chances for two of them to disagree about what somebody holds.
  * ======================================================================== */
-const TIERS = [
-    { key: 'standard', name: 'Standard', accent: '#4A5568' },
-    { key: 'bronze', name: 'Bronze', accent: '#A4622B' },
-    { key: 'silver', name: 'Silver', accent: '#7C8794' },
-    { key: 'gold', name: 'Gold', accent: '#B8860B' },
-    { key: 'platinum', name: 'Platinum', accent: '#2C3446' },
-];
-
-/**
- * Which finish a pilot on rung `index` of a ladder of `count` holds.
- *
- * Proportional, and the top rung always lands on the top finish: "I made
- * Captain and my card went black" is the entire point, and an airline whose
- * last rung mapped to Gold because of a rounding step would have lost it.
- *
- * A pilot with no rank at all — a ladder the VA has not written, or a rung that
- * has been renamed out from under them — gets Standard. That is not a failure
- * state, it is the honest one: they are a pilot of this airline and the airline
- * has not said anything else about them.
- */
-function tierFor(index, count) {
-    const n = Math.max(0, Math.round(Number(count) || 0));
-    const i = Math.round(Number(index));
-    if (!n || !Number.isFinite(i) || i < 0) return 0;
-    if (n === 1) return 0;
-    if (i >= n - 1) return TIERS.length - 1;
-    // Floor rather than round: a finish should be EARNED, and rounding up means
-    // the second rung of a five-rung ladder wearing Silver on day two.
-    return Math.max(0, Math.min(TIERS.length - 1,
-        Math.floor((i / (n - 1)) * (TIERS.length - 1))));
-}
-
-/** The finish itself, ready to be drawn. */
-function tier(index, count, color) {
-    const at = tierFor(index, count);
-    const t = TIERS[at];
-    return {
-        key: t.key,
-        name: t.name,
-        // 0-based, and `of` alongside it, so a card can draw four pips and fill
-        // two without the client knowing how many tiers there are.
-        index: at,
-        of: TIERS.length,
-        // The VA's own colour for this rung where they set one. See above: an
-        // airline that has painted its ladder has already answered this.
-        accent: str(color, 20) || t.accent,
-        branded: !!str(color, 20),
-    };
-}
 
 /**
  * The card, for the pilot it belongs to.
@@ -521,22 +467,21 @@ function tier(index, count, color) {
  * whole requirement — the client derives the same thing when the server has not
  * sent one, and this is here so the two agree.
  */
-function wallet(member, { rank = '', rankIndex = -1, rankCount = 0, rankColor = '' } = {}) {
+function wallet(member, { rank = '', club = null } = {}) {
     if (!member) return null;
     const pts = member.points || {};
     return {
         pilotId: member._id,
         name: member.name || '',
         callsign: member.callsign || '',
+        // BOTH ladders, because they say different things and the card shows
+        // both: the rank is what this airline calls them, the club is what
+        // their flying has earned them.
         rank,
-        // Where that rank sits, and the finish it buys. Sent rather than
-        // computed in the browser because the ladder is the VA's and the card
-        // is drawn in four different places — the pilot's home, the shop's
-        // hero, the crew list and the dashboard tile — which is four chances
-        // for two of them to disagree about what somebody holds.
-        rankIndex: Number.isFinite(Number(rankIndex)) ? Math.max(-1, Math.round(Number(rankIndex))) : -1,
-        rankCount: Math.max(0, Math.round(Number(rankCount)) || 0),
-        tier: tier(rankIndex, rankCount, rankColor),
+        club: club || null,
+        // What the club was worked out from. On the card so "38h to Gold" can
+        // be drawn without a second fetch of the roster row it came from.
+        hours: Math.max(0, Math.round((Number(member.hours) || 0) * 10) / 10),
         since: member.createdAt || null,
         balance: Math.max(0, Number(pts.balance) || 0),
         earned: Math.max(0, Number(pts.earned) || 0),
@@ -612,12 +557,12 @@ function holdings(orders, { limit = 12 } = {}) {
  * it is the same statement as the hours column, denominated in whatever the VA
  * calls its currency, and it never goes down.
  */
-const publicHolder = (member, { rank = '', rankIndex = -1, rankCount = 0, rankColor = '', orders = [], isMe = false } = {}) => ({
+const publicHolder = (member, { rank = '', club = null, orders = [], isMe = false } = {}) => ({
     pilotId: member._id,
     name: member.name || '',
     callsign: member.callsign || '',
     rank,
-    tier: tier(rankIndex, rankCount, rankColor),
+    club: club || null,
     hours: Math.round(Number(member.hours) || 0),
     since: member.createdAt || null,
     status: member.status || 'active',
@@ -628,7 +573,6 @@ const publicHolder = (member, { rank = '', rankIndex = -1, rankCount = 0, rankCo
 
 module.exports = {
     RATES,
-    TIERS,
     CATALOGUE,
     NOMINAL_FLIGHT,
     roundPrice,
@@ -641,8 +585,6 @@ module.exports = {
     publicItem,
     publicOrder,
     wallet,
-    tierFor,
-    tier,
     holdings,
     publicHolder,
 };

@@ -16,6 +16,7 @@
 'use strict';
 
 const crewShop = require('../crewShop');
+const crewClubs = require('../crewClubs');
 const crewAwards = require('../crewAwards');
 const crewHealth = require('../crewHealth');
 const crewRetention = require('../crewRetention');
@@ -290,42 +291,20 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
 
 /* --------------------------------------------------- the card's finish (v16) */
 
+// The finish is the pilot's CLUB, and the club ladder is crewClubs' — tested in
+// full in test-crew-clubs.js. What this file has to hold is that the wallet
+// CARRIES one rather than working one out, because the card is drawn in four
+// places and a browser deriving it would be a fifth copy of the rule.
+
 {
-    // Five finishes, and every ladder from two rungs to twenty maps onto them.
-    // The property that matters is the TOP one: "I made Captain and my card
-    // went black" is the whole point of the feature, and a ladder whose last
-    // rung landed on Gold because of a rounding step would have lost it.
-    check('the top rung always gets the top finish',
-        [2, 3, 4, 5, 8, 12, 20].every((n) => crewShop.tierFor(n - 1, n) === crewShop.TIERS.length - 1));
-    check('…and the bottom rung always gets the first',
-        [2, 3, 4, 5, 8, 12, 20].every((n) => crewShop.tierFor(0, n) === 0));
-    check('a one-rung ladder is not a progression', crewShop.tierFor(0, 1) === 0);
-    check('a pilot with no rank is Standard rather than broken', crewShop.tierFor(-1, 5) === 0);
-    check('no ladder is missing a rung', crewShop.tierFor(2, 0) === 0);
-
-    // Monotonic: climbing must never move the card DOWN.
-    const climb = [];
-    for (let i = 0; i < 12; i++) climb.push(crewShop.tierFor(i, 12));
-    check('climbing never downgrades the card',
-        climb.every((t, i) => i === 0 || t >= climb[i - 1]));
-    check('…and it does move on the way up', new Set(climb).size === crewShop.TIERS.length);
-
-    // Earned, not rounded into. The second rung of five must not be wearing
-    // Silver on day two.
-    check('a finish is floored rather than rounded up', crewShop.tierFor(1, 5) === 1);
-
-    const branded = crewShop.tier(1, 5, '#123456');
-    check('a VA that has painted its ladder wins', branded.accent === '#123456');
-    check('…and says the colour is theirs', branded.branded === true);
-    check('a VA that has painted nothing gets the tier colour',
-        crewShop.tier(1, 5, '').branded === false);
-
-    const w = crewShop.wallet({ _id: 'm1', name: 'A pilot', points: { balance: 10, earned: 40, spent: 30 } },
-        { rank: 'Captain', rankIndex: 3, rankCount: 4 });
-    check('the card carries its finish', w.tier.key === 'platinum');
-    check('…and where the rank sits', w.rankIndex === 3 && w.rankCount === 4);
-    check('a card with no ladder behind it still draws',
-        crewShop.wallet({ _id: 'm2', points: {} }, {}).tier.key === 'standard');
+    const club = crewClubs.memberClub(undefined, 260);
+    const w = crewShop.wallet({ _id: 'm1', name: 'A pilot', hours: 260, points: { balance: 10, earned: 40, spent: 30 } },
+        { rank: 'Captain', club });
+    check('the card carries the club the server worked out', w.club.key === 'gold');
+    check('…and the rank beside it, not instead of it', w.rank === 'Captain');
+    check('…and the hours behind both, so "38h to Platinum" needs no second fetch', w.hours === 260);
+    check('a card with no club behind it still draws',
+        crewShop.wallet({ _id: 'm2', points: {} }, {}).club === null);
     check('no member, no card', crewShop.wallet(null, {}) === null);
 }
 
@@ -359,15 +338,14 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
 
     const holder = crewShop.publicHolder(
         { _id: 'm9', name: 'Ada', callsign: 'BAW9', hours: 212, status: 'active', points: { balance: 4200, earned: 9000, spent: 4800 } },
-        { rank: 'Senior First Officer', rankIndex: 2, rankCount: 4, orders: [order('A badge on your profile', 'fulfilled')] },
+        { rank: 'Senior First Officer', club: crewClubs.memberClub(undefined, 212),
+            orders: [order('A badge on your profile', 'fulfilled')] },
     );
     check('the crew list never publishes a balance', holder.balance === undefined);
     check('…nor what anybody has spent', holder.spent === undefined);
     check('…but earned is a fact about flying, like the hours column', holder.earned === 9000);
-    // Rung 3 of 4. A four-rung ladder has one fewer rung than there are
-    // finishes, so one is skipped on the way up — the top rung keeps the top
-    // finish and the gap falls in the middle, which is where it does least harm.
-    check('a crew card carries the finish the roster can see', holder.tier.key === 'silver');
+    // 212 hours: past Silver (100), short of Gold (250).
+    check('a crew card carries the club the roster can see', holder.club.key === 'silver');
     check('…and the shelf', holder.holds[0].count === 1);
 }
 

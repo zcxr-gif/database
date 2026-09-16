@@ -3016,7 +3016,7 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // pilot callsign is built from the VA's registered mask (see crewCallsign.js),
 // and every handler that issues or validates one already resolves the VA
 // through here. None of the three is a secret.
-const SELECT = '_id slug callsign callsigns callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewFeatured crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
+const SELECT = '_id slug callsign callsigns callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewClubs crewFeatured crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);

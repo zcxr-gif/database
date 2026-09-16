@@ -15,7 +15,8 @@
     "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js",
     "test:staff-pilot": "node scripts/test-crew-staff-pilot.js",
     "test:routes": "node scripts/test-route-library.js",
-    "test:featured": "node scripts/test-crew-featured.js"
+    "test:featured": "node scripts/test-crew-featured.js",
+    "test:clubs": "node scripts/test-crew-clubs.js"
   },
   "keywords": [],
   "author": "Antony",
