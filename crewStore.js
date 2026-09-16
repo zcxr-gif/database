@@ -304,6 +304,13 @@ const NOT_CONNECTED = () => new CrewStoreError(
 // Small helpers
 // ---------------------------------------------------------------------------
 const str = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
+// How long a stored pilot callsign may be. It was 20, which is shorter than
+// real callsigns are: a pilot's callsign is the VA's airline, a number and a tag
+// ("AEROMEXICO CONNECT 007CX" is 24), and truncating it produces a callsign that
+// matches neither the VA's registered mask nor the pilot's own flights. Every
+// column behind this is `text`, so the cap was only ever a guess. See
+// crewCallsign.js for how the string is built.
+const CALLSIGN_MAX = 40;
 const icao = (v) => str(v, 8).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
 const num = (v, min, max) => {
     const n = Number(v);
@@ -371,7 +378,7 @@ const memberFromRow = (r) => r && {
 const memberToRow = (m) => {
     const out = {};
     pick(m, out, 'name', 'name', (v) => str(v, 60));
-    pick(m, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(m, out, 'callsign', 'callsign', (v) => str(v, CALLSIGN_MAX));
     pick(m, out, 'hours', 'hours', (v) => num(v, 0, 1e6));
     pick(m, out, 'role', 'role', (v) => str(v, 40));
     pick(m, out, 'aircraft', 'aircraft', (v) => (Array.isArray(v) ? v.slice(0, 40).map((a) => str(a, 40)).filter(Boolean) : []));
@@ -532,7 +539,7 @@ const pirepToRow = (p) => {
     pick(p, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
     pick(p, out, 'scheduleId', 'schedule_id', (v) => (str(v, 64) || null));
     pick(p, out, 'pilotName', 'pilot_name', (v) => str(v, 60));
-    pick(p, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(p, out, 'callsign', 'callsign', (v) => str(v, CALLSIGN_MAX));
     pick(p, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
     pick(p, out, 'ifUserId', 'if_user_id', (v) => str(v, 40));
     pick(p, out, 'flightId', 'flight_id', (v) => str(v, 60));
@@ -592,7 +599,12 @@ const applicationToRow = (a) => {
     const out = {};
     pick(a, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
     pick(a, out, 'email', 'email', (v) => str(v, 120).toLowerCase());
-    pick(a, out, 'callsignPrefix', 'callsign_prefix', (v) => str(v, 10));
+    // 40, not 10: this holds the AIRLINE a pilot's callsign is built on (see
+    // crewCallsign.js), and a real one runs past ten characters — "AEROMEXICO
+    // CONNECT" truncated to "AEROMEXICO" no longer matches any callsign the VA
+    // registered, so the application reads back in the wrong shape. The column
+    // is `text`; the cap was only ever a guess at how long a prefix gets.
+    pick(a, out, 'callsignPrefix', 'callsign_prefix', (v) => str(v, 40));
     pick(a, out, 'callsignNumber', 'callsign_number', (v) => str(v, 10));
     pick(a, out, 'grade', 'grade', (v) => int(v, 0, 5));
     pick(a, out, 'ifVerified', 'if_verified', (v) => !!v);
@@ -701,7 +713,7 @@ const signupToRow = (s) => {
     pick(s, out, 'memberId', 'member_id', (v) => (str(v, 64) || null));
     pick(s, out, 'accountId', 'account_id', (v) => (str(v, 64) || null));
     pick(s, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
-    pick(s, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(s, out, 'callsign', 'callsign', (v) => str(v, CALLSIGN_MAX));
     pick(s, out, 'aircraft', 'aircraft', (v) => str(v, 60));
     // Upper-cased on the way in, because the unique index that makes a stand
     // one pilot's is on upper(gate) — storing "b24" would claim the same stand
@@ -800,7 +812,7 @@ const bookingToRow = (b) => {
     pick(b, out, 'memberId', 'member_id', (v) => (str(v, 64) || null));
     pick(b, out, 'accountId', 'account_id', (v) => (str(v, 64) || null));
     pick(b, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
-    pick(b, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(b, out, 'callsign', 'callsign', (v) => str(v, CALLSIGN_MAX));
     pick(b, out, 'seat', 'seat', (v) => int(v, 1, 20));
     pick(b, out, 'note', 'note', (v) => str(v, 300));
     pick(b, out, 'status', 'status', (v) => (v === 'flown' ? 'flown' : 'booked'));
@@ -3000,7 +3012,11 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // crew route — the roster, the route network's gating, a promotion notice — and
 // fetching the same small array again in each handler would be a second query
 // per request for a field that is a few hundred bytes.
-const SELECT = '_id slug callsign name contactEmail crewAccent ranks crewShop crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
+// `callsigns`, `callsignPrefix` and `callsignReservedMax` ride along because a
+// pilot callsign is built from the VA's registered mask (see crewCallsign.js),
+// and every handler that issues or validates one already resolves the VA
+// through here. None of the three is a secret.
+const SELECT = '_id slug callsign callsigns callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);

@@ -102,6 +102,11 @@ const routeLibrary = require('./routeLibrary');
 // disagree — and so a rank can gate something. See crewRanks.js.
 const crewRanks = require('./crewRanks');
 
+// Pilot callsigns: the shape one takes (the VA's registered mask, not a prefix
+// glued to a number), whether it is already held, and which low numbers are
+// staff-issue only. See crewCallsign.js.
+const crewCallsign = require('./crewCallsign');
+
 // Events, and the gate board that stops a dozen aircraft spawning on the same
 // stand. Everything that is a decision rather than a database write lives
 // there — including where the stands themselves come from. See crewEvents.js.
@@ -688,6 +693,14 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // joinMode: 'free' = instant account; 'application' = staff review.
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
     callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
+    // The top of the range of pilot numbers this VA keeps back for itself.
+    // Numbers at or below it can only be issued by staff (anything behind a
+    // roster.manage check); the public join form refuses them. 001 is the
+    // founder's, not whoever filled the form in first. 0 switches the
+    // reservation off entirely; unset means the default, because a VA that has
+    // never thought about it has not asked for its low numbers to be up for
+    // grabs. See crewCallsign.js.
+    callsignReservedMax: { type: Number, default: crewCallsign.DEFAULT_RESERVED_MAX, min: 0, max: 999 },
     // A staff-built application form: ordered questions.
     // `type` nested — see the crewFleet note above. Declared inline as
     // `type: String` this was an array of strings, so no VA's application form
@@ -3250,7 +3263,9 @@ function cleanMember(b) {
     b = b || {};
     return {
         name: String(b.name || '').trim().slice(0, 60),
-        callsign: String(b.callsign || '').trim().slice(0, 20),
+        // 40, matching CALLSIGN_MAX in crewStore.js: "AEROMEXICO CONNECT 007CX"
+        // is 24 characters and the old cap of 20 cut the tag off the end of it.
+        callsign: String(b.callsign || '').trim().slice(0, 40),
         hours: Math.max(0, Math.min(1e6, Number(b.hours) || 0)),
         role: String(b.role || '').trim().slice(0, 40),
         aircraft: Array.isArray(b.aircraft) ? b.aircraft.slice(0, 40).map(a => String(a).trim().slice(0, 40)).filter(Boolean) : [],
@@ -3261,6 +3276,125 @@ function cleanMember(b) {
         ifcName: String(b.ifcName || '').trim().slice(0, 60),
     };
 }
+// ---- Pilot callsigns -------------------------------------------------------
+// A pilot's callsign is the VA's REGISTERED MASK with the pilot's number in it
+// ("AEROMEXICO ###MX" + 1 -> "AEROMEXICO 001MX"), not an airline stapled to a
+// number. crewCallsign.js has the why; these three wrappers are what the
+// handlers here reach for.
+
+/**
+ * The callsign shape this VA issues, optionally the one for a named airline —
+ * a VA may register several (a parent brand plus its sub-fleets) and a pilot
+ * flies under one of them.
+ *
+ * A VA that HAS registered callsigns issues those and no others, so an unknown
+ * airline is refused rather than quietly redirected to the primary: an
+ * applicant does not get to invent one on the join form. A VA that has
+ * registered nothing has no shape to enforce, so whatever they typed becomes
+ * one — read as a mask, so a bare "ACA" picks up the "##VA" tag that every
+ * display path in this product already promises for a bare base.
+ */
+function callsignFormatFor(va, airline) {
+    const list = crewCallsign.formatsFor(va);
+    const typed = airline ? crewCallsign.parseMask(airline) : null;
+    if (!typed) return list[0] || null;
+    const want = crewCallsign.compact(typed.base);
+    const hit = list.find((f) => crewCallsign.compact(f.base) === want);
+    if (hit) return hit;
+    return list.length ? null : typed;
+}
+
+/**
+ * What an application's callsign reads as.
+ *
+ * An application stores the airline and the number, not the finished callsign —
+ * adding a column would put every VA's own project behind this code (see
+ * LATE_COLUMNS in crewStore.js) — so the shape is applied on the way out. That
+ * also means an application submitted before the VA corrected its mask is shown,
+ * and accepted, in the corrected shape.
+ */
+function applicationCallsign(appDoc, va) {
+    if (!appDoc) return '';
+    const fmt = callsignFormatFor(va, appDoc.callsignPrefix);
+    const n = crewCallsign.numberValue(appDoc.callsignNumber);
+    if (fmt && n != null) return crewCallsign.build(fmt, n);
+    // Nothing to build from — a VA with no callsign at all, or a row with no
+    // number. Fall back to what the old code stored so it still reads as itself.
+    return ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim();
+}
+
+/**
+ * Who already holds this callsign, or null. Checks the roster AND applications
+ * still awaiting review — without the second half two applicants race, both are
+ * accepted, and the VA finds out on the map.
+ *
+ * Matching is deliberately loose (crewCallsign.same: same airline, same number,
+ * ignoring padding, spacing and tag) so a callsign issued by the old code
+ * collides with the equivalent one issued now.
+ *
+ * `exceptMemberId` skips one roster row, so staff re-saving a pilot do not
+ * collide with that pilot's own callsign. `exceptApplicationId` does the same
+ * for one application, which the accept handler needs: the row it is accepting
+ * is still 'pending' when it runs the check, so without this every acceptance
+ * would collide with itself.
+ */
+async function callsignHolder(va, store, callsign, { exceptMemberId = null, exceptApplicationId = null } = {}) {
+    if (!callsign) return null;
+    const members = await store.listMembers({ limit: 5000 });
+    const held = crewCallsign.heldBy(members, callsign, { exceptId: exceptMemberId });
+    if (held) return { kind: 'member', name: held.name || '' };
+    // Best-effort: a VA whose project cannot serve applications should not have
+    // its roster check fail with it. The roster half above is the one that must
+    // be right, and it already ran.
+    let pending = [];
+    try {
+        pending = await store.listApplications({ status: 'pending', limit: 1000 }) || [];
+    } catch (err) {
+        console.error('callsign application check error:', err?.message || err);
+    }
+    const claimed = crewCallsign.heldBy(
+        pending.map((a) => ({ _id: a._id, callsign: applicationCallsign(a, va) })),
+        callsign,
+        { exceptId: exceptApplicationId },
+    );
+    // No name: an applicant is not public the way a rostered pilot is.
+    return claimed ? { kind: 'application' } : null;
+}
+
+// The holder, said out loud. A rostered pilot can be named — the roster is
+// public — and a pending applicant cannot.
+const callsignTakenMessage = (holder, callsign) => (holder && holder.kind === 'member'
+    ? `${callsign} is already flown by ${holder.name || 'another pilot'}. Pick a different number.`
+    : `${callsign} is already spoken for by an application under review. Pick a different number.`);
+
+/**
+ * Put a callsign a member of staff typed into the VA's shape. "aeromexico 1",
+ * "AEROMEXICO001" and a bare "1" all become "AEROMEXICO 001MX".
+ *
+ * Anything that is not a pilot number on an airline this VA registered is
+ * stored exactly as typed: an "OPS" or a "DISPATCH" is a real thing to call
+ * somebody, and so is a callsign on an airline the VA has not got round to
+ * registering. Staff are trusted with both — the reserved-number rule does not
+ * apply to them either, because being given a low number BY staff is the whole
+ * of what being selected for one means.
+ */
+function normalizeStaffCallsign(va, raw) {
+    const typed = String(raw || '').trim();
+    if (!typed) return '';
+    const primary = callsignFormatFor(va, '');
+    // Bare digits mean "this number, on our airline".
+    if (/^\d+$/.test(typed)) {
+        const n = crewCallsign.numberValue(typed);
+        if (primary && n != null) return crewCallsign.build(primary, n).slice(0, 40);
+    }
+    const parts = crewCallsign.split(typed);
+    if (parts && parts.n != null) {
+        const fmt = callsignFormatFor(va, parts.base);
+        if (fmt) return crewCallsign.build(fmt, parts.n).slice(0, 40);
+    }
+    return typed.toUpperCase().slice(0, 40);
+}
+
 // `ranks` is the VA's ladder. Passing it resolves the pilot's rank here rather
 // than in each of the three front-ends that draw a badge — one arithmetic, one
 // answer. A new pilot at zero hours lands on the entry rung rather than on
@@ -3430,7 +3564,12 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const m = await store.createMember(cleanMember(req.body));
+        const values = cleanMember(req.body);
+        // Staff may issue a reserved number; they may not issue one twice.
+        values.callsign = normalizeStaffCallsign(va, values.callsign);
+        const holder = await callsignHolder(va, store, values.callsign);
+        if (holder) return res.status(409).json({ error: callsignTakenMessage(holder, values.callsign), code: 'callsign_taken' });
+        const m = await store.createMember(values);
         vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
         res.status(201).json({ member: publicMember(m, va.ranks) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
@@ -3446,7 +3585,13 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
         // Merge over the current record before cleaning so a partial PATCH keeps
         // the fields it didn't mention (notably the IF link, which the roster
         // editor never sends back).
-        const m = await store.updateMember(req.params.id, cleanMember({ ...existing, ...req.body }));
+        const values = cleanMember({ ...existing, ...req.body });
+        values.callsign = normalizeStaffCallsign(va, values.callsign);
+        // Skipping this pilot's own row, or re-saving them unchanged would
+        // collide with themselves.
+        const holder = await callsignHolder(va, store, values.callsign, { exceptMemberId: existing._id });
+        if (holder) return res.status(409).json({ error: callsignTakenMessage(holder, values.callsign), code: 'callsign_taken' });
+        const m = await store.updateMember(req.params.id, values);
         // Staff editing hours by hand can promote someone too — that is a real
         // promotion and worth the same notice an approved flight would earn.
         const promotion = crewRanks.promotionFor(va.ranks, existing.hours, m.hours, m.checksPassed);
@@ -4941,19 +5086,30 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const members = await store.listMembers();
+        // Both sides go through the VA's callsign shape before the planner
+        // matches on it. Rows in this file were typed by a person, and rows
+        // already on the roster may have been issued by older code, so without
+        // this "AEROMEXICO001" in the file and "AEROMEXICO 001MX" on the roster
+        // look like two pilots and the import mints a duplicate of somebody who
+        // is already there. Normalised, they match, and the row updates the
+        // pilot it is actually about.
+        const shape = (cs) => normalizeStaffCallsign(va, cs);
         await runCsvImport({
             req, res, store, kind: 'roster', spec: crewCsv.ROSTER_SPEC,
             existing: (members || []).map((m) => ({
-                id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
+                id: m._id, name: m.name, callsign: shape(m.callsign), hours: m.hours, role: m.role,
                 aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
             })),
-            create: (values) => store.createMember(cleanMember(values)),
+            create: (values) => store.createMember({ ...cleanMember(values), callsign: shape(values.callsign) }),
             // Merge over what is already there before cleaning, exactly as the
             // roster editor's PATCH does — a file with six columns must not
             // blank the three it never mentioned.
-            update: (id, values, before) => store.updateMember(id, cleanMember({ ...before, ...values })),
+            update: (id, values, before) => {
+                const merged = cleanMember({ ...before, ...values });
+                return store.updateMember(id, { ...merged, callsign: shape(merged.callsign) });
+            },
         });
     } catch (err) { crewFail(res, err, { log: 'roster import error', message: 'Could not import the roster.' }); }
 });
@@ -10174,7 +10330,9 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         // crewStore.SELECT carries the VA's data-store connection: the
         // application (and the pilot record a 'free' join creates) is written to
         // the VA's own project, not ours.
-        const applyFields = `${crewStore.SELECT} joinMode minGrade callsignPrefix applicationForm joinRequirements +crewWebhookUrl`;
+        // crewStore.SELECT already carries the callsign mask, prefix and
+        // reserved range the callsign is built and checked against.
+        const applyFields = `${crewStore.SELECT} joinMode minGrade applicationForm joinRequirements +crewWebhookUrl`;
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(applyFields).lean();
         if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
@@ -10228,9 +10386,31 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             });
             return res.status(403).json({ error: `You don’t meet this VA’s requirements yet — ${human.join('; ')}.`, requirementFailures: evalRes.failures });
         }
-        const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
-        const number = String(b.callsignNumber || '').trim().slice(0, 10);
-        const cs = (prefix + number).trim();
+        // The callsign. Built from the VA's registered mask rather than pasted
+        // together, checked against everyone who already holds one, and refused
+        // outright inside the VA's reserved range — see crewCallsign.js for all
+        // three. This is a public form, so `staff: false` is not negotiable here.
+        const fmt = callsignFormatFor(ad, b.callsignPrefix);
+        if (!fmt) {
+            return res.status(400).json({
+                error: crewCallsign.formatsFor(ad).length
+                    ? 'Pick one of this VA’s callsigns.'
+                    : 'This VA has not set a callsign yet — ask its staff to add one.',
+                code: 'callsign_airline',
+            });
+        }
+        const verdict = crewCallsign.validate(fmt, b.callsignNumber, {
+            reservedMax: crewCallsign.reservedMaxOf(ad),
+            staff: false,
+        });
+        if (!verdict.ok) return res.status(422).json({ error: verdict.error, code: `callsign_${verdict.code}` });
+        const cs = verdict.callsign;
+        const holder = await callsignHolder(ad, store, cs);
+        if (holder) return res.status(409).json({ error: callsignTakenMessage(holder, cs), code: 'callsign_taken' });
+        // Stored as the two halves the application row has columns for; the
+        // finished callsign is rebuilt on the way out by applicationCallsign.
+        const prefix = fmt.base.slice(0, 40);
+        const number = String(verdict.n).slice(0, 10);
         const email = isEmail(b.email) ? String(b.email).trim().toLowerCase().slice(0, 120) : '';
         const answers = Array.isArray(b.answers)
             ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
@@ -10251,7 +10431,7 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         let credentials = null;
         if (status === 'accepted') {
             const member = await store.createMember({
-                name: ifcName, callsign: (prefix + number).trim(),
+                name: ifcName, callsign: cs,
                 hours: 0, role: '', aircraft: [], status: 'active',
                 ifUserId: ifUserId || '', ifcName,
             });
@@ -10345,6 +10525,53 @@ app.post('/api/crew/:slug/verify-if', async (req, res) => {
     } catch (err) { console.error('verify-if error:', err); res.status(500).json({ error: 'Verification is unavailable right now.' }); }
 });
 
+/**
+ * Public: is this callsign number free, and may this applicant have it?
+ *
+ * The join form asks as the pilot types, so "001 is taken" arrives while they
+ * can still do something about it rather than after they have been accepted —
+ * which was the whole of the old behaviour. The answer is advisory: /apply runs
+ * exactly the same three checks (shape, reserved range, holder) and is the one
+ * that decides, because the number can go between the two calls.
+ *
+ * Deliberately says little. `taken` names a rostered pilot, who is already
+ * public on GET /roster; a pending applicant is not public and is reported as
+ * taken with no name attached.
+ */
+app.post('/api/crew/:slug/callsign-check', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const fmt = callsignFormatFor(va, b.callsignPrefix);
+        if (!fmt) {
+            return res.json({
+                ok: false, code: 'airline',
+                error: crewCallsign.formatsFor(va).length
+                    ? 'Pick one of this VA’s callsigns.'
+                    : 'This VA has not set a callsign yet — ask its staff to add one.',
+            });
+        }
+        const verdict = crewCallsign.validate(fmt, b.callsignNumber, {
+            reservedMax: crewCallsign.reservedMaxOf(va),
+            staff: false,
+        });
+        if (!verdict.ok) return res.json({ ok: false, code: verdict.code, error: verdict.error, callsign: '' });
+        const holder = await callsignHolder(va, store, verdict.callsign);
+        if (holder) {
+            return res.json({
+                ok: false, code: 'taken', callsign: verdict.callsign,
+                error: callsignTakenMessage(holder, verdict.callsign),
+            });
+        }
+        res.json({ ok: true, callsign: verdict.callsign });
+    } catch (err) {
+        // A store that will not answer must not be read as "it's free". The form
+        // treats a missing verdict as unknown and lets them submit; /apply is
+        // still there to refuse it.
+        crewFail(res, err, { log: 'callsign check error', message: 'Could not check that callsign right now.' });
+    }
+});
+
 // Everything a rendering of an invitation needs to know. One builder, used by
 // the acceptance response, the applicant's status page and the staff clipboard,
 // so the three cannot drift into saying different things about the same login.
@@ -10352,7 +10579,7 @@ function inviteContext(va, appDoc, slug) {
     return {
         vaName: (va && va.name) || '',
         ifcName: (appDoc && appDoc.ifcName) || '',
-        callsign: (((appDoc && appDoc.callsignPrefix) || '') + ((appDoc && appDoc.callsignNumber) || '')).trim(),
+        callsign: applicationCallsign(appDoc, va),
         signInUrl: `${SITE_ORIGIN}/crew/${encodeURIComponent((va && va.slug) || slug)}`,
         discordInvite: (appDoc && appDoc.discordInvite) || '',
         staffMessage: (appDoc && appDoc.staffMessage) || '',
@@ -10387,7 +10614,7 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
             status: appDoc.status,
             message: appDoc.staffMessage || '',
             ifcName: appDoc.ifcName || '',
-            callsign: ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim(),
+            callsign: applicationCallsign(appDoc, va),
             // Only meaningful once accepted, and only ever set by the accept
             // handler from a validated invite.
             discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : '',
@@ -10414,7 +10641,15 @@ function staffApplication(appDoc, va, slug) {
         inviteUsername, invitePassword, inviteIssuedAt, inviteClaimedAt,
         inviteRevokedAt, inviteAccountId, ...rest
     } = appDoc || {};
-    return { ...rest, invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, slug)) };
+    return {
+        ...rest,
+        // The finished callsign, so the review list shows what this pilot will
+        // actually be issued rather than the two halves it is stored as. The
+        // dashboard's fallback (prefix + number, concatenated) renders
+        // "AEROMEXICO1" — the shape this whole area exists to stop.
+        callsign: applicationCallsign(appDoc, va),
+        invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, slug)),
+    };
 }
 
 // Staff: list applications (default pending).
@@ -10486,8 +10721,23 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
             // re-accepting an already-accepted application can't duplicate them.
             let member = null;
             if (appDoc.status !== 'accepted') {
+                // The callsign was free when they applied. Between then and now
+                // staff may have issued it to somebody else, or accepted an
+                // applicant who asked for the same number — so it is checked
+                // again at the moment it actually becomes theirs. Refusing here
+                // is the point: the reviewer can edit the pilot's number on the
+                // roster afterwards, but two pilots must not leave this handler
+                // sharing one callsign.
+                const wanted = applicationCallsign(appDoc, va);
+                const clash = await callsignHolder(va, store, wanted, { exceptApplicationId: appDoc._id });
+                if (clash) {
+                    return res.status(409).json({
+                        error: `${callsignTakenMessage(clash, wanted)} Change this applicant’s number before accepting them.`,
+                        code: 'callsign_taken',
+                    });
+                }
                 member = await store.createMember({
-                    name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
+                    name: appDoc.ifcName, callsign: wanted,
                     hours: 0, role: '', aircraft: [], status: 'active',
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
@@ -10567,7 +10817,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         if (message) patch.staffMessage = message;
         appDoc = (await store.updateApplication(appDoc._id, patch)) || { ...appDoc, ...patch };
 
-        const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
+        const cs = applicationCallsign(appDoc, va);
         const accepted = appDoc.status === 'accepted';
         // Post the decision (+ the staff's message) to the VA's Discord.
         const hook = await crewWebhookUrlFor(va._id);
@@ -13894,7 +14144,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -13980,6 +14230,20 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 mode: ad.joinMode || 'application',
                 minGrade: ad.minGrade || 0,
                 callsignPrefix: ad.callsignPrefix || ad.callsign || '',
+                // The shape a pilot callsign actually takes here, so the join
+                // form builds "AEROMEXICO 001MX" in front of the applicant
+                // instead of pasting an airline onto a number and hoping. One
+                // entry per airline this VA registered — a pilot flying for a
+                // VA with sub-fleets picks which one. `reservedMax` is the top
+                // of the range only staff can issue; the form greys those out
+                // rather than letting someone ask for 001 and be refused after
+                // filling the rest of it in.
+                callsign: {
+                    airlines: crewCallsign.formatsFor(ad).map((f) => ({
+                        base: f.base, tag: f.tag, digits: f.digits, sample: crewCallsign.sample(f),
+                    })),
+                    reservedMax: crewCallsign.reservedMaxOf(ad),
+                },
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
                 requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
                 emailEnabled: !!ad.crewEmailConfigured,

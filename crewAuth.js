@@ -27,6 +27,7 @@ const crypto = require('crypto');
 const vaSites = require('./vaSites');
 
 const crewStore = require('./crewStore');
+const crewCallsign = require('./crewCallsign');
 const crewAccounts = require('./crewAccounts');
 // Signing in with Discord. The rules and the two calls that touch the network
 // live there; the routes that use them are at the bottom of this file.
@@ -1068,7 +1069,7 @@ function registerCrewAuthRoutes(app) {
             const can = (c) => caps.includes(c);
             const body = req.body || {};
             const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social'].some(f => body[f] !== undefined);
-            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
+            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
             const touchesSchedule = body.schedule !== undefined;
@@ -1233,6 +1234,17 @@ function registerCrewAuthRoutes(app) {
             if (typeof req.body?.callsignPrefix === 'string') {
                 ad.callsignPrefix = req.body.callsignPrefix.trim().slice(0, 10);
             }
+            // The top of the range of pilot numbers this VA keeps for itself.
+            // Staff can still issue one from the roster; the join form cannot.
+            // Sanitised in crewCallsign so an unreadable value falls back to the
+            // default rather than to "nothing is reserved" — losing 001 to a
+            // typo in a settings field is not a recoverable mistake.
+            if (req.body?.callsignReservedMax !== undefined) {
+                ad.callsignReservedMax = crewCallsign.reservedMaxFrom(
+                    req.body.callsignReservedMax,
+                    ad.callsignReservedMax,
+                );
+            }
             // The VA's Discord invite, offered to every pilot they accept. The
             // accept dialog pre-fills from this and can override it per pilot.
             if (req.body?.discordInvite !== undefined) {
@@ -1276,6 +1288,7 @@ function registerCrewAuthRoutes(app) {
                 ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 partners: ad.crewPartners || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
+                callsignReservedMax: crewCallsign.reservedMaxOf(ad),
                 discordInvite: ad.crewDiscordInvite || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
