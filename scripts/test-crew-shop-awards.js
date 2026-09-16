@@ -16,6 +16,7 @@
 'use strict';
 
 const crewShop = require('../crewShop');
+const crewClubs = require('../crewClubs');
 const crewAwards = require('../crewAwards');
 const crewHealth = require('../crewHealth');
 const crewRetention = require('../crewRetention');
@@ -286,6 +287,66 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
     });
     check('leave with no date — every hand-set one from before v15 — behaves as it always did',
         openEnded.inactivityDue.length === 0);
+}
+
+/* --------------------------------------------------- the card's finish (v16) */
+
+// The finish is the pilot's CLUB, and the club ladder is crewClubs' — tested in
+// full in test-crew-clubs.js. What this file has to hold is that the wallet
+// CARRIES one rather than working one out, because the card is drawn in four
+// places and a browser deriving it would be a fifth copy of the rule.
+
+{
+    const club = crewClubs.memberClub(undefined, 260);
+    const w = crewShop.wallet({ _id: 'm1', name: 'A pilot', hours: 260, points: { balance: 10, earned: 40, spent: 30 } },
+        { rank: 'Captain', club });
+    check('the card carries the club the server worked out', w.club.key === 'gold');
+    check('…and the rank beside it, not instead of it', w.rank === 'Captain');
+    check('…and the hours behind both, so "38h to Platinum" needs no second fetch', w.hours === 260);
+    check('a card with no club behind it still draws',
+        crewShop.wallet({ _id: 'm2', points: {} }, {}).club === null);
+    check('no member, no card', crewShop.wallet(null, {}) === null);
+}
+
+/* ------------------------------------------------------ what a pilot holds */
+
+{
+    const order = (name, status, extra) => ({
+        _id: Math.random().toString(36).slice(2), itemName: name, status,
+        price: 500, code: 'SECRET', createdAt: daysAgo(10), decidedAt: daysAgo(9), ...(extra || {}),
+    });
+
+    const held = crewShop.holdings([
+        order('A badge on your profile', 'fulfilled'),
+        order('A badge on your profile', 'fulfilled'),
+        order('Your own callsign', 'fulfilled'),
+        order('Lead the next group flight', 'placed'),
+        order('Request a livery', 'cancelled'),
+    ]);
+    check('two of the same thing read as one row', held.length === 2);
+    check('…with a count', held.find((h) => h.name === 'A badge on your profile').count === 2);
+    check('an order still in the queue is not a thing they hold',
+        !held.some((h) => h.name === 'Lead the next group flight'));
+    check('nor is a refunded one', !held.some((h) => h.name === 'Request a livery'));
+    check('the most-held is first', held[0].name === 'A badge on your profile');
+    check('a holding never carries what it cost',
+        held.every((h) => h.price === undefined));
+    check('…nor the code', held.every((h) => h.code === undefined));
+    check('nothing delivered is an empty shelf, not an error', crewShop.holdings([]).length === 0);
+    check('an order whose item the VA has since removed survives',
+        crewShop.holdings([order('A badge on your profile', 'fulfilled', { itemId: null })]).length === 1);
+
+    const holder = crewShop.publicHolder(
+        { _id: 'm9', name: 'Ada', callsign: 'BAW9', hours: 212, status: 'active', points: { balance: 4200, earned: 9000, spent: 4800 } },
+        { rank: 'Senior First Officer', club: crewClubs.memberClub(undefined, 212),
+            orders: [order('A badge on your profile', 'fulfilled')] },
+    );
+    check('the crew list never publishes a balance', holder.balance === undefined);
+    check('…nor what anybody has spent', holder.spent === undefined);
+    check('…but earned is a fact about flying, like the hours column', holder.earned === 9000);
+    // 212 hours: past Silver (100), short of Gold (250).
+    check('a crew card carries the club the roster can see', holder.club.key === 'silver');
+    check('…and the shelf', holder.holds[0].count === 1);
 }
 
 /* ------------------------------------------------------------------- report */

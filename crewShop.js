@@ -436,6 +436,28 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
     } : {}),
 });
 
+/* ===========================================================================
+ * THE CARD'S FINISH
+ *
+ * A card that looks the same on a pilot's first day and on their thousandth
+ * hour is a card that stops being worth looking at. So the face changes as they
+ * climb — and what it changes with is their CLUB, which lives in crewClubs.js.
+ *
+ * WHY NOT THE RANK. The first cut of this keyed the finish to the rank ladder,
+ * and that was wrong for a reason worth writing down: a rank is something the
+ * airline GIVES you. Staff sign off a check-ride, staff edit hours, staff
+ * decide you are a Captain — so a card painted by it changes when somebody
+ * remembers to promote you. A club is a line you crossed by flying. Nobody has
+ * to apply it, nobody can forget to, and it is what the card is actually about.
+ *
+ * SO THERE IS ALMOST NOTHING LEFT HERE. The ladder, the colours, the thresholds
+ * and the benefits are all crewClubs'. This file's only remaining interest is
+ * that a wallet CARRIES one — which is why `wallet` takes a club rather than
+ * working one out. The card is drawn in four places (the pilot's home, the
+ * shop's hero, the crew list, the dashboard tile) and four copies of a rule is
+ * four chances for two of them to disagree about what somebody holds.
+ * ======================================================================== */
+
 /**
  * The card, for the pilot it belongs to.
  *
@@ -445,20 +467,109 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
  * whole requirement — the client derives the same thing when the server has not
  * sent one, and this is here so the two agree.
  */
-function wallet(member, { rank = '' } = {}) {
+function wallet(member, { rank = '', club = null } = {}) {
     if (!member) return null;
     const pts = member.points || {};
     return {
         pilotId: member._id,
         name: member.name || '',
         callsign: member.callsign || '',
+        // BOTH ladders, because they say different things and the card shows
+        // both: the rank is what this airline calls them, the club is what
+        // their flying has earned them.
         rank,
+        club: club || null,
+        // What the club was worked out from. On the card so "38h to Gold" can
+        // be drawn without a second fetch of the roster row it came from.
+        hours: Math.max(0, Math.round((Number(member.hours) || 0) * 10) / 10),
         since: member.createdAt || null,
         balance: Math.max(0, Number(pts.balance) || 0),
         earned: Math.max(0, Number(pts.earned) || 0),
         spent: Math.max(0, Number(pts.spent) || 0),
     };
 }
+
+/* ===========================================================================
+ * WHAT A PILOT HOLDS
+ *
+ * The shop has always been able to tell a pilot what THEY bought and nobody
+ * else. That is the right rule for a receipt — a shop is not a place to publish
+ * who spent what — and the wrong one for the things people buy here, because
+ * almost everything on the shelf is a thing whose entire value is that other
+ * people can see it. A badge nobody can see is not a badge. "First pick of the
+ * gate" that the rest of the roster never hears about is a discount on nothing.
+ *
+ * So holdings are public to the crew and receipts are not, and the line between
+ * them is drawn here rather than in a route:
+ *
+ *   * DELIVERED ONLY. An order still in the queue is a thing somebody asked
+ *     for, not a thing they hold, and a refunded one is a thing they no longer
+ *     have. Both would read as a claim.
+ *   * WHAT, AND HOW MANY. Never what it cost, never when, never the code. The
+ *     price is the airline's business with that pilot; the code is a key.
+ *   * NOTHING NEW IS PUBLISHED. The roster already hands out every name,
+ *     callsign and rank without a gate. This adds "and they hold three badges",
+ *     which is the sentence the badge was sold to produce.
+ * ======================================================================== */
+const HELD_STATUSES = new Set(['fulfilled', 'delivered', 'claimed']);
+
+/**
+ * One pilot's shelf, grouped.
+ *
+ * Grouped by the order's OWN copy of the name rather than by item id: an item
+ * a VA has since taken off the shelf still exists in everybody's holdings, and
+ * `crew_shop_orders.item_id` is `on delete set null` precisely so it survives.
+ * Two orders of the same thing read as "×2", which is what a shelf looks like.
+ */
+function holdings(orders, { limit = 12 } = {}) {
+    const byName = new Map();
+    for (const o of orders || []) {
+        if (!o || !HELD_STATUSES.has(String(o.status || ''))) continue;
+        const name = str(o.itemName, 80);
+        if (!name) continue;
+        const key = name.toLowerCase();
+        const at = byName.get(key);
+        const when = o.decidedAt || o.createdAt || null;
+        if (at) {
+            at.count += 1;
+            if (when && (!at.since || new Date(when) < new Date(at.since))) at.since = when;
+        } else {
+            byName.set(key, { name, count: 1, since: when, itemId: o.itemId || null });
+        }
+    }
+    return [...byName.values()]
+        // Most-held first, then alphabetical: a shelf reads as "what they have a
+        // lot of", and ties that reorder themselves between two page loads look
+        // like the data changed when it did not.
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+        .slice(0, Math.max(1, limit));
+}
+
+/**
+ * A pilot as the rest of the crew may see them: the card face, and the shelf.
+ *
+ * NO BALANCE. What somebody has left to spend is between them and the airline,
+ * and a crew list that ranked pilots by it would turn a shop into a scoreboard
+ * for who has flown the most hours — which the standings already are, honestly,
+ * and on flying rather than on spending.
+ *
+ * `earned` IS here, because it is a fact about flying rather than about money:
+ * it is the same statement as the hours column, denominated in whatever the VA
+ * calls its currency, and it never goes down.
+ */
+const publicHolder = (member, { rank = '', club = null, orders = [], isMe = false } = {}) => ({
+    pilotId: member._id,
+    name: member.name || '',
+    callsign: member.callsign || '',
+    rank,
+    club: club || null,
+    hours: Math.round(Number(member.hours) || 0),
+    since: member.createdAt || null,
+    status: member.status || 'active',
+    earned: Math.max(0, Number((member.points || {}).earned) || 0),
+    holds: holdings(orders),
+    isMe: !!isMe,
+});
 
 module.exports = {
     RATES,
@@ -474,4 +585,6 @@ module.exports = {
     publicItem,
     publicOrder,
     wallet,
+    holdings,
+    publicHolder,
 };
