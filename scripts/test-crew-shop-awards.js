@@ -288,6 +288,89 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
         openEnded.inactivityDue.length === 0);
 }
 
+/* --------------------------------------------------- the card's finish (v16) */
+
+{
+    // Five finishes, and every ladder from two rungs to twenty maps onto them.
+    // The property that matters is the TOP one: "I made Captain and my card
+    // went black" is the whole point of the feature, and a ladder whose last
+    // rung landed on Gold because of a rounding step would have lost it.
+    check('the top rung always gets the top finish',
+        [2, 3, 4, 5, 8, 12, 20].every((n) => crewShop.tierFor(n - 1, n) === crewShop.TIERS.length - 1));
+    check('…and the bottom rung always gets the first',
+        [2, 3, 4, 5, 8, 12, 20].every((n) => crewShop.tierFor(0, n) === 0));
+    check('a one-rung ladder is not a progression', crewShop.tierFor(0, 1) === 0);
+    check('a pilot with no rank is Standard rather than broken', crewShop.tierFor(-1, 5) === 0);
+    check('no ladder is missing a rung', crewShop.tierFor(2, 0) === 0);
+
+    // Monotonic: climbing must never move the card DOWN.
+    const climb = [];
+    for (let i = 0; i < 12; i++) climb.push(crewShop.tierFor(i, 12));
+    check('climbing never downgrades the card',
+        climb.every((t, i) => i === 0 || t >= climb[i - 1]));
+    check('…and it does move on the way up', new Set(climb).size === crewShop.TIERS.length);
+
+    // Earned, not rounded into. The second rung of five must not be wearing
+    // Silver on day two.
+    check('a finish is floored rather than rounded up', crewShop.tierFor(1, 5) === 1);
+
+    const branded = crewShop.tier(1, 5, '#123456');
+    check('a VA that has painted its ladder wins', branded.accent === '#123456');
+    check('…and says the colour is theirs', branded.branded === true);
+    check('a VA that has painted nothing gets the tier colour',
+        crewShop.tier(1, 5, '').branded === false);
+
+    const w = crewShop.wallet({ _id: 'm1', name: 'A pilot', points: { balance: 10, earned: 40, spent: 30 } },
+        { rank: 'Captain', rankIndex: 3, rankCount: 4 });
+    check('the card carries its finish', w.tier.key === 'platinum');
+    check('…and where the rank sits', w.rankIndex === 3 && w.rankCount === 4);
+    check('a card with no ladder behind it still draws',
+        crewShop.wallet({ _id: 'm2', points: {} }, {}).tier.key === 'standard');
+    check('no member, no card', crewShop.wallet(null, {}) === null);
+}
+
+/* ------------------------------------------------------ what a pilot holds */
+
+{
+    const order = (name, status, extra) => ({
+        _id: Math.random().toString(36).slice(2), itemName: name, status,
+        price: 500, code: 'SECRET', createdAt: daysAgo(10), decidedAt: daysAgo(9), ...(extra || {}),
+    });
+
+    const held = crewShop.holdings([
+        order('A badge on your profile', 'fulfilled'),
+        order('A badge on your profile', 'fulfilled'),
+        order('Your own callsign', 'fulfilled'),
+        order('Lead the next group flight', 'placed'),
+        order('Request a livery', 'cancelled'),
+    ]);
+    check('two of the same thing read as one row', held.length === 2);
+    check('…with a count', held.find((h) => h.name === 'A badge on your profile').count === 2);
+    check('an order still in the queue is not a thing they hold',
+        !held.some((h) => h.name === 'Lead the next group flight'));
+    check('nor is a refunded one', !held.some((h) => h.name === 'Request a livery'));
+    check('the most-held is first', held[0].name === 'A badge on your profile');
+    check('a holding never carries what it cost',
+        held.every((h) => h.price === undefined));
+    check('…nor the code', held.every((h) => h.code === undefined));
+    check('nothing delivered is an empty shelf, not an error', crewShop.holdings([]).length === 0);
+    check('an order whose item the VA has since removed survives',
+        crewShop.holdings([order('A badge on your profile', 'fulfilled', { itemId: null })]).length === 1);
+
+    const holder = crewShop.publicHolder(
+        { _id: 'm9', name: 'Ada', callsign: 'BAW9', hours: 212, status: 'active', points: { balance: 4200, earned: 9000, spent: 4800 } },
+        { rank: 'Senior First Officer', rankIndex: 2, rankCount: 4, orders: [order('A badge on your profile', 'fulfilled')] },
+    );
+    check('the crew list never publishes a balance', holder.balance === undefined);
+    check('…nor what anybody has spent', holder.spent === undefined);
+    check('…but earned is a fact about flying, like the hours column', holder.earned === 9000);
+    // Rung 3 of 4. A four-rung ladder has one fewer rung than there are
+    // finishes, so one is skipped on the way up — the top rung keeps the top
+    // finish and the gap falls in the middle, which is where it does least harm.
+    check('a crew card carries the finish the roster can see', holder.tier.key === 'silver');
+    check('…and the shelf', holder.holds[0].count === 1);
+}
+
 /* ------------------------------------------------------------------- report */
 
 console.log(`${pass} passed, ${fails.length} failed`);

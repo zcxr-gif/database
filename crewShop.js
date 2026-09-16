@@ -436,6 +436,82 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
     } : {}),
 });
 
+/* ===========================================================================
+ * THE CARD'S FINISH
+ *
+ * A card that looks the same on a pilot's first day and on their thousandth
+ * hour is a card that stops being worth looking at. So the face changes as they
+ * climb: five finishes, and which one somebody holds is decided by where their
+ * rank sits on THEIR airline's ladder rather than by hours, because a VA with
+ * four ranks and a VA with twelve are both complete ladders and an hours
+ * threshold would hand one of them every finish in the first month.
+ *
+ * FIVE, AND NOT ONE PER RANK. A finish per rung would mean a twelve-rung
+ * airline had twelve card colours, which is a palette rather than a
+ * progression — nobody can tell the eighth from the ninth, and the thing people
+ * actually want is to see the card change. Five steps are distinguishable at a
+ * glance, and every ladder from two rungs to twenty maps onto them.
+ *
+ * THE VA'S OWN COLOUR WINS. A rung can carry a colour the VA set (see
+ * crewRanks), and where it does, that is the card — an airline that has painted
+ * its ladder gold at the top has said what it wants and this must not argue.
+ * The tiers below are what a VA that has set nothing gets, which is nearly all
+ * of them.
+ *
+ * The names are sent to the client and drawn on the card. They are deliberately
+ * the words an airline already uses for exactly this, because a pilot reading
+ * "Gold" on their card knows what it means without being told.
+ * ======================================================================== */
+const TIERS = [
+    { key: 'standard', name: 'Standard', accent: '#4A5568' },
+    { key: 'bronze', name: 'Bronze', accent: '#A4622B' },
+    { key: 'silver', name: 'Silver', accent: '#7C8794' },
+    { key: 'gold', name: 'Gold', accent: '#B8860B' },
+    { key: 'platinum', name: 'Platinum', accent: '#2C3446' },
+];
+
+/**
+ * Which finish a pilot on rung `index` of a ladder of `count` holds.
+ *
+ * Proportional, and the top rung always lands on the top finish: "I made
+ * Captain and my card went black" is the entire point, and an airline whose
+ * last rung mapped to Gold because of a rounding step would have lost it.
+ *
+ * A pilot with no rank at all — a ladder the VA has not written, or a rung that
+ * has been renamed out from under them — gets Standard. That is not a failure
+ * state, it is the honest one: they are a pilot of this airline and the airline
+ * has not said anything else about them.
+ */
+function tierFor(index, count) {
+    const n = Math.max(0, Math.round(Number(count) || 0));
+    const i = Math.round(Number(index));
+    if (!n || !Number.isFinite(i) || i < 0) return 0;
+    if (n === 1) return 0;
+    if (i >= n - 1) return TIERS.length - 1;
+    // Floor rather than round: a finish should be EARNED, and rounding up means
+    // the second rung of a five-rung ladder wearing Silver on day two.
+    return Math.max(0, Math.min(TIERS.length - 1,
+        Math.floor((i / (n - 1)) * (TIERS.length - 1))));
+}
+
+/** The finish itself, ready to be drawn. */
+function tier(index, count, color) {
+    const at = tierFor(index, count);
+    const t = TIERS[at];
+    return {
+        key: t.key,
+        name: t.name,
+        // 0-based, and `of` alongside it, so a card can draw four pips and fill
+        // two without the client knowing how many tiers there are.
+        index: at,
+        of: TIERS.length,
+        // The VA's own colour for this rung where they set one. See above: an
+        // airline that has painted its ladder has already answered this.
+        accent: str(color, 20) || t.accent,
+        branded: !!str(color, 20),
+    };
+}
+
 /**
  * The card, for the pilot it belongs to.
  *
@@ -445,7 +521,7 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
  * whole requirement — the client derives the same thing when the server has not
  * sent one, and this is here so the two agree.
  */
-function wallet(member, { rank = '' } = {}) {
+function wallet(member, { rank = '', rankIndex = -1, rankCount = 0, rankColor = '' } = {}) {
     if (!member) return null;
     const pts = member.points || {};
     return {
@@ -453,6 +529,14 @@ function wallet(member, { rank = '' } = {}) {
         name: member.name || '',
         callsign: member.callsign || '',
         rank,
+        // Where that rank sits, and the finish it buys. Sent rather than
+        // computed in the browser because the ladder is the VA's and the card
+        // is drawn in four different places — the pilot's home, the shop's
+        // hero, the crew list and the dashboard tile — which is four chances
+        // for two of them to disagree about what somebody holds.
+        rankIndex: Number.isFinite(Number(rankIndex)) ? Math.max(-1, Math.round(Number(rankIndex))) : -1,
+        rankCount: Math.max(0, Math.round(Number(rankCount)) || 0),
+        tier: tier(rankIndex, rankCount, rankColor),
         since: member.createdAt || null,
         balance: Math.max(0, Number(pts.balance) || 0),
         earned: Math.max(0, Number(pts.earned) || 0),
@@ -460,8 +544,91 @@ function wallet(member, { rank = '' } = {}) {
     };
 }
 
+/* ===========================================================================
+ * WHAT A PILOT HOLDS
+ *
+ * The shop has always been able to tell a pilot what THEY bought and nobody
+ * else. That is the right rule for a receipt — a shop is not a place to publish
+ * who spent what — and the wrong one for the things people buy here, because
+ * almost everything on the shelf is a thing whose entire value is that other
+ * people can see it. A badge nobody can see is not a badge. "First pick of the
+ * gate" that the rest of the roster never hears about is a discount on nothing.
+ *
+ * So holdings are public to the crew and receipts are not, and the line between
+ * them is drawn here rather than in a route:
+ *
+ *   * DELIVERED ONLY. An order still in the queue is a thing somebody asked
+ *     for, not a thing they hold, and a refunded one is a thing they no longer
+ *     have. Both would read as a claim.
+ *   * WHAT, AND HOW MANY. Never what it cost, never when, never the code. The
+ *     price is the airline's business with that pilot; the code is a key.
+ *   * NOTHING NEW IS PUBLISHED. The roster already hands out every name,
+ *     callsign and rank without a gate. This adds "and they hold three badges",
+ *     which is the sentence the badge was sold to produce.
+ * ======================================================================== */
+const HELD_STATUSES = new Set(['fulfilled', 'delivered', 'claimed']);
+
+/**
+ * One pilot's shelf, grouped.
+ *
+ * Grouped by the order's OWN copy of the name rather than by item id: an item
+ * a VA has since taken off the shelf still exists in everybody's holdings, and
+ * `crew_shop_orders.item_id` is `on delete set null` precisely so it survives.
+ * Two orders of the same thing read as "×2", which is what a shelf looks like.
+ */
+function holdings(orders, { limit = 12 } = {}) {
+    const byName = new Map();
+    for (const o of orders || []) {
+        if (!o || !HELD_STATUSES.has(String(o.status || ''))) continue;
+        const name = str(o.itemName, 80);
+        if (!name) continue;
+        const key = name.toLowerCase();
+        const at = byName.get(key);
+        const when = o.decidedAt || o.createdAt || null;
+        if (at) {
+            at.count += 1;
+            if (when && (!at.since || new Date(when) < new Date(at.since))) at.since = when;
+        } else {
+            byName.set(key, { name, count: 1, since: when, itemId: o.itemId || null });
+        }
+    }
+    return [...byName.values()]
+        // Most-held first, then alphabetical: a shelf reads as "what they have a
+        // lot of", and ties that reorder themselves between two page loads look
+        // like the data changed when it did not.
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+        .slice(0, Math.max(1, limit));
+}
+
+/**
+ * A pilot as the rest of the crew may see them: the card face, and the shelf.
+ *
+ * NO BALANCE. What somebody has left to spend is between them and the airline,
+ * and a crew list that ranked pilots by it would turn a shop into a scoreboard
+ * for who has flown the most hours — which the standings already are, honestly,
+ * and on flying rather than on spending.
+ *
+ * `earned` IS here, because it is a fact about flying rather than about money:
+ * it is the same statement as the hours column, denominated in whatever the VA
+ * calls its currency, and it never goes down.
+ */
+const publicHolder = (member, { rank = '', rankIndex = -1, rankCount = 0, rankColor = '', orders = [], isMe = false } = {}) => ({
+    pilotId: member._id,
+    name: member.name || '',
+    callsign: member.callsign || '',
+    rank,
+    tier: tier(rankIndex, rankCount, rankColor),
+    hours: Math.round(Number(member.hours) || 0),
+    since: member.createdAt || null,
+    status: member.status || 'active',
+    earned: Math.max(0, Number((member.points || {}).earned) || 0),
+    holds: holdings(orders),
+    isMe: !!isMe,
+});
+
 module.exports = {
     RATES,
+    TIERS,
     CATALOGUE,
     NOMINAL_FLIGHT,
     roundPrice,
@@ -474,4 +641,8 @@ module.exports = {
     publicItem,
     publicOrder,
     wallet,
+    tierFor,
+    tier,
+    holdings,
+    publicHolder,
 };

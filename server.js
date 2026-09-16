@@ -154,6 +154,12 @@ const crewShop = require('./crewShop');
 const crewDiscord = require('./crewDiscord');
 const crewAwards = require('./crewAwards');
 const crewHealth = require('./crewHealth');
+// Which leg to fly next, and why that one: the Route of the Week / of the Day
+// pick, a pilot's flying habits read off their own approved reports, and the
+// scoring that turns the VA's network into a short list of suggestions. Same
+// shape as the three above — decisions only, no I/O, and nothing here is a
+// gate: what a pilot MAY fly is still publicRoute's business.
+const crewFeatured = require('./crewFeatured');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -687,6 +693,32 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         perLanding: { type: Number, default: 0, min: 0, max: 100000 },
         fleetBonus: { type: Number, default: 0, min: 0, max: 100000 },
         violationPenalty: { type: Number, default: 0, min: 0, max: 100000 },
+    },
+
+    // --- The featured routes (v16) ---
+    //
+    // Which leg the airline is flying this week, and which today. Normally
+    // NEITHER OF THESE IS SET, and that is the intended state: the pick is
+    // derived from the network and the period (see crewFeatured.js), so a VA
+    // that has never opened this screen has a Route of the Week the first time
+    // one of its pilots looks.
+    //
+    // What lives here is a staff OVERRIDE — the half the shop's "Name a route"
+    // item has been promising since it shipped, where a pilot buys the right to
+    // have their sector flown as that week's featured route and there was
+    // nothing to write it onto. `weekPeriod` / `dayPeriod` stamp the period the
+    // pin was set in, and crewFeatured lapses a pin whose period has rolled
+    // over: a pin that never expires is a rotation that silently stopped.
+    //
+    // Here rather than in the VA's own Postgres for the reason crewShop's
+    // settings are: it is a decision about how the airline is run, it is two
+    // small fields, and it must not cost a round trip to somebody else's
+    // database — nor a schema migration in three hundred VA projects — to read.
+    crewFeatured: {
+        weekRouteId: { type: String, trim: true, default: '' },
+        weekPeriod: { type: String, trim: true, default: '' },
+        dayRouteId: { type: String, trim: true, default: '' },
+        dayPeriod: { type: String, trim: true, default: '' },
     },
 
     // --- Recruitment / join settings ---
@@ -4404,6 +4436,11 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
             myId ? store.getMember(myId) : Promise.resolve(null),
         ]);
         const rank = member ? crewRanks.memberRank(va.ranks, member.hours, member.checksPassed) : null;
+        // Where that rank sits on THIS airline's ladder, which is what decides
+        // the card's finish. Sent as a position rather than as a colour because
+        // a five-rung airline and a twelve-rung one are both complete ladders,
+        // and only the ladder itself knows which rung is the top one.
+        const ladder = crewRanks.normalizeLadder(va.ranks);
 
         res.json({
             enabled: settings.enabled,
@@ -4424,9 +4461,94 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
                 suggested: crewShop.suggestedItems(settings),
             } : {}),
             items: items.map(crewShop.publicItem),
-            wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '' }),
+            wallet: crewShop.wallet(member, {
+                rank: (rank && rank.name) || '',
+                rankIndex: rank ? crewRanks.rankIndex(va.ranks, rank.name) : -1,
+                rankCount: ladder.length,
+                rankColor: (rank && rank.color) || '',
+            }),
         });
     } catch (err) { crewFail(res, err, { log: 'shop read error', message: 'The shop could not be opened.' }); }
+});
+
+/**
+ * THE CREW, AND WHAT THEY HOLD.
+ *
+ * The shop shipped able to tell a pilot what they themselves bought and nothing
+ * about anybody else. That is the right rule for a receipt and the wrong one
+ * for the shelf, because almost everything a VA sells is a thing whose entire
+ * value is that other people can see it — a badge nobody can see is not a
+ * badge, and "first pick of the gate" that the roster never hears about is a
+ * discount on nothing.
+ *
+ * So: any signed-in pilot of this airline may see the crew's cards and what is
+ * on their shelves. Staff too, because staff fly. Not the public — the roster
+ * is public, but who has bought what is a thing said inside an airline.
+ *
+ * WHAT IS AND IS NOT SENT is decided in crewShop.publicHolder, not here:
+ * delivered orders only, grouped by name with a count, and never a price, a
+ * date of purchase, a code or a balance. See the comment there.
+ *
+ * ONE READ OF THE ORDER TABLE for the whole crew rather than one per pilot. A
+ * roster of two hundred would otherwise be two hundred round trips into
+ * somebody else's database to draw one list.
+ */
+app.get('/api/crew/:slug/shop/crew', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const settings = shopSettingsFor(va);
+        if (!settings.enabled) return res.json({ enabled: false, currency: settings.currency, crew: [] });
+
+        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const viewer = await crewViewer(req, store);
+        const me = await crewPilot(req, store);
+        const myId = (me && me.memberId) ? String(me.memberId) : '';
+        // Signed in as somebody, or nothing. The gate is deliberately "are you
+        // of this airline" rather than "are you on the roster": a staff member
+        // who has not claimed a roster row is still crew.
+        if (!canManage && !viewer && !myId) {
+            return res.status(401).json({ error: 'Sign in to see the crew.', code: 'not_authenticated' });
+        }
+
+        const ladder = crewRanks.normalizeLadder(va.ranks);
+        const [members, orders] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            store.listShopOrders({ limit: 5000 }).catch(() => []),
+        ]);
+
+        const byMember = new Map();
+        for (const o of orders || []) {
+            const key = String(o.memberId || '');
+            if (!key) continue;
+            if (!byMember.has(key)) byMember.set(key, []);
+            byMember.get(key).push(o);
+        }
+
+        const crew = (members || [])
+            .filter((m) => m && m.status !== 'inactive')
+            .map((m) => {
+                const rank = crewRanks.memberRank(va.ranks, m.hours, m.checksPassed);
+                return crewShop.publicHolder(m, {
+                    rank: (rank && rank.name) || '',
+                    rankIndex: rank ? crewRanks.rankIndex(va.ranks, rank.name) : -1,
+                    rankCount: ladder.length,
+                    rankColor: (rank && rank.color) || '',
+                    orders: byMember.get(String(m._id)) || [],
+                    isMe: !!myId && String(m._id) === myId,
+                });
+            })
+            // The pilots who hold something first — that is what this list is
+            // for — then by the finish they have earned, then by name. Not by
+            // balance: what somebody has left to spend is between them and the
+            // airline, and ranking on it turns a shop into a scoreboard.
+            .sort((a, b) => (b.holds.length - a.holds.length)
+                || (b.tier.index - a.tier.index)
+                || (b.hours - a.hours)
+                || a.name.localeCompare(b.name));
+
+        res.set('Cache-Control', 'no-store');
+        res.json({ enabled: true, currency: settings.currency, crew });
+    } catch (err) { crewFail(res, err, { log: 'shop crew error', message: 'The crew could not be read.' }); }
 });
 
 // ---- Turning it on, naming the currency, setting the rates ----
@@ -4948,6 +5070,232 @@ app.get('/api/crew/:slug/route-map', async (req, res) => {
             },
         });
     } catch (err) { crewFail(res, err, { log: 'route map error', message: 'Could not load the route map.' }); }
+});
+
+
+/* ===========================================================================
+ * THE FEATURED ROUTES, AND WHAT TO FLY NEXT
+ *
+ * A crew center has always been able to answer "what does this airline fly".
+ * It has never been able to answer the question a pilot actually opens it with,
+ * which is "what should I fly TONIGHT" — and a route list of four hundred legs
+ * is the worst possible answer to that.
+ *
+ * Two endpoints, because they are two different questions:
+ *
+ *   /featured-routes   one leg for the whole airline, for the week and for the
+ *                      day. The same leg for everybody, so it is a thing to
+ *                      talk about in the Discord rather than a personal
+ *                      recommendation.
+ *
+ *   /suggestions       a short list for ONE pilot, scored against what that
+ *                      pilot actually flies and against wherever ATC is open.
+ *
+ * NEITHER IS STORED AND NEITHER NEEDS A JOB TO RUN. See crewFeatured.js: the
+ * pick is a pure function of the network and the period, so every VA on the
+ * platform has a Route of the Week the moment this deploys, and a VA that later
+ * pins one gets their pin until the period rolls over.
+ *
+ * WHERE THE LIVE ATC COMES FROM. The browser, not this server. The crew center
+ * runs on a tracker that already holds the live network in the tab, and having
+ * this process poll Infinite Flight on behalf of every VA would be a second
+ * copy of a feed that is already open — so the page posts what it can see and
+ * the server does the part only it can do, which is knowing the airline.
+ * Absent, everything still answers; no tile claims an ATC reason it cannot
+ * support.
+ * ======================================================================== */
+
+/** The pins on the VA record, in the shape crewFeatured reads them. */
+const featuredPins = (va) => crewFeatured.normalizePins(va && va.crewFeatured);
+
+/**
+ * What the browser says is going on out there, bounded.
+ *
+ * Everything in here arrives from a page and is therefore a claim, so it is
+ * clamped to something that cannot cost anything: at most 200 controlled
+ * fields and 200 counted ones, four characters each. It can only ever move a
+ * suggestion up a list — there is no gate behind it — but a request is not a
+ * place to accept an unbounded object.
+ */
+function readBusy(src) {
+    const s = src || {};
+    const codes = (v) => String(v == null ? '' : v)
+        .split(',').map((x) => x.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4))
+        .filter(Boolean).slice(0, 200);
+    const atc = codes(s.atc).map((icao) => ({ icao }));
+    const inbound = {};
+    // `LEMG:7,EGKK:3` — a count per field, in one query parameter, because this
+    // arrives on a GET that the page repeats every couple of minutes.
+    String(s.inbound == null ? '' : s.inbound).split(',').slice(0, 200).forEach((pair) => {
+        const [code, n] = String(pair).split(':');
+        const icao = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+        const count = Math.max(0, Math.min(9999, parseInt(n, 10) || 0));
+        if (icao && count) inbound[icao] = count;
+    });
+    return (atc.length || Object.keys(inbound).length) ? { atc, inbound } : null;
+}
+
+/**
+ * One featured route, with everything a tile needs and nothing it does not.
+ *
+ * The period key travels with it so a page can cache it honestly: "this is
+ * 2026-W38's leg" is a fact that stops being true at a known moment, which is
+ * a different and much more useful thing than a max-age.
+ */
+const publicFeatured = (pick, ranks, viewer) => (pick ? {
+    period: pick.period,
+    periodKey: pick.periodKey,
+    pinned: pick.pinned,
+    estimatedMin: crewFeatured.legMinutes(pick.route),
+    route: publicRoute(pick.route, ranks, viewer),
+} : null);
+
+/**
+ * Both features, for anybody.
+ *
+ * Public for the reason /routes is: the featured leg is what a VA advertises,
+ * and it is the thing a Discord bot or a VA's own website most wants to print.
+ * `publicRoute` still decides per-viewer what is locked, so a pilot who cannot
+ * yet fly this week's leg is told that rather than shown a route that is not
+ * theirs — "unlocks in 12h" being exactly the sentence that makes a rank ladder
+ * worth climbing.
+ */
+app.get('/api/crew/:slug/featured-routes', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes({ activeOnly: true });
+        const viewer = await crewViewer(req, store);
+        const pins = featuredPins(va);
+        const slug = String(req.params.slug || '').toLowerCase();
+        const week = crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week });
+        const day = crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day });
+        // No cache header. The pick turns over at a wall-clock moment and a
+        // pilot who opens the page at 00:01Z should see the new one, not the
+        // last five minutes of yesterday's.
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            week: publicFeatured(week, va.ranks, viewer),
+            day: publicFeatured(day, va.ranks, viewer),
+            canManage: !(await requireCap(req, req.params.slug, 'routes.manage')).error,
+            // So a back office can say "this is the rotation's pick" rather than
+            // leaving staff unsure whether their pin took.
+            network: crewFeatured.eligible(routes).length,
+        });
+    } catch (err) { crewFail(res, err, { log: 'featured routes error', message: 'Could not work out this week’s route.' }); }
+});
+
+/**
+ * Pinning one, or handing the slot back.
+ *
+ * `routes.manage`, because this is an editorial decision about the network and
+ * it is the same people who make every other one. Body is
+ * `{ week: '<routeId>' }` / `{ day: '' }` — an empty id clears that pin, which
+ * is how staff put the slot back on the rotation.
+ *
+ * The period is stamped by crewFeatured rather than taken from the request: a
+ * pin is always for the period it is set in, and letting a caller name its own
+ * would let somebody pin a leg for a week in 2031.
+ */
+app.post('/api/crew/:slug/featured-routes', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const body = req.body || {};
+        const patch = {};
+        for (const period of crewFeatured.PERIODS) {
+            if (!(period in body)) continue;
+            const id = String(body[period] || '').trim().slice(0, 64);
+            // A pin on a leg that is not on the network is a pin nobody would
+            // ever see take effect — crewFeatured would lapse it silently on
+            // the first read. Better to refuse it where somebody is looking.
+            if (id) {
+                const route = await store.getRoute(id).catch(() => null);
+                if (!route) return res.status(404).json({ error: 'That route is not on the network.' });
+                if (route.active === false) {
+                    return res.status(409).json({ error: 'That route is a draft. Publish it first.', code: 'route_draft' });
+                }
+            }
+            patch[period] = id;
+        }
+        if (!Object.keys(patch).length) return res.status(400).json({ error: 'Say which one you are pinning.' });
+
+        const record = crewFeatured.toPinRecord(patch, (va && va.crewFeatured) || {}, new Date());
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewFeatured: record } });
+
+        const routes = await store.listRoutes({ activeOnly: true });
+        const pins = crewFeatured.normalizePins(record);
+        const slug = String(req.params.slug || '').toLowerCase();
+        res.json({
+            week: publicFeatured(crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week }), va.ranks, null),
+            day: publicFeatured(crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day }), va.ranks, null),
+        });
+    } catch (err) { crewFail(res, err, { log: 'featured pin error', message: 'That could not be saved.' }); }
+});
+
+/**
+ * What THIS pilot should fly next.
+ *
+ * One round trip for a whole panel: the two features, the short list, and the
+ * profile the short list was built from. The profile is sent back on purpose —
+ * a recommendation whose basis is invisible is a recommendation nobody trusts,
+ * and "you mostly fly the 737 out of EGLL, about 80 minutes at a time" is the
+ * sentence that makes the rest of the panel make sense.
+ *
+ * Signed out, or signed in as somebody with no roster identity, this still
+ * answers: the habit signals simply do not fire, the features and the live ATC
+ * carry it, and nothing claims a habit this caller has not got.
+ */
+app.get('/api/crew/:slug/suggestions', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewViewer(req, store);
+        const me = await crewPilot(req, store);
+        const slug = String(req.params.slug || '').toLowerCase();
+        const limit = Math.max(1, Math.min(12, parseInt(req.query.limit, 10) || 6));
+
+        const [routes, fleetDoc] = await Promise.all([
+            store.listRoutes({ activeOnly: true }),
+            VirtualAirlineAd.findById(va._id).select('crewFleet').lean().catch(() => null),
+        ]);
+        // Their own reports, and only theirs. A profile is built from what one
+        // pilot flew; the roster's hours column says how much and never what.
+        const flights = me && me.memberId
+            ? await store.listPirepsForMember(me.memberId, { limit: 500 }).catch(() => [])
+            : [];
+
+        const profile = crewFeatured.flyingProfile(flights);
+        const pins = featuredPins(va);
+        const week = crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week });
+        const day = crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day });
+
+        // The features are scored UP rather than pulled out of the list: they
+        // are legs of this network like any other, and a pilot for whom this
+        // week's route is also their best match should see one strong tile
+        // rather than the same sector twice.
+        const featuredIds = [week, day].filter(Boolean).map((p) => String(p.route.id || p.route._id));
+        // `locked` is decided per viewer, so the scoring sees what this pilot
+        // sees — a leg above their rank is not a suggestion, it is a tease.
+        const visible = routes.map((r) => publicRoute(r, va.ranks, viewer));
+        const picks = crewFeatured.suggest(visible, profile, {
+            busy: readBusy(req.query),
+            limit,
+            featured: featuredIds,
+            fleet: (fleetDoc && fleetDoc.crewFleet) || [],
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            suggestions: picks.map(crewFeatured.publicSuggestion),
+            profile: crewFeatured.publicProfile(profile),
+            week: publicFeatured(week, va.ranks, viewer),
+            day: publicFeatured(day, va.ranks, viewer),
+            // So the panel can tell "you have not flown enough for us to lean on
+            // your habits yet" apart from "the network is empty", which are two
+            // different empty states with two different sentences.
+            network: crewFeatured.eligible(routes).length,
+        });
+    } catch (err) { crewFail(res, err, { log: 'suggestions error', message: 'Could not work out what to suggest.' }); }
 });
 
 app.post('/api/crew/:slug/routes', async (req, res) => {
