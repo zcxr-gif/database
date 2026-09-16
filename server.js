@@ -166,6 +166,10 @@ const crewFeatured = require('./crewFeatured');
 // as the modules above: handed a ladder and a number of hours it says which
 // club that is, and every benefit it names is enforced by a route below.
 const crewClubs = require('./crewClubs');
+// The join behind the row across the top of a pilot's own page: their rank,
+// their club, their awards and what they have claimed, in one order. Pure like
+// the rest — handed the four, it returns the row.
+const crewBadges = require('./crewBadges');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -4262,6 +4266,81 @@ app.get('/api/crew/:slug/awards', async (req, res) => {
             forName: (member && (member.name || member.callsign)) || '',
         });
     } catch (err) { crewFail(res, err, { log: 'awards read error', message: 'Those could not be counted up.' }); }
+});
+
+
+/* ===========================================================================
+ * WHAT A PILOT WEARS (v16)
+ *
+ * One round trip for the row across the top of the pilot's own page: their
+ * rank, their club, every award they have earned and everything they have
+ * claimed from the shop.
+ *
+ * ONE ROUTE AND NOT FOUR, because it is one row. The four facts live in four
+ * different places — the rank ladder on the VA record, the club ladder beside
+ * it, the awards computed from the flight log, the holdings in the VA's own
+ * order table — and a page stitching that together from four fetches is a page
+ * that renders four times and settles into the right answer last. The hero is
+ * the first thing anybody sees; it does not get to flicker.
+ *
+ * NOTHING NEW IS PUBLISHED. Every one of these four is already readable by
+ * this pilot on another screen of the same crew center. What is new is that
+ * they are in one place, at the top.
+ *
+ * SIGNED-IN PILOTS ONLY. It is a row about one named person, and there is no
+ * version of it for the public. A staff member who has not claimed a roster
+ * row gets the empty answer rather than an error — they are a manager watching
+ * rather than a pilot with a rank, which is a state, not a failure.
+ *
+ * (`shopSettingsFor` and `clubsFor` are declared further down this file, with
+ * the rest of the shop. Both are read at request time, long after the module
+ * has finished loading — the same arrangement AIRPORT_COORDS has.)
+ * ======================================================================== */
+app.get('/api/crew/:slug/me/badges', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+        if (!me || !me.memberId) {
+            return res.json({ badges: [], total: 0, counts: {}, pilot: null });
+        }
+        const member = await store.getMember(me.memberId);
+        if (!member) return res.json({ badges: [], total: 0, counts: {}, pilot: null });
+
+        const settings = shopSettingsFor(va);
+        // The flight log, and — only where the VA runs a shop — the orders and
+        // the shelf. A VA with no shop has no holdings to read and no reason to
+        // pay for two queries into somebody else's database to find that out.
+        const [pireps, orders, items] = await Promise.all([
+            store.listPirepsForMember(me.memberId, { limit: 5000 }).catch(() => []),
+            settings.enabled ? store.listShopOrders({ memberId: String(me.memberId), limit: 500 }).catch(() => []) : [],
+            settings.enabled ? store.listShopItems({ limit: 200 }).catch(() => []) : [],
+        ]);
+
+        const rank = crewRanks.memberRank(va.ranks, member.hours, member.checksPassed);
+        const club = crewClubs.memberClub(clubsFor(va), member.hours);
+        const { earned } = crewAwards.forMember({ member, pireps });
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ...crewBadges.forPilot({
+                rank,
+                // Always, shop or no shop: a club is earned by flying and
+                // exists whether or not the airline sells anything. Only the
+                // holdings above depend on there being a shop.
+                club,
+                earned,
+                catalog: crewAwards.catalog(),
+                orders,
+                items: items.map(crewShop.publicItem),
+            }),
+            pilot: {
+                memberId: member._id,
+                name: member.name || '',
+                callsign: member.callsign || '',
+                hours: Math.max(0, Math.round((Number(member.hours) || 0) * 10) / 10),
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/badges error', message: 'Could not read your badges.' }); }
 });
 
 /* ===========================================================================
