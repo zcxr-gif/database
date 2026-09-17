@@ -45,6 +45,9 @@
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+// Only for clearPatch: a password that changes must take any outstanding reset
+// link with it. See dropReset below.
+const crewPasswordReset = require('./crewPasswordReset');
 
 const BCRYPT_ROUNDS = 12;
 const MIN_PASSWORD_LENGTH = 8;
@@ -62,6 +65,33 @@ function generatePassword(length = 14) {
 }
 
 const clean = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
+
+/**
+ * Take away any outstanding reset link and any request waiting on staff.
+ *
+ * Called after every password change, because "the link somebody emailed you
+ * stops working once you have changed your password another way" has to be
+ * enforced by the code rather than hoped for. A pilot who remembers their
+ * password mid-reset, or a staff member who issues one from the account list
+ * while a request sits in the queue, must not leave a live link behind.
+ *
+ * A SEPARATE, BEST-EFFORT WRITE, and that is the whole reason this function
+ * exists rather than five more fields in the patches above. The reset columns
+ * arrived in v19 and are deliberately not droppable (see LATE_COLUMNS in
+ * crewStore.js), so folding them into the main update would make an ordinary
+ * password change fail outright on every project that has not re-run the SQL —
+ * breaking the thing that works to tidy up after a feature that project has
+ * not got. So the password lands first, on its own, and this follows.
+ *
+ * Failing silently is correct here and only here: the worst case is a link that
+ * outlives the password change until it expires on its own, on a project where
+ * no link can have been minted in the first place.
+ */
+function dropReset(store, accountId) {
+    return Promise.resolve()
+        .then(() => store.updateAccount(accountId, crewPasswordReset.clearPatch()))
+        .catch(() => null);
+}
 
 // A username derived from the pilot's name: lower-case, letters/digits/dots
 // only. `usernameFor` then makes it unique within THIS crew center — uniqueness
@@ -381,7 +411,42 @@ async function changePassword(store, accountId, currentPassword, newPassword) {
         passwordHash: await bcrypt.hash(next, BCRYPT_ROUNDS),
         mustChangePassword: false,
     });
+    await dropReset(store, account._id);
     return { ok: true };
+}
+
+/**
+ * The password a pilot chose for themselves at the far end of a reset link.
+ *
+ * NOT changePassword above, and the difference is the whole point: that one
+ * requires the current password, which is the one thing this pilot has not
+ * got. What stands in for it is the link — a 256-bit token that was emailed to
+ * the address on the account, whose hash the caller has already matched and
+ * whose lifetime it has already checked (crewPasswordReset.isLive).
+ *
+ * ONE WRITE, deliberately. The new hash and the death of the token are the
+ * same update, so there is no window in which the password has changed and the
+ * link is still live — and none in which the link is spent but the password is
+ * not yet set, which would lock the pilot out with their one link gone.
+ *
+ * `mustChangePassword` is cleared rather than set: they have just chosen this
+ * themselves, so there is nothing to nag them about. That is the opposite of
+ * resetPassword below, where staff generate one and read it out.
+ *
+ * @returns {{ok: true, username: string} | {error: string, status: number}}
+ */
+async function setPasswordFromReset(store, account, newPassword) {
+    if (!account) return { error: 'Account not found.', status: 404 };
+    const next = String(newPassword || '');
+    if (next.length < MIN_PASSWORD_LENGTH) {
+        return { error: `Please choose at least ${MIN_PASSWORD_LENGTH} characters.`, status: 400 };
+    }
+    await store.updateAccount(account._id, {
+        passwordHash: await bcrypt.hash(next, BCRYPT_ROUNDS),
+        mustChangePassword: false,
+        ...crewPasswordReset.clearPatch(),
+    });
+    return { ok: true, username: account.username };
 }
 
 /**
@@ -396,6 +461,9 @@ async function resetPassword(store, accountId) {
         passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS),
         mustChangePassword: true,
     });
+    // Whatever they had asked for, they have now been given. This is also what
+    // takes an issued request out of the Logins tab.
+    await dropReset(store, account._id);
     return { username: account.username, password };
 }
 
@@ -427,6 +495,7 @@ module.exports = {
     findUnclaimedNamesake,
     authenticate,
     changePassword,
+    setPasswordFromReset,
     resetPassword,
     publicAccount,
     generatePassword,

@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 18;
+const EXPECTED_SCHEMA_VERSION = 19;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -162,6 +162,16 @@ const STAFF_PILOT_SCHEMA_VERSION = 17;
 // record who did it here yet" rather than failing the write.
 const SHOP_SHELVES_SCHEMA_VERSION = 18;
 
+// The version that added the five reset columns to crew_accounts. Its own
+// feature constant in the mould of events and the links board rather than a
+// silent LATE_COLUMNS entry, because "a pilot can get back in without asking a
+// human" is a whole feature a v18 project has not got — and the honest answer
+// to a pilot on one is that there is nothing coming and they should message
+// their staff, which is a different sentence from "check your inbox". See
+// LATE_COLUMNS: these columns are NOT droppable, for the reason discord_id is
+// not.
+const PASSWORD_RESET_SCHEMA_VERSION = 19;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -215,7 +225,15 @@ const LATE_COLUMNS = {
      * So a VA on a pre-v16 schema now gets `store_schema_outdated` from the
      * link, which the callback prints as "your database needs updating" with
      * the button that fixes it. `portal_account_id` and the terms columns stay
-     * droppable: those writes carry other fields that are worth keeping. */
+     * droppable: those writes carry other fields that are worth keeping.
+     *
+     * THE v19 RESET COLUMNS ARE NOT IN HERE EITHER, and it is the same failure
+     * twice over. On a reset request the column IS the write: drop
+     * `reset_token_hash` and the update succeeds, stores nothing, and the pilot
+     * is told a way back in is on its way. Drop `reset_needs_staff` and the
+     * request never reaches the Logins tab, so the staff half does not happen
+     * either. Both are a confirmation that is not true, which is the one
+     * failure mode worse than an error. */
     crew_accounts: new Set(['portal_account_id', 'terms_version', 'terms_accepted_at']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
@@ -440,6 +458,15 @@ const accountFromRow = (r) => r && {
     // answered — the crew center cannot tell those apart and does not need to.
     termsVersion: r.terms_version || '',
     termsAcceptedAt: date(r.terms_accepted_at),
+    // v19. A forgotten password. The HASH of the one-time link, never the link
+    // — see crewPasswordReset.js, which is the only thing that should read any
+    // of these. Empty on every account that has not asked, which is almost all
+    // of them almost all of the time.
+    resetTokenHash: r.reset_token_hash || '',
+    resetTokenExpiresAt: date(r.reset_token_expires_at),
+    resetRequestedAt: date(r.reset_requested_at),
+    resetNeedsStaff: !!r.reset_needs_staff,
+    resetReason: r.reset_reason || '',
     lastLoginAt: date(r.last_login_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -470,6 +497,14 @@ const accountToRow = (a) => {
     pick(a, out, 'portalAccountId', 'portal_account_id', (v) => (/^[a-f0-9]{24}$/i.test(String(v || '')) ? String(v) : ''));
     pick(a, out, 'termsVersion', 'terms_version', (v) => str(v, 20));
     pick(a, out, 'termsAcceptedAt', 'terms_accepted_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // v19. Hex SHA-256, so 64 characters — bounded here as well as at the edge
+    // because this is the last thing between a value and the index an
+    // unauthenticated reset link is looked up on.
+    pick(a, out, 'resetTokenHash', 'reset_token_hash', (v) => (/^[a-f0-9]{64}$/i.test(String(v || '')) ? String(v).toLowerCase() : ''));
+    pick(a, out, 'resetTokenExpiresAt', 'reset_token_expires_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(a, out, 'resetRequestedAt', 'reset_requested_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(a, out, 'resetNeedsStaff', 'reset_needs_staff', (v) => !!v);
+    pick(a, out, 'resetReason', 'reset_reason', (v) => str(v, 40));
     return out;
 };
 
@@ -1557,6 +1592,69 @@ class SupabaseStore {
         return this.accounts(async () => { await this.db.remove('crew_accounts', this.ident(id)); return true; });
     }
 
+    // --- Forgotten passwords (v19) ---
+    //
+    // The same shape as accounts() above, one layer in: a project on a pre-v19
+    // schema HAS the logins table and is signing pilots in perfectly, and what
+    // it has not got is the five columns a reset needs. So the error names that
+    // rather than the table, and the routes turn this one code into the answer
+    // the sign-in page gives a pilot — "this crew centre cannot do resets yet,
+    // message your staff" — instead of promising an email that is not coming.
+    //
+    // A filter or a select naming a column the project has not got comes back
+    // as store_schema_outdated; a project with no crew_accounts at all comes
+    // back as store_accounts_missing from accounts(). Both mean the same thing
+    // here, and both are the VA's to fix with one button.
+    async resets(fn) {
+        try { return await this.accounts(fn); } catch (err) {
+            if (err instanceof CrewStoreError
+                && (err.code === 'store_schema_missing' || err.code === 'store_schema_outdated'
+                    || err.code === 'store_accounts_missing')) {
+                throw new CrewStoreError(
+                    'This crew center’s project cannot do password resets yet. Re-run the setup SQL (Settings → Data store) to add them.',
+                    { status: 409, code: 'store_resets_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The account a reset link opens, or null.
+     *
+     * Looked up by the HASH of the token — the link itself is never stored, so
+     * this is the only question that can be asked of it. Whether the link is
+     * still in date is NOT decided here: crewPasswordReset.tokenState owns
+     * that, so "expired" is one rule in one place rather than a filter here
+     * and a check there that can disagree.
+     *
+     * The empty hash is refused rather than queried, because every account
+     * that has never asked holds '' and a filter on it would open the first
+     * one of them to anybody who pressed `?reset=`.
+     */
+    getAccountByResetToken(hash) {
+        const h = String(hash || '').toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(h)) return Promise.resolve(null);
+        return this.resets(() => this.one('crew_accounts', { ...this.scope, reset_token_hash: `eq.${h}` }, accountFromRow));
+    }
+
+    /**
+     * What is still waiting on a human: the requests that could not be emailed
+     * and have not been dealt with.
+     *
+     * Oldest first, deliberately — this is a queue of people who cannot get
+     * into their crew center, and the one who has been waiting longest is the
+     * one to deal with next.
+     */
+    listPasswordRequests({ limit = 200 } = {}) {
+        return this.resets(async () => {
+            const rows = await this.db.select('crew_accounts', {
+                ...this.scope, reset_needs_staff: 'is.true',
+                order: 'reset_requested_at.asc', limit,
+            });
+            return (rows || []).map(accountFromRow);
+        });
+    }
+
     // --- Routes ---
     async listRoutes({ activeOnly = false, limit = 3000 } = {}) {
         const params = { ...this.scope, order: 'flight_number.asc,created_at.desc', limit };
@@ -2514,6 +2612,12 @@ class SupabaseStore {
                 // or both, and two flags would only invite a panel to imply
                 // otherwise.
                 staffPilot: version >= STAFF_PILOT_SCHEMA_VERSION,
+                // v19. Whether a pilot who has forgotten their password can get
+                // back in without a staff member doing it for them. Its own
+                // flag like every feature above, so the sign-in page can say
+                // "this crew centre cannot do resets yet" rather than promising
+                // an email a pre-v19 project has nowhere to record.
+                passwordResets: version >= PASSWORD_RESET_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -2533,6 +2637,7 @@ class SupabaseStore {
                 training: false,
                 leave: false,
                 shop: false,
+                passwordResets: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2657,6 +2762,14 @@ const PURGE_PASSES = 40;
 // deliberately a straight translation of what the handlers used to do inline,
 // so behaviour for a not-yet-migrated VA is bit-for-bit what it was.
 // ---------------------------------------------------------------------------
+// A legacy VA asked for something that needs a column their crew accounts do
+// not have, because those accounts are rows in OUR collection. The same code
+// the Supabase store raises on a pre-v19 project, so the routes have one case
+// to answer rather than two.
+const legacyResetsUnsupported = () => new CrewStoreError(
+    'Password resets need this VA’s own data store. Connect one in Crew Center → Settings → Data store.',
+    { status: 409, code: 'store_resets_missing' });
+
 class LegacyStore {
     constructor(va) {
         this.kind = 'managed';
@@ -2774,6 +2887,23 @@ class LegacyStore {
     // exists to replace.
     async getAccountByDiscord() { return null; }
     async getAccountByPortal() { return null; }
+    /* Forgotten passwords (v19) THROW here rather than answering "nobody", and
+     * that is the opposite of the two methods above on purpose.
+     *
+     * "No such account" is a true answer for a Discord id on the legacy store.
+     * "No outstanding reset" would not be: a legacy crew account is a row in
+     * OUR central collection, which has no column for a one-time link, and
+     * updateAccount below writes only the fields this interface owns and drops
+     * the rest. So a request would be accepted, store nothing, and tell the
+     * pilot a way back in is on its way — the confirmation-that-is-not-true
+     * failure that LATE_COLUMNS refuses the reset columns to avoid.
+     *
+     * The route turns this code into the same sentence a pre-v19 project gets:
+     * this crew centre cannot do resets, message your staff. Which is the
+     * honest answer, and the fix is the migration these VAs are already being
+     * asked to run. */
+    async getAccountByResetToken() { throw legacyResetsUnsupported(); }
+    async listPasswordRequests() { throw legacyResetsUnsupported(); }
     async createAccount(data) {
         const doc = await models.VaPortalAccount.create({
             username: str(data.username, 60).toLowerCase(),
@@ -3038,7 +3168,11 @@ class LegacyStore {
         // database instead of the VA's, which is the thing the migration fixes.
         // `events: false` — those never existed here; see the block above.
         return {
+            // `passwordResets: false` — a reset needs somewhere to record a
+            // one-time link, and a central account has no column for one. See
+            // the two methods that say so rather than answering nothing.
             ok: true, provisioned: true, managed: true, accounts: true, events: false,
+            passwordResets: false,
             version: 0, expectedVersion: EXPECTED_SCHEMA_VERSION,
         };
     }
@@ -3221,6 +3355,7 @@ module.exports = {
     EXPECTED_SCHEMA_VERSION,
     DISCORD_SCHEMA_VERSION,
     STAFF_PILOT_SCHEMA_VERSION,
+    PASSWORD_RESET_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,
     EVENTS_SCHEMA_VERSION,
     SCHEDULES_SCHEMA_VERSION,
