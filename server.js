@@ -9094,6 +9094,176 @@ app.get('/api/crew/:slug/me/pilot', async (req, res) => {
 });
 
 /* ===========================================================================
+ * THE FLIGHT THE PILOT IS ON RIGHT NOW
+ *
+ * WHY THE CREW CENTRE DID NOT KNOW
+ *
+ * A pilot could be three hours into a leg flown under the airline's own
+ * callsign, with the crew centre open in the next tab, and nothing on the page
+ * knew. The live map behind the hero showed their aeroplane as one dot among
+ * everybody else's, unlabelled and unremarked; the logbook showed nothing until
+ * they landed and filed. The one moment a pilot is most engaged with their
+ * airline — the moment they are actually flying for it — was the one moment the
+ * crew centre had nothing to say to them.
+ *
+ * WHAT "FLYING FOR THE VA" MEANS, AND WHY IT IS NOT DECIDED HERE
+ *
+ * It means the callsign in the sim matches what the airline registered. That
+ * rule already exists, in exactly one place — the ACARS backend's va_filter,
+ * which is what the live map, the takeoff/landing webhooks and the Discord feed
+ * all match on. So this asks that service for the airline's live roster and
+ * looks for this pilot in it, rather than re-deciding a question that has a
+ * canonical answer somewhere else. A pilot airborne as "N472RJ" is not flying
+ * for the airline and this endpoint says so by finding nothing, which is the
+ * same answer the map gives.
+ *
+ * MATCHED ON THE INFINITE FLIGHT USER ID, never on a name. The roster row
+ * carries `ifUserId` because the pilot linked it, and it is the only identifier
+ * in this product that a stranger cannot type into their callsign.
+ *
+ * CACHED FOR TWENTY SECONDS, PER AIRLINE. The roster is a snapshot of a poll
+ * that happens on a schedule we do not control; asking for it once per pilot
+ * per refresh would multiply one upstream read by the size of the crew. Twenty
+ * seconds is shorter than the interval the page polls on, so nobody ever sees a
+ * cached answer twice in a row, and it is long enough that a sixty-pilot airline
+ * costs the upstream three reads a minute rather than sixty.
+ * ========================================================================= */
+
+/** One airline's live roster, from the service that owns the matching rule. */
+const _liveRosterCache = new Map();   // slug -> { at, flights }
+const LIVE_ROSTER_TTL_MS = 20 * 1000;
+
+async function vaLiveRoster(ad) {
+    const key = String(ad.slug || ad._id);
+    const hit = _liveRosterCache.get(key);
+    if (hit && Date.now() - hit.at < LIVE_ROSTER_TTL_MS) return hit.flights;
+
+    // The same fields the ACARS backend reads off a VA listing when it builds
+    // its own watch list, so the answer here and the answer on the live map
+    // cannot disagree about whose flight this is.
+    const params = {
+        va: ad.callsign || '',
+        callsigns: [ad.callsign, ...(Array.isArray(ad.callsigns) ? ad.callsigns : [])]
+            .filter(Boolean).join(','),
+        callsignMatch: ad.callsignMatch || 'strict',
+    };
+    if (!params.va && !params.callsigns) return [];
+    /* ONE LIMITATION, WRITTEN DOWN RATHER THAN PAPERED OVER. A VA whose
+     * `rosterTrust` waives the callsign rule — "our members fly partner
+     * callsigns, count those too" — has pilots the ACARS matcher forwards on
+     * roster membership alone, through a different path entirely (see
+     * /api/va/roster-watch). This roster is the callsign match only, so such a
+     * pilot flying an unmatched callsign gets no card. That is the same answer
+     * the live map gives them, which is the point: this endpoint agrees with
+     * the map rather than inventing a third opinion about whose flight it is. */
+
+    let flights = [];
+    try {
+        const resp = await axios.get(`${ACARS_BACKEND_URL}/api/va/roster`, { params, timeout: 8000 });
+        flights = Array.isArray(resp.data && resp.data.flights) ? resp.data.flights : [];
+    } catch (err) {
+        console.warn('live roster unavailable —', (err && err.message) || err);
+        // Cached as empty for the same TTL, deliberately: an upstream that is
+        // down should be asked again in twenty seconds, not on every request
+        // from every pilot for as long as it stays down.
+        flights = [];
+    }
+    _liveRosterCache.set(key, { at: Date.now(), flights });
+    return flights;
+}
+
+/** Looks like an airport, rather than like a fix. */
+const looksIcao = (v) => /^[A-Z]{3,4}$/.test(String(v || '').trim().toUpperCase());
+
+/**
+ * Where this flight is going, from the plan the pilot filed.
+ *
+ * Infinite Flight's plan is a tree of waypoints and procedures with no "origin"
+ * and no "destination" on it — the first and last items that look like airports
+ * ARE those two, which is how every tool that reads these plans derives them.
+ * A pilot who filed nothing, or filed a plan that starts at a fix, simply has no
+ * route to show: the card says the callsign and the aircraft instead, which is
+ * still more than the page had before.
+ *
+ * Never throws. A route is an enrichment on top of "you are flying", and the
+ * flight is the thing worth reporting.
+ */
+async function livePlanRoute(flightId) {
+    if (!flightId) return { origin: '', destination: '' };
+    try {
+        const resp = await axios.get(
+            `${ACARS_BACKEND_URL}/api/flights/${encodeURIComponent(flightId)}/plan`,
+            { timeout: 6000 });
+        const pts = (resp.data && Array.isArray(resp.data.waypoints)) ? resp.data.waypoints : [];
+        const named = pts.map((w) => String((w && w.name) || '').trim().toUpperCase()).filter(looksIcao);
+        return {
+            origin: named.length ? named[0] : '',
+            destination: named.length > 1 ? named[named.length - 1] : '',
+        };
+    } catch (err) {
+        return { origin: '', destination: '' };
+    }
+}
+
+app.get('/api/crew/:slug/me/live', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+
+        res.set('Cache-Control', 'no-store');
+        // Not signed in, or signed in as somebody with no roster identity.
+        // Not an error: the card simply never appears, exactly as it does not
+        // for a pilot who is on the ground.
+        if (!me || !me.memberId) return res.json({ linked: false, flying: null });
+
+        const member = await store.getMember(me.memberId);
+        // No linked Infinite Flight account is the one case worth naming, and
+        // only to the pilot themselves: it is the reason this will never work
+        // for them, it is fixable, and nothing else on the page says so.
+        if (!member || !member.ifUserId) {
+            return res.json({ linked: false, reason: 'no_if_account', flying: null });
+        }
+
+        const flights = await vaLiveRoster(va);
+        const mine = flights.find((f) => f && String(f.userId || '') === String(member.ifUserId));
+        if (!mine) return res.json({ linked: true, flying: null });
+
+        const route = await livePlanRoute(mine.flightId);
+        // Decoded here rather than in the browser, like every other enum in
+        // this product: the names live in the aircraft catalogue and a page
+        // that mapped ids to words itself would be a second copy to correct.
+        // resolveFlightNames is the same function the logbook and the PIREP
+        // sync use, so a live flight and the report it becomes name the
+        // aircraft identically.
+        let meta;
+        try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+        const names = resolveFlightNames(mine, meta);
+
+        res.json({
+            linked: true,
+            flying: {
+                flightId: mine.flightId || '',
+                callsign: mine.callsign || '',
+                server: mine.server || '',
+                aircraftName: names.aircraftName || '',
+                liveryName: names.liveryName || '',
+                origin: route.origin,
+                destination: route.destination,
+                altitude: Math.round(Number(mine.altitude) || 0),
+                speed: Math.round(Number(mine.speed) || 0),
+                heading: Math.round(Number(mine.heading) || 0),
+                verticalSpeed: Math.round(Number(mine.verticalSpeed) || 0),
+                latitude: Number(mine.latitude) || 0,
+                longitude: Number(mine.longitude) || 0,
+                // What the sim last said, so the page can say "as of a moment
+                // ago" rather than implying this is live to the second.
+                lastReport: mine.lastReport || null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/live error', message: 'Could not read your live flight.' }); }
+});
+
+/* ===========================================================================
  * LEAVING, OF YOUR OWN ACCORD
  *
  * WHY A PILOT NEEDS THIS DOOR
@@ -15450,6 +15620,52 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
             loginBackdrop: ad.loginBackdrop || 'auto',
+            /* THE VA'S OWN LIVE-MAP EMBED, IF THEY HAVE MADE ONE.
+             *
+             * The crew centre draws a live map by building
+             * `embed.html?va=<CALLSIGN>&mode=map&…` out of thin air. That is
+             * the widget's "direct params" path, which produces a BRAND NEW
+             * generic embed every time — and so the crew centre has never
+             * shown the embed the VA actually configured. Everything they set
+             * up in the embeds tool was ignored: their Mapbox token (so the
+             * map silently fell back to the free basemap), their appearance,
+             * their callsign rules, their server filter, their hubs.
+             *
+             * So the token is published here and the crew centre uses it. It
+             * is not a secret — it is designed to sit in a `src` on the VA's
+             * own public website, which is a strictly more exposed place than
+             * this — and everything it unlocks is the VA's own presentation of
+             * their own flights.
+             *
+             * ONLY A LIVE ONE. A revoked or expired token resolves to an error
+             * page, and a crew centre showing "this embed has been revoked"
+             * where its map should be is worse than the generic map it would
+             * otherwise have drawn. Those come back as null and the crew
+             * centre falls back.
+             *
+             * `mode` rides along because a VA whose embed is a ROSTER widget
+             * has not made a map, and pointing the crew centre's map panel at
+             * it would replace a map with a list. The crew centre checks. */
+            liveEmbed: await (async () => {
+                try {
+                    const cfg = await EmbedConfig.findOne({
+                        vaAdId: ad._id,
+                        revoked: { $ne: true },
+                        $or: [{ expiresAt: null }, { expiresAt: { $exists: false } }, { expiresAt: { $gt: new Date() } }],
+                    })
+                        // The newest one a VA made is the one they are looking
+                        // at in the tool, so it is the one they mean.
+                        .sort({ createdAt: -1 })
+                        .select('token mode')
+                        .lean();
+                    return cfg && cfg.token ? { token: cfg.token, mode: cfg.mode || 'roster' } : null;
+                } catch (err) {
+                    // A branding read must not fail over the map. No embed, and
+                    // the crew centre draws the generic one as it always has.
+                    console.warn('crew embed lookup skipped —', (err && err.message) || err);
+                    return null;
+                }
+            })(),
             // How this VA has built the band across the top of its crew
             // centre. Public for the same reason the layout is: it decides the
             // first paint, and a hero that waits for a session is a hero that
@@ -18547,10 +18763,23 @@ app.get('/api/embed/resolve', async (req, res) => {
         if (cfg.expiresAt && Date.now() > new Date(cfg.expiresAt).getTime())
                          return res.status(410).json({ ok: false, error: 'expired' });
 
-        // Optional per-token origin lock. We only enforce it when the widget
-        // actually reports an origin (some browsers strip the referrer).
+        /* Optional per-token origin lock. We only enforce it when the widget
+         * actually reports an origin (some browsers strip the referrer).
+         *
+         * OUR OWN SURFACES ARE NEVER LOCKED OUT. The allow-list exists to stop
+         * SOMEBODY ELSE'S website using a VA's token; it was never meant to
+         * stop the VA's own crew centre, which is ours and is where the token
+         * is now used to draw their live map (see `liveEmbed` on the branding
+         * endpoint). A VA who locked their embed to their own domain — which
+         * is the careful thing to do, and exactly what the feature is for —
+         * would otherwise find that the more carefully they configured it, the
+         * more certainly their crew centre map broke.
+         *
+         * The same matchers the community endpoint uses, so "one of ours" has
+         * one definition and one place to change it. */
+        const firstParty = COMMUNITY_SUBMIT_MATCHERS.some((match) => match(origin.replace(/\/+$/, '')));
         if (Array.isArray(cfg.allowedOrigins) && cfg.allowedOrigins.length &&
-            origin && !cfg.allowedOrigins.includes(origin)) {
+            origin && !firstParty && !cfg.allowedOrigins.includes(origin)) {
             return res.status(403).json({ ok: false, error: 'origin not allowed' });
         }
 
