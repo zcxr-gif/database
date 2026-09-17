@@ -170,6 +170,11 @@ const crewClubs = require('./crewClubs');
 // their club, their awards and what they have claimed, in one order. Pure like
 // the rest — handed the four, it returns the row.
 const crewBadges = require('./crewBadges');
+// What the band across the top of a pilot's crew centre is made of. Pure, like
+// the rest: handed a VA's saved choices it returns a bounded set that cannot
+// produce a broken hero, and the default of every field is the hero as it
+// shipped — so a VA who never opens the screen cannot tell it exists.
+const crewHero = require('./crewHero');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -703,6 +708,33 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         perLanding: { type: Number, default: 0, min: 0, max: 100000 },
         fleetBonus: { type: Number, default: 0, min: 0, max: 100000 },
         violationPenalty: { type: Number, default: 0, min: 0, max: 100000 },
+    },
+
+    // --- The hero (v18) ---
+    //
+    // How the band across the top of the pilot crew centre is put together.
+    // Here, beside the layout and the accent, for the reason they are: the
+    // crew centre reads it BEFORE it has a session, because the hero is the
+    // first paint and a setting it has to wait for a login to read is a hero
+    // that draws twice.
+    //
+    // Flat, not nested, and deliberately: a nested object on a Mongoose
+    // document has to be marked modified, and a field nobody remembers to mark
+    // is a setting that silently does not save.
+    //
+    // EVERY DEFAULT IS THE HERO AS IT SHIPPED. Bounds are enforced again in
+    // crewHero.normalize — the module that also applies them — so a value
+    // saved here cannot mean something different when the page draws it.
+    crewHero: {
+        backdrop: { type: String, trim: true, default: 'banner' },
+        height: { type: String, trim: true, default: 'standard' },
+        align: { type: String, trim: true, default: 'left' },
+        brand: { type: Boolean, default: true },
+        crest: { type: Boolean, default: true },
+        badges: { type: Boolean, default: true },
+        actions: { type: String, trim: true, default: 'both' },
+        line: { type: String, trim: true, default: '' },
+        dim: { type: Number, default: 55, min: 10, max: 90 },
     },
 
     // --- The clubs (v16) ---
@@ -2088,12 +2120,20 @@ async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) 
         if (dryRun) continue;
         try {
             if (remove) {
-                // The login goes with the pilot. Leaving an account behind
-                // whose member row is gone is an account that can sign in to a
-                // crew center it is no longer on.
-                const acct = await store.getAccountByMember(m._id).catch(() => null);
-                if (acct) await store.deleteAccount(acct._id).catch(() => {});
-                await store.deleteMember(m._id);
+                /* The same verb a staff member gets. `purgeMember` takes the
+                 * roster row, the flight reports, the bookings, the signups,
+                 * the orders, the messages and the login — see crewStore.js.
+                 *
+                 * It used to delete the account and the member row and leave
+                 * the rest, which meant the sweep and the Remove button meant
+                 * two different things by "removed", and both left a pilot's
+                 * flights in the log attached to nobody. One verb now.
+                 *
+                 * A VA that does not want a timer destroying anybody's history
+                 * has the setting for it and always has: the rule's action can
+                 * be 'deactivate' instead, which is the branch below and marks
+                 * them inactive without touching a thing. */
+                await store.purgeMember(m._id);
             } else {
                 await store.updateMember(m._id, { status: 'inactive' });
             }
@@ -3689,14 +3729,59 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
         res.json({ member: publicMember(m, va.ranks, va.crewClubs) });
     } catch (err) { crewFail(res, err, { log: 'roster edit error', message: 'Could not update the pilot.' }); }
 });
-// Remove a member.
+/**
+ * Remove a pilot, and everything of theirs with them.
+ *
+ * WHAT THIS USED TO DO, AND WHY IT WAS WRONG
+ *
+ * It deleted the roster row and nothing else. Every table that points at a
+ * pilot does so with `on delete set null`, so what was left behind was that
+ * person, scattered: their flights still in the log under their name with no
+ * pilot attached, their bookings still holding seats on departures nobody
+ * could release, their signups still counted against an event's capacity —
+ * and their LOGIN still working, because an account whose `member_id` has been
+ * nulled is a perfectly valid account. A VA who removed somebody was told it
+ * had happened and it had not.
+ *
+ * So remove means remove. See `purgeMember` in crewStore.js for the order and
+ * for why a missing table is counted as zero rather than failing the run.
+ *
+ * THIS IS NOT REVERSIBLE AND IT TAKES THE AIRLINE'S OWN HISTORY WITH IT.
+ * A pilot's flight reports are also the airline's: they are what its total
+ * hours, its activity feed and its insights are built from, so removing a
+ * pilot who flew four hundred legs removes those legs from the airline's
+ * figures too. That is the honest meaning of "wipe everything" and it is what
+ * was asked for — but it is the sentence the confirm dialog has to say out
+ * loud, which is why the reply carries the counts rather than a bare ok.
+ */
 app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
-        await store.deleteMember(req.params.id);
-        res.json({ ok: true });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const member = await store.getMember(req.params.id);
+        if (!member) return res.status(404).json({ error: 'Pilot not found.' });
+
+        const result = await store.purgeMember(member._id);
+        // The crew is told somebody has left, exactly as it is told when
+        // somebody joins. Not a judgement and not a reason — those are staff's
+        // business — only that the roster changed, so a crew reading the feed
+        // does not have to notice an absence to learn about it.
+        postAnnouncement(va, {
+            kind: 'leave',
+            title: `${member.name || 'A pilot'} has left the airline`,
+            body: '',
+            refId: null,
+        });
+        res.json({
+            ok: true,
+            name: member.name || '',
+            removed: (result && result.removed) || {},
+            // Named rather than swallowed: a table that refused the delete is a
+            // pilot who is gone from the roster with something of theirs still
+            // in the project, and staff should know which.
+            failed: (result && result.failed) || [],
+        });
     } catch (err) { crewFail(res, err, { log: 'roster delete error', message: 'Could not remove the pilot.' }); }
 });
 
@@ -5044,6 +5129,14 @@ function cleanShopItem(b, existing) {
     return {
         name: String(src.name || '').trim().slice(0, 60),
         desc: String(src.desc || '').trim().slice(0, 240),
+        // The shelf a VA has sorted this onto. Free text and theirs entirely —
+        // the picker offers whatever groups their shelf already uses, which is
+        // the only list that could ever be right for three hundred airlines.
+        group: String(src.group || '').trim().slice(0, 40),
+        // How loudly the shelf draws it. Bounded by the module that also reads
+        // it, so an unrecognised value is an ordinary tile rather than an item
+        // that fails to save. See TIERS in crewShop.js.
+        tier: crewShop.tierOf(src.tier),
         // Rendered in an <img> on a page a pilot opens, so anything that is not
         // plainly an https URL is dropped rather than passed through — the rule
         // the branding fields and partner logos already follow.
@@ -9000,6 +9093,333 @@ app.get('/api/crew/:slug/me/pilot', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'me/pilot read error', message: 'Could not read your pilot record.' }); }
 });
 
+/* ===========================================================================
+ * THE FLIGHT THE PILOT IS ON RIGHT NOW
+ *
+ * WHY THE CREW CENTRE DID NOT KNOW
+ *
+ * A pilot could be three hours into a leg flown under the airline's own
+ * callsign, with the crew centre open in the next tab, and nothing on the page
+ * knew. The live map behind the hero showed their aeroplane as one dot among
+ * everybody else's, unlabelled and unremarked; the logbook showed nothing until
+ * they landed and filed. The one moment a pilot is most engaged with their
+ * airline — the moment they are actually flying for it — was the one moment the
+ * crew centre had nothing to say to them.
+ *
+ * WHAT "FLYING FOR THE VA" MEANS, AND WHY IT IS NOT DECIDED HERE
+ *
+ * It means the callsign in the sim matches what the airline registered. That
+ * rule already exists, in exactly one place — the ACARS backend's va_filter,
+ * which is what the live map, the takeoff/landing webhooks and the Discord feed
+ * all match on. So this asks that service for the airline's live roster and
+ * looks for this pilot in it, rather than re-deciding a question that has a
+ * canonical answer somewhere else. A pilot airborne as "N472RJ" is not flying
+ * for the airline and this endpoint says so by finding nothing, which is the
+ * same answer the map gives.
+ *
+ * MATCHED ON THE INFINITE FLIGHT USER ID, never on a name. The roster row
+ * carries `ifUserId` because the pilot linked it, and it is the only identifier
+ * in this product that a stranger cannot type into their callsign.
+ *
+ * CACHED FOR TWENTY SECONDS, PER AIRLINE. The roster is a snapshot of a poll
+ * that happens on a schedule we do not control; asking for it once per pilot
+ * per refresh would multiply one upstream read by the size of the crew. Twenty
+ * seconds is shorter than the interval the page polls on, so nobody ever sees a
+ * cached answer twice in a row, and it is long enough that a sixty-pilot airline
+ * costs the upstream three reads a minute rather than sixty.
+ * ========================================================================= */
+
+/** One airline's live roster, from the service that owns the matching rule. */
+const _liveRosterCache = new Map();   // slug -> { at, flights }
+const LIVE_ROSTER_TTL_MS = 20 * 1000;
+
+async function vaLiveRoster(ad) {
+    const key = String(ad.slug || ad._id);
+    const hit = _liveRosterCache.get(key);
+    if (hit && Date.now() - hit.at < LIVE_ROSTER_TTL_MS) return hit.flights;
+
+    // The same fields the ACARS backend reads off a VA listing when it builds
+    // its own watch list, so the answer here and the answer on the live map
+    // cannot disagree about whose flight this is.
+    const params = {
+        va: ad.callsign || '',
+        callsigns: [ad.callsign, ...(Array.isArray(ad.callsigns) ? ad.callsigns : [])]
+            .filter(Boolean).join(','),
+        callsignMatch: ad.callsignMatch || 'strict',
+    };
+    if (!params.va && !params.callsigns) return [];
+    /* ONE LIMITATION, WRITTEN DOWN RATHER THAN PAPERED OVER. A VA whose
+     * `rosterTrust` waives the callsign rule — "our members fly partner
+     * callsigns, count those too" — has pilots the ACARS matcher forwards on
+     * roster membership alone, through a different path entirely (see
+     * /api/va/roster-watch). This roster is the callsign match only, so such a
+     * pilot flying an unmatched callsign gets no card. That is the same answer
+     * the live map gives them, which is the point: this endpoint agrees with
+     * the map rather than inventing a third opinion about whose flight it is. */
+
+    let flights = [];
+    try {
+        const resp = await axios.get(`${ACARS_BACKEND_URL}/api/va/roster`, { params, timeout: 8000 });
+        flights = Array.isArray(resp.data && resp.data.flights) ? resp.data.flights : [];
+    } catch (err) {
+        console.warn('live roster unavailable —', (err && err.message) || err);
+        // Cached as empty for the same TTL, deliberately: an upstream that is
+        // down should be asked again in twenty seconds, not on every request
+        // from every pilot for as long as it stays down.
+        flights = [];
+    }
+    _liveRosterCache.set(key, { at: Date.now(), flights });
+    return flights;
+}
+
+/** Looks like an airport, rather than like a fix. */
+const looksIcao = (v) => /^[A-Z]{3,4}$/.test(String(v || '').trim().toUpperCase());
+
+/**
+ * Where this flight is going, from the plan the pilot filed.
+ *
+ * Infinite Flight's plan is a tree of waypoints and procedures with no "origin"
+ * and no "destination" on it — the first and last items that look like airports
+ * ARE those two, which is how every tool that reads these plans derives them.
+ * A pilot who filed nothing, or filed a plan that starts at a fix, simply has no
+ * route to show: the card says the callsign and the aircraft instead, which is
+ * still more than the page had before.
+ *
+ * Never throws. A route is an enrichment on top of "you are flying", and the
+ * flight is the thing worth reporting.
+ */
+async function livePlanRoute(flightId) {
+    if (!flightId) return { origin: '', destination: '' };
+    try {
+        const resp = await axios.get(
+            `${ACARS_BACKEND_URL}/api/flights/${encodeURIComponent(flightId)}/plan`,
+            { timeout: 6000 });
+        const pts = (resp.data && Array.isArray(resp.data.waypoints)) ? resp.data.waypoints : [];
+        const named = pts.map((w) => String((w && w.name) || '').trim().toUpperCase()).filter(looksIcao);
+        return {
+            origin: named.length ? named[0] : '',
+            destination: named.length > 1 ? named[named.length - 1] : '',
+        };
+    } catch (err) {
+        return { origin: '', destination: '' };
+    }
+}
+
+app.get('/api/crew/:slug/me/live', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+
+        res.set('Cache-Control', 'no-store');
+        // Not signed in, or signed in as somebody with no roster identity.
+        // Not an error: the card simply never appears, exactly as it does not
+        // for a pilot who is on the ground.
+        if (!me || !me.memberId) return res.json({ linked: false, flying: null });
+
+        const member = await store.getMember(me.memberId);
+        // No linked Infinite Flight account is the one case worth naming, and
+        // only to the pilot themselves: it is the reason this will never work
+        // for them, it is fixable, and nothing else on the page says so.
+        if (!member || !member.ifUserId) {
+            return res.json({ linked: false, reason: 'no_if_account', flying: null });
+        }
+
+        const flights = await vaLiveRoster(va);
+        const mine = flights.find((f) => f && String(f.userId || '') === String(member.ifUserId));
+        if (!mine) return res.json({ linked: true, flying: null });
+
+        const route = await livePlanRoute(mine.flightId);
+        // Decoded here rather than in the browser, like every other enum in
+        // this product: the names live in the aircraft catalogue and a page
+        // that mapped ids to words itself would be a second copy to correct.
+        // resolveFlightNames is the same function the logbook and the PIREP
+        // sync use, so a live flight and the report it becomes name the
+        // aircraft identically.
+        let meta;
+        try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+        const names = resolveFlightNames(mine, meta);
+
+        res.json({
+            linked: true,
+            flying: {
+                flightId: mine.flightId || '',
+                callsign: mine.callsign || '',
+                server: mine.server || '',
+                aircraftName: names.aircraftName || '',
+                liveryName: names.liveryName || '',
+                origin: route.origin,
+                destination: route.destination,
+                altitude: Math.round(Number(mine.altitude) || 0),
+                speed: Math.round(Number(mine.speed) || 0),
+                heading: Math.round(Number(mine.heading) || 0),
+                verticalSpeed: Math.round(Number(mine.verticalSpeed) || 0),
+                latitude: Number(mine.latitude) || 0,
+                longitude: Number(mine.longitude) || 0,
+                // What the sim last said, so the page can say "as of a moment
+                // ago" rather than implying this is live to the second.
+                lastReport: mine.lastReport || null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/live error', message: 'Could not read your live flight.' }); }
+});
+
+/* ===========================================================================
+ * LEAVING, OF YOUR OWN ACCORD
+ *
+ * WHY A PILOT NEEDS THIS DOOR
+ *
+ * Every way out of a virtual airline went through somebody else. A pilot who
+ * wanted to leave had to ask staff to remove them and then wait — which is a
+ * strange thing to have to ask permission for, and in practice means people
+ * stop signing in instead and sit on the roster forever as somebody the
+ * retention sweep keeps nagging. There is a "set your own leave" for going away
+ * temporarily; there was nothing at all for going away for good.
+ *
+ * WHAT IT DOES IS THE SAME VERB STAFF USE. `purgeMember` — the roster row, the
+ * flight reports, the bookings, the signups, the orders, the messages and the
+ * login. Not a `status: 'left'` flag, because a flag is a person still in
+ * somebody else's database being counted, and that is precisely what somebody
+ * leaving is asking to stop being.
+ *
+ * SO IT IS TYPED, NOT CLICKED. This is irreversible and it is the only
+ * irreversible thing a pilot can do to themselves in this product, so it takes
+ * a confirmation somebody cannot produce by accident: their own username, typed
+ * out. A checkbox and a red button is what a person taps twice while meaning to
+ * tap something else.
+ *
+ * STAFF CANNOT LEAVE THROUGH HERE, and that is not paternalism. A VA staff
+ * login is one of OUR accounts, not a row in the airline's project — this route
+ * cannot delete it, so an owner who "left" would lose their roster row and
+ * their flying and still be the owner, signed in, looking at a crew centre with
+ * a hole where they used to be. They take their staff role off first, or
+ * another owner removes them. Said plainly rather than refused silently.
+ *
+ * THE CREW IS TOLD, in the same one line the board uses when somebody joins.
+ * Not a reason and not a judgement — those are nobody's business — only that
+ * the roster changed, so the people who flew with them are not left working it
+ * out from an absence.
+ * ========================================================================= */
+/**
+ * What leaving would actually take, before anybody types anything.
+ *
+ * A warning that says "everything will be wiped" is a form of words. A warning
+ * that says "your 214 hours, your 96 flights, your Gold card and the three
+ * things you have claimed" is the same sentence with the person's own life in
+ * it, and it is the difference between a dialog somebody dismisses and one they
+ * read. So the confirm screen is drawn from this rather than from adjectives.
+ *
+ * Read-only, and it says `expects` — the exact string the POST will demand —
+ * so the form can label its box instead of making the pilot guess which of
+ * their names is being asked for.
+ */
+app.get('/api/crew/:slug/me/leave', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.kind !== 'crew') {
+        return res.json({ canLeave: false, reason: 'staff_account' });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccount(p.sub);
+        if (!account || account.active === false) return res.status(401).json({ error: 'Not authenticated.' });
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+
+        // Everything below is best-effort: a VA on an older schema has no
+        // orders table and a pilot with no roster row has no flights, and
+        // neither is a reason to refuse to show somebody the door. A count we
+        // could not read is left out rather than reported as zero — "0 flights"
+        // is a claim, and this is the one screen where a wrong one costs
+        // somebody their flying.
+        const [flights, orders] = await Promise.all([
+            member ? store.listPirepsForMember(member._id, { limit: 5000 }).catch(() => null) : Promise.resolve([]),
+            member ? store.listShopOrders({ memberId: member._id, limit: 500 }).catch(() => null) : Promise.resolve([]),
+        ]);
+        const approved = Array.isArray(flights) ? flights.filter((f) => f.status === 'approved') : [];
+        const clubs = clubsFor(va);
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            canLeave: true,
+            expects: account.username || '',
+            pilot: member ? {
+                name: member.name || '',
+                callsign: member.callsign || '',
+                since: member.createdAt || null,
+            } : null,
+            takes: {
+                linked: !!member,
+                hours: member ? Math.round((Number(member.hours) || 0) * 10) / 10 : 0,
+                flights: Array.isArray(flights) ? approved.length : null,
+                reports: Array.isArray(flights) ? flights.length : null,
+                held: Array.isArray(orders) ? crewShop.holdings(orders, { limit: 50 }).length : null,
+                rank: member ? (crewRanks.memberRank(va.ranks, member.hours, member.checksPassed) || {}).name || '' : '',
+                club: member ? ((crewClubs.memberClub(clubs, member.hours) || {}).name || '') : '',
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew leave preview error', message: 'Could not read your account.' }); }
+});
+
+app.post('/api/crew/:slug/me/leave', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    // See the note above: this route cannot reach a central staff account, so
+    // it must not pretend to have closed one.
+    if (p.kind !== 'crew') {
+        return res.status(400).json({
+            error: 'Staff accounts leave a different way — remove your staff role first, or ask another owner to take you off the roster.',
+            code: 'staff_account',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccount(p.sub);
+        if (!account || account.active === false) return res.status(401).json({ error: 'Not authenticated.' });
+
+        /* THE TYPED CONFIRMATION. Their own username, which is the one string
+         * they certainly know and certainly cannot hit by accident. Compared
+         * case-insensitively and trimmed, because asking somebody to reproduce
+         * capitalisation under a red banner is a puzzle rather than a check. */
+        const typed = String((req.body || {}).confirm || '').trim().toLowerCase();
+        const expect = String(account.username || '').trim().toLowerCase();
+        if (!expect || typed !== expect) {
+            return res.status(400).json({
+                error: 'Type your username exactly to confirm.',
+                code: 'confirm_mismatch',
+                // So the form can label the box with what it wants, rather than
+                // the pilot guessing which of their names is being asked for.
+                expects: account.username || '',
+            });
+        }
+
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+        const name = (member && member.name) || account.displayName || account.username || 'A pilot';
+
+        let removed = {};
+        if (member) {
+            const result = await store.purgeMember(member._id);
+            removed = (result && result.removed) || {};
+        } else {
+            // A login that was never linked to a roster row. There is no pilot
+            // to purge, but the account is still theirs to close — and leaving
+            // it would leave them able to sign in to an airline they have just
+            // left, which is the one outcome this route exists to prevent.
+            await store.deleteAccount(account._id);
+            removed.crew_accounts = 1;
+        }
+
+        postAnnouncement(va, {
+            kind: 'leave',
+            title: `${name} has left the airline`,
+            body: '',
+            refId: null,
+        });
+        res.json({ ok: true, name, removed });
+    } catch (err) { crewFail(res, err, { log: 'crew self-leave error', message: 'We could not close your account. Nothing has been removed.' }); }
+});
+
 app.post('/api/crew/:slug/me/pilot', async (req, res) => {
     const p = verifyCrewRequest(req);
     if (!p) return res.status(401).json({ error: 'Not authenticated.' });
@@ -10351,6 +10771,85 @@ function tellPilotAboutFlight(va, store, pirep, approved) {
 }
 
 /**
+ * Tell the pilot a staff member filed a flight onto their record.
+ *
+ * The other half of the correction notice below, and there for the same
+ * reason: this is a change to somebody's flying that they did not make and are
+ * not watching for. A pilot whose hours jump with nothing in their bell reads
+ * it as a fault in the product, and the one thing worse than a wrong number is
+ * a right one that arrived from nowhere.
+ *
+ * Says the leg, the time and who filed it. `senderName` is the staff member,
+ * so the bell can show a person rather than the airline — this is somebody
+ * doing something for them, not the system doing something to them.
+ */
+function tellPilotAboutFiledForThem(va, member, pirep, by) {
+    if (!va || !member || !pirep) return;
+    const leg = [pirep.origin, pirep.destination].filter(Boolean).join(' → ')
+        || pirep.flightNumber || 'A flight';
+    const mins = Math.max(0, Number(pirep.durationMin) || 0);
+    const h = Math.floor(mins / 60), mi = Math.round(mins % 60);
+    const length = h ? `${h}h${mi ? ` ${mi}m` : ''}` : `${mi}m`;
+    Promise.resolve()
+        .then(() => notifyPilot(va, member, {
+            kind: pirep.status === 'approved' ? 'flight_approved' : 'flight_edited',
+            title: `${leg} was added to your logbook`,
+            body: `${length}, filed for you by ${by}.`
+                + (pirep.status === 'approved' ? ' It has been credited.' : ' It is waiting on review.'),
+            refId: pirep._id,
+            senderName: by,
+        }))
+        .catch((err) => console.warn('filed-for notice skipped —', (err && err.message) || err));
+}
+
+/**
+ * Tell the pilot a staff member corrected one of their flights.
+ *
+ * Its own function rather than a third state of tellPilotAboutFlight, because
+ * it is a different sentence: that one says a decision was made about a report,
+ * this one says a number changed. The pilot did not ask for it and will not be
+ * looking for it, and the consequence — their hours, and therefore possibly
+ * their rank — is the kind a person notices later and reads as a fault.
+ *
+ * IT SAYS WHAT MOVED AND BY HOW MUCH. "Your flight was updated" is the notice
+ * that makes somebody open a support thread. "CYYZ → EGLL is now 7h 10m, down
+ * from 7h 40m" is the notice that does not.
+ *
+ * Silent when nothing about the time changed: a corrected ICAO or a fixed
+ * livery is housekeeping, and a bell for it is a bell people stop reading.
+ *
+ * Detached, like every other notice in this file: a pilot's message must not sit
+ * in front of the reply to the staff member who pressed Save, and a project that
+ * cannot take the row must not fail the correction.
+ */
+function tellPilotAboutCorrection(va, store, pirep, wasMin) {
+    if (!va || !pirep || !pirep.memberId) return;
+    const nowMin = Math.max(0, Number(pirep.durationMin) || 0);
+    const before = Math.max(0, Number(wasMin) || 0);
+    if (nowMin === before) return;
+    const leg = [pirep.origin, pirep.destination].filter(Boolean).join(' → ')
+        || pirep.flightNumber || 'One of your flights';
+    const hrs = (m) => {
+        const h = Math.floor(m / 60), mi = Math.round(m % 60);
+        return h ? `${h}h${mi ? ` ${mi}m` : ''}` : `${mi}m`;
+    };
+    Promise.resolve()
+        .then(async () => {
+            const member = await store.getMember(pirep.memberId);
+            if (!member) return;
+            notifyPilot(va, member, {
+                kind: 'flight_edited',
+                title: `${leg} was corrected`,
+                body: `Now ${hrs(nowMin)}, ${nowMin > before ? 'up' : 'down'} from ${hrs(before)}.`
+                    + (pirep.hoursApplied ? ' Your hours have been adjusted to match.' : ''),
+                refId: pirep._id,
+                senderName: pirep.editedBy || '',
+            });
+        })
+        .catch((err) => console.warn('correction notice skipped —', (err && err.message) || err));
+}
+
+/**
  * Pay for one approved flight.
  *
  * Split out because the calculation is the VA's settings and the payment is the
@@ -10417,6 +10916,21 @@ const publicPirep = (p) => ({
     distanceNm: p.distanceNm, server: p.server, inFleet: p.inFleet,
     routeMatched: !!p.routeId,   // did this leg match a route in the network?
     source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
+    // Whether this report is Infinite Flight's own record of a flight or
+    // somebody's description of one. `source` does not answer that — a flight
+    // a pilot PICKED out of their logbook is filed as 'manual', because a
+    // person chose to file it — and it is the first question staff reading a
+    // logbook have. The flight id is the proof, so its presence is the answer.
+    fromLogbook: !!p.flightId,
+    // v18. When a staff member last corrected this by hand, and who. Null on
+    // every report nobody has touched, which is nearly all of them. See the
+    // note over the edit action in PATCH /pireps/:id.
+    editedAt: p.editedAt || null,
+    editedBy: p.editedBy || '',
+    hoursApplied: !!p.hoursApplied,
+    // What it paid, where the VA runs a shop and it has paid anything. Null and
+    // 0 are different answers — see the column's note in the schema.
+    pointsAwarded: p.pointsAwarded == null ? null : Number(p.pointsAwarded) || 0,
 });
 
 /* ===========================================================================
@@ -10721,9 +11235,46 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             }
         }
 
-        // Optional: attribute to a roster pilot (so approving can credit hours).
+        /* WHOSE FLIGHT THIS IS.
+         *
+         * `memberId` attributes the report to a roster pilot, which is what
+         * makes approving it credit somebody's hours. It used to be honoured
+         * for anybody signed in, which meant any pilot at the airline could
+         * file a flight onto any other pilot's record — and staff could not
+         * rely on it either way, because there was no rule to rely on.
+         *
+         * Now there is one, and it is the same capability that approves a
+         * flight: `flights.review`. A staff member trusted to say a flight
+         * counts is the one who may file it on somebody's behalf, which is what
+         * makes the whole point of this endpoint's manual half work — a pilot
+         * whose logbook hours are wrong needs their staff to put the real
+         * flight in, and before this the only way was to ask the pilot to type
+         * it themselves.
+         *
+         * Anybody else filing gets their OWN roster row, whatever they sent.
+         * Not an error: they are filing their own flight, which is the ordinary
+         * case, and a 403 over a field a form did not mean to send would break
+         * filing for everybody.
+         */
+        const canFileForOthers = !(await requireCap(req, req.params.slug, 'flights.review')).error;
         let member = null;
-        if (b.memberId) member = await store.getMember(b.memberId);
+        let filedForSomeoneElse = false;
+        if (canFileForOthers) {
+            // A reviewer's `memberId` is taken at its word, INCLUDING when it
+            // is absent: the back office offers "Unassigned pilot" as a real
+            // choice, and quietly attributing that to whoever pressed the
+            // button would put somebody else's hours on a staff member's row.
+            if (b.memberId) {
+                member = await store.getMember(b.memberId);
+                if (!member) return res.status(404).json({ error: 'That pilot isn’t on the roster.' });
+                const self = await crewPilot(req, store);
+                filedForSomeoneElse = !(self && String(self.memberId) === String(member._id));
+            }
+        } else {
+            // Everybody else files their own flight, whatever they sent.
+            const self = await crewPilot(req, store);
+            if (self && self.memberId) member = await store.getMember(self.memberId);
+        }
 
         /* Filing a flight the pilot PICKED out of their own Infinite Flight
          * logbook (see GET /me/if-flights). The body carries an id and nothing
@@ -10803,7 +11354,15 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         // the setting means "trust Infinite Flight's record", not "trust the
         // form", and crediting hours off an unverified number is the one thing
         // it must not do.
-        const willApprove = !!(picked && vaFull && vaFull.crewPirepAutoApprove && inFleet);
+        //
+        // The one addition: a STAFF member filing a correction, who has asked
+        // for it to count straight away. That is not "trust the form" — it is
+        // the person who would otherwise press Approve one second later saying
+        // so on the way in, and they hold the capability that does it. Without
+        // this, the manual half of this endpoint is a two-step: file the flight
+        // the pilot really flew, then go and find it in the queue.
+        const staffApproves = !!(!picked && canFileForOthers && b.approve === true);
+        const willApprove = !!(picked && vaFull && vaFull.crewPirepAutoApprove && inFleet) || staffApproves;
 
         let doc = await store.createPirep({
             memberId: (member && member._id) || null,
@@ -10855,7 +11414,13 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         // the same whether a human pressed the button or the rule did.
         if (willApprove) {
             doc = await applyPirepHours(store, doc, va);
-            postPirepNotice(va, 'approved', doc, { name: 'Auto-approval' });
+            postPirepNotice(va, 'approved', doc, staffApproves ? p : { name: 'Auto-approval' });
+        }
+        // A flight somebody else put on this pilot's record. They did not file
+        // it and would otherwise find out by noticing their hours moved, which
+        // is the same problem the correction notice exists to solve.
+        if (filedForSomeoneElse && member) {
+            tellPilotAboutFiledForThem(va, member, doc, (p && p.name) || 'Staff');
         }
         res.status(201).json({
             pirep: publicPirep(doc),
@@ -10863,9 +11428,113 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             flightNumberMismatch,
             fromLogbook: !!picked,
             autoApproved: willApprove,
+            // Whose record it landed on, when that is not the caller's. The
+            // panel says "Filed for Rae Okafor" rather than "Filed", which is
+            // the difference between a confirmation and a guess.
+            filedFor: filedForSomeoneElse && member ? { id: member._id, name: member.name || '' } : null,
             route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
         });
     } catch (err) { crewFail(res, err, { log: 'pirep file error', message: 'Could not file the flight.' }); }
+});
+
+/* ===========================================================================
+ * ONE PILOT'S LOGBOOK, FOR STAFF
+ *
+ * WHY THIS EXISTS
+ *
+ * A pilot's hours are the one number in this product that decides things. They
+ * decide the rank they hold, the club their card wears, what the shop will sell
+ * them and whether a rank-gated route is even on their network. And they are
+ * built by adding up flight reports, most of which arrive from Infinite Flight
+ * without a human ever looking at them.
+ *
+ * Which means they are sometimes wrong. A flight that dropped its connection
+ * ten minutes before the gate is filed at the duration IF recorded, not the
+ * duration flown. A pilot who spent forty minutes on a stand with the engines
+ * running has forty minutes of it in their logbook. A pilot who was told to
+ * file the same leg twice has it twice. None of those is unusual and none of
+ * them was fixable: staff could APPROVE a report, REJECT it or DELETE it, and
+ * nothing else. The tool for "this flight is real but it says 4h 10m and it was
+ * 3h 20m" was to delete the pilot's flight and ask them to file it again by
+ * hand, which loses the Infinite Flight record, the XP, the violations and the
+ * date it was actually flown.
+ *
+ * So there are two new things, and they are the same thing from two ends:
+ *
+ *   THIS ROUTE  — the whole of one pilot's flying, every status, with the
+ *                 arithmetic underneath it. The question staff actually have is
+ *                 never "what is this one report", it is "their roster row says
+ *                 214 hours and their logbook adds up to 197, which is right",
+ *                 and that is a question you cannot answer one report at a
+ *                 time. So the totals come with it, AND the roster figure, AND
+ *                 the difference between them — stated rather than left for
+ *                 somebody to work out with a calculator.
+ *
+ *   THE EDIT ACTION on PATCH /pireps/:id — the correction itself.
+ *
+ * WHO. `flights.review` — the same capability that approves and rejects. A
+ * staff member trusted to decide whether a flight counts is the one who should
+ * be able to say how much of it counts; splitting the two would mean a flight
+ * reviewer who can delete a report but not shorten it, which is the worse power
+ * of the two.
+ *
+ * ONE ROUND TRIP, because it is one screen. A panel that stitched this together
+ * from /roster + /pireps + a filter would read the whole airline's flights to
+ * draw one pilot's.
+ * ========================================================================= */
+app.get('/api/crew/:slug/roster/:id/logbook', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const member = await store.getMember(req.params.id);
+        if (!member) return res.status(404).json({ error: 'That pilot isn’t on the roster.' });
+
+        const flights = await store.listPirepsForMember(member._id, { limit: 2000 });
+        const approved = flights.filter((f) => f.status === 'approved');
+        const minutes = (list) => list.reduce((sum, f) => sum + (Math.max(0, Number(f.durationMin) || 0)), 0);
+        const landings = (list) => list.reduce((sum, f) => sum + (Math.max(0, Number(f.landings) || 0)), 0);
+
+        // What the roster says, and what the reports add up to. BOTH, because
+        // the gap between them is the thing staff open this screen to find —
+        // and because the gap is not always a fault: hours edited by hand on
+        // the roster row, hours carried over from a previous VA, and a report
+        // approved before this product recorded hours at all all produce one.
+        const rosterHours = Math.max(0, Number(member.hours) || 0);
+        const flownHours = minutes(approved) / 60;
+        const drift = Math.round((rosterHours - flownHours) * 10) / 10;
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            pilot: {
+                id: member._id,
+                name: member.name || '',
+                callsign: member.callsign || '',
+                hours: Math.round(rosterHours * 10) / 10,
+                status: member.status || 'active',
+                ifUserId: member.ifUserId || '',
+                since: member.createdAt || null,
+            },
+            rank: crewRanks.memberRank(va.ranks, rosterHours, member.checksPassed),
+            flights: flights.map(publicPirep),
+            totals: {
+                flights: approved.length,
+                pending: flights.filter((f) => f.status === 'pending').length,
+                rejected: flights.filter((f) => f.status === 'rejected').length,
+                reports: flights.length,
+                minutes: minutes(approved),
+                landings: landings(approved),
+                // Hours as the logbook has them, hours as the roster has them,
+                // and the difference. Rounded to one place, because a drift of
+                // 0.03h is arithmetic rather than a discrepancy and reporting
+                // it as one sends somebody looking for a bug that is not there.
+                flownHours: Math.round(flownHours * 10) / 10,
+                rosterHours: Math.round(rosterHours * 10) / 10,
+                drift,
+                lastFlightAt: approved.length ? (approved[0].flownAt || approved[0].createdAt) : null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'staff logbook error', message: 'Could not load that logbook.' }); }
 });
 
 // Auto-capture: pull each linked pilot's recent IF flights and turn any we
@@ -10971,6 +11640,102 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
                 postPirepNotice(va, 'rejected', p, gate.p);
                 tellPilotAboutFlight(va, store, p, false);
             }
+        } else if (action === 'edit') {
+            /* CORRECT THE REPORT ITSELF.
+             *
+             * The tool that did not exist. Staff could approve a flight, reject
+             * it or delete it, and nothing else — so "this flight is real but it
+             * says 4h 10m and it was 3h 20m" meant deleting the pilot's flight
+             * and asking them to file it again, which throws away the Infinite
+             * Flight record, the XP, the violations and the date it was flown.
+             *
+             * THE HOURS MOVE WITH IT, AND THAT IS THE WHOLE DIFFICULTY.
+             * A report that has been approved has already added its duration to
+             * the pilot's roster row. Editing the duration without moving the
+             * row would leave the roster saying one thing and the logbook
+             * another, which is precisely the drift this screen exists to close.
+             * So the DIFFERENCE is applied — not the new figure, and not a
+             * recount — because a recount would silently absorb every hour a VA
+             * has ever deliberately granted by hand.
+             *
+             * A report that has NOT been credited (pending, rejected) moves
+             * nothing: its hours are not on the row yet, and approving it later
+             * will credit whatever it says then.
+             *
+             * AND WHAT IT PAID IS RE-PRICED. A flight's earnings are worked out
+             * from its duration and its landings, so an edited flight that kept
+             * its old payment would be paying for time nobody flew. Reversed and
+             * re-credited rather than adjusted, because crew_shop_credit is the
+             * one statement allowed to move a balance and it re-reads the figure
+             * itself. Best-effort, like every other shop call on this path: a
+             * project that cannot pay must not cost the pilot their correction.
+             *
+             * WHAT MAY BE EDITED is the flight as flown — how long, how many
+             * landings, where, in what, when, and what it cost them in
+             * violations. Not the pilot it belongs to (that is a different
+             * report), not its status (that is approve/reject above), and not
+             * the Infinite Flight id, which is the dedupe key and the proof.
+             */
+            const b = req.body || {};
+            const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+            const num = (v, min, max) => Math.max(min, Math.min(max, Math.round(Number(v) || 0)));
+            const patch = {};
+
+            // Duration accepts either a minutes figure or hours+minutes, the
+            // same two shapes the filing form takes — staff correcting a flight
+            // and a pilot filing one are typing into the same kind of box.
+            if (b.durationMin !== undefined || b.hours !== undefined || b.minutes !== undefined) {
+                patch.durationMin = b.durationMin !== undefined
+                    ? num(b.durationMin, 0, 100000)
+                    : num((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0), 0, 100000);
+            }
+            if (b.landings !== undefined) patch.landings = num(b.landings, 0, 100);
+            if (b.violations !== undefined) patch.violations = num(b.violations, 0, 10000);
+            if (b.origin !== undefined) patch.origin = icao(b.origin);
+            if (b.destination !== undefined) patch.destination = icao(b.destination);
+            if (b.aircraftName !== undefined) patch.aircraftName = String(b.aircraftName || '').trim().slice(0, 60);
+            if (b.liveryName !== undefined) patch.liveryName = String(b.liveryName || '').trim().slice(0, 80);
+            if (b.flightNumber !== undefined) patch.flightNumber = String(b.flightNumber || '').trim().slice(0, 12);
+            if (b.flownAt !== undefined) {
+                const when = new Date(b.flownAt);
+                if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'That isn’t a date we can read.' });
+                patch.flownAt = when;
+            }
+            if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to change.' });
+            // A leg with only one end is not a leg. Guarded here rather than
+            // left to the column, because blanking one ICAO is a plausible slip
+            // and an unmatched report is the expensive kind of wrong.
+            const nextOrigin = patch.origin === undefined ? p.origin : patch.origin;
+            const nextDest = patch.destination === undefined ? p.destination : patch.destination;
+            if (!nextOrigin || !nextDest) {
+                return res.status(400).json({ error: 'A flight needs both a departure and an arrival airport.' });
+            }
+
+            const wasMin = Math.max(0, Number(p.durationMin) || 0);
+            const wasCredited = !!p.hoursApplied;
+
+            patch.editedAt = new Date();
+            patch.editedBy = (gate.p && gate.p.name) || 'Staff';
+            p = await store.updatePirep(p._id, patch) || p;
+
+            if (wasCredited && p.memberId) {
+                const deltaHrs = ((Math.max(0, Number(p.durationMin) || 0)) - wasMin) / 60;
+                if (deltaHrs) await store.addMemberHours(p.memberId, deltaHrs);
+                // Re-priced only where there is a shop to re-price it in.
+                // creditFlightPoints is itself inert for a VA with no shop, but
+                // the reversal is not, so the pair is guarded rather than the
+                // second half of it.
+                if (crewShop.fromRecord(va && va.crewShop).enabled) {
+                    try { await store.uncreditFlight(p._id, p.memberId); }
+                    catch (err) { console.warn('shop reversal skipped —', (err && err.message) || err); }
+                    await creditFlightPoints(store, p, va);
+                }
+            }
+            // The pilot is told, and deliberately: their hours have changed and
+            // nothing else on this path would say so. A correction a pilot
+            // discovers by noticing their rank moved is a correction that reads
+            // as a fault in the product.
+            tellPilotAboutCorrection(va, store, p, wasMin);
         } else return res.status(400).json({ error: 'Unknown action.' });
         res.json({ pirep: publicPirep(p) });
     } catch (err) { crewFail(res, err, { log: 'pirep review error', message: 'Could not update the flight.' }); }
@@ -14814,7 +15579,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -14855,6 +15620,57 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
             loginBackdrop: ad.loginBackdrop || 'auto',
+            /* THE VA'S OWN LIVE-MAP EMBED, IF THEY HAVE MADE ONE.
+             *
+             * The crew centre draws a live map by building
+             * `embed.html?va=<CALLSIGN>&mode=map&…` out of thin air. That is
+             * the widget's "direct params" path, which produces a BRAND NEW
+             * generic embed every time — and so the crew centre has never
+             * shown the embed the VA actually configured. Everything they set
+             * up in the embeds tool was ignored: their Mapbox token (so the
+             * map silently fell back to the free basemap), their appearance,
+             * their callsign rules, their server filter, their hubs.
+             *
+             * So the token is published here and the crew centre uses it. It
+             * is not a secret — it is designed to sit in a `src` on the VA's
+             * own public website, which is a strictly more exposed place than
+             * this — and everything it unlocks is the VA's own presentation of
+             * their own flights.
+             *
+             * ONLY A LIVE ONE. A revoked or expired token resolves to an error
+             * page, and a crew centre showing "this embed has been revoked"
+             * where its map should be is worse than the generic map it would
+             * otherwise have drawn. Those come back as null and the crew
+             * centre falls back.
+             *
+             * `mode` rides along because a VA whose embed is a ROSTER widget
+             * has not made a map, and pointing the crew centre's map panel at
+             * it would replace a map with a list. The crew centre checks. */
+            liveEmbed: await (async () => {
+                try {
+                    const cfg = await EmbedConfig.findOne({
+                        vaAdId: ad._id,
+                        revoked: { $ne: true },
+                        $or: [{ expiresAt: null }, { expiresAt: { $exists: false } }, { expiresAt: { $gt: new Date() } }],
+                    })
+                        // The newest one a VA made is the one they are looking
+                        // at in the tool, so it is the one they mean.
+                        .sort({ createdAt: -1 })
+                        .select('token mode')
+                        .lean();
+                    return cfg && cfg.token ? { token: cfg.token, mode: cfg.mode || 'roster' } : null;
+                } catch (err) {
+                    // A branding read must not fail over the map. No embed, and
+                    // the crew centre draws the generic one as it always has.
+                    console.warn('crew embed lookup skipped —', (err && err.message) || err);
+                    return null;
+                }
+            })(),
+            // How this VA has built the band across the top of its crew
+            // centre. Public for the same reason the layout is: it decides the
+            // first paint, and a hero that waits for a session is a hero that
+            // draws once as ours and again as theirs.
+            hero: crewHero.publicHero(ad.crewHero),
             // Whether this deployment can offer "Continue with Discord" at all.
             // Read by the sign-in page BEFORE anybody has a session, which is
             // the only reason it is out here: a button that leaves for Discord
@@ -17947,10 +18763,23 @@ app.get('/api/embed/resolve', async (req, res) => {
         if (cfg.expiresAt && Date.now() > new Date(cfg.expiresAt).getTime())
                          return res.status(410).json({ ok: false, error: 'expired' });
 
-        // Optional per-token origin lock. We only enforce it when the widget
-        // actually reports an origin (some browsers strip the referrer).
+        /* Optional per-token origin lock. We only enforce it when the widget
+         * actually reports an origin (some browsers strip the referrer).
+         *
+         * OUR OWN SURFACES ARE NEVER LOCKED OUT. The allow-list exists to stop
+         * SOMEBODY ELSE'S website using a VA's token; it was never meant to
+         * stop the VA's own crew centre, which is ours and is where the token
+         * is now used to draw their live map (see `liveEmbed` on the branding
+         * endpoint). A VA who locked their embed to their own domain — which
+         * is the careful thing to do, and exactly what the feature is for —
+         * would otherwise find that the more carefully they configured it, the
+         * more certainly their crew centre map broke.
+         *
+         * The same matchers the community endpoint uses, so "one of ours" has
+         * one definition and one place to change it. */
+        const firstParty = COMMUNITY_SUBMIT_MATCHERS.some((match) => match(origin.replace(/\/+$/, '')));
         if (Array.isArray(cfg.allowedOrigins) && cfg.allowedOrigins.length &&
-            origin && !cfg.allowedOrigins.includes(origin)) {
+            origin && !firstParty && !cfg.allowedOrigins.includes(origin)) {
             return res.status(403).json({ ok: false, error: 'origin not allowed' });
         }
 

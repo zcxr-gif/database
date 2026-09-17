@@ -76,6 +76,12 @@ const KINDS = [
     // of the glanceable difference between them.
     'flight_approved', // a report they filed was credited
     'flight_rejected', // a report they filed was not
+    // v18. A staff member corrected a flight's hours or landings by hand. Its
+    // own kind rather than a 'flight_approved' with a different body, and for
+    // the same reason those two are separate: the glanceable difference is the
+    // icon, and "we changed a number on your record" is not the same news as
+    // "your flight counted".
+    'flight_edited',
     'order',        // something they bought was handed over, or refunded
 ];
 

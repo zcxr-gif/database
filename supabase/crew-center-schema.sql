@@ -703,7 +703,8 @@ create table if not exists crew_announcements (
     title       text not null default '',
     body        text not null default '',
     kind        text not null default 'notice'
-                check (kind in ('notice','promotion','join','event','checkride')),
+                check (kind in ('notice','promotion','join','event','checkride',
+                                'schedule','leave')),
     source      text not null default 'staff' check (source in ('staff','auto')),
     -- Pinned notices sort above everything regardless of age: "read the new
     -- rules before you file" has to stay at the top of the board.
@@ -720,11 +721,15 @@ create index if not exists crew_announcements_va_idx
 -- widened in place because the constraint is an inline column check, and a
 -- project provisioned at v7 carries the old five-value version — a row it has
 -- never heard of is refused, and the notice would vanish with no explanation.
+-- v18. And 'leave' joins it, as the other half of 'join': a pilot coming off
+-- the roster is the same class of fact as one arriving, and a board that
+-- announces only the arrivals is a board where people quietly stop existing.
+-- Widened the same way and for the same reason as v8 above.
 do $$
 begin
     alter table crew_announcements drop constraint if exists crew_announcements_kind_check;
     alter table crew_announcements add constraint crew_announcements_kind_check
-        check (kind in ('notice','promotion','join','event','checkride','schedule'));
+        check (kind in ('notice','promotion','join','event','checkride','schedule','leave'));
 end $$;
 
 -- ----------------------------------------------------------------------------
@@ -880,6 +885,20 @@ create index if not exists crew_pireps_schedule_idx
 -- 0 means "paid, and the rates came to nothing" — a real answer, and a different
 -- one.
 alter table crew_pireps add column if not exists points_awarded int;
+
+-- v18. When a staff member last corrected this report by hand, and who did it.
+--
+-- Staff can now open any pilot's logbook and edit a flight's duration and
+-- landings -- which they need, because Infinite Flight's own record is
+-- occasionally wrong and the alternative was deleting the report and asking the
+-- pilot to file it again. A logbook that can be edited is a logbook that has to
+-- say when it was: hours that change with nothing anywhere to point at are the
+-- same class of problem as a rejection with no reason.
+--
+-- Both are droppable (see LATE_COLUMNS in crewStore.js): a correction written
+-- without them is still a correction, and the hours still move.
+alter table crew_pireps add column if not exists edited_at timestamptz;
+alter table crew_pireps add column if not exists edited_by text not null default '';
 
 -- ----------------------------------------------------------------------------
 -- The link to Infinite Flight Live. v13.
@@ -1060,7 +1079,13 @@ create table if not exists crew_notifications (
                                 -- nothing used to tell a pilot about at all: a
                                 -- flight they filed being reviewed, and an order
                                 -- they paid for being handed over.
-                                'flight_approved','flight_rejected','order')),
+                                'flight_approved','flight_rejected',
+                                -- v18. Staff corrected a flight's hours or
+                                -- landings by hand. Its own kind so the bell
+                                -- can draw it differently: "we changed a
+                                -- number on your record" is not the same news
+                                -- as "your flight counted".
+                                'flight_edited','order')),
     -- What it is about, when it is about something — an event, a departure, a
     -- document. Untyped on purpose: `kind` says which table to read it against,
     -- and a hard reference to seven of them would make deleting any one of
@@ -1079,11 +1104,16 @@ create table if not exists crew_notifications (
 -- every "your flight was approved" with a constraint violation. Dropped by the
 -- name Postgres gives an inline column check; a project whose constraint has
 -- been renamed by hand simply gains a second, identical one.
+-- v18 widens it again, for 'flight_edited'. Same shape and same reason: the
+-- inline check only runs on a fresh create, so without this an established VA
+-- refuses every correction notice with a constraint violation -- and the
+-- correction itself would go through, leaving the pilot's hours changed and
+-- nothing anywhere telling them so.
 alter table crew_notifications drop constraint if exists crew_notifications_kind_check;
 alter table crew_notifications add constraint crew_notifications_kind_check
     check (kind in ('message','application','promotion','booking',
                     'event','document','checkride','system',
-                    'flight_approved','flight_rejected','order'));
+                    'flight_approved','flight_rejected','flight_edited','order'));
 
 -- The inbox itself: one pilot's messages, newest first.
 create index if not exists crew_notifications_account_idx
@@ -1281,6 +1311,23 @@ create table if not exists crew_shop_items (
 );
 create index if not exists crew_shop_items_va_idx
     on crew_shop_items (va_slug, active, created_at);
+
+-- v18. Two presentation columns, both additive and both with inert defaults,
+-- so every item written before they existed is a valid row on the new shape.
+--
+-- `item_group` and not `group`: `group` is a reserved word in SQL, and a column
+-- called one is a column every hand-written query has to quote forever.
+--
+-- `tier` is how loudly the shelf draws a thing -- 'standard' (an ordinary tile,
+-- and the default, which is what every existing item already was), 'showcase'
+-- (a thing whose whole value is that other people can see it, drawn wide) and
+-- 'flagship' (a thing that changes the AIRLINE rather than the pilot, drawn as
+-- a band at the top of the shelf). The check is deliberately permissive about
+-- an empty string: the backend bounds the value on the way in and reads an
+-- unrecognised one as 'standard', and a constraint that rejects a row is a
+-- worse failure here than a tile drawn small.
+alter table crew_shop_items add column if not exists item_group text not null default '';
+alter table crew_shop_items add column if not exists tier       text not null default 'standard';
 
 -- An order is a receipt, so it keeps its own copy of the name and the price.
 -- The item it came from may be edited, repriced or taken off the shelf
@@ -2059,5 +2106,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 17)
+insert into crew_schema_info (id, version) values (1, 18)
 on conflict (id) do update set version = excluded.version, updated_at = now();
