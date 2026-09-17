@@ -18,6 +18,7 @@
     "test:routes": "node scripts/test-route-library.js",
     "test:featured": "node scripts/test-crew-featured.js",
     "test:clubs": "node scripts/test-crew-clubs.js",
+    "test:streaks": "node scripts/test-crew-streaks.js",
     "test:badges": "node scripts/test-crew-badges.js"
   },
   "keywords": [],
