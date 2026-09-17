@@ -703,7 +703,8 @@ create table if not exists crew_announcements (
     title       text not null default '',
     body        text not null default '',
     kind        text not null default 'notice'
-                check (kind in ('notice','promotion','join','event','checkride')),
+                check (kind in ('notice','promotion','join','event','checkride',
+                                'schedule','leave')),
     source      text not null default 'staff' check (source in ('staff','auto')),
     -- Pinned notices sort above everything regardless of age: "read the new
     -- rules before you file" has to stay at the top of the board.
@@ -720,11 +721,15 @@ create index if not exists crew_announcements_va_idx
 -- widened in place because the constraint is an inline column check, and a
 -- project provisioned at v7 carries the old five-value version — a row it has
 -- never heard of is refused, and the notice would vanish with no explanation.
+-- v18. And 'leave' joins it, as the other half of 'join': a pilot coming off
+-- the roster is the same class of fact as one arriving, and a board that
+-- announces only the arrivals is a board where people quietly stop existing.
+-- Widened the same way and for the same reason as v8 above.
 do $$
 begin
     alter table crew_announcements drop constraint if exists crew_announcements_kind_check;
     alter table crew_announcements add constraint crew_announcements_kind_check
-        check (kind in ('notice','promotion','join','event','checkride','schedule'));
+        check (kind in ('notice','promotion','join','event','checkride','schedule','leave'));
 end $$;
 
 -- ----------------------------------------------------------------------------

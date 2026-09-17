@@ -860,7 +860,9 @@ const announcementFromRow = (r) => r && {
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
-const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule'];
+// v18. 'leave' is the other half of 'join'. A board that announces only the
+// arrivals is a board where people quietly stop existing.
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule', 'leave'];
 const announcementToRow = (a) => {
     const out = {};
     pick(a, out, 'title', 'title', (v) => str(v, 160));
@@ -1284,6 +1286,20 @@ class Postgrest {
 
     remove(table, params) { return this.request('delete', `/${table}`, { params }); }
 
+    /**
+     * A delete that says what it deleted.
+     *
+     * PostgREST answers a plain DELETE with 204 and no body, which is the right
+     * default — nobody wants a thousand rows echoed back for saying "drop the
+     * old ones". `purgeMember` is the one caller that genuinely needs the
+     * count: it is telling a person what was removed when they were promised
+     * everything would be, and "ok" is not an answer to that. Bounded by
+     * construction, because it only ever matches one pilot's own rows.
+     */
+    removeReturning(table, params) {
+        return this.request('delete', `/${table}`, { params, prefer: 'return=representation' });
+    }
+
     rpc(fn, args) { return this.request('post', `/rpc/${fn}`, { data: args }); }
 }
 
@@ -1348,6 +1364,99 @@ class SupabaseStore {
         return row ? memberFromRow(row) : null;
     }
     async deleteMember(id) { await this.db.remove('crew_members', this.ident(id)); return true; }
+
+    /* ===================================================================
+     * EVERYTHING THIS PILOT IS, GONE.
+     *
+     * WHY deleteMember ABOVE IS NOT ENOUGH
+     *
+     * Every table that points at a roster row does so with `on delete set
+     * null` — deliberately, because an order is a receipt and a flight report
+     * is a record, and neither should vanish because somebody was taken off a
+     * list. So `deleteMember` removed the row and left the rest of that person
+     * behind, orphaned: their flights still in the log with a name on them and
+     * no pilot to attach to, their bookings still holding seats on departures,
+     * their signups still counted against an event's capacity, and — the one
+     * that actually matters — THEIR LOGIN STILL WORKING. A pilot removed from
+     * the roster could still sign in, because crew_accounts.member_id was set
+     * to null rather than the account being deleted, and an account with no
+     * member is a perfectly valid account.
+     *
+     * This is the other verb. Remove is "take them off the list"; purge is
+     * "this person was never here", and it is what both doors that end a
+     * membership now use — a staff member removing somebody, and somebody
+     * leaving of their own accord.
+     *
+     * CHILDREN FIRST, ROSTER ROW LAST. If the run dies halfway, what is left
+     * is a pilot with less history rather than a set of orphans with no pilot;
+     * the first is recoverable by hand and the second is not.
+     *
+     * A MISSING TABLE IS NOT A FAILURE. A project on a pre-v6 schema has no
+     * crew_event_signups and a pre-v15 one has no crew_shop_orders. There is
+     * nothing of this pilot's in a table that does not exist, so the absence is
+     * counted as zero and the purge carries on — refusing to remove somebody
+     * because their VA has not re-run the SQL would be the wrong answer to the
+     * wrong question.
+     *
+     * Returns what it removed, per table, so the caller can say so rather than
+     * reporting a bare ok to somebody who has just been told everything would
+     * go.
+     * =================================================================== */
+    async purgeMember(id) {
+        const memberId = String(id || '');
+        if (!memberId) return { ok: false, removed: {} };
+        const byMember = { ...this.scope, member_id: `eq.${memberId}` };
+
+        // The order is the point — see the note above. `crew_accounts` sits
+        // second to last, immediately before the roster row: it is the one
+        // whose survival is a security problem rather than a tidiness one, so
+        // it goes even if something earlier threw.
+        const tables = [
+            'crew_shop_orders',
+            'crew_training_requests',
+            'crew_bookings',
+            'crew_event_signups',
+            'crew_notifications',
+            'crew_pireps',
+        ];
+        const removed = {};
+        const failed = [];
+        for (const table of tables) {
+            try {
+                const rows = await this.db.removeReturning(table, byMember);
+                removed[table] = Array.isArray(rows) ? rows.length : 0;
+            } catch (err) {
+                // A table this project has not got holds nothing of theirs.
+                // Anything else is recorded and the purge continues, because
+                // stopping here is what leaves a working login behind.
+                if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                    removed[table] = 0;
+                } else {
+                    removed[table] = 0;
+                    failed.push(table);
+                }
+            }
+        }
+
+        // The login. Last but one, and never skipped: an account whose
+        // member_id was nulled is still an account that signs in.
+        try {
+            const rows = await this.db.removeReturning('crew_accounts', byMember);
+            removed.crew_accounts = Array.isArray(rows) ? rows.length : 0;
+        } catch (err) {
+            removed.crew_accounts = 0;
+            if (!(err instanceof CrewStoreError && err.code === 'store_schema_missing')) {
+                // This one IS worth failing over. Everything else left behind
+                // is clutter; a login left behind is a person who was told
+                // they were gone and can still sign in.
+                throw err;
+            }
+        }
+
+        await this.db.remove('crew_members', this.ident(memberId));
+        removed.crew_members = 1;
+        return { ok: true, removed, failed };
+    }
 
     // Credit or debit a pilot's hours. Read-modify-write: PostgREST has no
     // atomic increment, and the alternative (an RPC) would mean a VA whose
@@ -2583,6 +2692,24 @@ class LegacyStore {
         return this.lean(m);
     }
     async deleteMember(id) { await models.CrewMember.deleteOne({ ...this.q, _id: id }); return true; }
+    /**
+     * Everything this pilot is, gone — see purgeMember on the Supabase store
+     * for what the verb means and why it exists.
+     *
+     * This store is the legacy managed one and holds only four of the tables
+     * the real one does: members, flight reports, routes and applications. Two
+     * of those are a pilot's. There are no bookings, no signups, no orders and
+     * no logins here to remove, so the purge is smaller — not because less is
+     * kept, but because less was ever here.
+     */
+    async purgeMember(id) {
+        const removed = {};
+        const gone = await models.CrewPirep.deleteMany({ ...this.q, memberId: id });
+        removed.crew_pireps = gone.deletedCount || 0;
+        await models.CrewMember.deleteOne({ ...this.q, _id: id });
+        removed.crew_members = 1;
+        return { ok: true, removed, failed: [] };
+    }
     async addMemberHours(id, deltaHours) {
         const d = Number(deltaHours) || 0;
         if (d >= 0) {

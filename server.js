@@ -2120,12 +2120,20 @@ async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) 
         if (dryRun) continue;
         try {
             if (remove) {
-                // The login goes with the pilot. Leaving an account behind
-                // whose member row is gone is an account that can sign in to a
-                // crew center it is no longer on.
-                const acct = await store.getAccountByMember(m._id).catch(() => null);
-                if (acct) await store.deleteAccount(acct._id).catch(() => {});
-                await store.deleteMember(m._id);
+                /* The same verb a staff member gets. `purgeMember` takes the
+                 * roster row, the flight reports, the bookings, the signups,
+                 * the orders, the messages and the login — see crewStore.js.
+                 *
+                 * It used to delete the account and the member row and leave
+                 * the rest, which meant the sweep and the Remove button meant
+                 * two different things by "removed", and both left a pilot's
+                 * flights in the log attached to nobody. One verb now.
+                 *
+                 * A VA that does not want a timer destroying anybody's history
+                 * has the setting for it and always has: the rule's action can
+                 * be 'deactivate' instead, which is the branch below and marks
+                 * them inactive without touching a thing. */
+                await store.purgeMember(m._id);
             } else {
                 await store.updateMember(m._id, { status: 'inactive' });
             }
@@ -3721,14 +3729,59 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
         res.json({ member: publicMember(m, va.ranks, va.crewClubs) });
     } catch (err) { crewFail(res, err, { log: 'roster edit error', message: 'Could not update the pilot.' }); }
 });
-// Remove a member.
+/**
+ * Remove a pilot, and everything of theirs with them.
+ *
+ * WHAT THIS USED TO DO, AND WHY IT WAS WRONG
+ *
+ * It deleted the roster row and nothing else. Every table that points at a
+ * pilot does so with `on delete set null`, so what was left behind was that
+ * person, scattered: their flights still in the log under their name with no
+ * pilot attached, their bookings still holding seats on departures nobody
+ * could release, their signups still counted against an event's capacity —
+ * and their LOGIN still working, because an account whose `member_id` has been
+ * nulled is a perfectly valid account. A VA who removed somebody was told it
+ * had happened and it had not.
+ *
+ * So remove means remove. See `purgeMember` in crewStore.js for the order and
+ * for why a missing table is counted as zero rather than failing the run.
+ *
+ * THIS IS NOT REVERSIBLE AND IT TAKES THE AIRLINE'S OWN HISTORY WITH IT.
+ * A pilot's flight reports are also the airline's: they are what its total
+ * hours, its activity feed and its insights are built from, so removing a
+ * pilot who flew four hundred legs removes those legs from the airline's
+ * figures too. That is the honest meaning of "wipe everything" and it is what
+ * was asked for — but it is the sentence the confirm dialog has to say out
+ * loud, which is why the reply carries the counts rather than a bare ok.
+ */
 app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
-        await store.deleteMember(req.params.id);
-        res.json({ ok: true });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const member = await store.getMember(req.params.id);
+        if (!member) return res.status(404).json({ error: 'Pilot not found.' });
+
+        const result = await store.purgeMember(member._id);
+        // The crew is told somebody has left, exactly as it is told when
+        // somebody joins. Not a judgement and not a reason — those are staff's
+        // business — only that the roster changed, so a crew reading the feed
+        // does not have to notice an absence to learn about it.
+        postAnnouncement(va, {
+            kind: 'leave',
+            title: `${member.name || 'A pilot'} has left the airline`,
+            body: '',
+            refId: null,
+        });
+        res.json({
+            ok: true,
+            name: member.name || '',
+            removed: (result && result.removed) || {},
+            // Named rather than swallowed: a table that refused the delete is a
+            // pilot who is gone from the roster with something of theirs still
+            // in the project, and staff should know which.
+            failed: (result && result.failed) || [],
+        });
     } catch (err) { crewFail(res, err, { log: 'roster delete error', message: 'Could not remove the pilot.' }); }
 });
 
@@ -9038,6 +9091,163 @@ app.get('/api/crew/:slug/me/pilot', async (req, res) => {
             pilotSide,
         });
     } catch (err) { crewFail(res, err, { log: 'me/pilot read error', message: 'Could not read your pilot record.' }); }
+});
+
+/* ===========================================================================
+ * LEAVING, OF YOUR OWN ACCORD
+ *
+ * WHY A PILOT NEEDS THIS DOOR
+ *
+ * Every way out of a virtual airline went through somebody else. A pilot who
+ * wanted to leave had to ask staff to remove them and then wait — which is a
+ * strange thing to have to ask permission for, and in practice means people
+ * stop signing in instead and sit on the roster forever as somebody the
+ * retention sweep keeps nagging. There is a "set your own leave" for going away
+ * temporarily; there was nothing at all for going away for good.
+ *
+ * WHAT IT DOES IS THE SAME VERB STAFF USE. `purgeMember` — the roster row, the
+ * flight reports, the bookings, the signups, the orders, the messages and the
+ * login. Not a `status: 'left'` flag, because a flag is a person still in
+ * somebody else's database being counted, and that is precisely what somebody
+ * leaving is asking to stop being.
+ *
+ * SO IT IS TYPED, NOT CLICKED. This is irreversible and it is the only
+ * irreversible thing a pilot can do to themselves in this product, so it takes
+ * a confirmation somebody cannot produce by accident: their own username, typed
+ * out. A checkbox and a red button is what a person taps twice while meaning to
+ * tap something else.
+ *
+ * STAFF CANNOT LEAVE THROUGH HERE, and that is not paternalism. A VA staff
+ * login is one of OUR accounts, not a row in the airline's project — this route
+ * cannot delete it, so an owner who "left" would lose their roster row and
+ * their flying and still be the owner, signed in, looking at a crew centre with
+ * a hole where they used to be. They take their staff role off first, or
+ * another owner removes them. Said plainly rather than refused silently.
+ *
+ * THE CREW IS TOLD, in the same one line the board uses when somebody joins.
+ * Not a reason and not a judgement — those are nobody's business — only that
+ * the roster changed, so the people who flew with them are not left working it
+ * out from an absence.
+ * ========================================================================= */
+/**
+ * What leaving would actually take, before anybody types anything.
+ *
+ * A warning that says "everything will be wiped" is a form of words. A warning
+ * that says "your 214 hours, your 96 flights, your Gold card and the three
+ * things you have claimed" is the same sentence with the person's own life in
+ * it, and it is the difference between a dialog somebody dismisses and one they
+ * read. So the confirm screen is drawn from this rather than from adjectives.
+ *
+ * Read-only, and it says `expects` — the exact string the POST will demand —
+ * so the form can label its box instead of making the pilot guess which of
+ * their names is being asked for.
+ */
+app.get('/api/crew/:slug/me/leave', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.kind !== 'crew') {
+        return res.json({ canLeave: false, reason: 'staff_account' });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccount(p.sub);
+        if (!account || account.active === false) return res.status(401).json({ error: 'Not authenticated.' });
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+
+        // Everything below is best-effort: a VA on an older schema has no
+        // orders table and a pilot with no roster row has no flights, and
+        // neither is a reason to refuse to show somebody the door. A count we
+        // could not read is left out rather than reported as zero — "0 flights"
+        // is a claim, and this is the one screen where a wrong one costs
+        // somebody their flying.
+        const [flights, orders] = await Promise.all([
+            member ? store.listPirepsForMember(member._id, { limit: 5000 }).catch(() => null) : Promise.resolve([]),
+            member ? store.listShopOrders({ memberId: member._id, limit: 500 }).catch(() => null) : Promise.resolve([]),
+        ]);
+        const approved = Array.isArray(flights) ? flights.filter((f) => f.status === 'approved') : [];
+        const clubs = clubsFor(va);
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            canLeave: true,
+            expects: account.username || '',
+            pilot: member ? {
+                name: member.name || '',
+                callsign: member.callsign || '',
+                since: member.createdAt || null,
+            } : null,
+            takes: {
+                linked: !!member,
+                hours: member ? Math.round((Number(member.hours) || 0) * 10) / 10 : 0,
+                flights: Array.isArray(flights) ? approved.length : null,
+                reports: Array.isArray(flights) ? flights.length : null,
+                held: Array.isArray(orders) ? crewShop.holdings(orders, { limit: 50 }).length : null,
+                rank: member ? (crewRanks.memberRank(va.ranks, member.hours, member.checksPassed) || {}).name || '' : '',
+                club: member ? ((crewClubs.memberClub(clubs, member.hours) || {}).name || '') : '',
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew leave preview error', message: 'Could not read your account.' }); }
+});
+
+app.post('/api/crew/:slug/me/leave', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    // See the note above: this route cannot reach a central staff account, so
+    // it must not pretend to have closed one.
+    if (p.kind !== 'crew') {
+        return res.status(400).json({
+            error: 'Staff accounts leave a different way — remove your staff role first, or ask another owner to take you off the roster.',
+            code: 'staff_account',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccount(p.sub);
+        if (!account || account.active === false) return res.status(401).json({ error: 'Not authenticated.' });
+
+        /* THE TYPED CONFIRMATION. Their own username, which is the one string
+         * they certainly know and certainly cannot hit by accident. Compared
+         * case-insensitively and trimmed, because asking somebody to reproduce
+         * capitalisation under a red banner is a puzzle rather than a check. */
+        const typed = String((req.body || {}).confirm || '').trim().toLowerCase();
+        const expect = String(account.username || '').trim().toLowerCase();
+        if (!expect || typed !== expect) {
+            return res.status(400).json({
+                error: 'Type your username exactly to confirm.',
+                code: 'confirm_mismatch',
+                // So the form can label the box with what it wants, rather than
+                // the pilot guessing which of their names is being asked for.
+                expects: account.username || '',
+            });
+        }
+
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+        const name = (member && member.name) || account.displayName || account.username || 'A pilot';
+
+        let removed = {};
+        if (member) {
+            const result = await store.purgeMember(member._id);
+            removed = (result && result.removed) || {};
+        } else {
+            // A login that was never linked to a roster row. There is no pilot
+            // to purge, but the account is still theirs to close — and leaving
+            // it would leave them able to sign in to an airline they have just
+            // left, which is the one outcome this route exists to prevent.
+            await store.deleteAccount(account._id);
+            removed.crew_accounts = 1;
+        }
+
+        postAnnouncement(va, {
+            kind: 'leave',
+            title: `${name} has left the airline`,
+            body: '',
+            refId: null,
+        });
+        res.json({ ok: true, name, removed });
+    } catch (err) { crewFail(res, err, { log: 'crew self-leave error', message: 'We could not close your account. Nothing has been removed.' }); }
 });
 
 app.post('/api/crew/:slug/me/pilot', async (req, res) => {
