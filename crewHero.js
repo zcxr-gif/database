@@ -92,7 +92,15 @@ function normalize(cfg) {
         // this is the difference between white text that reads and white text
         // that is a rumour. Bounded well short of both ends: 0 is unreadable
         // over most photographs and 100 is a black rectangle with no picture.
-        dim: Math.max(10, Math.min(90, Math.round(Number(c.dim)) || 55)),
+        dim: (() => {
+            // `|| 55` would have been wrong here in the one case somebody is
+            // most likely to try: 0 is falsy, so "as light as it goes" would
+            // have come back as the default rather than as the floor. A number
+            // that is not a number is what falls back; a number that is one is
+            // clamped.
+            const n = Math.round(Number(c.dim));
+            return Number.isFinite(n) ? Math.max(10, Math.min(90, n)) : 55;
+        })(),
     };
 }
 

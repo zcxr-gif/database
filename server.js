@@ -10391,6 +10391,85 @@ function tellPilotAboutFlight(va, store, pirep, approved) {
 }
 
 /**
+ * Tell the pilot a staff member filed a flight onto their record.
+ *
+ * The other half of the correction notice below, and there for the same
+ * reason: this is a change to somebody's flying that they did not make and are
+ * not watching for. A pilot whose hours jump with nothing in their bell reads
+ * it as a fault in the product, and the one thing worse than a wrong number is
+ * a right one that arrived from nowhere.
+ *
+ * Says the leg, the time and who filed it. `senderName` is the staff member,
+ * so the bell can show a person rather than the airline — this is somebody
+ * doing something for them, not the system doing something to them.
+ */
+function tellPilotAboutFiledForThem(va, member, pirep, by) {
+    if (!va || !member || !pirep) return;
+    const leg = [pirep.origin, pirep.destination].filter(Boolean).join(' → ')
+        || pirep.flightNumber || 'A flight';
+    const mins = Math.max(0, Number(pirep.durationMin) || 0);
+    const h = Math.floor(mins / 60), mi = Math.round(mins % 60);
+    const length = h ? `${h}h${mi ? ` ${mi}m` : ''}` : `${mi}m`;
+    Promise.resolve()
+        .then(() => notifyPilot(va, member, {
+            kind: pirep.status === 'approved' ? 'flight_approved' : 'flight_edited',
+            title: `${leg} was added to your logbook`,
+            body: `${length}, filed for you by ${by}.`
+                + (pirep.status === 'approved' ? ' It has been credited.' : ' It is waiting on review.'),
+            refId: pirep._id,
+            senderName: by,
+        }))
+        .catch((err) => console.warn('filed-for notice skipped —', (err && err.message) || err));
+}
+
+/**
+ * Tell the pilot a staff member corrected one of their flights.
+ *
+ * Its own function rather than a third state of tellPilotAboutFlight, because
+ * it is a different sentence: that one says a decision was made about a report,
+ * this one says a number changed. The pilot did not ask for it and will not be
+ * looking for it, and the consequence — their hours, and therefore possibly
+ * their rank — is the kind a person notices later and reads as a fault.
+ *
+ * IT SAYS WHAT MOVED AND BY HOW MUCH. "Your flight was updated" is the notice
+ * that makes somebody open a support thread. "CYYZ → EGLL is now 7h 10m, down
+ * from 7h 40m" is the notice that does not.
+ *
+ * Silent when nothing about the time changed: a corrected ICAO or a fixed
+ * livery is housekeeping, and a bell for it is a bell people stop reading.
+ *
+ * Detached, like every other notice in this file: a pilot's message must not sit
+ * in front of the reply to the staff member who pressed Save, and a project that
+ * cannot take the row must not fail the correction.
+ */
+function tellPilotAboutCorrection(va, store, pirep, wasMin) {
+    if (!va || !pirep || !pirep.memberId) return;
+    const nowMin = Math.max(0, Number(pirep.durationMin) || 0);
+    const before = Math.max(0, Number(wasMin) || 0);
+    if (nowMin === before) return;
+    const leg = [pirep.origin, pirep.destination].filter(Boolean).join(' → ')
+        || pirep.flightNumber || 'One of your flights';
+    const hrs = (m) => {
+        const h = Math.floor(m / 60), mi = Math.round(m % 60);
+        return h ? `${h}h${mi ? ` ${mi}m` : ''}` : `${mi}m`;
+    };
+    Promise.resolve()
+        .then(async () => {
+            const member = await store.getMember(pirep.memberId);
+            if (!member) return;
+            notifyPilot(va, member, {
+                kind: 'flight_edited',
+                title: `${leg} was corrected`,
+                body: `Now ${hrs(nowMin)}, ${nowMin > before ? 'up' : 'down'} from ${hrs(before)}.`
+                    + (pirep.hoursApplied ? ' Your hours have been adjusted to match.' : ''),
+                refId: pirep._id,
+                senderName: pirep.editedBy || '',
+            });
+        })
+        .catch((err) => console.warn('correction notice skipped —', (err && err.message) || err));
+}
+
+/**
  * Pay for one approved flight.
  *
  * Split out because the calculation is the VA's settings and the payment is the
@@ -10457,6 +10536,21 @@ const publicPirep = (p) => ({
     distanceNm: p.distanceNm, server: p.server, inFleet: p.inFleet,
     routeMatched: !!p.routeId,   // did this leg match a route in the network?
     source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
+    // Whether this report is Infinite Flight's own record of a flight or
+    // somebody's description of one. `source` does not answer that — a flight
+    // a pilot PICKED out of their logbook is filed as 'manual', because a
+    // person chose to file it — and it is the first question staff reading a
+    // logbook have. The flight id is the proof, so its presence is the answer.
+    fromLogbook: !!p.flightId,
+    // v18. When a staff member last corrected this by hand, and who. Null on
+    // every report nobody has touched, which is nearly all of them. See the
+    // note over the edit action in PATCH /pireps/:id.
+    editedAt: p.editedAt || null,
+    editedBy: p.editedBy || '',
+    hoursApplied: !!p.hoursApplied,
+    // What it paid, where the VA runs a shop and it has paid anything. Null and
+    // 0 are different answers — see the column's note in the schema.
+    pointsAwarded: p.pointsAwarded == null ? null : Number(p.pointsAwarded) || 0,
 });
 
 /* ===========================================================================
@@ -10761,9 +10855,46 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             }
         }
 
-        // Optional: attribute to a roster pilot (so approving can credit hours).
+        /* WHOSE FLIGHT THIS IS.
+         *
+         * `memberId` attributes the report to a roster pilot, which is what
+         * makes approving it credit somebody's hours. It used to be honoured
+         * for anybody signed in, which meant any pilot at the airline could
+         * file a flight onto any other pilot's record — and staff could not
+         * rely on it either way, because there was no rule to rely on.
+         *
+         * Now there is one, and it is the same capability that approves a
+         * flight: `flights.review`. A staff member trusted to say a flight
+         * counts is the one who may file it on somebody's behalf, which is what
+         * makes the whole point of this endpoint's manual half work — a pilot
+         * whose logbook hours are wrong needs their staff to put the real
+         * flight in, and before this the only way was to ask the pilot to type
+         * it themselves.
+         *
+         * Anybody else filing gets their OWN roster row, whatever they sent.
+         * Not an error: they are filing their own flight, which is the ordinary
+         * case, and a 403 over a field a form did not mean to send would break
+         * filing for everybody.
+         */
+        const canFileForOthers = !(await requireCap(req, req.params.slug, 'flights.review')).error;
         let member = null;
-        if (b.memberId) member = await store.getMember(b.memberId);
+        let filedForSomeoneElse = false;
+        if (canFileForOthers) {
+            // A reviewer's `memberId` is taken at its word, INCLUDING when it
+            // is absent: the back office offers "Unassigned pilot" as a real
+            // choice, and quietly attributing that to whoever pressed the
+            // button would put somebody else's hours on a staff member's row.
+            if (b.memberId) {
+                member = await store.getMember(b.memberId);
+                if (!member) return res.status(404).json({ error: 'That pilot isn’t on the roster.' });
+                const self = await crewPilot(req, store);
+                filedForSomeoneElse = !(self && String(self.memberId) === String(member._id));
+            }
+        } else {
+            // Everybody else files their own flight, whatever they sent.
+            const self = await crewPilot(req, store);
+            if (self && self.memberId) member = await store.getMember(self.memberId);
+        }
 
         /* Filing a flight the pilot PICKED out of their own Infinite Flight
          * logbook (see GET /me/if-flights). The body carries an id and nothing
@@ -10843,7 +10974,15 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         // the setting means "trust Infinite Flight's record", not "trust the
         // form", and crediting hours off an unverified number is the one thing
         // it must not do.
-        const willApprove = !!(picked && vaFull && vaFull.crewPirepAutoApprove && inFleet);
+        //
+        // The one addition: a STAFF member filing a correction, who has asked
+        // for it to count straight away. That is not "trust the form" — it is
+        // the person who would otherwise press Approve one second later saying
+        // so on the way in, and they hold the capability that does it. Without
+        // this, the manual half of this endpoint is a two-step: file the flight
+        // the pilot really flew, then go and find it in the queue.
+        const staffApproves = !!(!picked && canFileForOthers && b.approve === true);
+        const willApprove = !!(picked && vaFull && vaFull.crewPirepAutoApprove && inFleet) || staffApproves;
 
         let doc = await store.createPirep({
             memberId: (member && member._id) || null,
@@ -10895,7 +11034,13 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         // the same whether a human pressed the button or the rule did.
         if (willApprove) {
             doc = await applyPirepHours(store, doc, va);
-            postPirepNotice(va, 'approved', doc, { name: 'Auto-approval' });
+            postPirepNotice(va, 'approved', doc, staffApproves ? p : { name: 'Auto-approval' });
+        }
+        // A flight somebody else put on this pilot's record. They did not file
+        // it and would otherwise find out by noticing their hours moved, which
+        // is the same problem the correction notice exists to solve.
+        if (filedForSomeoneElse && member) {
+            tellPilotAboutFiledForThem(va, member, doc, (p && p.name) || 'Staff');
         }
         res.status(201).json({
             pirep: publicPirep(doc),
@@ -10903,9 +11048,113 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             flightNumberMismatch,
             fromLogbook: !!picked,
             autoApproved: willApprove,
+            // Whose record it landed on, when that is not the caller's. The
+            // panel says "Filed for Rae Okafor" rather than "Filed", which is
+            // the difference between a confirmation and a guess.
+            filedFor: filedForSomeoneElse && member ? { id: member._id, name: member.name || '' } : null,
             route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
         });
     } catch (err) { crewFail(res, err, { log: 'pirep file error', message: 'Could not file the flight.' }); }
+});
+
+/* ===========================================================================
+ * ONE PILOT'S LOGBOOK, FOR STAFF
+ *
+ * WHY THIS EXISTS
+ *
+ * A pilot's hours are the one number in this product that decides things. They
+ * decide the rank they hold, the club their card wears, what the shop will sell
+ * them and whether a rank-gated route is even on their network. And they are
+ * built by adding up flight reports, most of which arrive from Infinite Flight
+ * without a human ever looking at them.
+ *
+ * Which means they are sometimes wrong. A flight that dropped its connection
+ * ten minutes before the gate is filed at the duration IF recorded, not the
+ * duration flown. A pilot who spent forty minutes on a stand with the engines
+ * running has forty minutes of it in their logbook. A pilot who was told to
+ * file the same leg twice has it twice. None of those is unusual and none of
+ * them was fixable: staff could APPROVE a report, REJECT it or DELETE it, and
+ * nothing else. The tool for "this flight is real but it says 4h 10m and it was
+ * 3h 20m" was to delete the pilot's flight and ask them to file it again by
+ * hand, which loses the Infinite Flight record, the XP, the violations and the
+ * date it was actually flown.
+ *
+ * So there are two new things, and they are the same thing from two ends:
+ *
+ *   THIS ROUTE  — the whole of one pilot's flying, every status, with the
+ *                 arithmetic underneath it. The question staff actually have is
+ *                 never "what is this one report", it is "their roster row says
+ *                 214 hours and their logbook adds up to 197, which is right",
+ *                 and that is a question you cannot answer one report at a
+ *                 time. So the totals come with it, AND the roster figure, AND
+ *                 the difference between them — stated rather than left for
+ *                 somebody to work out with a calculator.
+ *
+ *   THE EDIT ACTION on PATCH /pireps/:id — the correction itself.
+ *
+ * WHO. `flights.review` — the same capability that approves and rejects. A
+ * staff member trusted to decide whether a flight counts is the one who should
+ * be able to say how much of it counts; splitting the two would mean a flight
+ * reviewer who can delete a report but not shorten it, which is the worse power
+ * of the two.
+ *
+ * ONE ROUND TRIP, because it is one screen. A panel that stitched this together
+ * from /roster + /pireps + a filter would read the whole airline's flights to
+ * draw one pilot's.
+ * ========================================================================= */
+app.get('/api/crew/:slug/roster/:id/logbook', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const member = await store.getMember(req.params.id);
+        if (!member) return res.status(404).json({ error: 'That pilot isn’t on the roster.' });
+
+        const flights = await store.listPirepsForMember(member._id, { limit: 2000 });
+        const approved = flights.filter((f) => f.status === 'approved');
+        const minutes = (list) => list.reduce((sum, f) => sum + (Math.max(0, Number(f.durationMin) || 0)), 0);
+        const landings = (list) => list.reduce((sum, f) => sum + (Math.max(0, Number(f.landings) || 0)), 0);
+
+        // What the roster says, and what the reports add up to. BOTH, because
+        // the gap between them is the thing staff open this screen to find —
+        // and because the gap is not always a fault: hours edited by hand on
+        // the roster row, hours carried over from a previous VA, and a report
+        // approved before this product recorded hours at all all produce one.
+        const rosterHours = Math.max(0, Number(member.hours) || 0);
+        const flownHours = minutes(approved) / 60;
+        const drift = Math.round((rosterHours - flownHours) * 10) / 10;
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            pilot: {
+                id: member._id,
+                name: member.name || '',
+                callsign: member.callsign || '',
+                hours: Math.round(rosterHours * 10) / 10,
+                status: member.status || 'active',
+                ifUserId: member.ifUserId || '',
+                since: member.createdAt || null,
+            },
+            rank: crewRanks.memberRank(va.ranks, rosterHours, member.checksPassed),
+            flights: flights.map(publicPirep),
+            totals: {
+                flights: approved.length,
+                pending: flights.filter((f) => f.status === 'pending').length,
+                rejected: flights.filter((f) => f.status === 'rejected').length,
+                reports: flights.length,
+                minutes: minutes(approved),
+                landings: landings(approved),
+                // Hours as the logbook has them, hours as the roster has them,
+                // and the difference. Rounded to one place, because a drift of
+                // 0.03h is arithmetic rather than a discrepancy and reporting
+                // it as one sends somebody looking for a bug that is not there.
+                flownHours: Math.round(flownHours * 10) / 10,
+                rosterHours: Math.round(rosterHours * 10) / 10,
+                drift,
+                lastFlightAt: approved.length ? (approved[0].flownAt || approved[0].createdAt) : null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'staff logbook error', message: 'Could not load that logbook.' }); }
 });
 
 // Auto-capture: pull each linked pilot's recent IF flights and turn any we
@@ -11011,6 +11260,102 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
                 postPirepNotice(va, 'rejected', p, gate.p);
                 tellPilotAboutFlight(va, store, p, false);
             }
+        } else if (action === 'edit') {
+            /* CORRECT THE REPORT ITSELF.
+             *
+             * The tool that did not exist. Staff could approve a flight, reject
+             * it or delete it, and nothing else — so "this flight is real but it
+             * says 4h 10m and it was 3h 20m" meant deleting the pilot's flight
+             * and asking them to file it again, which throws away the Infinite
+             * Flight record, the XP, the violations and the date it was flown.
+             *
+             * THE HOURS MOVE WITH IT, AND THAT IS THE WHOLE DIFFICULTY.
+             * A report that has been approved has already added its duration to
+             * the pilot's roster row. Editing the duration without moving the
+             * row would leave the roster saying one thing and the logbook
+             * another, which is precisely the drift this screen exists to close.
+             * So the DIFFERENCE is applied — not the new figure, and not a
+             * recount — because a recount would silently absorb every hour a VA
+             * has ever deliberately granted by hand.
+             *
+             * A report that has NOT been credited (pending, rejected) moves
+             * nothing: its hours are not on the row yet, and approving it later
+             * will credit whatever it says then.
+             *
+             * AND WHAT IT PAID IS RE-PRICED. A flight's earnings are worked out
+             * from its duration and its landings, so an edited flight that kept
+             * its old payment would be paying for time nobody flew. Reversed and
+             * re-credited rather than adjusted, because crew_shop_credit is the
+             * one statement allowed to move a balance and it re-reads the figure
+             * itself. Best-effort, like every other shop call on this path: a
+             * project that cannot pay must not cost the pilot their correction.
+             *
+             * WHAT MAY BE EDITED is the flight as flown — how long, how many
+             * landings, where, in what, when, and what it cost them in
+             * violations. Not the pilot it belongs to (that is a different
+             * report), not its status (that is approve/reject above), and not
+             * the Infinite Flight id, which is the dedupe key and the proof.
+             */
+            const b = req.body || {};
+            const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+            const num = (v, min, max) => Math.max(min, Math.min(max, Math.round(Number(v) || 0)));
+            const patch = {};
+
+            // Duration accepts either a minutes figure or hours+minutes, the
+            // same two shapes the filing form takes — staff correcting a flight
+            // and a pilot filing one are typing into the same kind of box.
+            if (b.durationMin !== undefined || b.hours !== undefined || b.minutes !== undefined) {
+                patch.durationMin = b.durationMin !== undefined
+                    ? num(b.durationMin, 0, 100000)
+                    : num((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0), 0, 100000);
+            }
+            if (b.landings !== undefined) patch.landings = num(b.landings, 0, 100);
+            if (b.violations !== undefined) patch.violations = num(b.violations, 0, 10000);
+            if (b.origin !== undefined) patch.origin = icao(b.origin);
+            if (b.destination !== undefined) patch.destination = icao(b.destination);
+            if (b.aircraftName !== undefined) patch.aircraftName = String(b.aircraftName || '').trim().slice(0, 60);
+            if (b.liveryName !== undefined) patch.liveryName = String(b.liveryName || '').trim().slice(0, 80);
+            if (b.flightNumber !== undefined) patch.flightNumber = String(b.flightNumber || '').trim().slice(0, 12);
+            if (b.flownAt !== undefined) {
+                const when = new Date(b.flownAt);
+                if (Number.isNaN(when.getTime())) return res.status(400).json({ error: 'That isn’t a date we can read.' });
+                patch.flownAt = when;
+            }
+            if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to change.' });
+            // A leg with only one end is not a leg. Guarded here rather than
+            // left to the column, because blanking one ICAO is a plausible slip
+            // and an unmatched report is the expensive kind of wrong.
+            const nextOrigin = patch.origin === undefined ? p.origin : patch.origin;
+            const nextDest = patch.destination === undefined ? p.destination : patch.destination;
+            if (!nextOrigin || !nextDest) {
+                return res.status(400).json({ error: 'A flight needs both a departure and an arrival airport.' });
+            }
+
+            const wasMin = Math.max(0, Number(p.durationMin) || 0);
+            const wasCredited = !!p.hoursApplied;
+
+            patch.editedAt = new Date();
+            patch.editedBy = (gate.p && gate.p.name) || 'Staff';
+            p = await store.updatePirep(p._id, patch) || p;
+
+            if (wasCredited && p.memberId) {
+                const deltaHrs = ((Math.max(0, Number(p.durationMin) || 0)) - wasMin) / 60;
+                if (deltaHrs) await store.addMemberHours(p.memberId, deltaHrs);
+                // Re-priced only where there is a shop to re-price it in.
+                // creditFlightPoints is itself inert for a VA with no shop, but
+                // the reversal is not, so the pair is guarded rather than the
+                // second half of it.
+                if (crewShop.fromRecord(va && va.crewShop).enabled) {
+                    try { await store.uncreditFlight(p._id, p.memberId); }
+                    catch (err) { console.warn('shop reversal skipped —', (err && err.message) || err); }
+                    await creditFlightPoints(store, p, va);
+                }
+            }
+            // The pilot is told, and deliberately: their hours have changed and
+            // nothing else on this path would say so. A correction a pilot
+            // discovers by noticing their rank moved is a correction that reads
+            // as a fault in the product.
+            tellPilotAboutCorrection(va, store, p, wasMin);
         } else return res.status(400).json({ error: 'Unknown action.' });
         res.json({ pirep: publicPirep(p) });
     } catch (err) { crewFail(res, err, { log: 'pirep review error', message: 'Could not update the flight.' }); }

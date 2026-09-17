@@ -1074,7 +1074,13 @@ create table if not exists crew_notifications (
                                 -- nothing used to tell a pilot about at all: a
                                 -- flight they filed being reviewed, and an order
                                 -- they paid for being handed over.
-                                'flight_approved','flight_rejected','order')),
+                                'flight_approved','flight_rejected',
+                                -- v18. Staff corrected a flight's hours or
+                                -- landings by hand. Its own kind so the bell
+                                -- can draw it differently: "we changed a
+                                -- number on your record" is not the same news
+                                -- as "your flight counted".
+                                'flight_edited','order')),
     -- What it is about, when it is about something — an event, a departure, a
     -- document. Untyped on purpose: `kind` says which table to read it against,
     -- and a hard reference to seven of them would make deleting any one of
@@ -1093,11 +1099,16 @@ create table if not exists crew_notifications (
 -- every "your flight was approved" with a constraint violation. Dropped by the
 -- name Postgres gives an inline column check; a project whose constraint has
 -- been renamed by hand simply gains a second, identical one.
+-- v18 widens it again, for 'flight_edited'. Same shape and same reason: the
+-- inline check only runs on a fresh create, so without this an established VA
+-- refuses every correction notice with a constraint violation -- and the
+-- correction itself would go through, leaving the pilot's hours changed and
+-- nothing anywhere telling them so.
 alter table crew_notifications drop constraint if exists crew_notifications_kind_check;
 alter table crew_notifications add constraint crew_notifications_kind_check
     check (kind in ('message','application','promotion','booking',
                     'event','document','checkride','system',
-                    'flight_approved','flight_rejected','order'));
+                    'flight_approved','flight_rejected','flight_edited','order'));
 
 -- The inbox itself: one pilot's messages, newest first.
 create index if not exists crew_notifications_account_idx
