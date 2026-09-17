@@ -9,13 +9,16 @@
  * The rules, and nothing that talks to a database. Two of them:
  *
  *   SETTINGS   a VA's shop is off until they turn it on; they name their own
- *              currency and set four rates. Normalizing that is this file's
- *              job, because the four numbers arrive from a form and a rate of
- *              1e9 is a VA's typo, not a decision.
+ *              currency and set their rates. Normalizing that is this file's
+ *              job, because the numbers arrive from a form and a rate of 1e9 is
+ *              a VA's typo, not a decision.
  *
- *   EARNING    what one approved flight pays. One function, used by both doors
- *              into approval (a staff member pressing the button, and the
- *              auto-approve rule in the PIREP sweep), so the two cannot drift.
+ *   EARNING    what one approved flight pays, line by line. One function, used
+ *              by both doors into approval (a staff member pressing the button,
+ *              and the auto-approve rule in the PIREP sweep), so the two cannot
+ *              drift — and used again by the screen that explains a payment to
+ *              the pilot who got it, so the explanation cannot drift from the
+ *              payment either.
  *
  * The arithmetic that MOVES a balance is deliberately not here: it is in the
  * VA's own database, in crew_shop_buy and crew_shop_credit, because a debit
@@ -33,8 +36,53 @@
  * answer "is there a shop?" on every page load.
  */
 
-/** The four rates, in the order the back office draws them. */
-const RATES = ['perHour', 'perLanding', 'fleetBonus', 'violationPenalty'];
+/* ===========================================================================
+ * THE RATES, IN THE ORDER THE BACK OFFICE DRAWS THEM
+ *
+ * The shop shipped with four: an hourly rate, a per-landing rate, a bonus for
+ * flying the airline's own aircraft, and a penalty per violation. That is a
+ * complete economy and it is a thin one, because three of the four are the same
+ * sentence — "you flew, here is some money" — and the fourth is a fine. Nothing
+ * in it could say that one flight was worth more to the airline than another.
+ *
+ * Every rate added here answers that, and each one is a thing a VA actually
+ * asks its pilots to do:
+ *
+ *   per100Nm     the long haul. An hourly rate already pays for time, but a
+ *                nine-hour sector is a different commitment from six ninety
+ *                minute hops, and distance is the only number that says so.
+ *                Per HUNDRED miles rather than per mile, because a rate a VA
+ *                types as "12" and gets 60,000 from is a rate they typed
+ *                wrong.
+ *   routeBonus   flying the network the VA actually built, rather than any two
+ *                airports. The single most common thing a VA wants and has
+ *                never had a lever for.
+ *   scheduleBonus  turning up for a rostered departure they booked a seat on.
+ *   eventBonus   flying the group flight. The back office has offered this
+ *                field since the shop shipped and nothing has ever paid it —
+ *                see the note on earnFor.
+ *   featuredBonus  flying the route of the week or the route of the day. The
+ *                half of crewFeatured that was a suggestion with nothing
+ *                behind it.
+ *   cleanBonus   landing it with no violations. The mirror of the penalty, and
+ *                the more useful half: a penalty punishes the bad flight, a
+ *                clean bonus is a reason to fly the good one.
+ *
+ * EVERY ONE OF THEM DEFAULTS TO ZERO, so a VA that has run this shop for a year
+ * sees exactly the economy they had until they open the screen and change it.
+ * That is the same rule the original four follow.
+ *
+ * THEY ARE ALL PAID THROUGH THE FLIGHT, which is the rule the whole economy is
+ * built on: an approved flight report is the only currency supply this product
+ * has, because a second one is unauditable and every VA that has hand-rolled an
+ * economy has had the argument about it. Nothing here hands a pilot anything —
+ * it decides what a flight was worth.
+ * ======================================================================== */
+const RATES = [
+    'perHour', 'perLanding', 'per100Nm',
+    'fleetBonus', 'routeBonus', 'scheduleBonus', 'eventBonus', 'featuredBonus', 'cleanBonus',
+    'violationPenalty',
+];
 
 const int = (v, min, max) => {
     const n = Math.round(Number(v));
@@ -44,15 +92,20 @@ const int = (v, min, max) => {
 const str = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
 
 /**
+ * The ceiling on any one rate.
+ *
+ * It is not a policy about how much a VA may pay; it is the difference between
+ * a typo and a balance nobody can ever spend.
+ */
+const MAX_RATE = 1e5;
+
+/**
  * The VA's shop settings, bounded.
  *
  * Every default is the inert one. A VA that has never opened this screen gets a
  * shop that is off, pays nothing and is called "Points" — because the
  * alternative is that deploying this file starts an economy in three hundred
  * airlines that did not ask for one.
- *
- * The ceiling on a rate is 100,000. It is not a policy about how much a VA may
- * pay; it is the difference between a typo and a balance nobody can ever spend.
  */
 function normalizeSettings(cfg) {
     const c = cfg || {};
@@ -64,33 +117,36 @@ function normalizeSettings(cfg) {
             name: str(cur.name, 24) || 'Points',
             short: str(cur.short, 6) || 'pts',
         },
-        earn: {
-            perHour: int(earn.perHour, 0, 1e5),
-            perLanding: int(earn.perLanding, 0, 1e5),
-            fleetBonus: int(earn.fleetBonus, 0, 1e5),
-            violationPenalty: int(earn.violationPenalty, 0, 1e5),
-        },
+        // Bounded one way, from one list: a rate added to RATES above is a rate
+        // that is normalized, saved and paid, and there is no second place to
+        // forget to add it. That is not tidiness — `eventBonus` spent two
+        // releases in the back office being typed, saved and silently dropped
+        // by a normalizer that listed the four rates it knew by hand.
+        earn: RATES.reduce((out, k) => {
+            out[k] = int(earn[k], 0, MAX_RATE);
+            return out;
+        }, {}),
     };
 }
 
 /**
  * The VA record's shop field, in the shape the rest of this file works in.
  *
- * The record stores the six numbers flat (`currencyName`, `perHour`, …) and
+ * The record stores the numbers flat (`currencyName`, `perHour`, …) and
  * everything else here reads them nested, because nested is the shape the panel
  * sends and the shape a reader can see the structure of. One adapter each way,
  * in the one file that knows both, rather than the nesting leaking into every
  * caller.
+ *
+ * The rates are lifted off the record BY NAME FROM `RATES` for the reason
+ * normalizeSettings bounds them that way: one list, so a rate cannot exist in
+ * the schema, be typed in the back office, and then be dropped on the floor by
+ * an adapter nobody remembered to extend.
  */
 const fromRecord = (rec) => normalizeSettings(rec && {
     enabled: rec.enabled,
     currency: { name: rec.currencyName, short: rec.currencyShort },
-    earn: {
-        perHour: rec.perHour,
-        perLanding: rec.perLanding,
-        fleetBonus: rec.fleetBonus,
-        violationPenalty: rec.violationPenalty,
-    },
+    earn: RATES.reduce((out, k) => { out[k] = rec[k]; return out; }, {}),
 });
 
 /**
@@ -108,48 +164,200 @@ function toRecord(patch, current) {
         currency: { ...now.currency, ...(p.currency || {}) },
         earn: { ...now.earn, ...(p.earn || {}) },
     });
-    return {
+    return RATES.reduce((out, k) => {
+        out[k] = next.earn[k];
+        return out;
+    }, {
         enabled: next.enabled,
         currencyName: next.currency.name,
         currencyShort: next.currency.short,
-        perHour: next.earn.perHour,
-        perLanding: next.earn.perLanding,
-        fleetBonus: next.earn.fleetBonus,
-        violationPenalty: next.earn.violationPenalty,
-    };
+    });
 }
 
+/* ===========================================================================
+ * WHAT A FLIGHT IS WORTH
+ *
+ * One function builds the LINES — what each rate contributed and why — and
+ * everything else in the product reads its total. That shape is deliberate and
+ * it replaces an `earnFor` that returned a bare number.
+ *
+ * A bare number is fine right up until somebody asks the only question pilots
+ * actually ask about a shop, which is "why did that flight pay 412?". With four
+ * rates a staff member could work it out on paper. With ten of them, a club
+ * bonus and a streak on top, nobody can — and an economy whose payments cannot
+ * be explained is one every VA eventually turns off.
+ *
+ * So the explanation is not a second implementation for the UI to draw. It is
+ * the SAME arithmetic, and the total is the sum of the lines the pilot is
+ * shown. Two copies of a rule are two rules eventually; this file already
+ * exists because approving by hand and approving by rule must price a flight
+ * identically.
+ * ======================================================================== */
+
+/** What each rate is called where a pilot reads it, and what triggers it. */
+const LINES = [
+    { key: 'perHour', label: 'Flight time', per: (p) => Math.max(0, Number(p.durationMin) || 0) / 60 },
+    { key: 'perLanding', label: 'Landings', per: (p) => Math.max(0, Number(p.landings) || 0) },
+    { key: 'per100Nm', label: 'Distance', per: (p) => Math.max(0, Number(p.distanceNm) || 0) / 100 },
+    { key: 'fleetBonus', label: 'Flown in your fleet', per: (p) => (p.inFleet ? 1 : 0) },
+    { key: 'routeBonus', label: 'On the route network', per: (p) => (p.routeId ? 1 : 0) },
+    { key: 'scheduleBonus', label: 'A rostered departure', per: (p) => (p.scheduleId ? 1 : 0) },
+    /* EVENTS PAY, AND THEY PAY THROUGH THE FLIGHT.
+     *
+     * Every VA wants its group flights to be worth turning up to, and the
+     * obvious way to do that — a button that hands out points for attendance —
+     * is the one thing this economy does not have and must not get.
+     *
+     * So an event pays the way everything else does: the pilot flies it, files
+     * it, a staff member approves it, and the approval carries this on top.
+     * Signing up and not flying pays nothing, which is also the honest answer.
+     *
+     * This rate has been in the back office since the shop shipped. It was
+     * never in the normalizer, so it was typed, saved to the VA record, and
+     * dropped on the floor by fromRecord on the way back out — a VA could set
+     * an event bonus, see it stick, and watch every event flight pay the plain
+     * rate forever. See the note over RATES for the change that makes that
+     * class of bug unrepresentable.
+     */
+    { key: 'eventBonus', label: 'Flown for an event', per: (p) => (p.eventId ? 1 : 0) },
+    { key: 'featuredBonus', label: 'The featured route', per: (p) => (p.isFeatured ? 1 : 0) },
+    /* The mirror of the penalty below, and the more useful half of it: a
+     * penalty punishes a bad flight, where this is a reason to fly a good one.
+     * A flight with no landings is not a clean flight, it is a flight that did
+     * not finish — so it takes one. */
+    {
+        key: 'cleanBonus',
+        label: 'No violations',
+        per: (p) => ((Number(p.violations) || 0) === 0 && (Number(p.landings) || 0) > 0 ? 1 : 0),
+    },
+    { key: 'violationPenalty', label: 'Violations', sign: -1, per: (p) => Math.max(0, Number(p.violations) || 0) },
+];
+
 /**
- * What one approved flight pays.
+ * What one approved flight pays, line by line, before club and streak.
  *
  * Hours are the flight's real duration rather than its credited hours: the two
  * are the same number everywhere in this product, and reading the minutes keeps
  * this honest for a report whose hours a staff member has edited by hand.
  *
+ * `isFeatured` is the one input that is not on the report — a flight does not
+ * know whether the route it flew is this week's pick, because that is a fact
+ * about the airline on the day and crewFeatured owns it. The caller resolves it
+ * and sets the flag; this file stays a function of its arguments.
+ *
  * Floored at zero. A flight with more violations than it was worth pays
  * nothing; it does not take a pilot's existing balance off them, because a
- * penalty is a rate on the flight and not a fine on the account.
+ * penalty is a rate on the flight and not a fine on the account. The floor is
+ * applied to the TOTAL rather than per line, so a VA can see the penalty that
+ * swallowed a flight rather than a list that mysteriously sums to nothing.
  */
-function earnFor(pirep, rates) {
+function earnLines(pirep, rates) {
     const r = normalizeSettings({ earn: rates }).earn;
     const p = pirep || {};
-    const hours = Math.max(0, Number(p.durationMin) || 0) / 60;
-    const landings = Math.max(0, Number(p.landings) || 0);
-    const violations = Math.max(0, Number(p.violations) || 0);
-    const total = (r.perHour * hours)
-        + (r.perLanding * landings)
-        + (p.inFleet ? r.fleetBonus : 0)
-        - (r.violationPenalty * violations);
+    const out = [];
+    for (const line of LINES) {
+        const rate = r[line.key] || 0;
+        if (!rate) continue;
+        const units = line.per(p);
+        if (!units) continue;
+        const amount = Math.round(rate * units) * (line.sign || 1);
+        if (!amount) continue;
+        out.push({ key: line.key, label: line.label, rate, units: Math.round(units * 100) / 100, amount });
+    }
+    return out;
+}
+
+/** The same sum as a single number — what the flight is worth on its own. */
+function earnFor(pirep, rates) {
+    const total = earnLines(pirep, rates).reduce((n, l) => n + l.amount, 0);
     return Math.max(0, Math.round(total));
 }
 
+/* ===========================================================================
+ * AND WHAT THE PILOT IS WORTH
+ *
+ * Two multipliers sit on top of the flight: the pilot's club (crewClubs) and
+ * their streak (crewStreaks). Neither is this file's business to work out — it
+ * is handed the two percentages — but the ORDER they combine in is, because
+ * that is a rule about money and it must have exactly one answer.
+ *
+ * THEY ADD, THEY DO NOT COMPOUND. 20% from Gold and 30% from a streak is 50%,
+ * not 56%. Compounding is the shape nobody can do in their head, and it makes
+ * the value of a club depend on something that has nothing to do with clubs.
+ *
+ * ROUNDED ONCE, AT THE END. Rounding the base, then the club, then the streak
+ * loses a point on most flights, and it is the kind of arithmetic pilots notice
+ * and nobody can explain.
+ * ======================================================================== */
+
 /**
- * The worked example under the four inputs, computed the same way a real flight
- * is. The back office draws its own copy as the rates are typed; this is the
+ * The whole payment for one approved flight, with its working shown.
+ *
+ * `milestone` is a one-off that rides on this flight rather than a rate on it —
+ * a streak milestone is the only thing in the economy that is not proportional
+ * to the flying — so it is added after the multipliers rather than multiplied
+ * by them. A pilot who crosses a year of flying gets what the VA said a year is
+ * worth, not that plus a percentage of it.
+ */
+function payFor(pirep, rates, { clubName = '', clubPercent = 0, streakWeeks = 0, streakPercent = 0, milestone = null } = {}) {
+    const lines = earnLines(pirep, rates);
+    const base = Math.max(0, Math.round(lines.reduce((n, l) => n + l.amount, 0)));
+    const club = Math.max(0, Math.round(Number(clubPercent) || 0));
+    const streak = Math.max(0, Math.round(Number(streakPercent) || 0));
+    const withBonus = Math.round(base * (1 + (club + streak) / 100));
+
+    const extras = [];
+    // Split back out for display, so the two bonuses can be shown separately
+    // even though they were applied together. Attributed proportionally, with
+    // the club taking the rounding remainder: one line has to, and the club is
+    // the older and the more visible of the two.
+    const uplift = withBonus - base;
+    const streakShare = club + streak > 0 ? Math.round((uplift * streak) / (club + streak)) : 0;
+    if (club) {
+        extras.push({
+            key: 'club', label: clubName ? `${clubName} bonus` : 'Club bonus',
+            rate: club, units: 1, amount: uplift - streakShare,
+        });
+    }
+    if (streak) {
+        extras.push({
+            key: 'streak', label: `${streakWeeks}-week streak`,
+            rate: streak, units: 1, amount: streakShare,
+        });
+    }
+    const bonus = Math.max(0, Math.round(Number(milestone && milestone.bonus) || 0));
+    if (bonus) {
+        extras.push({
+            key: 'milestone',
+            label: `${milestone.weeks} weeks running`,
+            rate: bonus, units: 1, amount: bonus,
+        });
+    }
+    return {
+        lines: lines.concat(extras),
+        base,
+        clubPercent: club,
+        streakPercent: streak,
+        milestone: bonus ? { weeks: milestone.weeks, bonus } : null,
+        total: Math.max(0, withBonus + bonus),
+    };
+}
+
+/**
+ * The worked example under the rates, computed the same way a real flight is.
+ * The back office draws its own copy as the rates are typed; this is the
  * server's, so the sentence a VA reads before saving and the sum they get
  * afterwards come from one function.
+ *
+ * An ordinary in-fleet leg off the airline's own network: 2h 15m, one landing,
+ * 980nm, clean. It has to exercise the bonuses to be worth printing — an
+ * example that ignores six of the ten rates would tell a VA their new distance
+ * rate changed nothing.
  */
-const exampleFlight = { durationMin: 135, landings: 1, violations: 0, inFleet: true };
+const exampleFlight = {
+    durationMin: 135, landings: 1, violations: 0, inFleet: true,
+    distanceNm: 980, routeId: 'example',
+};
 const examplePay = (rates) => earnFor(exampleFlight, rates);
 
 /* ===========================================================================
@@ -636,7 +844,7 @@ const publicOrder = (o, { member = null, canManage = false } = {}) => ({
  * whole requirement — the client derives the same thing when the server has not
  * sent one, and this is here so the two agree.
  */
-function wallet(member, { rank = '', club = null } = {}) {
+function wallet(member, { rank = '', club = null, streak = null } = {}) {
     if (!member) return null;
     const pts = member.points || {};
     return {
@@ -648,6 +856,12 @@ function wallet(member, { rank = '', club = null } = {}) {
         // their flying has earned them.
         rank,
         club: club || null,
+        // And the streak, which is neither — it is not a ladder, it does not go
+        // up with volume, and it is the only number on this card that can go
+        // DOWN. Null where the caller could not work one out (see the shop
+        // route: a logbook that will not answer costs the line, not the card),
+        // which a card draws as no streak rather than as a zero.
+        streak: streak || null,
         // What the club was worked out from. On the card so "38h to Gold" can
         // be drawn without a second fetch of the roster row it came from.
         hours: Math.max(0, Math.round((Number(member.hours) || 0) * 10) / 10),
@@ -742,6 +956,8 @@ const publicHolder = (member, { rank = '', club = null, orders = [], isMe = fals
 
 module.exports = {
     RATES,
+    MAX_RATE,
+    LINES,
     CATALOGUE,
     TIERS,
     tierOf,
@@ -751,7 +967,10 @@ module.exports = {
     normalizeSettings,
     fromRecord,
     toRecord,
+    earnLines,
     earnFor,
+    payFor,
+    exampleFlight,
     examplePay,
     publicItem,
     publicOrder,

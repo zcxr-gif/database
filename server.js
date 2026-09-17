@@ -169,6 +169,14 @@ const crewFeatured = require('./crewFeatured');
 // as the modules above: handed a ladder and a number of hours it says which
 // club that is, and every benefit it names is enforced by a route below.
 const crewClubs = require('./crewClubs');
+// v20. And the third ladder, which is the only one that is not a ladder: how
+// many weeks running a pilot has flown. Ranks and clubs both count volume in
+// the end; a streak counts somebody COMING BACK, which is the thing a VA
+// actually needs and had no way to see. Pure like the rest, and — unlike the
+// other two — it holds no state at all: a streak is derived from the logbook
+// every time it is asked for, so there is nothing to store and nothing to
+// reconcile. See crewStreaks.js.
+const crewStreaks = require('./crewStreaks');
 // The join behind the row across the top of a pilot's own page: their rank,
 // their club, their awards and what they have claimed, in one order. Pure like
 // the rest — handed the four, it returns the row.
@@ -706,11 +714,67 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         // nothing a pilot reads ever says "points" unless the VA chose it.
         currencyName: { type: String, trim: true, default: 'Points' },
         currencyShort: { type: String, trim: true, default: 'pts' },
-        // The four rates, applied by crewShop.earnFor when a flight is approved.
+        // The rates, applied by crewShop.earnLines when a flight is approved.
+        // Every one of them is zero until a VA sets it, so a shop that has been
+        // running for a year pays exactly what it paid yesterday when this
+        // deploys. crewShop.RATES is the list these are read and written by —
+        // add a rate there and here, and nothing in between has to be touched.
         perHour: { type: Number, default: 0, min: 0, max: 100000 },
         perLanding: { type: Number, default: 0, min: 0, max: 100000 },
+        // v20. Distance, per hundred miles — the long haul, which an hourly
+        // rate alone cannot tell from six short hops.
+        per100Nm: { type: Number, default: 0, min: 0, max: 100000 },
         fleetBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        // v20. The five bonuses that pay a pilot for flying what the AIRLINE
+        // wants flown rather than simply for flying: its own network, a
+        // rostered departure, an event, the featured route, and a clean one.
+        routeBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        scheduleBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        // Offered by the back office since the shop shipped and paid by nothing
+        // until v20: it was never on this record, so it was typed, saved to
+        // nowhere, and every event flight paid the plain rate. See crewShop's
+        // note over RATES.
+        eventBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        featuredBonus: { type: Number, default: 0, min: 0, max: 100000 },
+        cleanBonus: { type: Number, default: 0, min: 0, max: 100000 },
         violationPenalty: { type: Number, default: 0, min: 0, max: 100000 },
+    },
+
+    // --- The streak (v20) ---
+    //
+    // What a pilot gets for coming BACK. Hours, flights and miles all count the
+    // same thing — volume — and a VA needs to be able to tell the pilot who
+    // flies two hours every week for a year from the one who flew a hundred in
+    // March and was never seen again. See crewStreaks.js for why the period is
+    // a week and why the current week never breaks a run.
+    //
+    // NOTHING IS STORED PER PILOT, here or anywhere. A streak is a function of
+    // the logbook the VA's project already holds, so it costs no column, no
+    // migration and no reconciliation — and it cannot drift out of step with
+    // the flights it is counting. What lives here is only what a streak is
+    // WORTH, which is a decision about how the airline is run and belongs with
+    // the rank ladder, the clubs and the shop's rates for the same reason.
+    //
+    // Inert by default, like the clubs' benefits and the shop's rates: every
+    // pilot has a streak the moment this deploys, and no airline starts paying
+    // for one until somebody sets these.
+    crewStreaks: {
+        // A percentage on every flight, per week of the run, capped.
+        perWeek: { type: Number, default: 0, min: 0, max: 25 },
+        maxBonus: { type: Number, default: 0, min: 0, max: 200 },
+        // Whether a week spent on declared leave holds the run instead of
+        // ending it. On by default: a streak that punishes a pilot for telling
+        // their airline they are away is a streak that stops anyone declaring
+        // leave, which costs the VA the thing leave exists to tell them.
+        freezeOnLeave: { type: Boolean, default: true },
+        // One-off payments, carried by the flight that crosses them. Bounds are
+        // enforced again in crewStreaks.normalize, so a value saved here cannot
+        // mean something different when a flight is paid against it.
+        milestones: [{
+            _id: false,
+            weeks: { type: Number, default: 1, min: 1, max: 208 },
+            bonus: { type: Number, default: 0, min: 0, max: 100000 },
+        }],
     },
 
     // --- The hero (v18) ---
@@ -4611,6 +4675,9 @@ const shopSettingsFor = (va) => crewShop.fromRecord(va && va.crewShop);
 /** The VA's club ladder. Its own five where the VA has written none. */
 const clubsFor = (va) => crewClubs.fromRecord(va && va.crewClubs);
 
+/** What a streak is worth here. Inert on every VA until one sets it. */
+const streaksFor = (va) => crewStreaks.fromRecord(va && va.crewStreaks);
+
 /**
  * One shelf item, with early access applied for the pilot asking.
  *
@@ -4681,6 +4748,24 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
         const clubs = clubsFor(va);
         const club = member ? crewClubs.memberClub(clubs, member.hours) : null;
         const now = Date.now();
+        /* v20. And the streak, which is the one thing on this screen that is
+         * not already in hand: the club came off the roster row, the shelf came
+         * back with the items, and a streak is a count of weeks in a logbook.
+         *
+         * So it is fetched only for a pilot who has one to fetch, it is bounded
+         * to the window crewStreaks can count, and it pulls dates rather than
+         * reports. Best-effort on top of that: a logbook that will not answer
+         * costs the streak line on the card, not the shop.
+         */
+        const streakCfg = streaksFor(va);
+        const streak = member
+            ? await streakForMember(store, member, streakCfg)
+                .then((sum) => (sum ? crewStreaks.publicStreak(sum, streakCfg, { short: settings.currency.short }) : null))
+                .catch((err) => {
+                    console.warn('streak skipped —', (err && err.message) || err);
+                    return null;
+                })
+            : null;
 
         res.json({
             enabled: settings.enabled,
@@ -4699,15 +4784,24 @@ app.get('/api/crew/:slug/shop', async (req, res) => {
             ...(canManage ? {
                 earn: settings.earn,
                 suggested: crewShop.suggestedItems(settings),
+                // What one ordinary flight pays here. The back office draws its
+                // own copy of this as the rates are typed; this is the server's,
+                // so a VA pricing a milestone in flights and a VA reading the
+                // worked example are looking at one number.
+                unit: crewShop.examplePay(settings.earn),
             } : {}),
             items: items.map((i) => shelfItem(i, {
                 clubs, clubKey: club ? club.key : '', canManage, now,
             })),
-            wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '', club }),
+            wallet: crewShop.wallet(member, { rank: (rank && rank.name) || '', club, streak }),
             // The whole ladder, so the shelf can say what a closed item is
             // waiting on and the Clubs tab can draw where this pilot sits
             // without a second round trip for one screen.
             clubs: clubs.map(crewClubs.publicClub),
+            // v20. And what a streak is worth here, for the same reason: the
+            // card draws one, and a page that had to fetch the offer separately
+            // would draw a bonus before it knew whether there was one.
+            streaks: crewStreaks.publicSettings(streakCfg, { short: settings.currency.short }),
         });
     } catch (err) { crewFail(res, err, { log: 'shop read error', message: 'The shop could not be opened.' }); }
 });
@@ -4884,6 +4978,134 @@ app.get('/api/crew/:slug/clubs/suggested', async (req, res) => {
         const { va } = await resolveCrewStore(req.params.slug);
         res.json({ clubs: crewClubs.suggestedBenefits(clubsFor(va)).map(crewClubs.publicClub) });
     } catch (err) { crewFail(res, err, { log: 'clubs suggest error', message: 'Could not work that out.' }); }
+});
+
+/* ===========================================================================
+ * THE STREAK
+ *
+ * The third thing a pilot's flying earns them, and the only one that is not a
+ * ladder: how many weeks in a row they have flown. See crewStreaks.js for why a
+ * week and not a day, why the current week never breaks a run, and why leave
+ * freezes it.
+ *
+ * NOTHING IS STORED PER PILOT. A streak is derived from the logbook every time
+ * it is asked for, which is why these two endpoints are the whole feature: there
+ * is no column, no migration and no nightly job that could get it wrong, and a
+ * VA on the oldest schema this product still supports has streaks the moment
+ * this deploys.
+ *
+ * WHICH IS ALSO WHY THE READ IS NOT FREE, unlike the clubs — a club comes off
+ * the roster row the handler already has. So the window is bounded to what
+ * crewStreaks can count, and the query pulls dates rather than logbooks (see
+ * listFlightDatesForMember). It is one narrow query for one pilot, which is
+ * what the panel asking for it already costs.
+ *
+ * PUBLIC TO READ for the reason the clubs and the rank ladder are: what flying
+ * is worth at this airline is the thing a pilot deciding whether to fly tonight
+ * should be able to read. What is NOT public is anybody else's streak — this
+ * answers for the caller and nobody else.
+ * ======================================================================== */
+
+/**
+ * One pilot's streak, off their own logbook.
+ *
+ * Returns null rather than a zero for somebody with no roster row: "you are on
+ * a nought-week streak" is a claim about a person, and for the public and for
+ * staff with no pilot identity we do not have one. Same rule as the clubs'
+ * `me`.
+ */
+async function streakForMember(store, member, cfg) {
+    if (!member) return null;
+    const flights = await store.listFlightDatesForMember(member._id, {
+        since: crewStreaks.weekStart(crewStreaks.weekIndex(Date.now()) - crewStreaks.MAX_WEEKS),
+    });
+    return crewStreaks.streakFrom(flights, { member, freezeOnLeave: cfg.freezeOnLeave });
+}
+
+app.get('/api/crew/:slug/streaks', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const cfg = streaksFor(va);
+        const settings = crewShop.fromRecord(va && va.crewShop);
+        const me = await crewPilot(req, store).catch(() => null);
+        const member = me && me.memberId ? await store.getMember(me.memberId).catch(() => null) : null;
+        // Best-effort, like every other read of somebody else's database on a
+        // page that has other things to say: a logbook that will not answer
+        // costs the streak card, not the screen.
+        const mine = await streakForMember(store, member, cfg).catch((err) => {
+            console.warn('streak read skipped —', (err && err.message) || err);
+            return null;
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            // What a streak is worth here, so a pilot can read the offer
+            // whether or not they are on one.
+            settings: crewStreaks.publicSettings(cfg, { short: settings.currency.short }),
+            currency: settings.currency,
+            // Whether the shop is on at all. A streak still exists in an
+            // airline with no shop — it is a fact about a logbook — but its
+            // bonuses have nothing to pay into, and a panel that could not tell
+            // the two apart would offer a percentage of nothing.
+            shop: settings.enabled,
+            me: mine ? crewStreaks.publicStreak(mine, cfg, { short: settings.currency.short }) : null,
+            canManage: !(await requireCap(req, req.params.slug, 'settings.branding')).error,
+        });
+    } catch (err) { crewFail(res, err, { log: 'streaks read error', message: 'Could not read the streak.' }); }
+});
+
+/**
+ * What a streak is worth, saved.
+ *
+ * A merge for the two percentages and a replace for the milestone list — see
+ * crewStreaks.toRecord for why the two halves differ. Every field is bounded
+ * again on the way in, so a percentage typed as 1e9 is clamped rather than
+ * saved: that is a VA's typo, not a decision.
+ *
+ * Nothing already paid is re-priced. A flight's earnings are written onto the
+ * report when it is approved and changing a bonus today cannot reach back into
+ * last week's flying — which is also why a VA can raise this without having to
+ * work out what it would have cost them.
+ */
+app.post('/api/crew/:slug/streaks', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va } = await resolveCrewStore(req.params.slug);
+        const next = crewStreaks.toRecord(req.body || {}, (va && va.crewStreaks) || {});
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewStreaks: next } });
+        const settings = crewShop.fromRecord(va && va.crewShop);
+        res.json({ settings: crewStreaks.publicSettings(next, { short: settings.currency.short }) });
+    } catch (err) { crewFail(res, err, { log: 'streaks save error', message: 'That could not be saved.' }); }
+});
+
+/**
+ * A worked set of streak settings, priced against this VA's own rates.
+ *
+ * The same answer the shelf gives to "what does a virtual airline sell" and the
+ * clubs give to "what should Gold be worth": a starting point, RETURNED rather
+ * than written, so a VA taps once and owns ordinary settings they can edit.
+ *
+ * Priced in FLIGHTS rather than in points, which is why it needs the VA's rates
+ * — a milestone of "1,500" is a fortnight to one airline and a lifetime to
+ * another. Staff only: it is a back-office question, and a pilot shown it would
+ * be reading an offer their airline has not agreed to.
+ */
+app.get('/api/crew/:slug/streaks/suggested', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va } = await resolveCrewStore(req.params.slug);
+        const settings = crewShop.fromRecord(va && va.crewShop);
+        const next = crewStreaks.suggested(crewShop.examplePay(settings.earn));
+        res.json({
+            settings: crewStreaks.publicSettings(next, { short: settings.currency.short }),
+            // What one ordinary flight pays here, because it is the unit the
+            // milestones above were priced in and a VA reading "1,400 at three
+            // months" should be able to see where it came from.
+            unit: crewShop.examplePay(settings.earn),
+        });
+    } catch (err) { crewFail(res, err, { log: 'streaks suggest error', message: 'Could not work that out.' }); }
 });
 
 // ---- Turning it on, naming the currency, setting the rates ----
@@ -10866,33 +11088,117 @@ function tellPilotAboutCorrection(va, store, pirep, wasMin) {
 async function creditFlightPoints(store, pirep, va) {
     const settings = crewShop.fromRecord(va && va.crewShop);
     if (!settings.enabled || !pirep || !pirep.memberId) return;
-    const base = crewShop.earnFor(pirep, settings.earn);
-    // v16. And the pilot's club on top, where their club pays one.
-    //
-    // WHICH HOURS. The ones they hold now, INCLUDING this flight — applyPirepHours
-    // credits the hours before it calls this. So the leg that takes somebody
-    // into Gold is paid at Gold. That is deliberate and it is the kinder
-    // reading of an ambiguous moment; it is also the one a pilot would assume,
-    // and being surprised by your own promotion paying less is a bad surprise.
-    //
-    // Best-effort, like the payment it is part of: a roster row that cannot be
-    // read pays the base rate rather than failing the approval. A pilot is
-    // never charged for our not knowing which club they are in.
-    let amount = base;
+    const receipt = await priceFlight(store, pirep, va, settings);
     try {
-        const member = await store.getMember(pirep.memberId);
-        if (member) amount = crewClubs.payWithClub(base, crewClubs.clubFor(crewClubs.fromRecord(va && va.crewClubs), member.hours));
-    } catch (err) {
-        console.warn('club bonus skipped —', (err && err.message) || err);
-    }
-    try {
-        await store.creditFlight(pirep._id, pirep.memberId, amount);
+        await store.creditFlight(pirep._id, pirep.memberId, receipt.total);
     } catch (err) {
         // A shop that cannot pay is a shop to fix, not a reason to refuse a
         // flight its hours. The VA sees this in the panel the next time they
         // open it, with the update button attached.
         console.warn('shop credit skipped —', (err && err.message) || err);
     }
+}
+
+/**
+ * What this flight is worth to this pilot at this moment, with its working.
+ *
+ * Split out from the payment above because the pilot's logbook needs the SAME
+ * answer without a payment happening: "what did that flight pay, and why" is
+ * the only question anybody asks about a shop, and an explanation computed
+ * anywhere other than here would be a second implementation that drifts from
+ * the money within a release.
+ *
+ * EVERY LOOKUP IS BEST-EFFORT AND EVERY FAILURE PAYS THE LOWER, SAFE NUMBER. A
+ * roster row that cannot be read, a network that will not list, a logbook that
+ * times out — none of them may cost a pilot their flight. They cost a bonus,
+ * they are logged, and the approval stands. That is the same rule the club
+ * bonus has always followed.
+ *
+ * AND EVERY LOOKUP IS SKIPPED WHERE ITS RATE IS ZERO, which is the state nearly
+ * every VA is in for nearly all of them. A VA that pays no featured bonus never
+ * fetches a route network to decide one, and a VA with no streak settings never
+ * reads a logbook to count weeks — so approving a flight costs what it always
+ * cost unless the VA has actually asked for more.
+ */
+async function priceFlight(store, pirep, va, settings) {
+    const rates = (settings || crewShop.fromRecord(va && va.crewShop)).earn;
+    const streakCfg = crewStreaks.fromRecord(va && va.crewStreaks);
+
+    // v20. Is this the leg the whole airline is being pointed at this week?
+    // Only asked where the VA pays for it AND the report matched a route at
+    // all: the featured pick is drawn from the network, so a leg that is not on
+    // the network cannot be it, and that test is free.
+    let isFeatured = false;
+    if (rates.featuredBonus && pirep.routeId) {
+        try {
+            const routes = await store.listRoutes({ activeOnly: true });
+            const pins = crewFeatured.normalizePins(va && va.crewFeatured);
+            const flownAt = pirep.flownAt || new Date();
+            // Both periods count. A VA that has set a featured bonus means "the
+            // leg we are pointing people at", and the day's pick is as much
+            // that as the week's.
+            //
+            // Resolved as of WHEN IT WAS FLOWN rather than when it was
+            // approved: a pilot who flew this week's route on Sunday and had it
+            // approved on Tuesday flew the featured route, and telling them
+            // otherwise because staff were slow is the bad half of every rule
+            // in this file.
+            isFeatured = crewFeatured.PERIODS.some((period) => {
+                const pick = crewFeatured.pickFeatured(routes, {
+                    period, now: flownAt, slug: va.slug, pin: pins[period],
+                });
+                return !!(pick && String(pick.route.id || pick.route._id) === String(pirep.routeId));
+            });
+        } catch (err) {
+            console.warn('featured bonus skipped —', (err && err.message) || err);
+        }
+    }
+
+    // v16. The pilot's club, and v20, their streak.
+    //
+    // WHICH HOURS. The ones they hold now, INCLUDING this flight —
+    // applyPirepHours credits the hours before it calls this. So the leg that
+    // takes somebody into Gold is paid at Gold. That is deliberate and it is
+    // the kinder reading of an ambiguous moment; it is also the one a pilot
+    // would assume, and being surprised by your own promotion paying less is a
+    // bad surprise. The streak is counted the same way and for the same reason:
+    // this report is already approved by the time this runs, so the flight that
+    // starts week four is paid at four weeks.
+    let clubName = '';
+    let clubPercent = 0;
+    let streakWeeks = 0;
+    let streakPercent = 0;
+    let milestone = null;
+    try {
+        const member = await store.getMember(pirep.memberId);
+        if (member) {
+            const club = crewClubs.clubFor(crewClubs.fromRecord(va && va.crewClubs), member.hours);
+            clubName = club.name || '';
+            clubPercent = club.earnBonus || 0;
+            if (crewStreaks.pays(streakCfg)) {
+                const flights = await store.listFlightDatesForMember(member._id, {
+                    since: crewStreaks.weekStart(crewStreaks.weekIndex(Date.now()) - crewStreaks.MAX_WEEKS),
+                });
+                const opts = { member, freezeOnLeave: streakCfg.freezeOnLeave };
+                const after = crewStreaks.streakFrom(flights, opts).weeks;
+                streakWeeks = after;
+                streakPercent = crewStreaks.bonusFor(after, streakCfg);
+                // The crossing. See crewStreaks' header for why a milestone is
+                // derived from the logbook with and without this flight rather
+                // than recorded in a column somebody has to keep in step.
+                const before = crewStreaks.streakFrom(
+                    flights.filter((f) => String(f._id || f.id) !== String(pirep._id)), opts,
+                ).weeks;
+                milestone = crewStreaks.milestoneCrossed(before, after, streakCfg);
+            }
+        }
+    } catch (err) {
+        console.warn('flight bonuses skipped —', (err && err.message) || err);
+    }
+
+    return crewShop.payFor({ ...pirep, isFeatured }, rates, {
+        clubName, clubPercent, streakWeeks, streakPercent, milestone,
+    });
 }
 // Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
 // at 0 by the store.
@@ -10995,6 +11301,26 @@ app.get('/api/crew/:slug/me/flying', async (req, res) => {
             // reimplement in markup that cannot see the ladder.
             rank: crewRanks.memberRank(va.ranks, hours, member && member.checksPassed),
             flights: flights.map(publicPirep),
+            /* v20. The streak, counted off the logbook that is already in hand.
+             *
+             * Free here in a way it is nowhere else: this handler has already
+             * fetched every report this pilot has filed, so counting weeks over
+             * them costs one pass and no query. That is also why it is on THIS
+             * screen — the pilot's own flying is where a run of weeks belongs,
+             * next to the flights that made it.
+             *
+             * Sent whether or not the airline pays for one, because a streak is
+             * a fact about a logbook rather than a benefit: the offer attached
+             * to it (`bonus`, `next`) is empty until a VA sets one, and the
+             * count is true either way.
+             */
+            streak: member
+                ? crewStreaks.publicStreak(
+                    crewStreaks.streakFrom(flights, { member, freezeOnLeave: streaksFor(va).freezeOnLeave }),
+                    streaksFor(va),
+                    { short: crewShop.fromRecord(va && va.crewShop).currency.short },
+                )
+                : null,
             totals: {
                 flights: approved.length,
                 pending: flights.filter((f) => f.status === 'pending').length,
@@ -11096,6 +11422,68 @@ app.get('/api/crew/:slug/pireps', async (req, res) => {
         const pireps = await store.listPireps({ status });
         res.json({ pireps: pireps.map(publicPirep), canReview: isManager });
     } catch (err) { crewFail(res, err, { log: 'pireps list error', message: 'Could not load flights.' }); }
+});
+
+/* ===========================================================================
+ * WHY DID THAT FLIGHT PAY THAT?
+ *
+ * The only question anybody ever asks about a VA's shop, and until now there
+ * was no answer to it anywhere in the product. A report carried one number,
+ * `pointsAwarded`, and the ten rates, the club bonus, the streak and the
+ * milestone that produced it were invisible — so a pilot comparing two flights
+ * could see that one paid more and never find out why, and a staff member could
+ * not settle the argument either.
+ *
+ * WHAT IT ANSWERS DEPENDS ON WHETHER THE FLIGHT HAS BEEN PAID.
+ *
+ *   PAID       the lines are the working, and `paid` is what actually landed in
+ *              the wallet — read off the report, not recomputed. Those two can
+ *              differ, and it is important that the endpoint shows it rather
+ *              than hides it: a VA that has changed a rate since approving this
+ *              flight will see a breakdown that does not sum to what was paid,
+ *              and that is the truth. Nothing re-prices history.
+ *   NOT PAID   the same lines, as a QUOTE. What this flight would be worth if
+ *              it were approved right now, which is the number a staff member
+ *              working the review queue actually wants.
+ *
+ * WHO MAY SEE IT: the pilot it belongs to, and anybody who may review flights.
+ * Not the public — what a pilot earns is between them and their airline, which
+ * is the same line crewShop.publicHolder draws between a holding and a receipt.
+ * ======================================================================== */
+app.get('/api/crew/:slug/pireps/:id/earnings', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const settings = crewShop.fromRecord(va && va.crewShop);
+        if (!settings.enabled) return res.status(404).json({ error: 'This airline does not run a shop.' });
+
+        const pirep = await store.getPirep(req.params.id);
+        if (!pirep) return res.status(404).json({ error: 'Flight not found.' });
+
+        const canReview = !(await requireCap(req, req.params.slug, 'flights.review')).error;
+        const me = canReview ? null : await crewPilot(req, store).catch(() => null);
+        const mine = !!(me && me.memberId && pirep.memberId
+            && String(me.memberId) === String(pirep.memberId));
+        if (!canReview && !mine) {
+            return res.status(403).json({ error: 'That is not your flight.' });
+        }
+
+        const receipt = await priceFlight(store, pirep, va, settings);
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            currency: settings.currency,
+            // What the report says it was paid. Null means never paid — which
+            // is a different answer from nought, and the column is nullable
+            // precisely so the two can be told apart.
+            paid: pirep.pointsAwarded == null ? null : Number(pirep.pointsAwarded) || 0,
+            status: pirep.status,
+            ...receipt,
+            // True where this is what the flight WOULD pay rather than what it
+            // did. The screen says "would pay" or "paid" off this one flag,
+            // instead of inferring it from a null and getting it wrong for the
+            // flight that was approved and genuinely paid nothing.
+            quote: pirep.pointsAwarded == null,
+        });
+    } catch (err) { crewFail(res, err, { log: 'pirep earnings error', message: 'Could not work that out.' }); }
 });
 
 /* ===========================================================================

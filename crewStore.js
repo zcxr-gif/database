@@ -1719,6 +1719,34 @@ class SupabaseStore {
         return (rows || []).map(pirepFromRow);
     }
 
+    /**
+     * Just the dates a pilot has flown on, for the streak.
+     *
+     * A separate method rather than listPirepsForMember with a filter, because
+     * the difference is the whole point: a streak needs one column and a status
+     * off every approved report a pilot has, and pulling their entire logbook —
+     * liveries, routes, remarks, five hundred rows of it — to count weeks would
+     * put the heaviest query in the crew center behind the lightest number on
+     * the card.
+     *
+     * `since` bounds it to the window crewStreaks can actually count, so a pilot
+     * with four years of flying costs the same as one with four months.
+     */
+    async listFlightDatesForMember(memberId, { since = null, limit = 1000 } = {}) {
+        if (!memberId) return [];
+        const params = {
+            ...this.scope, member_id: `eq.${memberId}`, status: 'eq.approved',
+            select: 'id,status,flown_at,created_at',
+            order: 'flown_at.desc.nullslast,created_at.desc', limit,
+        };
+        if (since) params.flown_at = `gte.${new Date(since).toISOString()}`;
+        const rows = await this.db.select('crew_pireps', params);
+        return (rows || []).map((r) => ({
+            _id: r.id, status: r.status || 'approved',
+            flownAt: date(r.flown_at), createdAt: date(r.created_at),
+        }));
+    }
+
     // Which of these Infinite Flight flight ids have we already captured? Used
     // by the sync to skip flights without attempting (and failing) an insert.
     async seenFlightIds(flightIds) {
@@ -2974,6 +3002,16 @@ class LegacyStore {
         return models.CrewPirep.find({ ...this.q, memberId: String(memberId) })
             .sort({ flownAt: -1, createdAt: -1 }).limit(limit).lean();
     }
+    // The same window, off the managed collection. Narrowed with select() for
+    // the reason the Supabase store narrows its own: this is a count of weeks,
+    // not a logbook.
+    async listFlightDatesForMember(memberId, { since = null, limit = 1000 } = {}) {
+        if (!memberId) return [];
+        const q = { ...this.q, memberId: String(memberId), status: 'approved' };
+        if (since) q.flownAt = { $gte: new Date(since) };
+        return models.CrewPirep.find(q).select('status flownAt createdAt')
+            .sort({ flownAt: -1, createdAt: -1 }).limit(limit).lean();
+    }
     async seenFlightIds(flightIds) {
         const ids = (flightIds || []).filter(Boolean);
         if (!ids.length) return new Set();
@@ -3314,7 +3352,7 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // pilot callsign is built from the VA's registered mask (see crewCallsign.js),
 // and every handler that issues or validates one already resolves the VA
 // through here. None of the three is a secret.
-const SELECT = '_id slug callsign callsigns callsignMatch callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewClubs crewFeatured crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
+const SELECT = '_id slug callsign callsigns callsignMatch callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewClubs crewStreaks crewFeatured crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);
