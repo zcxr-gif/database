@@ -91,6 +91,9 @@ const crewAccounts = require('./crewAccounts');
 // credential once it has been used, thrown away or left to age out. Nothing
 // outside this module may read the stored password directly. See crewInvite.js.
 const crewInvite = require('./crewInvite');
+// Forgotten passwords: the token's lifetime, the rate limiter, and the one
+// answer every request gets. See crewPasswordReset.js.
+const crewPasswordReset = require('./crewPasswordReset');
 
 // Roster and route network in and out as CSV — the same columns both ways, so a
 // VA can take their data to a spreadsheet and bring it back. See crewCsv.js.
@@ -13715,6 +13718,409 @@ app.post('/api/crew/:slug/account/password', async (req, res) => {
         if (out.error) return res.status(out.status).json({ error: out.error });
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'crew password change error', message: 'Could not change the password.' }); }
+});
+
+/* ===========================================================================
+ * FORGOTTEN PASSWORDS
+ *
+ * A pilot who forgot their password had exactly one route back: message the
+ * airline. A staff member then opened the dashboard, found them, issued a
+ * temporary password, copied the message and sent it — usually not that day,
+ * and usually not the staff member who was asked.
+ *
+ * There are three ways back and the server picks whichever THIS airline and
+ * THIS account can support — Discord if they linked it, a one-time email link
+ * if the VA runs a provider and the account has an address, and otherwise a
+ * request that lands in the crew centre's Logins tab as one press.
+ *
+ * THE CALLER IS NEVER TOLD WHICH. See the note on the request route: that one
+ * property is what the rest of this is shaped around, and crewPasswordReset.js
+ * holds every decision that must not leak out of it.
+ * ======================================================================== */
+
+// The caller, for the rate limiter. Hashed, and never stored — it is a key in
+// an in-memory counter for an hour, which is the least we can keep and still
+// stop one machine walking a username list.
+const resetCaller = (req) => hashIp(req.ip || req.connection?.remoteAddress);
+
+/* A crew centre that cannot do resets at all.
+ *
+ * Answered as 404 rather than the store's own 409, and this is the ONE case
+ * the sign-in page is allowed to tell apart, because it is the difference
+ * between waiting for an email that is coming and waiting for one that is not.
+ * The page says so and points at the staff — the only honest answer while the
+ * VA is on an older schema or still on our managed store.
+ *
+ * Every OTHER outcome of a request — found, not found, has an email, has none,
+ * rate-limited — is the same 200. */
+function resetsUnavailable(res, err) {
+    // `va_not_found` joins it because the two mean the same thing to a pilot
+    // waiting at a sign-in page: there is nothing coming here, go and ask a
+    // person. Neither leaks anything — a slug is public, and the answer is the
+    // same for every account at that slug.
+    if (err instanceof crewStore.CrewStoreError
+        && (err.code === 'store_resets_missing' || err.code === 'va_not_found')) {
+        res.status(404).json({ error: err.message, code: err.code });
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Which account somebody means by what they typed.
+ *
+ * A username or an email address, because a pilot who has forgotten their
+ * password is quite likely to have forgotten which of the two they were given.
+ * The email match is done in JS over the account list for the reason
+ * crewAccounts.findByDisplayName is: the store interface has no email filter,
+ * rosters are hundreds and not millions, and this runs once per request from
+ * somebody who is already waiting.
+ *
+ * An inactive account matches and then goes nowhere: a suspended pilot is not
+ * told they are suspended by a reset form, and is not let back in by one
+ * either.
+ */
+async function resetTarget(store, who) {
+    const typed = String(who || '').trim().slice(0, 120).toLowerCase();
+    if (!typed) return null;
+    const byName = await store.getAccountByUsername(typed).catch(() => null);
+    if (byName) return byName;
+    if (!typed.includes('@')) return null;
+    const all = await store.listAccounts({ limit: 5000 }).catch(() => []);
+    return (all || []).find((a) => String(a.email || '').toLowerCase() === typed) || null;
+}
+
+/* POST /api/crew/:slug/forgot-password  { who }  ->  { ok: true }
+ *
+ * THE ANSWER IS THE SAME EVERY TIME, AND EVERYTHING ELSE RESTS ON THAT.
+ *
+ * A route that answers "check your email" for one username and "we have told
+ * your staff" for another is a route that will tell a stranger which usernames
+ * exist at this airline, and which of them have an address on file. It takes
+ * about four minutes to turn that into a list of an airline's pilots.
+ *
+ * So: same status, same body, whether or not the account exists, whether or
+ * not it has an email address, whether the send worked, and whether the caller
+ * is over the rate limit — a 429 would be the same oracle by another route.
+ * The page carries the one sentence that is true of all of them.
+ *
+ * Same TIMING, too — see the note at the reply itself. The email is an HTTPS
+ * round trip to somebody else's API, so a route that awaited it would answer
+ * the question in how long it took instead of in what it said.
+ */
+app.post('/api/crew/:slug/forgot-password', async (req, res) => {
+    // One answer, built once, returned from every path below.
+    const said = () => { res.set('Cache-Control', 'no-store'); res.json({ ok: true }); };
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+
+        /* A PROJECT THAT CANNOT RECORD A RESET MUST NOT BE TOLD ONE HAPPENED,
+         * so this is probed FIRST — before the account is even looked up, so
+         * the 404 does not depend on whether the username was real — and it is
+         * probed with a read rather than trusted from the schema version,
+         * because the read is the thing that will actually fail.
+         * listPasswordRequests touches every reset column; on a pre-v19
+         * project, or on our managed store, it raises store_resets_missing,
+         * which is the 404 above. */
+        await store.listPasswordRequests({ limit: 1 });
+
+        const account = await resetTarget(store, req.body?.who);
+
+        // The rate limit is applied to what was typed either way: a caller
+        // walking a list must burn their own allowance on the misses, or the
+        // limit is one they can stay under by being wrong.
+        if (!crewPasswordReset.allow(account ? String(account._id) : '', resetCaller(req))) return said();
+
+        /* ANSWERED NOW, AND THE WORK HAPPENS AFTER.
+         *
+         * Not an optimisation — it is the last hole in "the page is never told
+         * which". Everything above is the same two store reads whoever asked;
+         * everything below is not. Sending an email is an HTTPS round trip to
+         * Resend or Mailgun, and a route that replies in 400ms for an address
+         * on file and 30ms for a username that does not exist has answered the
+         * question in the timing instead of the body.
+         *
+         * So the reply goes out at the same point on every path, and the
+         * routing, the token and the send are detached. Nothing below can
+         * change what the pilot was told, which is precisely why there is
+         * nothing to wait for — and this process is a long-lived Express
+         * server, the same assumption every other fire-and-forget crew email
+         * in this file already makes.
+         */
+        said();
+
+        Promise.resolve().then(async () => {
+            // Nothing matched. The one path that does nothing at all, and the
+            // caller cannot tell it apart from the others.
+            if (!account) return;
+
+            /* A STAFF MEMBER'S OWN PILOT SIDE HAS NO PASSWORD BY CONSTRUCTION,
+             * and a reset must not invent one. Minting a password here would
+             * not restore access, it would CREATE a door to a colleague's pilot
+             * identity that never existed — see the note on the staff reset
+             * route above. They sign in with their staff account or with
+             * Discord, and this request records nothing. */
+            if (account.portalAccountId) return;
+            // A suspended login is not a way back in, and saying so would say it.
+            if (account.active === false) return;
+
+            const signInUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`;
+            const emailCfg = isEmail(account.email) ? await crewEmailConfigFor(va._id) : null;
+
+            // No provider, or no address: this one is the staff's, and the
+            // reason is recorded because "yours to pass on" is only actionable
+            // with it.
+            if (!emailCfg) {
+                await store.updateAccount(account._id, crewPasswordReset.requestPatch({
+                    needsStaff: true,
+                    reason: isEmail(account.email)
+                        ? crewPasswordReset.REASON.EMAIL_FAILED
+                        : crewPasswordReset.REASON.NO_EMAIL,
+                }));
+                return;
+            }
+
+            /* The email path. The token is minted and STORED FIRST, then sent:
+             * a link that arrives before the row can answer for it is a link
+             * that does not work, and of the two orders this is the one whose
+             * failure mode is a stored token nobody ever uses. */
+            const { token, hash } = crewPasswordReset.mintToken();
+            await store.updateAccount(account._id, crewPasswordReset.requestPatch({ hash }));
+
+            const link = crewPasswordReset.resetUrl(signInUrl, token);
+            const sent = await sendCrewEmailDetailed(emailCfg, {
+                to: account.email,
+                subject: `Reset your ${va.name || 'crew center'} password`,
+                html: crewEmailHtml({
+                    vaName: va.name, accent: va.crewAccent, heading: 'Get back into your crew center',
+                    bodyHtml: `Somebody — we hope you — asked for a new password for <b>${escHtml(account.username)}</b>.`
+                        + `<br><br>This link works once, and only for the next ${crewPasswordReset.TTL_MINUTES} minutes.`
+                        + `<br><br><span style="color:#6b7280">If it was not you, you can ignore this. `
+                        + `Your password has not changed, and it will not change unless somebody uses the link below.</span>`,
+                    button: { url: link, label: 'Choose a new password' },
+                }),
+            });
+
+            /* The send failed — a wrong API key, an unverified domain, a
+             * bounced address. The pilot is waiting for an email that is never
+             * arriving, so the request becomes the staff's with the reason
+             * attached, and the token goes: leaving a live link behind for a
+             * message nobody received is a credential with no purpose. */
+            if (!sent.ok) {
+                await store.updateAccount(account._id, crewPasswordReset.requestPatch({
+                    needsStaff: true, reason: crewPasswordReset.REASON.EMAIL_FAILED,
+                }));
+            }
+        }).catch((err) => {
+            // The pilot has already been told what everybody is told. This is
+            // ours to see and nobody else's, and it must not become an unhandled
+            // rejection on a route that answers a stranger.
+            console.error('crew forgot-password (after reply) error:', err);
+        });
+    } catch (err) {
+        if (resetsUnavailable(res, err)) return;
+        /* EVEN A FAULT ANSWERS THE SAME THING, as long as it is ours. A store
+         * that is unreachable for one username and answering for another is the
+         * oracle again, in the one place nobody would think to look for it. It
+         * is logged here, where it belongs, and the pilot is told what they are
+         * told in every other case. */
+        console.error('crew forgot-password error:', err);
+        return said();
+    }
+});
+
+/* GET /api/crew/:slug/password-reset/:token  ->  { ok, name }
+ *
+ * Asked by the page BEFORE it draws a form, because a form that cannot work is
+ * worse than a sentence: somebody types a password twice, presses the button
+ * and only then finds out the link was spent.
+ *
+ * The name goes out because the pilot is about to set a password and ought to
+ * see whose it is — and because holding the link is already proof of being the
+ * person it was emailed to. Nothing else does: no username, no address.
+ */
+app.get('/api/crew/:slug/password-reset/:token', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccountByResetToken(crewPasswordReset.hashToken(req.params.token));
+        res.set('Cache-Control', 'no-store');
+        // One answer for a token that never existed, one that has been spent
+        // and one that has aged out. They are the same thing to the person
+        // holding it, and the answer to all three is to ask for another.
+        if (!account || !crewPasswordReset.isLive(account) || account.active === false) {
+            return res.status(410).json({
+                error: 'That link has been used already, or it has expired. Ask for another one.',
+                code: 'reset_link_dead',
+            });
+        }
+        res.json({ ok: true, name: account.displayName || account.username || '' });
+    } catch (err) {
+        if (resetsUnavailable(res, err)) return;
+        crewFail(res, err, { log: 'crew reset check error', message: 'Could not check that link.' });
+    }
+});
+
+/* POST /api/crew/:slug/password-reset/:token  { newPassword }  ->  { ok, username }
+ *
+ * THE PILOT IS DELIBERATELY NOT SIGNED IN BY THIS. The reset proves somebody
+ * held the link; typing the password once on the way in proves they know what
+ * they just chose, which is the cheapest possible confirmation and the reason
+ * the reply carries the username rather than a session.
+ *
+ * Single use: the token is cleared in the SAME write as the new hash, so there
+ * is no window in which the password has changed and the link is still live,
+ * and none in which the link is spent but the password is not set — which would
+ * lock the pilot out with their one link gone.
+ *
+ * Stated precisely: the check and the write are not one atomic operation, so
+ * two requests racing on the same token can both land, and the second password
+ * wins. That is the same person, with the same link, choosing twice — not a way
+ * in for anybody else — and closing it would need a conditional update the
+ * store interface has not got. Once the write lands the link is dead for good.
+ *
+ * crewAccounts.changePassword is not used here on purpose: it requires the
+ * current password, which is the one thing this pilot has not got.
+ */
+app.post('/api/crew/:slug/password-reset/:token', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccountByResetToken(crewPasswordReset.hashToken(req.params.token));
+        res.set('Cache-Control', 'no-store');
+        if (!account || !crewPasswordReset.isLive(account) || account.active === false) {
+            return res.status(410).json({
+                error: 'That link has been used already, or it has expired. Ask for another one.',
+                code: 'reset_link_dead',
+            });
+        }
+        // The page checks the length too. It is checked again in there because
+        // the page is not the only thing that can post to this route — and the
+        // hashing lives in crewAccounts.js because that module owns passwords
+        // and is the only place that writes one.
+        const out = await crewAccounts.setPasswordFromReset(store, account, req.body?.newPassword);
+        if (out.error) return res.status(out.status).json({ error: out.error });
+        res.json({ ok: true, username: out.username });
+    } catch (err) {
+        if (resetsUnavailable(res, err)) return;
+        crewFail(res, err, { log: 'crew reset error', message: 'Could not set that password.' });
+    }
+});
+
+/* GET /api/crew/:slug/password-requests  ->  { requests: [...] }
+ *
+ * The half that still reaches a human: the pilots whose request could not be
+ * emailed. Staff see who asked, how long ago, and why it reached them at all.
+ *
+ * A crew centre on an older database gets the 404 above, which the dashboard
+ * draws as a tab with one fewer thing in it rather than an error where the list
+ * should be.
+ */
+app.get('/api/crew/:slug/password-requests', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const rows = await store.listPasswordRequests();
+        res.set('Cache-Control', 'no-store');
+        res.json({ requests: (rows || []).map(crewPasswordReset.staffRequest) });
+    } catch (err) {
+        if (resetsUnavailable(res, err)) return;
+        crewFail(res, err, { log: 'crew password requests error', message: 'Could not load password requests.' });
+    }
+});
+
+/* POST /api/crew/:slug/password-requests/:id  { action: 'issue' | 'dismiss' }
+ *
+ * One press. `issue` mints a password, emails it where that is possible, and
+ * hands back the message staff paste where it is not — the same Copy message
+ * invitations already use, because this is the same job arriving a different
+ * way.
+ *
+ * `dismiss` TOUCHES NOTHING but the request. They keep the password they have
+ * and can ask again from the sign-in page, which is what makes dismissing safe
+ * to press on something that turned out to be nobody's problem.
+ */
+app.post('/api/crew/:slug/password-requests/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    const action = String(req.body?.action || '').trim();
+    if (action !== 'issue' && action !== 'dismiss') {
+        return res.status(400).json({ error: 'Issue a password, or dismiss the request.' });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const account = await store.getAccount(req.params.id);
+        if (!account) return res.status(404).json({ error: 'That pilot’s login no longer exists.' });
+        res.set('Cache-Control', 'no-store');
+
+        if (action === 'dismiss') {
+            // The password is not touched. Only the request goes.
+            await store.updateAccount(account._id, crewPasswordReset.clearPatch());
+            return res.json({ ok: true });
+        }
+
+        // The same guard as the staff reset route, for the same reason: that
+        // row has no password by construction and issuing one would create a
+        // way into a colleague's pilot identity rather than restore access.
+        if (account.portalAccountId) {
+            return res.status(409).json({
+                error: 'That login belongs to a staff member’s own pilot account. It has no password to reset — they sign in with their staff account, or with Discord.',
+                code: 'staff_owned',
+            });
+        }
+
+        // resetPassword sets mustChangePassword, exactly as an invitation does,
+        // so a temporary password a staff member has read is replaced on first
+        // sign-in — and it clears the request, which is what takes this card
+        // out of the tab's count.
+        const out = await crewAccounts.resetPassword(store, account._id);
+        if (!out) return res.status(404).json({ error: 'That pilot’s login no longer exists.' });
+
+        const signInUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`;
+        const message = crewPasswordReset.buildIssuedMessage({
+            vaName: va.name, name: account.displayName, username: out.username,
+            password: out.password, signInUrl,
+        });
+
+        // Emailed as well where that is possible, because the pilot who could
+        // not be emailed a LINK may still be reachable — a provider that was
+        // not configured when they asked may be configured now.
+        let emailed = false;
+        if (isEmail(account.email)) {
+            const cfg = await crewEmailConfigFor(va._id);
+            if (cfg) {
+                emailed = (await sendCrewEmailDetailed(cfg, {
+                    to: account.email,
+                    subject: `Your new ${va.name || 'crew center'} password`,
+                    html: crewEmailHtml({
+                        vaName: va.name, accent: va.crewAccent, heading: 'Here is a new password',
+                        bodyHtml: `${escHtml(va.name || 'Your airline')} has issued you a new crew center password.`
+                            + crewCredentialsHtml({ username: out.username, password: out.password, signInUrl }),
+                    }),
+                })).ok;
+            }
+        }
+
+        /* The password goes out ONCE, here, and is not stored anywhere — which
+         * is the difference between this and an invitation. An invitation is
+         * read back hours later by whoever picks the job up, so crewInvite.js
+         * keeps a copy and accepts the cost of doing so. This one is on the
+         * screen of the person who pressed the button, who is about to paste it
+         * to the pilot, so there is nothing to gain by keeping it. */
+        res.json({
+            request: {
+                id: account._id,
+                name: account.displayName || '',
+                username: out.username,
+                email: account.email || '',
+                password: out.password,
+                message,
+                emailed,
+            },
+        });
+    } catch (err) {
+        if (resetsUnavailable(res, err)) return;
+        crewFail(res, err, { log: 'crew password request action error', message: 'Could not do that.' });
+    }
 });
 
 // Staff: read the crew webhook state (never the secret URL itself, just a hint).

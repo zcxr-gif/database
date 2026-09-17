@@ -308,6 +308,64 @@ create unique index if not exists crew_accounts_portal_idx
 alter table crew_accounts add column if not exists terms_version     text not null default '';
 alter table crew_accounts add column if not exists terms_accepted_at timestamptz;
 
+-- v19. Getting back in without asking a human.
+--
+-- A pilot who forgot their password had exactly one route back: message the
+-- airline, and wait for whoever next opened the dashboard to find them, issue a
+-- temporary password and send it. It is the commonest piece of admin a VA does
+-- and the slowest thing that happens to one of its pilots.
+--
+-- These five columns are the whole of what the database has to remember for
+-- that to stop being a person's job:
+--
+--   reset_token_hash        SHA-256 of the one-time link, never the link. A
+--                           reset link is a bearer credential for this account,
+--                           and a readable copy of one in a row is a password
+--                           by another name. It is emailed once and cannot be
+--                           recovered from here afterwards — the same trade
+--                           password_hash makes, and deliberately NOT the one
+--                           crew_applications.invite_password makes, because
+--                           that one exists to be read out by a staff member.
+--   reset_token_expires_at  when the link stops working. A link with no end
+--                           date is a second password.
+--   reset_requested_at      when they asked. What the Logins tab counts
+--                           "waiting 4 minutes" from.
+--   reset_needs_staff       true only for the requests that could not be
+--                           emailed. This is what makes the staff queue a
+--                           queue: a pilot whose link went out is not in it.
+--   reset_reason            why it reached a human — 'no_email' or
+--                           'email_failed'. Stored because "this one is yours
+--                           to pass on" is only actionable with the reason.
+--
+-- There is at most ONE outstanding request per account: a new request replaces
+-- whatever was here, so the newest link is the only live one. That is why there
+-- is no crew_password_resets table — a row per account is the shape of the
+-- thing, and a table would also need its own RLS, its own purge entry and its
+-- own answer to "what happens when the account is deleted". Here, a deleted
+-- account takes its reset with it.
+--
+-- NOT droppable in crewStore.js's LATE_COLUMNS, for the reason discord_id is
+-- not: on a request, the column IS the write. Drop it and the update succeeds,
+-- stores nothing, and the pilot is told a way back in is on its way. It never
+-- arrives, and nothing anywhere says why.
+alter table crew_accounts add column if not exists reset_token_hash       text not null default '';
+alter table crew_accounts add column if not exists reset_token_expires_at timestamptz;
+alter table crew_accounts add column if not exists reset_requested_at     timestamptz;
+alter table crew_accounts add column if not exists reset_needs_staff      boolean not null default false;
+alter table crew_accounts add column if not exists reset_reason           text not null default '';
+
+-- The link lookup runs on an UNAUTHENTICATED route, once per press of a reset
+-- link, so it is the one read here that must not become a scan. Partial on the
+-- non-empty hashes: every account that has not asked holds '' in this column,
+-- and indexing those is indexing the whole roster.
+create index if not exists crew_accounts_reset_token_idx
+    on crew_accounts (va_slug, reset_token_hash) where reset_token_hash <> '';
+
+-- The staff queue. Partial for the same reason, and on the same table the
+-- roster drawer is already reading.
+create index if not exists crew_accounts_reset_staff_idx
+    on crew_accounts (va_slug, reset_requested_at) where reset_needs_staff;
+
 -- ----------------------------------------------------------------------------
 -- Membership applications submitted through the crew center's join form.
 --
@@ -2106,5 +2164,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 18)
+insert into crew_schema_info (id, version) values (1, 19)
 on conflict (id) do update set version = excluded.version, updated_at = now();
