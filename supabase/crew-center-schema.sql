@@ -881,6 +881,20 @@ create index if not exists crew_pireps_schedule_idx
 -- one.
 alter table crew_pireps add column if not exists points_awarded int;
 
+-- v18. When a staff member last corrected this report by hand, and who did it.
+--
+-- Staff can now open any pilot's logbook and edit a flight's duration and
+-- landings -- which they need, because Infinite Flight's own record is
+-- occasionally wrong and the alternative was deleting the report and asking the
+-- pilot to file it again. A logbook that can be edited is a logbook that has to
+-- say when it was: hours that change with nothing anywhere to point at are the
+-- same class of problem as a rejection with no reason.
+--
+-- Both are droppable (see LATE_COLUMNS in crewStore.js): a correction written
+-- without them is still a correction, and the hours still move.
+alter table crew_pireps add column if not exists edited_at timestamptz;
+alter table crew_pireps add column if not exists edited_by text not null default '';
+
 -- ----------------------------------------------------------------------------
 -- The link to Infinite Flight Live. v13.
 --
@@ -1281,6 +1295,23 @@ create table if not exists crew_shop_items (
 );
 create index if not exists crew_shop_items_va_idx
     on crew_shop_items (va_slug, active, created_at);
+
+-- v18. Two presentation columns, both additive and both with inert defaults,
+-- so every item written before they existed is a valid row on the new shape.
+--
+-- `item_group` and not `group`: `group` is a reserved word in SQL, and a column
+-- called one is a column every hand-written query has to quote forever.
+--
+-- `tier` is how loudly the shelf draws a thing -- 'standard' (an ordinary tile,
+-- and the default, which is what every existing item already was), 'showcase'
+-- (a thing whose whole value is that other people can see it, drawn wide) and
+-- 'flagship' (a thing that changes the AIRLINE rather than the pilot, drawn as
+-- a band at the top of the shelf). The check is deliberately permissive about
+-- an empty string: the backend bounds the value on the way in and reads an
+-- unrecognised one as 'standard', and a constraint that rejects a row is a
+-- worse failure here than a tile drawn small.
+alter table crew_shop_items add column if not exists item_group text not null default '';
+alter table crew_shop_items add column if not exists tier       text not null default 'standard';
 
 -- An order is a receipt, so it keeps its own copy of the name and the price.
 -- The item it came from may be edited, repriced or taken off the shelf
@@ -2059,5 +2090,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 17)
+insert into crew_schema_info (id, version) values (1, 18)
 on conflict (id) do update set version = excluded.version, updated_at = now();

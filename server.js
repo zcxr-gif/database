@@ -170,6 +170,11 @@ const crewClubs = require('./crewClubs');
 // their club, their awards and what they have claimed, in one order. Pure like
 // the rest — handed the four, it returns the row.
 const crewBadges = require('./crewBadges');
+// What the band across the top of a pilot's crew centre is made of. Pure, like
+// the rest: handed a VA's saved choices it returns a bounded set that cannot
+// produce a broken hero, and the default of every field is the hero as it
+// shipped — so a VA who never opens the screen cannot tell it exists.
+const crewHero = require('./crewHero');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -703,6 +708,33 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         perLanding: { type: Number, default: 0, min: 0, max: 100000 },
         fleetBonus: { type: Number, default: 0, min: 0, max: 100000 },
         violationPenalty: { type: Number, default: 0, min: 0, max: 100000 },
+    },
+
+    // --- The hero (v18) ---
+    //
+    // How the band across the top of the pilot crew centre is put together.
+    // Here, beside the layout and the accent, for the reason they are: the
+    // crew centre reads it BEFORE it has a session, because the hero is the
+    // first paint and a setting it has to wait for a login to read is a hero
+    // that draws twice.
+    //
+    // Flat, not nested, and deliberately: a nested object on a Mongoose
+    // document has to be marked modified, and a field nobody remembers to mark
+    // is a setting that silently does not save.
+    //
+    // EVERY DEFAULT IS THE HERO AS IT SHIPPED. Bounds are enforced again in
+    // crewHero.normalize — the module that also applies them — so a value
+    // saved here cannot mean something different when the page draws it.
+    crewHero: {
+        backdrop: { type: String, trim: true, default: 'banner' },
+        height: { type: String, trim: true, default: 'standard' },
+        align: { type: String, trim: true, default: 'left' },
+        brand: { type: Boolean, default: true },
+        crest: { type: Boolean, default: true },
+        badges: { type: Boolean, default: true },
+        actions: { type: String, trim: true, default: 'both' },
+        line: { type: String, trim: true, default: '' },
+        dim: { type: Number, default: 55, min: 10, max: 90 },
     },
 
     // --- The clubs (v16) ---
@@ -5044,6 +5076,14 @@ function cleanShopItem(b, existing) {
     return {
         name: String(src.name || '').trim().slice(0, 60),
         desc: String(src.desc || '').trim().slice(0, 240),
+        // The shelf a VA has sorted this onto. Free text and theirs entirely —
+        // the picker offers whatever groups their shelf already uses, which is
+        // the only list that could ever be right for three hundred airlines.
+        group: String(src.group || '').trim().slice(0, 40),
+        // How loudly the shelf draws it. Bounded by the module that also reads
+        // it, so an unrecognised value is an ordinary tile rather than an item
+        // that fails to save. See TIERS in crewShop.js.
+        tier: crewShop.tierOf(src.tier),
         // Rendered in an <img> on a page a pilot opens, so anything that is not
         // plainly an https URL is dropped rather than passed through — the rule
         // the branding fields and partner logos already follow.
@@ -14814,7 +14854,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -14855,6 +14895,11 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
             loginBackdrop: ad.loginBackdrop || 'auto',
+            // How this VA has built the band across the top of its crew
+            // centre. Public for the same reason the layout is: it decides the
+            // first paint, and a hero that waits for a session is a hero that
+            // draws once as ours and again as theirs.
+            hero: crewHero.publicHero(ad.crewHero),
             // Whether this deployment can offer "Continue with Discord" at all.
             // Read by the sign-in page BEFORE anybody has a session, which is
             // the only reason it is out here: a button that leaves for Discord

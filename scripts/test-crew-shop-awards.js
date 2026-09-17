@@ -145,9 +145,39 @@ const daysAgo = (n) => new Date(NOW - (n * DAY)).toISOString();
     check('anything absurd to hold two of is capped at one',
         ['callsign', 'registration', 'route', 'livery', 'destination', 'leave']
             .every(id => list.find(i => i.id === id).limitPerPilot === 1));
-    check('everything else is unlimited stock, because a role does not run out',
-        list.filter(i => !['registration', 'livery', 'lead', 'feature'].includes(i.id))
-            .every(i => i.stock === -1));
+    /* Derived from the catalogue rather than from a list typed here. The
+       hard-coded version of this broke the day the catalogue grew, which is
+       the wrong thing for a test to do: the rule is "stocked only where the
+       entry says so", not "these four ids". */
+    {
+        const stocked = new Set(crewShop.CATALOGUE.filter(c => c.stock !== undefined).map(c => c.id));
+        check('everything else is unlimited stock, because a role does not run out',
+            list.every(i => (stocked.has(i.id) ? i.stock >= 0 : i.stock === -1)));
+    }
+
+    /* v18. How loudly the shelf draws a thing. The tier is presentation and it
+       has one rule that matters: the inert value is what an entry with no tier
+       gets, because every item on every shelf saved before tiers existed has
+       no tier and must keep being an ordinary tile. */
+    check('a thing with no tier is an ordinary tile',
+        crewShop.tierOf(undefined) === 'standard'
+        && crewShop.tierOf('') === 'standard'
+        && crewShop.tierOf('FLAGSHIP') === 'flagship'
+        && crewShop.tierOf('nonsense') === 'standard');
+    check('every suggestion carries a tier the shelf knows how to draw',
+        list.every(i => crewShop.TIERS.includes(i.tier)));
+    check('the flagships are the things that change the airline, and they are scarce',
+        list.filter(i => i.tier === 'flagship').length >= 4
+        && list.filter(i => i.tier === 'flagship').every(i => i.stock > 0 && i.limitPerPilot === 1));
+    check('…and they cost more than anything a pilot buys for themselves',
+        Math.min(...list.filter(i => i.tier === 'flagship').map(i => i.price))
+        > Math.max(...list.filter(i => i.tier !== 'flagship').map(i => i.price)));
+    check('a shelf item carries its section and its tier to whoever draws it',
+        (() => {
+            const pub = crewShop.publicItem({ _id: 'x', name: 'A', group: 'Liveries', tier: 'showcase' });
+            return pub.group === 'Liveries' && pub.tier === 'showcase'
+                && crewShop.publicItem({ _id: 'y', name: 'B' }).tier === 'standard';
+        })());
 
     /* Nothing here is written into anybody's shop. Reading the catalogue is the
        whole of what this module does with it. */

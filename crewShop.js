@@ -206,8 +206,45 @@ const examplePay = (rates) => earnFor(exampleFlight, rates);
  *      to hold two of carries its own limit, and anything genuinely scarce
  *      carries stock.
  *
- * `group` is the shelf it sits on in the picker, so twelve suggestions read as
- * five short lists rather than one long one.
+ * `group` is the shelf it sits on in the picker, so the suggestions read as a
+ * handful of short lists rather than one long one.
+ *
+ * AND `tier` IS HOW LOUDLY IT IS DRAWN
+ * -----------------------------------
+ * The shelf shipped as one grid of identical tiles, which is the right shape
+ * for a shop where everything costs about the same and the wrong one for this
+ * one. The three things on it a pilot will actually talk about in a Discord —
+ * their own livery, the month they were the crew centre's hero, the route they
+ * put on the network — were the same 180px card as "a line in the next NOTAM",
+ * and the effect was that a shelf of genuinely good things read as a list of
+ * odds and ends.
+ *
+ *   standard   an ordinary tile. Most of the shelf, and the default, so a VA
+ *              that never touches this sees the shop they already had.
+ *   showcase   a thing whose whole value is that other people can see it.
+ *              Drawn wide, with room for the art, because a badge nobody
+ *              notices on the shelf is a badge nobody buys.
+ *   flagship   a thing that changes the AIRLINE rather than the pilot. Drawn
+ *              as a full-width band at the top of the shelf with the price in
+ *              it, because there are never more than a few and each one is a
+ *              month of somebody's flying.
+ *
+ * WHAT A FLAGSHIP IS, AND WHY IT IS NEW
+ * -------------------------------------
+ * Every original suggestion is something a pilot buys FOR THEMSELVES. That is
+ * the obvious half of the answer and it is the smaller half: what a pilot who
+ * has flown two hundred hours at one airline actually wants is not another
+ * badge, it is to have changed the airline. An aircraft type in the fleet that
+ * is there because they bought it. A base the airline flies out of because
+ * they opened it. An event with their name on it.
+ *
+ * Every one of those passes the same three tests as the rest of this list:
+ * staff can deliver it today with the tools already in this product (the fleet
+ * editor, the route network, the events calendar, the accent picker, the
+ * banner), a pilot obviously wants it, and it carries stock so it cannot be
+ * bought into nonsense. They are priced where they are — fifty to a hundred and
+ * fifty flights — because a thing the whole airline lives with should cost
+ * roughly what it is worth to the person who has flown that much.
  * ======================================================================== */
 const CATALOGUE = [
     /* IDENTITY — what a pilot is called and what they fly as. The cheapest
@@ -215,6 +252,7 @@ const CATALOGUE = [
        the ones that show up in a screenshot. */
     {
         id: 'badge',
+        tier: 'showcase',
         group: 'Identity',
         name: 'A badge on your profile',
         desc: 'A mark beside your name on the roster and your crew profile. Yours to keep.',
@@ -226,6 +264,7 @@ const CATALOGUE = [
     },
     {
         id: 'callsign',
+        tier: 'showcase',
         group: 'Identity',
         name: 'Your own callsign',
         desc: 'Reserve a flight number that is yours. Nobody else on the roster files it.',
@@ -235,6 +274,7 @@ const CATALOGUE = [
     },
     {
         id: 'registration',
+        tier: 'showcase',
         group: 'Identity',
         name: 'A tail number of your choosing',
         desc: 'Pick the registration on one of the airline’s aircraft. It goes on the fleet page under your name.',
@@ -251,6 +291,7 @@ const CATALOGUE = [
        ranks to reach. */
     {
         id: 'route',
+        tier: 'showcase',
         group: 'The network',
         name: 'Name a route',
         desc: 'Nominate a sector. Staff add it to the network and it is flown as that week’s featured route.',
@@ -260,6 +301,7 @@ const CATALOGUE = [
     },
     {
         id: 'livery',
+        tier: 'showcase',
         group: 'The network',
         name: 'Request a livery',
         desc: 'Nominate a livery for the fleet. If it can be flown, it gets added and you fly it first.',
@@ -291,6 +333,7 @@ const CATALOGUE = [
     },
     {
         id: 'lead',
+        tier: 'showcase',
         group: 'Events',
         name: 'Lead the next group flight',
         desc: 'Fly as number one. Everybody else is behind you and the screenshots are of your aircraft.',
@@ -327,6 +370,7 @@ const CATALOGUE = [
        pilots is the only thing on this list they actually want. */
     {
         id: 'feature',
+        tier: 'showcase',
         group: 'Recognition',
         name: 'Featured on the website',
         desc: 'Your name and your card on the airline’s own website for a month.',
@@ -344,6 +388,114 @@ const CATALOGUE = [
         icon: 'megaphone',
         flights: 4,
         limitPerPilot: 0,
+    },
+    {
+        id: 'hero',
+        tier: 'showcase',
+        group: 'Recognition',
+        name: 'Your photograph as the crew centre hero',
+        desc: 'Your screenshot across the top of the crew centre — the first thing every pilot sees when they sign in — for a month.',
+        icon: 'image',
+        flights: 22,
+        // One at a time. Two heroes is a hero nobody had.
+        stock: 1,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'title',
+        tier: 'showcase',
+        group: 'Identity',
+        name: 'A title of your own',
+        desc: 'A line under your name on the roster and your crew profile that is yours and nobody else’s. Staff approve the wording.',
+        icon: 'type',
+        flights: 9,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'wall',
+        tier: 'showcase',
+        group: 'Recognition',
+        name: 'A place on the wall',
+        desc: 'Your name written into the airline’s handbook, in the section that lists the people who built it. It does not come off.',
+        icon: 'scroll',
+        flights: 35,
+        limitPerPilot: 1,
+    },
+
+    /* ============ FOR THE AIRLINE ============
+       The other half of the answer, and the half nothing on this list used to
+       cover: what a pilot wants after two hundred hours is not another badge,
+       it is to have CHANGED THE AIRLINE. Everything here is delivered with a
+       tool that is already in this product — the fleet editor, the route
+       network, the events calendar, the accent picker — and everything here is
+       scarce, because a fleet everybody has added an aircraft to is a fleet
+       that means nothing. */
+    {
+        id: 'fleet',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'Put an aircraft in the fleet',
+        desc: 'Choose a type the airline does not operate. Staff add it, the whole roster can fly it, and it is in the fleet because you bought it.',
+        icon: 'plane-takeoff',
+        flights: 60,
+        stock: 3,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'base',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'Open a new base',
+        desc: 'Name an airport and the airline starts flying out of it — routes in, routes out, and your name on the announcement.',
+        icon: 'tower-control',
+        flights: 90,
+        stock: 2,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'event',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'An event with your name on it',
+        desc: 'The whole airline flies a group flight you chose — the city pair, the aircraft, the date. Staff build and run it.',
+        icon: 'calendar-heart',
+        flights: 45,
+        stock: 4,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'fleetlivery',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'A livery for the whole fleet',
+        desc: 'Your livery on every airframe the airline operates, for a season. Everybody flies it and everybody knows whose it is.',
+        icon: 'spray-can',
+        flights: 120,
+        // One. A fleet in two liveries is a fleet in no livery.
+        stock: 1,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'colours',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'The airline’s colours, for a week',
+        desc: 'The crew centre wears an accent you picked for seven days — the login, the buttons, every badge. Staff set it back afterwards.',
+        icon: 'palette',
+        flights: 50,
+        stock: 2,
+        limitPerPilot: 1,
+    },
+    {
+        id: 'charter',
+        tier: 'flagship',
+        group: 'For the airline',
+        name: 'Charter the airline',
+        desc: 'One sector, your choice, flown by everybody who signs up, under a flight number that is yours. The biggest thing on this shelf.',
+        icon: 'crown',
+        flights: 150,
+        stock: 1,
+        limitPerPilot: 1,
     },
 ];
 
@@ -390,6 +542,10 @@ function suggestedItems(settings) {
     return CATALOGUE.map(c => ({
         id: c.id,
         group: c.group,
+        // How loudly the shelf draws it. See the note over CATALOGUE: a
+        // suggestion that arrives as an ordinary tile when it is the most
+        // interesting thing a VA sells is a suggestion nobody takes up.
+        tier: TIERS.includes(c.tier) ? c.tier : 'standard',
         name: c.name,
         desc: c.desc,
         icon: c.icon,
@@ -401,9 +557,22 @@ function suggestedItems(settings) {
     }));
 }
 
+/** How loudly the shelf draws a thing. See the note over CATALOGUE. */
+const TIERS = ['standard', 'showcase', 'flagship'];
+
+/** The tier a stored item carries, bounded. Anything unrecognised — including
+ *  the absent value every item written before this existed carries — is an
+ *  ordinary tile, which is what those items already were. */
+const tierOf = (v) => (TIERS.includes(String(v || '').toLowerCase()) ? String(v).toLowerCase() : 'standard');
+
 /** One thing on the shelf, as any caller may see it. */
 const publicItem = (i) => ({
     id: i._id,
+    // The shelf a VA has sorted this onto. The client has grouped by it since
+    // the shelf could hold twenty things; it has never been sent, so nobody
+    // has ever seen a grouped shelf. Now it is.
+    group: i.group || '',
+    tier: tierOf(i.tier),
     name: i.name,
     desc: i.desc,
     image: i.image,
@@ -574,6 +743,8 @@ const publicHolder = (member, { rank = '', club = null, orders = [], isMe = fals
 module.exports = {
     RATES,
     CATALOGUE,
+    TIERS,
+    tierOf,
     NOMINAL_FLIGHT,
     roundPrice,
     suggestedItems,

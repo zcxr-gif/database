@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 17;
+const EXPECTED_SCHEMA_VERSION = 18;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -152,6 +152,16 @@ const DISCORD_SCHEMA_VERSION = 16;
 // taking anything else down with them.
 const STAFF_PILOT_SCHEMA_VERSION = 17;
 
+// The version that added the two shelf columns to crew_shop_items and the two
+// edit-audit columns to crew_pireps. NOT its own feature constant, and for the
+// same reason IF_LINK and Discord are not: the shop, the shelf and the logbook
+// all work exactly as they did on a v17 project. What a v17 project cannot do
+// is REMEMBER which shelf an item sits on, that it is a flagship, or who last
+// corrected a flight's hours by hand — so all four sit in LATE_COLUMNS and the
+// features degrade to "drawn as an ordinary tile" and "corrected, but we cannot
+// record who did it here yet" rather than failing the write.
+const SHOP_SHELVES_SCHEMA_VERSION = 18;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -181,7 +191,11 @@ const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
-    crew_pireps: new Set(['event_id', 'schedule_id']),
+    crew_pireps: new Set(['event_id', 'schedule_id', 'edited_at', 'edited_by']),
+    // v18. Both are presentation: an item written without them is a perfectly
+    // ordinary tile on an ungrouped shelf, which is what every item on every
+    // shelf was until this shipped. Exactly the test in the note above.
+    crew_shop_items: new Set(['item_group', 'tier']),
     crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
     /* THE DISCORD COLUMNS ARE NOT IN HERE, AND THAT IS THE POINT OF THE RULE
      * ABOVE RATHER THAN AN EXCEPTION TO IT.
@@ -216,6 +230,10 @@ const DRIFT_LABELS = {
     'crew_events.route_id': 'events tied to a route',
     'crew_pireps.event_id': 'flights logged against an event',
     'crew_pireps.schedule_id': 'flights logged against a scheduled departure',
+    'crew_pireps.edited_at': 'a record of hours edited by staff',
+    'crew_pireps.edited_by': 'a record of hours edited by staff',
+    'crew_shop_items.item_group': 'shelves in the shop',
+    'crew_shop_items.tier': 'the shop’s showcase and flagship items',
     'crew_schedules.if_schedule_id': 'departures pushed to Infinite Flight',
     'crew_schedules.if_aircraft_id': 'departures pushed to Infinite Flight',
     'crew_schedules.if_synced_at': 'departures pushed to Infinite Flight',
@@ -529,6 +547,12 @@ const pirepFromRow = (r) => r && {
     pointsAwarded: r.points_awarded == null ? null : Number(r.points_awarded) || 0,
     flownAt: date(r.flown_at),
     reviewedAt: date(r.reviewed_at),
+    // v18. When a staff member last corrected this report by hand, and who.
+    // A logbook staff can edit is a logbook that needs to say when they did:
+    // the alternative is a pilot's hours changing with nothing anywhere to
+    // point at, which is the same class of problem as a silent rejection.
+    editedAt: date(r.edited_at),
+    editedBy: r.edited_by || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -559,6 +583,8 @@ const pirepToRow = (p) => {
     pick(p, out, 'hoursApplied', 'hours_applied', (v) => !!v);
     pick(p, out, 'flownAt', 'flown_at', (v) => (date(v) ? date(v).toISOString() : null));
     pick(p, out, 'reviewedAt', 'reviewed_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(p, out, 'editedAt', 'edited_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(p, out, 'editedBy', 'edited_by', (v) => str(v, 60));
     return out;
 };
 
@@ -1016,6 +1042,12 @@ const trainingToRow = (t) => {
 // table with by hand.
 const shopItemFromRow = (r) => r && {
     _id: r.id,
+    // v18. The shelf it sits on, and how loudly the shop draws it. Both are
+    // late columns, so a project that has not re-run the SQL reads them as
+    // undefined — which is exactly the shape every item written before they
+    // existed has, and crewShop bounds both to their inert default.
+    group: r.item_group || '',
+    tier: r.tier || '',
     name: r.name || '',
     desc: r.description || '',
     image: r.image_url || '',
@@ -1029,6 +1061,11 @@ const shopItemFromRow = (r) => r && {
 };
 const shopItemToRow = (i) => {
     const out = {};
+    // `item_group` rather than `group`, because `group` is a reserved word in
+    // SQL and a column called one is a column every hand-written query has to
+    // quote forever.
+    pick(i, out, 'group', 'item_group', (v) => str(v, 40));
+    pick(i, out, 'tier', 'tier', (v) => str(v, 16));
     pick(i, out, 'name', 'name', (v) => str(v, 60));
     pick(i, out, 'desc', 'description', (v) => str(v, 240));
     pick(i, out, 'image', 'image_url', (v) => str(v, 500));

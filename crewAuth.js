@@ -41,6 +41,10 @@ const { CREW_TERMS_VERSION, CREW_TERMS_PAGE_PATH } = require('./crewTerms');
 // The schedule's rules are normalised by the module that enforces them, so the
 // bounds a VA can save and the bounds the endpoints apply are one definition.
 const crewSchedules = require('./crewSchedules');
+// The band across the top of the pilot crew centre. Normalised by the same
+// module that APPLIES these settings, so a hero saved here cannot mean
+// something different when the page draws it.
+const crewHero = require('./crewHero');
 const crewRetention = require('./crewRetention');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
@@ -1068,7 +1072,7 @@ function registerCrewAuthRoutes(app) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
@@ -1146,6 +1150,24 @@ function registerCrewAuthRoutes(app) {
                     return res.status(400).json({ error: 'Unknown login look.' });
                 }
                 ad.loginLook = look;
+            }
+            // How the hero is built. Gated on settings.branding with the rest
+            // of the appearance screen — it is the same decision as the layout
+            // and the accent, taken one band higher up the page.
+            //
+            // A MERGE, NOT A REPLACE, and crewHero.toRecord is what makes it
+            // one: this panel saves a switch as it is flipped, so a replace
+            // would have "turn the crest off" quietly reset the backdrop, the
+            // height and the VA's own line along with it.
+            if (req.body?.hero !== undefined && req.body.hero !== null) {
+                if (typeof req.body.hero !== 'object') {
+                    return res.status(400).json({ error: 'Hero settings must be an object.' });
+                }
+                ad.crewHero = crewHero.toRecord(req.body.hero, ad.crewHero);
+                // Flat on the document, but Mongoose still tracks it as a
+                // nested path — assigning the whole object replaces it, and
+                // marking it is what guarantees the write goes out.
+                ad.markModified('crewHero');
             }
             if (typeof req.body?.loginBackdrop === 'string') {
                 const bg = req.body.loginBackdrop.toLowerCase();
