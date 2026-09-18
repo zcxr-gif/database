@@ -1416,6 +1416,86 @@ create index if not exists crew_shop_orders_member_idx
     on crew_shop_orders (va_slug, member_id, created_at desc);
 
 -- ----------------------------------------------------------------------------
+-- v20. Staff applications: a pilot asking for a job on the team.
+--
+-- WHY THIS IS A TABLE AND NOT A MESSAGE.
+--
+-- Becoming staff used to have exactly one route: the owner noticed somebody,
+-- opened the team editor and promoted them. Everything before that moment —
+-- "we need a second PIREP reviewer", a pilot saying they would like to help,
+-- the owner comparing three volunteers — happened in Discord, off the record,
+-- and the crew centre knew nothing about it. The owner was the bottleneck and
+-- the only person who could see the queue, because there was no queue.
+--
+-- So an OPENING is a job the airline has advertised (held on the VA's own
+-- record alongside the staff roles it points at — see crewStaffApps.js), and a
+-- row here is one pilot asking for one of them. Accepting it runs the same
+-- promotion the owner would have run by hand, which is the point: this is a
+-- front door onto the existing path, not a second way of becoming staff.
+--
+-- WHOSE DATA. The VA's, like every other table in this file. These rows name a
+-- VA's own pilots and carry what they wrote about themselves and what staff
+-- wrote back about them, which is the airline's business and nobody else's.
+--
+-- PRIVACY: no anon policy and no grant (see the RLS block at the foot of this
+-- file). A rejected application is a thing a pilot told their airline in
+-- confidence; a browser key is refused at the door.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_staff_applications (
+    id          uuid primary key default gen_random_uuid(),
+    va_slug     text not null,
+    -- The opening as it was advertised. Both are kept, and both are plain text
+    -- rather than references, because an opening lives on the VA's record and
+    -- can be renamed, re-pointed or withdrawn while an application against it
+    -- is still open. A queue that reads "applied for (deleted)" is a queue
+    -- staff cannot work, so the title is copied at the moment of asking and the
+    -- ids are what the accept path re-resolves against what exists NOW.
+    opening_id  text not null default '',
+    role_id     text not null default '',
+    position    text not null default '',
+    -- Who is asking. `member_id` is the roster row and is the identity that
+    -- matters — the pilot's name and callsign are copied alongside it for the
+    -- same reason the position is, so the queue still reads properly for
+    -- somebody who has since left.
+    member_id   uuid references crew_members (id) on delete cascade,
+    pilot_name  text not null default '',
+    callsign    text not null default '',
+    -- Their answers to the opening's questions: [{ q, a }, …]. Same shape as
+    -- crew_applications.answers, deliberately — it is the same kind of thing
+    -- and the serialisers were written once.
+    answers     jsonb not null default '[]'::jsonb,
+    -- 'withdrawn' is the applicant's own move and is why this list is one
+    -- longer than crew_applications'. A pilot who changes their mind must be
+    -- able to take the ask back without a staff member having to decline them,
+    -- which is a small thing that decides whether the queue reflects reality.
+    status      text not null default 'pending'
+                check (status in ('pending','accepted','declined','withdrawn')),
+    -- What staff said. Shown to the applicant, so it is written as a reply
+    -- rather than as a note: there is deliberately no private staff field here,
+    -- because a box marked "they will never see this" invites the kind of
+    -- remark a VA would not want in its own database.
+    staff_message text not null default '',
+    decided_by  text not null default '',
+    decided_at  timestamptz,
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+-- The queue as staff work it: what is waiting, oldest ask first is the pilot's
+-- view and newest first is the reviewer's. Indexed for the reviewer, who is the
+-- one paging through it.
+create index if not exists crew_staff_applications_va_idx
+    on crew_staff_applications (va_slug, status, created_at desc);
+-- And one pilot's own asks, which is what their own screen draws.
+create index if not exists crew_staff_applications_member_idx
+    on crew_staff_applications (va_slug, member_id, created_at desc);
+-- One live ask per pilot per opening. A partial unique index rather than a
+-- constraint on the pair, because a pilot who was declined — or who withdrew —
+-- must be able to apply again when the airline advertises it next time.
+create unique index if not exists crew_staff_applications_open_idx
+    on crew_staff_applications (va_slug, member_id, opening_id)
+    where status = 'pending' and member_id is not null;
+
+-- ----------------------------------------------------------------------------
 -- Buying something.
 --
 -- One function, one transaction, and every check inside it. The order of the
@@ -1656,7 +1736,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_shop_items','crew_shop_orders','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_shop_items','crew_shop_orders','crew_staff_applications','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -1864,7 +1944,7 @@ declare
         'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
         'crew_events','crew_event_signups','crew_announcements','crew_schedules',
         'crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests',
-        'crew_shop_items','crew_shop_orders','crew_schema_info'];
+        'crew_shop_items','crew_shop_orders','crew_staff_applications','crew_schema_info'];
     t              text;
     rel            regclass;
     tbl_bytes      bigint;
@@ -1969,6 +2049,7 @@ alter table crew_links         enable row level security;
 alter table crew_training_requests enable row level security;
 alter table crew_shop_items    enable row level security;
 alter table crew_shop_orders   enable row level security;
+alter table crew_staff_applications enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -2098,6 +2179,14 @@ revoke all on crew_notifications from anon, authenticated;
 -- a signed-in session that knows whose request it is.
 revoke all on crew_training_requests from anon, authenticated;
 
+-- v20. Staff applications, same treatment and the same reason. A row names one
+-- pilot, carries what they wrote about why they should have the job and what
+-- staff wrote back when they said no. There is no filter one shared browser
+-- credential could be scoped by, so the table gets no policy above and no grant
+-- here; every read goes through the backend against a signed-in session that
+-- knows whether the caller is the applicant or the person reviewing them.
+revoke all on crew_staff_applications from anon, authenticated;
+
 -- v15. The shelf is readable with the browser key, because it is a shop window:
 -- a VA's own website should be able to show what its pilots can earn without
 -- asking us for anything. Only the items, and only the ones that are on sale --
@@ -2164,5 +2253,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 19)
+insert into crew_schema_info (id, version) values (1, 20)
 on conflict (id) do update set version = excluded.version, updated_at = now();
