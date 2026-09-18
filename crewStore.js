@@ -280,6 +280,12 @@ const DRIFT_LABELS = {
     'crew_applications.invite_claimed_at': 'saved pilot invitations',
     'crew_applications.invite_revoked_at': 'saved pilot invitations',
     'crew_applications.invite_account_id': 'saved pilot invitations',
+    // v20. Not a column — the only entry here that is not. `kind` is an inline
+    // CHECK constraint, and a project provisioned before the value being
+    // written was added refuses it; createAnnouncement posts the notice as a
+    // plain one rather than losing it, and records the downgrade here so a
+    // response that carries drift can say what was lost. See its note.
+    'crew_announcements.kind': 'the icon on a generated notice',
 };
 
 const isLateColumn = (table, col) => !!(LATE_COLUMNS[table] && LATE_COLUMNS[table].has(col));
@@ -905,7 +911,15 @@ const announcementFromRow = (r) => r && {
 };
 // v18. 'leave' is the other half of 'join'. A board that announces only the
 // arrivals is a board where people quietly stop existing.
-const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule', 'leave'];
+//
+// v20. 'staff' is somebody joining or leaving the team that RUNS the airline —
+// the one promotion the board used to say nothing about, so a VA's crew could
+// watch a pilot make Captain and never learn who had started approving their
+// flight reports. A kind the project's check constraint refuses is coerced to
+// 'notice' by the line below rather than failing the write, which is why this
+// list must not run ahead of the schema: see the v20 constraint widening in
+// supabase/crew-center-schema.sql.
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule', 'leave', 'staff'];
 const announcementToRow = (a) => {
     const out = {};
     pick(a, out, 'title', 'title', (v) => str(v, 160));
@@ -2110,10 +2124,43 @@ class SupabaseStore {
     getAnnouncement(id) {
         return this.announcements(() => this.one('crew_announcements', this.ident(id), announcementFromRow));
     }
+    /**
+     * Write a notice, and never lose one to a `kind` the project has not heard of.
+     *
+     * THE FAILURE THIS CLOSES. `kind` is an inline CHECK constraint, and the
+     * schema file has widened it three times — 'schedule' at v8, 'leave' at
+     * v18, 'staff' at v20 — each with a note saying that a project provisioned
+     * earlier refuses a value it does not know and "the notice would vanish
+     * with no explanation". That was not hypothetical and it was never fixed: a
+     * VA who has not re-run the SQL silently loses every notice of the newest
+     * kind, and because postAnnouncement is fire-and-forget nothing anywhere
+     * reports it.
+     *
+     * A check violation on `kind` is not a reason to drop the row. It is a
+     * reason to post it as 'notice' — which every project back to v7 accepts,
+     * and which costs only the icon the board would have drawn. The fact
+     * survives; the styling waits for the upgrade. Same trade as LATE_COLUMNS,
+     * for a constraint rather than a column.
+     *
+     * Retried ONCE, and only for this one constraint. Every other write failure
+     * is a real fault and still throws.
+     */
     createAnnouncement(data) {
         return this.announcements(async () => {
-            const [row] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...announcementToRow(data) });
-            return announcementFromRow(row);
+            const row = announcementToRow(data);
+            try {
+                const [saved] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...row });
+                return announcementFromRow(saved);
+            } catch (err) {
+                const refusedKind = err instanceof CrewStoreError
+                    && row.kind && row.kind !== 'notice'
+                    && /crew_announcements_kind_check|violates check constraint/i.test(String(err.detail || ''));
+                if (!refusedKind) throw err;
+                this.db.dropped.add('crew_announcements.kind');
+                const [saved] = await this.db.insert('crew_announcements',
+                    { va_slug: this.slug, ...row, kind: 'notice' });
+                return announcementFromRow(saved);
+            }
         });
     }
     updateAnnouncement(id, patch) {
@@ -2124,6 +2171,30 @@ class SupabaseStore {
     }
     deleteAnnouncement(id) {
         return this.announcements(async () => { await this.db.remove('crew_announcements', this.ident(id)); return true; });
+    }
+
+    /**
+     * Drop the generated notices that have scrolled off the board. v20.
+     *
+     * Returns how many went, and 0 for every reason it could not run — the
+     * project is on a pre-v20 schema and has no such function, the RPC failed,
+     * the VA's project is unreachable. Housekeeping is the one thing that must
+     * never turn into an error for the caller: this is invoked after a notice
+     * has already been written, and failing the write that caused it would mean
+     * a promotion reported as broken because the tidy-up afterwards did not
+     * happen. Same contract, and same reasoning, as noteLinkOpen above.
+     *
+     * The keep count, what is safe from it, and why it counts rows rather than
+     * days are all in the schema file under crew_announcements_prune. Nothing
+     * here decides any of it.
+     */
+    async pruneAnnouncements({ keep = 200 } = {}) {
+        try {
+            const out = await this.db.rpc('crew_announcements_prune', {
+                p_va_slug: this.slug, p_keep: keep,
+            });
+            return Number(Array.isArray(out) ? out[0] : out) || 0;
+        } catch { return 0; }
     }
 
     // --- The document library (v11) ---
@@ -3225,6 +3296,11 @@ class LegacyStore {
     createAnnouncement() { return this.announcements(); }
     updateAnnouncement() { return this.announcements(); }
     deleteAnnouncement() { return this.announcements(); }
+    // The one that does NOT refuse. A legacy store has no noticeboard to prune,
+    // so there is nothing here to tidy and nothing to report — and a rejection
+    // would make the caller handle an error over housekeeping it did not ask
+    // for. Zero is the honest answer: no rows went.
+    async pruneAnnouncements() { return 0; }
 
     // v11. The library and the inbox are the VA's operational record and are not
     // built on the retiring managed path either. Same reasoning, same refusal.
@@ -3544,5 +3620,6 @@ module.exports = {
     TRAINING_SCHEMA_VERSION,
     LEAVE_SCHEMA_VERSION,
     SHOP_SCHEMA_VERSION,
+    STAFF_APPS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

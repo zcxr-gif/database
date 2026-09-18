@@ -783,6 +783,52 @@ async function provisionStaffFromMember({ va, ad, memberId, roleId = '', permiss
     };
 }
 
+/* ---------------------------------------------------------------------------
+ * THE BOARD, FOR THE TEAM THAT RUNS THE AIRLINE. v20.
+ *
+ * The noticeboard recorded every promotion up the rank ladder and said nothing
+ * at all about the promotion that decides who can act on everybody else's
+ * behalf. So a VA's crew could watch a pilot make Captain and never learn who
+ * had started approving their flight reports.
+ *
+ * Both of these name the JOB rather than the permissions, because the board is
+ * public and "Rae can now connect the data store and remove pilots" is a map of
+ * the airline's access for anybody who cares to read it. The role's own name is
+ * what the airline chose to call the job and is what its crew would recognise.
+ *
+ * Both are fire-and-forget on the other side of announceToBoard. Nothing here
+ * can fail a promotion.
+ * ------------------------------------------------------------------------ */
+function announceStaffJoined(va, ad, member, roleId, byName) {
+    const who = (member && member.name) || 'A pilot';
+    const role = roleId
+        ? (Array.isArray(ad && ad.staffRoles) ? ad.staffRoles : []).find(r => r && r.id === roleId)
+        : null;
+    const job = (role && role.name) || '';
+    announceToBoard(va, {
+        kind: 'staff',
+        title: job ? `${who} has joined the staff team as ${job}` : `${who} has joined the staff team`,
+        // Deliberately not the capability list — see the note above.
+        body: '',
+        refId: (member && member._id) || null,
+        authorName: byName || '',
+    });
+}
+
+function announceStaffLeft(va, member, username) {
+    // The name where there is one, the login where the roster row has gone.
+    // Never nothing: a row reading "someone has stepped down" tells the crew
+    // that the team changed and refuses to say how, which is worse than silence.
+    const who = (member && member.name) || (username ? `@${username}` : '');
+    if (!who) return;
+    announceToBoard(va, {
+        kind: 'staff',
+        title: `${who} has stepped down from the staff team`,
+        body: '',
+        refId: (member && member._id) || null,
+    });
+}
+
 /**
  * The inverse, which did not exist.
  *
@@ -817,9 +863,13 @@ async function standDownStaff({ va, ad, username, store = null }) {
     // a VA whose project is unreachable must still be able to take somebody's
     // staff access away, because that is the half that is urgent.
     let pilotRestored = false;
+    // Their roster row, for the board. Read here because the store is already
+    // open; null is fine — the notice falls back to the login name.
+    let member = null;
     if (account.crewMemberId) {
         try {
             const st = store || await crewStore.forVa(va);
+            member = await st.getMember(String(account.crewMemberId)).catch(() => null);
             const pilotAcct = typeof st.getAccountByMember === 'function'
                 ? await st.getAccountByMember(String(account.crewMemberId)) : null;
             if (pilotAcct && pilotAcct.active === false) {
@@ -850,7 +900,7 @@ async function standDownStaff({ va, ad, username, store = null }) {
         await ad.save();
     }
 
-    return { username: uname, pilotRestored };
+    return { username: uname, pilotRestored, member };
 }
 
 function slugifyRoleId(s) {
@@ -1176,7 +1226,23 @@ function crewSession(va, identity, username, slugFallback) {
     };
 }
 
-function registerCrewAuthRoutes(app) {
+/* THE NOTICEBOARD, INJECTED. v20.
+ *
+ * Somebody joining or leaving the team that RUNS the airline belongs on the
+ * board next to somebody making Captain, and the two routes that do it live
+ * here while postAnnouncement lives in server.js. Requiring server.js from this
+ * file would be a cycle — it requires this one — so the writer is handed over
+ * at registration instead.
+ *
+ * Defaults to a no-op, which is what makes the test harness able to register
+ * these routes without standing up the noticeboard. Every call is
+ * fire-and-forget on the other side: a promotion that happened must not be
+ * reported as a failure because the notice about it could not be written.
+ */
+let announceToBoard = () => {};
+
+function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
+    if (typeof postAnnouncement === 'function') announceToBoard = postAnnouncement;
     // --- Sign in ---
     app.post('/api/crew/:slug/login', async (req, res) => {
         try {
@@ -1731,12 +1797,14 @@ function registerCrewAuthRoutes(app) {
             // Everything that actually happens is in provisionStaffFromMember —
             // one path, shared with a staff application being accepted. See its
             // note for why it is not two.
+            const roleId = clampStr(req.body && req.body.roleId, 40);
             const out = await provisionStaffFromMember({
-                va, ad, memberId,
-                roleId: clampStr(req.body && req.body.roleId, 40),
+                va, ad, memberId, roleId,
                 permissions: Array.isArray(req.body && req.body.permissions) ? req.body.permissions : [],
                 byName: p.name || p.uname || '',
             });
+
+            announceStaffJoined(va, ad, out.member, roleId, p.name || p.uname || '');
 
             res.set('Cache-Control', 'no-store');
             res.status(201).json({
@@ -1793,8 +1861,11 @@ function registerCrewAuthRoutes(app) {
             if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
 
             const out = await standDownStaff({ va, ad, username: req.params.username });
+            announceStaffLeft(va, out.member, out.username);
             res.set('Cache-Control', 'no-store');
-            res.json({ ok: true, ...out });
+            // `member` is the roster row, read only so the notice could name
+            // them — not part of what this route answers.
+            res.json({ ok: true, username: out.username, pilotRestored: out.pilotRestored });
         } catch (err) {
             if (err && err.code === 'not_found') return res.status(404).json({ error: err.message });
             if (err && (err.code === 'is_owner' || err.code === 'no_username')) {

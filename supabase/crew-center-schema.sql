@@ -783,12 +783,87 @@ create index if not exists crew_announcements_va_idx
 -- the roster is the same class of fact as one arriving, and a board that
 -- announces only the arrivals is a board where people quietly stop existing.
 -- Widened the same way and for the same reason as v8 above.
+-- v20. And 'staff', for somebody joining or leaving the team that RUNS the
+-- airline. Until now the board recorded every promotion up the rank ladder and
+-- said nothing at all about the one that decides who can act on everybody
+-- else's behalf — so a VA's crew could watch a pilot make Captain and never
+-- learn who had started approving their flight reports.
+--
+-- WHAT DOES NOT GET A ROW, and this is the more important half: a staff
+-- application arriving, and a staff application being declined. This board is
+-- PUBLIC (see the RLS policy at the foot of this file). A pilot who put their
+-- name forward and was turned down told their airline something in confidence,
+-- and "Sam applied to be PIREP manager" on a page the whole world can read is a
+-- betrayal of that, whichever way the decision went. The reviewers already hear
+-- about a new application down the recruitment webhook, which is private, and
+-- the applicant hears the outcome in their own inbox. Only an ACCEPTED
+-- application produces a row here, and it says what the other staff rows say —
+-- who is on the team now.
 do $$
 begin
     alter table crew_announcements drop constraint if exists crew_announcements_kind_check;
     alter table crew_announcements add constraint crew_announcements_kind_check
-        check (kind in ('notice','promotion','join','event','checkride','schedule','leave'));
+        check (kind in ('notice','promotion','join','event','checkride','schedule','leave','staff'));
 end $$;
+
+-- ----------------------------------------------------------------------------
+-- Keeping the board from becoming a log. v20.
+--
+-- THE THING THIS FIXES WAS DESIGNED FOR AND NEVER BUILT. `source` has said
+-- 'staff' or 'auto' since v7, and the note above the table says the column
+-- exists so "a job that prunes generated ones" cannot tidy away a staff
+-- member's hand-written notice. That job was never written. So every pilot who
+-- joined, every rank awarded, every fortnight of schedule published has been
+-- accumulating since the day each VA installed this file, and the board reads
+-- the newest fifty — which means an established airline is storing thousands of
+-- rows to display fifty, forever, in a database it pays for.
+--
+-- ROWS, NOT DAYS. A day-based cutoff gets this exactly wrong in both
+-- directions: a busy airline generates fifty rows in a week and would keep
+-- almost nothing worth keeping, while a quiet one takes a year to fill the
+-- board and would have its entire history deleted. What "off the board" means
+-- is a position in a list, so that is what is counted.
+--
+-- WHAT IT WILL NOT TOUCH, ever:
+--
+--   * `source = 'staff'`. Somebody typed it. It is not this function's to
+--     delete, however old — that is the whole reason the column is there, and
+--     the bulk-purge dropdown in the dashboard is where a VA clears those
+--     deliberately.
+--   * `pinned`. A pinned automatic row is one staff went out of their way to
+--     keep at the top of the board. Deleting it because it is old would undo a
+--     decision somebody made on purpose.
+--
+-- SECURITY: definer, and reachable only by the service key (see the grants at
+-- the foot of this file). It deletes rows; a browser credential has no business
+-- with it.
+-- ----------------------------------------------------------------------------
+create or replace function crew_announcements_prune(
+    p_va_slug text,
+    p_keep    int default 200
+) returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    keep    int := greatest(50, least(5000, coalesce(p_keep, 200)));
+    removed int;
+begin
+    with prunable as (
+        select id, row_number() over (order by created_at desc, id desc) as rn
+          from crew_announcements
+         where va_slug = p_va_slug
+           and source  = 'auto'
+           and not pinned
+    )
+    delete from crew_announcements a
+     using prunable p
+     where a.id = p.id and p.rn > keep;
+    get diagnostics removed = row_count;
+    return removed;
+end;
+$$;
 
 -- ----------------------------------------------------------------------------
 -- The schedule. v8.
@@ -2229,6 +2304,18 @@ do $$
 begin
     if exists (select 1 from pg_roles where rolname = 'service_role') then
         execute 'grant execute on function crew_link_open(text, uuid) to service_role';
+    end if;
+end $$;
+
+-- v20. crew_announcements_prune DELETES rows. The noticeboard is publicly
+-- readable, so a browser key that could call this could quietly empty any VA's
+-- board — which is why it is service-key only, like every other function here
+-- that changes something.
+revoke all on function crew_announcements_prune(text, int) from public, anon, authenticated;
+do $$
+begin
+    if exists (select 1 from pg_roles where rolname = 'service_role') then
+        execute 'grant execute on function crew_announcements_prune(text, int) to service_role';
     end if;
 end $$;
 

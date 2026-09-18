@@ -374,6 +374,101 @@ async function asyncOk(name, fn) {
             (err) => err.code === 'not_found');
     });
 
+    /* =====================================================================
+     * THE BOARD — hiring on it, and not growing forever.
+     *
+     * Against a fake PostgREST rather than a real one: what is being defended
+     * is which rows this module sends and what it does when the project refuses
+     * one, and both are decided here rather than in Postgres.
+     * ================================================================== */
+    console.log('\nThe noticeboard — a kind an old project has never heard of');
+
+    const { SupabaseStore } = crewStore;
+    function fakeStore({ refuseKind = false, pruned = null } = {}) {
+        const st = new SupabaseStore({ slug: 'ba', supabaseUrl: 'https://x.test', supabaseServiceKey: 'k' });
+        const sent = [];
+        st.db = {
+            dropped: new Set(),
+            insert: async (table, row) => {
+                sent.push(row);
+                if (refuseKind && row.kind !== 'notice') {
+                    throw new crewStore.CrewStoreError('write failed', {
+                        status: 502, code: 'store_error',
+                        detail: 'new row for relation "crew_announcements" violates check constraint "crew_announcements_kind_check"',
+                    });
+                }
+                return [{ id: 'n1', va_slug: 'ba', ...row, created_at: new Date().toISOString() }];
+            },
+            rpc: async (fn, args) => {
+                if (pruned === null) throw new crewStore.CrewStoreError('no such function', { code: 'store_schema_missing' });
+                st.lastPrune = { fn, args };
+                return pruned;
+            },
+        };
+        st.sent = sent;
+        return st;
+    }
+
+    await asyncOk('a project that knows “staff” gets a staff row', async () => {
+        const st = fakeStore();
+        const out = await st.createAnnouncement({ kind: 'staff', title: 'Rae has joined the staff team', source: 'auto' });
+        assert.strictEqual(out.kind, 'staff');
+        assert.strictEqual(st.sent.length, 1);
+        assert.strictEqual(st.db.dropped.size, 0);
+    });
+
+    await asyncOk('a project that refuses it still gets the notice, as a plain one', async () => {
+        // The failure this closes: the kind is an inline CHECK constraint, so a
+        // VA who has not re-run the SQL used to lose the whole row — silently,
+        // because postAnnouncement is fire-and-forget.
+        const st = fakeStore({ refuseKind: true });
+        const out = await st.createAnnouncement({ kind: 'staff', title: 'Rae has joined the staff team', source: 'auto' });
+        assert.strictEqual(out.kind, 'notice');
+        assert.strictEqual(out.title, 'Rae has joined the staff team');
+        assert.strictEqual(st.sent.length, 2, 'should have retried exactly once');
+        assert.ok(st.db.dropped.has('crew_announcements.kind'));
+        assert.deepStrictEqual(st.drift(), ['the icon on a generated notice']);
+    });
+
+    await asyncOk('any other write failure still throws', async () => {
+        const st = fakeStore();
+        st.db.insert = async () => { throw new crewStore.CrewStoreError('nope', { detail: 'permission denied' }); };
+        await assert.rejects(() => st.createAnnouncement({ kind: 'staff', title: 'x' }));
+    });
+
+    await asyncOk('a plain notice is never retried — there is nothing to fall back to', async () => {
+        const st = fakeStore({ refuseKind: true });
+        // refuseKind only refuses a non-notice kind, so this succeeds first
+        // time; the point is that the retry path is not entered for 'notice'.
+        const out = await st.createAnnouncement({ kind: 'notice', title: 'Read the new rules' });
+        assert.strictEqual(st.sent.length, 1);
+        assert.strictEqual(out.kind, 'notice');
+    });
+
+    console.log('\nPruning — the board is not a log');
+
+    await asyncOk('the prune says how many went', async () => {
+        const st = fakeStore({ pruned: 137 });
+        assert.strictEqual(await st.pruneAnnouncements(), 137);
+        assert.strictEqual(st.lastPrune.fn, 'crew_announcements_prune');
+        assert.strictEqual(st.lastPrune.args.p_va_slug, 'ba');
+        assert.strictEqual(st.lastPrune.args.p_keep, 200);
+    });
+
+    await asyncOk('a pre-v20 project with no such function answers 0, not an error', async () => {
+        // Housekeeping runs AFTER a notice has been written. A throw here would
+        // mean a promotion reported as broken because the tidy-up failed.
+        const st = fakeStore();   // rpc throws
+        assert.strictEqual(await st.pruneAnnouncements(), 0);
+    });
+
+    await asyncOk('a legacy store has no board to prune and says so quietly', async () => {
+        const legacy = new crewStore.LegacyStore({ _id: 'va1', slug: 'ba' });
+        assert.strictEqual(await legacy.pruneAnnouncements(), 0);
+        // Everything else about the noticeboard still refuses there.
+        await assert.rejects(() => legacy.createAnnouncement({ title: 'x' }));
+    });
+
     console.log('\nWhat somebody can do, in the airline’s own words');
 
     await asyncOk('capabilities come back as labels, never as ids', async () => {

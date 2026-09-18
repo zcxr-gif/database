@@ -1863,6 +1863,56 @@ function postCheckRideDueNotice(va, member, rung, actor) {
  * at all, and that is a reason to skip the notice, never to fail the thing that
  * caused it.
  */
+/* WHO PAYS FOR THE TIDY-UP. v20.
+ *
+ * Generated notices accumulate forever and the board reads the newest fifty, so
+ * an established airline stores thousands of rows to display fifty. The prune
+ * that fixes it has existed in the schema's intent since v7 (`source = 'auto'`
+ * is there for exactly this) and was never built.
+ *
+ * It runs on the WRITE rather than on a timer or on the read, for three
+ * reasons. There is no per-VA scheduler — this backend is one process serving
+ * every airline, and a cron that walked all of them would be a new moving part
+ * to own. The read is the hot path, asked by every pilot's home page and by
+ * public websites through crew-feed.js, and must not carry a delete. And the
+ * write is the thing that CAUSES the growth, which makes it the honest place to
+ * pay for it: a VA that never generates a notice never needs pruning and never
+ * gets asked.
+ *
+ * Throttled per airline because a bulk action writes a burst — a fortnight of
+ * schedule published in one press, an accepted application that also promotes
+ * somebody — and running the same delete eight times in a second would spend
+ * eight round trips to find nothing on seven of them. Once an hour per VA is
+ * far more often than any airline fills a boardful.
+ *
+ * In memory, and deliberately: losing the map on a restart means one extra
+ * prune, which is the cheap direction to be wrong in. Keyed by slug, and bounded
+ * — a backend serving thousands of VAs must not grow a permanent entry per
+ * airline that ever posted a notice.
+ */
+const ANNOUNCE_PRUNE_EVERY_MS = 60 * 60 * 1000;
+const ANNOUNCE_PRUNE_MAX_KEYS = 5000;
+const _announcePrunedAt = new Map();   // slug -> ms
+
+function shouldPruneAnnouncements(slug) {
+    if (!slug) return false;
+    const now = Date.now();
+    const last = _announcePrunedAt.get(slug) || 0;
+    if (now - last < ANNOUNCE_PRUNE_EVERY_MS) return false;
+    // Oldest-first eviction, and only when the map has actually got large.
+    // Map preserves insertion order, and re-setting a key below does not move
+    // it, so the first entries are the least recently *added* — good enough for
+    // a cache whose only cost of a miss is one extra delete.
+    if (_announcePrunedAt.size >= ANNOUNCE_PRUNE_MAX_KEYS) {
+        for (const k of _announcePrunedAt.keys()) {
+            _announcePrunedAt.delete(k);
+            if (_announcePrunedAt.size < ANNOUNCE_PRUNE_MAX_KEYS * 0.9) break;
+        }
+    }
+    _announcePrunedAt.set(slug, now);
+    return true;
+}
+
 function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null, authorName = '' }) {
     if (!va || !title) return;
     Promise.resolve()
@@ -1872,6 +1922,15 @@ function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null,
             await store.createAnnouncement({
                 kind, title, body, refId, authorName, source: 'auto',
             });
+            // AFTER the write, never before: the notice that was just posted is
+            // the newest row and must never be a candidate for its own prune.
+            // Awaited inside this promise so a failure lands in the catch below
+            // as a skipped tidy-up rather than an unhandled rejection — though
+            // pruneAnnouncements answers 0 rather than throwing.
+            if (typeof store.pruneAnnouncements === 'function' && shouldPruneAnnouncements(va.slug)) {
+                const gone = await store.pruneAnnouncements();
+                if (gone) console.log(`crew noticeboard: pruned ${gone} generated notices for ${va.slug}`);
+            }
         })
         .catch((err) => console.warn('announcement skipped —', err?.message || err));
 }
@@ -3325,7 +3384,9 @@ vaSites.registerVaSiteRoutes(app, {
 pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
-registerCrewAuthRoutes(app);
+// postAnnouncement is handed over rather than imported: crewAuth cannot require
+// this file back. See announceToBoard there.
+registerCrewAuthRoutes(app, { postAnnouncement });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they
@@ -13171,6 +13232,19 @@ app.patch('/api/crew/:slug/staff-applications/:id', async (req, res) => {
         // anybody to notice they cannot sign in.
         const saved = await store.updateStaffApplication(existing._id, {
             status: 'accepted', staffMessage: message, decidedBy: by, decidedAt: new Date(),
+        });
+
+        // The crew hears who joined the team, the same as they hear who made
+        // Captain. The ROLE's name, not the job title off the advert: two
+        // openings can point at one role ("Events coordinator (Europe)" and
+        // "(Americas)"), and what the board is recording is which job somebody
+        // now holds. Never the capability list — the board is public.
+        postAnnouncement(va, {
+            kind: 'staff',
+            title: `${(out.member && out.member.name) || 'A pilot'} has joined the staff team as ${role.name}`,
+            body: '',
+            refId: (out.member && out.member._id) || null,
+            authorName: by,
         });
 
         notifyPilot(va, out.member, {
