@@ -66,7 +66,11 @@ const pilotModeration = require('./pilotModeration');
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial,
+    capabilitySummary, provisionStaffFromMember, CREW_CAPABILITIES } = require('./crewAuth');
+// Openings and staff applications — see the head of that file for why hiring is
+// gated on team.manage rather than on a capability of its own.
+const crewStaffApps = require('./crewStaffApps');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -537,6 +541,23 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // that differs by a single tick. roleId is optional as a result: somebody
     // can be configured entirely by hand.
     staffAssignments: { type: [{ _id: false, username: String, roleId: String, permissions: [String] }], default: [] },
+    // v20. Jobs the airline is advertising. An opening is a staffRole with a job
+    // advert wrapped round it — a title, a sentence about the work, a few
+    // questions and an hours bar — and `roleId` is what the applicant is
+    // promoted into when they are accepted. Config, held here beside the roles
+    // it points at; the applications themselves are the VA's own data and live
+    // in their project (crew_staff_applications). See crewStaffApps.js.
+    //
+    // NOTE the `{ type: ... }` wrapping on the array, and the absence of any
+    // field called `type` inside it — see the crewFleet note below for what
+    // happens when a nested schema has one.
+    staffOpenings: {
+        type: [{
+            _id: false, id: String, roleId: String, title: String, blurb: String,
+            questions: [String], minHours: Number, open: Boolean,
+        }],
+        default: [],
+    },
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
@@ -1842,6 +1863,56 @@ function postCheckRideDueNotice(va, member, rung, actor) {
  * at all, and that is a reason to skip the notice, never to fail the thing that
  * caused it.
  */
+/* WHO PAYS FOR THE TIDY-UP. v20.
+ *
+ * Generated notices accumulate forever and the board reads the newest fifty, so
+ * an established airline stores thousands of rows to display fifty. The prune
+ * that fixes it has existed in the schema's intent since v7 (`source = 'auto'`
+ * is there for exactly this) and was never built.
+ *
+ * It runs on the WRITE rather than on a timer or on the read, for three
+ * reasons. There is no per-VA scheduler — this backend is one process serving
+ * every airline, and a cron that walked all of them would be a new moving part
+ * to own. The read is the hot path, asked by every pilot's home page and by
+ * public websites through crew-feed.js, and must not carry a delete. And the
+ * write is the thing that CAUSES the growth, which makes it the honest place to
+ * pay for it: a VA that never generates a notice never needs pruning and never
+ * gets asked.
+ *
+ * Throttled per airline because a bulk action writes a burst — a fortnight of
+ * schedule published in one press, an accepted application that also promotes
+ * somebody — and running the same delete eight times in a second would spend
+ * eight round trips to find nothing on seven of them. Once an hour per VA is
+ * far more often than any airline fills a boardful.
+ *
+ * In memory, and deliberately: losing the map on a restart means one extra
+ * prune, which is the cheap direction to be wrong in. Keyed by slug, and bounded
+ * — a backend serving thousands of VAs must not grow a permanent entry per
+ * airline that ever posted a notice.
+ */
+const ANNOUNCE_PRUNE_EVERY_MS = 60 * 60 * 1000;
+const ANNOUNCE_PRUNE_MAX_KEYS = 5000;
+const _announcePrunedAt = new Map();   // slug -> ms
+
+function shouldPruneAnnouncements(slug) {
+    if (!slug) return false;
+    const now = Date.now();
+    const last = _announcePrunedAt.get(slug) || 0;
+    if (now - last < ANNOUNCE_PRUNE_EVERY_MS) return false;
+    // Oldest-first eviction, and only when the map has actually got large.
+    // Map preserves insertion order, and re-setting a key below does not move
+    // it, so the first entries are the least recently *added* — good enough for
+    // a cache whose only cost of a miss is one extra delete.
+    if (_announcePrunedAt.size >= ANNOUNCE_PRUNE_MAX_KEYS) {
+        for (const k of _announcePrunedAt.keys()) {
+            _announcePrunedAt.delete(k);
+            if (_announcePrunedAt.size < ANNOUNCE_PRUNE_MAX_KEYS * 0.9) break;
+        }
+    }
+    _announcePrunedAt.set(slug, now);
+    return true;
+}
+
 function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null, authorName = '' }) {
     if (!va || !title) return;
     Promise.resolve()
@@ -1851,6 +1922,15 @@ function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null,
             await store.createAnnouncement({
                 kind, title, body, refId, authorName, source: 'auto',
             });
+            // AFTER the write, never before: the notice that was just posted is
+            // the newest row and must never be a candidate for its own prune.
+            // Awaited inside this promise so a failure lands in the catch below
+            // as a skipped tidy-up rather than an unhandled rejection — though
+            // pruneAnnouncements answers 0 rather than throwing.
+            if (typeof store.pruneAnnouncements === 'function' && shouldPruneAnnouncements(va.slug)) {
+                const gone = await store.pruneAnnouncements();
+                if (gone) console.log(`crew noticeboard: pruned ${gone} generated notices for ${va.slug}`);
+            }
         })
         .catch((err) => console.warn('announcement skipped —', err?.message || err));
 }
@@ -3304,7 +3384,9 @@ vaSites.registerVaSiteRoutes(app, {
 pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
-registerCrewAuthRoutes(app);
+// postAnnouncement is handed over rather than imported: crewAuth cannot require
+// this file back. See announceToBoard there.
+registerCrewAuthRoutes(app, { postAnnouncement });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they
@@ -12792,6 +12874,395 @@ app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
         const updated = await store.updateApplication(appDoc._id, crewInvite.revokePatch()) || { ...appDoc };
         res.json({ invite: crewInvite.staffInvite(updated, inviteContext(va, updated, req.params.slug)) });
     } catch (err) { crewFail(res, err, { log: 'invite revoke error', message: 'Could not discard that invitation.' }); }
+});
+
+/* ===========================================================================
+ * STAFF APPLICATIONS — a pilot asking for a job on the team
+ *
+ * The sibling of the membership applications above, and deliberately shaped
+ * like them: an advert, a form, a queue, a decision. What is different is what
+ * accepting does — it mints a staff login and hands over permissions, which is
+ * the escalation the whole capability system is careful about. So:
+ *
+ *   READING and DECIDING are gated on `team.manage` — the capability that
+ *   already means "build the team". There is no separate hiring capability;
+ *   see the head of crewStaffApps.js for why not.
+ *
+ *   ACCEPTING is additionally held to the no-escalation rule that makes
+ *   team.manage safe to delegate at all: you cannot hire somebody into a role
+ *   carrying a permission you do not hold yourself. Without that, "advertise a
+ *   job with integrations.manage on it, then accept your own alt" would be a
+ *   way round a rule the team editor enforces three different ways.
+ * ======================================================================== */
+
+// The VA's own record — the openings and the roles they point at, which the
+// store-backed `va` above does not carry.
+async function crewTeamDoc(slug) {
+    const raw = String(slug || '').trim().toLowerCase();
+    const sel = 'slug callsign staffRoles staffAssignments staffOpenings';
+    let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
+    if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
+    return ad;
+}
+
+// An opening, dressed for whoever is looking at it. The capability labels come
+// from the role it points at, because "what would I actually be doing" is the
+// question a pilot is trying to answer and a role id does not answer it.
+function dressOpening(o, ad) {
+    const role = (ad.staffRoles || []).find(r => r && r.id === o.roleId) || null;
+    const caps = role ? (role.permissions || []) : [];
+    return crewStaffApps.publicOpening(o, { role, labels: capabilitySummary(caps) });
+}
+
+// ---- The board: what is advertised, and where the caller stands with it ----
+app.get('/api/crew/:slug/staff-openings', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewTeamDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const gate = await requireCap(req, req.params.slug, 'team.manage');
+        const canHire = !gate.error;
+        // Separately from the gate: a staff member WITHOUT team.manage is still
+        // staff, and the gate hands back no principal when it refuses.
+        const who = verifyCrewRequest(req);
+        // Not public. A job advert names the airline's own permission structure
+        // — what each role can do, in plain words — which is the airline's
+        // business and its pilots', and nobody else's. Unlike the pilot join
+        // form, which exists to be found by strangers, this one is for people
+        // who are already flying here.
+        if (!who) {
+            return res.status(401).json({
+                error: 'Sign in to see what your airline is looking for.',
+                code: 'not_authenticated',
+            });
+        }
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+
+        // Staff see what is advertised INCLUDING the closed ones, because they
+        // are the ones who closed them. A pilot sees the open ones only.
+        const openings = (ad.staffOpenings || [])
+            .filter(o => canHire || o.open)
+            .map(o => dressOpening(o, ad));
+
+        // Whether this project can hold an application at all. Asked before
+        // anything is drawn, so a VA on a pre-v20 schema gets the update prompt
+        // rather than a form that would throw on submit.
+        const schema = await store.health().catch(() => ({ staffApps: false }));
+
+        // My own asks, so the board can say "applied" on the card rather than
+        // letting somebody apply twice and be told off for it.
+        let mine = [];
+        if (myId && schema.staffApps) {
+            mine = await store.listStaffApplications({ memberId: myId, limit: 50 })
+                .then(rows => rows.map(crewStaffApps.myApplicationView))
+                .catch(() => []);
+        }
+
+        // The badge, for the people who work the queue.
+        let pending = 0;
+        if (canHire && schema.staffApps) {
+            pending = await store.listStaffApplications({ status: 'pending', limit: 300 })
+                .then(rows => rows.length).catch(() => 0);
+        }
+
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            openings,
+            canHire,
+            supported: !!schema.staffApps,
+            hours: viewer ? viewer.hours : 0,
+            // A staff member applying for a staff job is a screen showing them
+            // something it should not; sent so it never gets that far.
+            isStaff: !!(who && (who.role === 'staff' || who.role === 'owner')),
+            mine,
+            pending,
+        }));
+    } catch (err) { crewFail(res, err, { log: 'staff openings read error', message: 'Could not read the openings.' }); }
+});
+
+// ---- Advertising a job ----
+//
+// The whole list at once, like the roles and assignments it sits beside: the
+// openings editor is one screen with one save, and a per-opening endpoint would
+// mean the editor had to reconcile three kinds of change against a server that
+// only ever saw one at a time.
+app.post('/api/crew/:slug/staff-openings', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'team.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to advertise staff jobs.',
+        });
+    }
+    try {
+        // Resolved the same way every other crew route resolves a slug — by
+        // slug then callsign, approved only — but as a live document, because
+        // this one saves.
+        const raw = String(req.params.slug || '').toLowerCase();
+        const ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            || await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' });
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const cleaned = crewStaffApps.sanitizeOpenings(req.body && req.body.openings, ad.staffRoles || []);
+        if (!cleaned) return res.status(400).json({ error: 'Send the openings as a list.' });
+
+        // The no-escalation rule, applied at the point the advert is written
+        // rather than only at the point somebody is hired. An owner holds
+        // everything so this can only fire for a delegate — who may advertise a
+        // job they could do themselves, and no other. Checked here as well as on
+        // accept because an advert nobody can honour is a pilot's wasted
+        // application, and finding out at the decision is finding out too late.
+        const isOwner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
+        if (!isOwner) {
+            const held = new Set(effectiveCaps(ad, gate.p));
+            for (const o of cleaned) {
+                const role = (ad.staffRoles || []).find(r => r && r.id === o.roleId);
+                const over = ((role && role.permissions) || []).find(c => !held.has(c));
+                if (over) {
+                    const label = (CREW_CAPABILITIES.find(c => c.id === over) || {}).label || over;
+                    return res.status(403).json({
+                        error: `You can’t advertise “${o.title}” — it carries “${label}”, which isn’t one of your own permissions.`,
+                    });
+                }
+            }
+        }
+
+        ad.staffOpenings = cleaned;
+        await ad.save();
+        res.set('Cache-Control', 'no-store');
+        // With `roleId`, which the pilot-facing view deliberately withholds.
+        // The editor needs it back: ids are minted here, and an editor that had
+        // to guess which role a returned job pointed at would re-mint them on
+        // the next save and orphan every application against them.
+        res.json({ openings: cleaned.map(o => ({ ...dressOpening(o, ad), roleId: o.roleId })) });
+    } catch (err) { crewFail(res, err, { log: 'staff openings save error', message: 'Could not save the openings.' }); }
+});
+
+// ---- A pilot applies ----
+app.post('/api/crew/:slug/staff-applications', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewTeamDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const p = verifyCrewRequest(req);
+        const viewer = await crewViewer(req, store);
+        if (!viewer || !viewer.memberId) {
+            return res.status(401).json({
+                error: 'Sign in as a pilot of this airline to apply for a staff job.',
+                code: 'not_authenticated',
+            });
+        }
+
+        const opening = (ad.staffOpenings || []).find(o => o && o.id === String((req.body || {}).openingId || ''));
+        const mine = await store.listStaffApplications({ memberId: viewer.memberId, limit: 50 });
+        const refusal = crewStaffApps.applyFailure(opening, {
+            hours: viewer.hours,
+            isStaff: !!(p && (p.role === 'staff' || p.role === 'owner')),
+            alreadyApplied: mine.some(a => a.status === 'pending' && a.openingId === (opening && opening.id)),
+        });
+        if (refusal) return res.status(409).json({ error: refusal });
+
+        const member = await store.getMember(viewer.memberId);
+        const saved = await store.createStaffApplication({
+            openingId: opening.id,
+            roleId: opening.roleId,
+            position: opening.title,
+            memberId: viewer.memberId,
+            pilotName: (member && member.name) || (p && p.name) || '',
+            callsign: (member && member.callsign) || '',
+            // Paired against the airline's questions rather than trusted from
+            // the form — see crewStaffApps.pairAnswers.
+            answers: crewStaffApps.pairAnswers(opening.questions, (req.body || {}).answers),
+            status: 'pending',
+        });
+
+        // Tell the people who would review it, down the recruitment feed a new
+        // membership application already uses — the queue is worked by the same
+        // people and a second channel for four posts a year helps nobody.
+        //
+        // Fire-and-forget, always: an application that landed must never be
+        // reported as a failure because the notice about it could not be sent.
+        crewWebhookUrlFor(va._id, 'recruitment')
+            .then(url => postCrewNotice(url, {
+                title: '🎖️ Staff application',
+                description: `**${(member && member.name) || 'A pilot'}** applied for **${opening.title}**.`,
+                color: 0x7C3AED,
+            }))
+            .catch(() => {});
+
+        res.status(201).json(withDrift(store, { application: crewStaffApps.myApplicationView(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'staff application error', message: 'Could not send that application.' }); }
+});
+
+// ---- The queue ----
+app.get('/api/crew/:slug/staff-applications', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'team.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to review staff applications.',
+        });
+    }
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const status = ['pending', 'accepted', 'declined', 'withdrawn']
+            .includes(String(req.query.status || '')) ? String(req.query.status) : '';
+        const rows = await store.listStaffApplications({ status, limit: 300 });
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, { applications: rows.map(crewStaffApps.staffApplicationView) }));
+    } catch (err) { crewFail(res, err, { log: 'staff applications list error', message: 'Could not load the staff applications.' }); }
+});
+
+// ---- Deciding, and withdrawing ----
+app.patch('/api/crew/:slug/staff-applications/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const gate = await requireCap(req, req.params.slug, 'team.manage');
+        const canHire = !gate.error;
+        const action = String((req.body || {}).action || '').trim();
+        const existing = await store.getStaffApplication(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'That application no longer exists.' });
+        if (existing.status !== 'pending') {
+            return res.status(409).json({ error: 'That application has already been decided.', code: 'already_decided' });
+        }
+
+        // Withdrawing is the applicant's own move on their own row. Staff may
+        // also do it — somebody has to be able to clear an ask a pilot left
+        // behind — and it is the one action here that is not hiring.
+        if (action === 'withdraw') {
+            const viewer = await crewViewer(req, store);
+            const mine = viewer && viewer.memberId && String(existing.memberId || '') === String(viewer.memberId);
+            if (!mine && !canHire) return res.status(403).json({ error: 'Not allowed.' });
+            const saved = await store.updateStaffApplication(existing._id, {
+                status: 'withdrawn', decidedAt: new Date(),
+            });
+            return res.json(withDrift(store, { application: crewStaffApps.myApplicationView(saved) }));
+        }
+
+        if (!canHire) {
+            return res.status(gate.error === 401 ? 401 : 403).json({
+                error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to decide staff applications.',
+            });
+        }
+
+        const message = String((req.body || {}).message || '').trim().slice(0, 1000);
+        const by = (gate.p && (gate.p.name || gate.p.uname)) || '';
+
+        if (action === 'decline') {
+            const saved = await store.updateStaffApplication(existing._id, {
+                status: 'declined', staffMessage: message, decidedBy: by, decidedAt: new Date(),
+            });
+            const member = existing.memberId ? await store.getMember(existing.memberId).catch(() => null) : null;
+            if (member) {
+                notifyPilot(va, member, {
+                    kind: 'application',
+                    title: `About your application for ${existing.position}`,
+                    body: message || 'Thanks for putting your name forward. The airline isn’t taking this one further right now.',
+                    senderName: va.name || '',
+                });
+            }
+            return res.json(withDrift(store, { application: crewStaffApps.staffApplicationView(saved) }));
+        }
+
+        if (action !== 'accept') return res.status(400).json({ error: 'Say whether to accept, decline or withdraw it.' });
+
+        const ad = await VirtualAirlineAd.findById(va._id);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        // The role AS IT IS NOW, not as it was when the job was advertised. An
+        // opening's role can be renamed, re-permissioned or deleted while an
+        // application against it sits in the queue, and the permissions somebody
+        // is actually given must be the ones on the screen today.
+        const role = (ad.staffRoles || []).find(r => r && r.id === existing.roleId);
+        if (!role) {
+            return res.status(409).json({
+                error: `The “${existing.position}” role has been deleted. Recreate it, or decline this one and promote them by hand.`,
+                code: 'role_gone',
+            });
+        }
+
+        // The no-escalation rule, at the moment it matters. See the header note.
+        const isOwner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
+        if (!isOwner) {
+            const held = new Set(effectiveCaps(ad, gate.p));
+            const over = (role.permissions || []).find(c => !held.has(c));
+            if (over) {
+                const label = (CREW_CAPABILITIES.find(c => c.id === over) || {}).label || over;
+                return res.status(403).json({
+                    error: `You can’t hire into “${role.name}” — it carries “${label}”, which isn’t one of your own permissions.`,
+                });
+            }
+        }
+
+        let out;
+        try {
+            out = await provisionStaffFromMember({
+                va, ad, memberId: existing.memberId, roleId: role.id,
+                permissions: [], byName: by, store,
+            });
+        } catch (err) {
+            // ALREADY STAFF IS NOT A DEAD END. Two ways to get here: somebody
+            // promoted them by hand while their application sat in the queue,
+            // or the account write below succeeded on an earlier press and the
+            // row update did not (see the order note further down). Both mean
+            // the same thing — they have the job — so the row is closed rather
+            // than left pending for a reviewer to press accept at forever.
+            if (err && err.code === 'already_staff') {
+                const done = await store.updateStaffApplication(existing._id, {
+                    status: 'accepted', staffMessage: message, decidedBy: by, decidedAt: new Date(),
+                });
+                return res.json(withDrift(store, {
+                    application: crewStaffApps.staffApplicationView(done),
+                    note: err.message,
+                }));
+            }
+            if (err && err.code === 'not_on_roster') {
+                return res.status(409).json({ error: 'That pilot has left the roster. Decline this one.' });
+            }
+            throw err;
+        }
+
+        // THE ACCOUNT FIRST, THE ROW SECOND, and that order is the safe one.
+        // Two things can go wrong here and only one of them is recoverable: an
+        // account that exists against a row still marked pending is fixed by
+        // pressing accept again (which answers "@name is already staff" and
+        // says exactly what happened), where a row marked accepted with no
+        // account behind it is a person told they got the job and no way for
+        // anybody to notice they cannot sign in.
+        const saved = await store.updateStaffApplication(existing._id, {
+            status: 'accepted', staffMessage: message, decidedBy: by, decidedAt: new Date(),
+        });
+
+        // The crew hears who joined the team, the same as they hear who made
+        // Captain. The ROLE's name, not the job title off the advert: two
+        // openings can point at one role ("Events coordinator (Europe)" and
+        // "(Americas)"), and what the board is recording is which job somebody
+        // now holds. Never the capability list — the board is public.
+        postAnnouncement(va, {
+            kind: 'staff',
+            title: `${(out.member && out.member.name) || 'A pilot'} has joined the staff team as ${role.name}`,
+            body: '',
+            refId: (out.member && out.member._id) || null,
+            authorName: by,
+        });
+
+        notifyPilot(va, out.member, {
+            kind: 'promotion',
+            title: `You’re now ${existing.position}`,
+            body: message || `Welcome to the team. Sign in as usual and you’ll find the crew centre’s staff tools waiting for you.`,
+            senderName: va.name || '',
+        });
+
+        res.json(withDrift(store, {
+            application: crewStaffApps.staffApplicationView(saved),
+            account: out.account,
+            // Shown once, and only when there was one to issue — a pilot who
+            // already had a login keeps it. See provisionStaffFromMember.
+            password: out.password,
+            keptTheirLogin: out.keptTheirLogin,
+        }));
+    } catch (err) { crewFail(res, err, { log: 'staff application decide error', message: 'Could not decide that application.' }); }
 });
 
 // ---- Public statistics ----

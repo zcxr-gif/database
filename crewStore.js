@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 19;
+const EXPECTED_SCHEMA_VERSION = 20;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -172,6 +172,14 @@ const SHOP_SHELVES_SCHEMA_VERSION = 18;
 // not.
 const PASSWORD_RESET_SCHEMA_VERSION = 19;
 
+// The version that introduced crew_staff_applications. Its own constant like
+// events, the links board and check-rides, and for the same reason: a pilot
+// applying for a job on the team is a whole feature a pre-v20 project has not
+// got a table for. The hiring panel names the missing thing and offers the
+// update button itself, rather than reporting a broken store over a VA whose
+// roster, routes and flights are all answering perfectly.
+const STAFF_APPS_SCHEMA_VERSION = 20;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -272,6 +280,12 @@ const DRIFT_LABELS = {
     'crew_applications.invite_claimed_at': 'saved pilot invitations',
     'crew_applications.invite_revoked_at': 'saved pilot invitations',
     'crew_applications.invite_account_id': 'saved pilot invitations',
+    // v20. Not a column — the only entry here that is not. `kind` is an inline
+    // CHECK constraint, and a project provisioned before the value being
+    // written was added refuses it; createAnnouncement posts the notice as a
+    // plain one rather than losing it, and records the downgrade here so a
+    // response that carries drift can say what was lost. See its note.
+    'crew_announcements.kind': 'the icon on a generated notice',
 };
 
 const isLateColumn = (table, col) => !!(LATE_COLUMNS[table] && LATE_COLUMNS[table].has(col));
@@ -897,7 +911,15 @@ const announcementFromRow = (r) => r && {
 };
 // v18. 'leave' is the other half of 'join'. A board that announces only the
 // arrivals is a board where people quietly stop existing.
-const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule', 'leave'];
+//
+// v20. 'staff' is somebody joining or leaving the team that RUNS the airline —
+// the one promotion the board used to say nothing about, so a VA's crew could
+// watch a pilot make Captain and never learn who had started approving their
+// flight reports. A kind the project's check constraint refuses is coerced to
+// 'notice' by the line below rather than failing the write, which is why this
+// list must not run ahead of the schema: see the v20 constraint widening in
+// supabase/crew-center-schema.sql.
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule', 'leave', 'staff'];
 const announcementToRow = (a) => {
     const out = {};
     pick(a, out, 'title', 'title', (v) => str(v, 160));
@@ -1131,6 +1153,47 @@ const shopOrderFromRow = (r) => r && {
     decidedBy: r.decided_by || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
+};
+
+// v20. A pilot asking for a job on the team.
+//
+// `position` and `pilotName`/`callsign` are copies, not joins, and that is the
+// point: an opening can be renamed or withdrawn and a pilot can leave the
+// roster while their application is still in the queue. A reviewer looking at
+// "(deleted) applied for (deleted)" cannot review anything, so the words are
+// frozen at the moment of asking and the ids are what the accept path
+// re-resolves against what exists now.
+const staffAppFromRow = (r) => r && {
+    _id: r.id,
+    openingId: r.opening_id || '',
+    roleId: r.role_id || '',
+    position: r.position || '',
+    memberId: r.member_id || null,
+    pilotName: r.pilot_name || '',
+    callsign: r.callsign || '',
+    answers: Array.isArray(r.answers) ? r.answers : [],
+    status: r.status || 'pending',
+    staffMessage: r.staff_message || '',
+    decidedBy: r.decided_by || '',
+    decidedAt: date(r.decided_at),
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const STAFF_APP_STATUSES = ['pending', 'accepted', 'declined', 'withdrawn'];
+const staffAppToRow = (a) => {
+    const out = {};
+    pick(a, out, 'openingId', 'opening_id', (v) => str(v, 40));
+    pick(a, out, 'roleId', 'role_id', (v) => str(v, 40));
+    pick(a, out, 'position', 'position', (v) => str(v, 120));
+    pick(a, out, 'memberId', 'member_id', (v) => v || null);
+    pick(a, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
+    pick(a, out, 'callsign', 'callsign', (v) => str(v, 40));
+    pick(a, out, 'answers', 'answers', (v) => (Array.isArray(v) ? v : []));
+    pick(a, out, 'status', 'status', (v) => (STAFF_APP_STATUSES.includes(v) ? v : 'pending'));
+    pick(a, out, 'staffMessage', 'staff_message', (v) => str(v, 1000));
+    pick(a, out, 'decidedBy', 'decided_by', (v) => str(v, 80));
+    pick(a, out, 'decidedAt', 'decided_at', (v) => (v ? new Date(v).toISOString() : null));
+    return out;
 };
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1512,11 @@ class SupabaseStore {
         const tables = [
             'crew_shop_orders',
             'crew_training_requests',
+            // v20. Their staff applications go with them. The row names what
+            // they wrote about themselves and what staff wrote back; a pilot
+            // who has left the airline has not left that behind for the next
+            // reviewer to read.
+            'crew_staff_applications',
             'crew_bookings',
             'crew_event_signups',
             'crew_notifications',
@@ -2056,10 +2124,43 @@ class SupabaseStore {
     getAnnouncement(id) {
         return this.announcements(() => this.one('crew_announcements', this.ident(id), announcementFromRow));
     }
+    /**
+     * Write a notice, and never lose one to a `kind` the project has not heard of.
+     *
+     * THE FAILURE THIS CLOSES. `kind` is an inline CHECK constraint, and the
+     * schema file has widened it three times — 'schedule' at v8, 'leave' at
+     * v18, 'staff' at v20 — each with a note saying that a project provisioned
+     * earlier refuses a value it does not know and "the notice would vanish
+     * with no explanation". That was not hypothetical and it was never fixed: a
+     * VA who has not re-run the SQL silently loses every notice of the newest
+     * kind, and because postAnnouncement is fire-and-forget nothing anywhere
+     * reports it.
+     *
+     * A check violation on `kind` is not a reason to drop the row. It is a
+     * reason to post it as 'notice' — which every project back to v7 accepts,
+     * and which costs only the icon the board would have drawn. The fact
+     * survives; the styling waits for the upgrade. Same trade as LATE_COLUMNS,
+     * for a constraint rather than a column.
+     *
+     * Retried ONCE, and only for this one constraint. Every other write failure
+     * is a real fault and still throws.
+     */
     createAnnouncement(data) {
         return this.announcements(async () => {
-            const [row] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...announcementToRow(data) });
-            return announcementFromRow(row);
+            const row = announcementToRow(data);
+            try {
+                const [saved] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...row });
+                return announcementFromRow(saved);
+            } catch (err) {
+                const refusedKind = err instanceof CrewStoreError
+                    && row.kind && row.kind !== 'notice'
+                    && /crew_announcements_kind_check|violates check constraint/i.test(String(err.detail || ''));
+                if (!refusedKind) throw err;
+                this.db.dropped.add('crew_announcements.kind');
+                const [saved] = await this.db.insert('crew_announcements',
+                    { va_slug: this.slug, ...row, kind: 'notice' });
+                return announcementFromRow(saved);
+            }
         });
     }
     updateAnnouncement(id, patch) {
@@ -2070,6 +2171,30 @@ class SupabaseStore {
     }
     deleteAnnouncement(id) {
         return this.announcements(async () => { await this.db.remove('crew_announcements', this.ident(id)); return true; });
+    }
+
+    /**
+     * Drop the generated notices that have scrolled off the board. v20.
+     *
+     * Returns how many went, and 0 for every reason it could not run — the
+     * project is on a pre-v20 schema and has no such function, the RPC failed,
+     * the VA's project is unreachable. Housekeeping is the one thing that must
+     * never turn into an error for the caller: this is invoked after a notice
+     * has already been written, and failing the write that caused it would mean
+     * a promotion reported as broken because the tidy-up afterwards did not
+     * happen. Same contract, and same reasoning, as noteLinkOpen above.
+     *
+     * The keep count, what is safe from it, and why it counts rows rather than
+     * days are all in the schema file under crew_announcements_prune. Nothing
+     * here decides any of it.
+     */
+    async pruneAnnouncements({ keep = 200 } = {}) {
+        try {
+            const out = await this.db.rpc('crew_announcements_prune', {
+                p_va_slug: this.slug, p_keep: keep,
+            });
+            return Number(Array.isArray(out) ? out[0] : out) || 0;
+        } catch { return 0; }
     }
 
     // --- The document library (v11) ---
@@ -2325,6 +2450,62 @@ class SupabaseStore {
         return this.training(async () => {
             const [row] = await this.db.update('crew_training_requests', this.ident(id), trainingToRow(patch));
             return row ? trainingFromRow(row) : null;
+        });
+    }
+
+    // --- Staff applications (v20) ---
+    async staffApps(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew centre’s project cannot take staff applications yet. Re-run the setup SQL (Settings → Data store) to add them.',
+                    { status: 409, code: 'store_staff_apps_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The queue, newest ask first.
+     *
+     * Descending, unlike the check-ride queue: hiring is read as a shortlist
+     * rather than worked as a first-come line, and the reviewer wants to see
+     * who has just applied. A pilot's own view re-sorts client-side.
+     *
+     * `memberId` narrows it to one pilot — what a signed-in pilot with no
+     * team.manage is allowed to see — and the filter is applied in the query so
+     * the rest of the airline's applications never leave Postgres. `status`
+     * narrows it to the open ones, which is what the badge counts.
+     */
+    listStaffApplications({ memberId = '', status = '', limit = 300 } = {}) {
+        return this.staffApps(async () => {
+            const q = { ...this.scope, order: 'created_at.desc', limit };
+            if (memberId) q.member_id = `eq.${memberId}`;
+            if (status) q.status = `eq.${status}`;
+            const rows = await this.db.select('crew_staff_applications', q);
+            return (rows || []).map(staffAppFromRow);
+        });
+    }
+    getStaffApplication(id) {
+        return this.staffApps(() => this.one('crew_staff_applications', this.ident(id), staffAppFromRow));
+    }
+    createStaffApplication(data) {
+        return this.staffApps(async () => {
+            const [row] = await this.db.insert('crew_staff_applications',
+                { va_slug: this.slug, ...staffAppToRow(data) });
+            return staffAppFromRow(row);
+        });
+    }
+    updateStaffApplication(id, patch) {
+        return this.staffApps(async () => {
+            const [row] = await this.db.update('crew_staff_applications', this.ident(id), staffAppToRow(patch));
+            return row ? staffAppFromRow(row) : null;
+        });
+    }
+    deleteStaffApplication(id) {
+        return this.staffApps(async () => {
+            await this.db.remove('crew_staff_applications', this.ident(id));
+            return true;
         });
     }
 
@@ -2646,6 +2827,13 @@ class SupabaseStore {
                 // "this crew centre cannot do resets yet" rather than promising
                 // an email a pre-v19 project has nowhere to record.
                 passwordResets: version >= PASSWORD_RESET_SCHEMA_VERSION,
+                // v20. Whether a pilot can apply for a job on the team. Its own
+                // flag like every feature above, so the hiring panel can offer
+                // the update button itself — and, more to the point, so the
+                // pilot's own screen can stay silent about openings a project
+                // has nowhere to record an application against, rather than
+                // taking an application it is about to lose.
+                staffApps: version >= STAFF_APPS_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -2666,6 +2854,7 @@ class SupabaseStore {
                 leave: false,
                 shop: false,
                 passwordResets: false,
+                staffApps: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2773,6 +2962,11 @@ const PURGE_DATASETS = {
     // than deleting. Bulk-clearing it belongs with the roster and the network,
     // behind its own conversation.
     notifications: { table: 'crew_notifications', dateColumn: 'created_at', label: 'Pilot messages' },
+    // v20. Hiring rounds pile up the same way membership applications do, and
+    // for the same reason a VA wants them gone: a declined application is a
+    // private thing about a pilot who is still on the roster and still flying
+    // with the people who declined them. Keeping it forever serves nobody.
+    staffApplications: { table: 'crew_staff_applications', dateColumn: 'created_at', label: 'Staff applications' },
 };
 
 // How many rows one count will look at, one delete will take at a time, and how
@@ -3102,6 +3296,11 @@ class LegacyStore {
     createAnnouncement() { return this.announcements(); }
     updateAnnouncement() { return this.announcements(); }
     deleteAnnouncement() { return this.announcements(); }
+    // The one that does NOT refuse. A legacy store has no noticeboard to prune,
+    // so there is nothing here to tidy and nothing to report — and a rejection
+    // would make the caller handle an error over housekeeping it did not ask
+    // for. Zero is the honest answer: no rows went.
+    async pruneAnnouncements() { return 0; }
 
     // v11. The library and the inbox are the VA's operational record and are not
     // built on the retiring managed path either. Same reasoning, same refusal.
@@ -3144,6 +3343,22 @@ class LegacyStore {
     getTrainingRequest() { return this.training(); }
     createTrainingRequest() { return this.training(); }
     updateTrainingRequest() { return this.training(); }
+
+    // v20. Staff applications were never built on the retiring managed path
+    // either. Same reasoning as events, the schedule and check-rides, same
+    // shape of refusal — and with rather less cost than the others, because a
+    // VA still on managed storage can go on promoting people by hand exactly
+    // as they always have.
+    staffApps() {
+        return Promise.reject(new CrewStoreError(
+            'Staff applications need your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_staff_apps_unsupported' }));
+    }
+    listStaffApplications() { return this.staffApps(); }
+    getStaffApplication() { return this.staffApps(); }
+    createStaffApplication() { return this.staffApps(); }
+    updateStaffApplication() { return this.staffApps(); }
+    deleteStaffApplication() { return this.staffApps(); }
 
     // v15. Leave was never built on the retiring managed path. `status = 'loa'`
     // can still be set by hand on a managed roster — that column is as old as
@@ -3405,5 +3620,6 @@ module.exports = {
     TRAINING_SCHEMA_VERSION,
     LEAVE_SCHEMA_VERSION,
     SHOP_SCHEMA_VERSION,
+    STAFF_APPS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };
