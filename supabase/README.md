@@ -752,6 +752,15 @@ Version history:
   `crew_notifications.kind` also gains `flight_approved`, `flight_rejected` and
   `order`, which is what the bell in the top bar carries.
 
+- **v21** — `crew_routes.departure_gate` / `arrival_gate`: a route can name the
+  stands it is flown between, so a leg is gate to gate rather than airport to
+  airport. Free text, both optional, set by the VA and enforced against nothing
+  — there is no table of gates to join to and no two airports name theirs the
+  same way, so a stand is something a route carries rather than something the
+  network is searched by. Both are in `LATE_COLUMNS`: drop them and the route is
+  still the route, flown between the same two airports, which is the test that
+  makes a column droppable.
+
 Note what v15 does NOT add: an awards table. A badge is a fact about an approved
 flight log, computed on read by `crewAwards.js`, and the date on one is the date
 of the flight that crossed the line — so there is nothing to migrate, nothing for

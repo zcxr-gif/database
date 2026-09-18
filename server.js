@@ -2010,6 +2010,9 @@ function postRouteNotice(va, event, route, actor, before) {
             ['origin', 'Origin'], ['destination', 'Destination'], ['aircraft', 'Aircraft'],
             ['flightNumber', 'Flight number'], ['kind', 'Type'], ['minRank', 'Rank required'],
             ['partnerName', 'Partner'], ['active', 'Published'],
+            // v21. A stand moving is worth a line: pilots who fly the leg
+            // regularly park on it from memory.
+            ['departureGate', 'Departure gate'], ['arrivalGate', 'Arrival gate'],
         ];
         for (const [key, label] of watch) {
             if (String(before[key] ?? '') !== String(route[key] ?? '')) {
@@ -2031,6 +2034,12 @@ function postRouteNotice(va, event, route, actor, before) {
                     : { name: 'Type', value: 'Own metal', inline: true },
                 route.minRank ? { name: 'Opens at', value: String(route.minRank), inline: true } : null,
                 route.distanceNm ? { name: 'Distance', value: `${Math.round(route.distanceNm)} nm`, inline: true } : null,
+                // Only when the VA set one. A "Gates: — → —" field on every
+                // route notice would be a column of nothing for the airlines
+                // that do not publish stands.
+                (route.departureGate || route.arrivalGate)
+                    ? { name: 'Gates', value: `${route.departureGate || '—'} → ${route.arrivalGate || '—'}`, inline: true }
+                    : null,
             ].filter(Boolean),
         }))
         .catch(() => {});
@@ -5483,8 +5492,18 @@ const cleanRoute = (b) => {
         partnerName: kind === 'codeshare' ? String(b.partnerName || '').trim().slice(0, 60) : '',
         partnerLogo: kind === 'codeshare' && /^https:\/\//i.test(logo) ? logo : '',
         minRank: String(b.minRank || '').trim().slice(0, 40),
+        // v21. The stands. Optional, VA-set, and deliberately not validated
+        // against anything: gate names are a fact about a real terminal and no
+        // two airports agree on their shape. Trimmed, collapsed and upper-cased
+        // so "a12" and "A 12 " are the same stand rather than two, and bounded
+        // at 12 characters, which holds the longest real one ("PIER C 51").
+        departureGate: gateName(b.departureGate),
+        arrivalGate: gateName(b.arrivalGate),
     };
 };
+// Shared by the route handlers and the CSV import, so a gate typed into a
+// spreadsheet lands the same way as one typed into the form.
+const gateName = (v) => String(v || '').trim().replace(/\s+/g, ' ').toUpperCase().slice(0, 12);
 // `viewer` carries the hours of the pilot asking, when there is one, so a route
 // can say whether it is open to them. Staff and the public get `locked: false`
 // — the gate is about what a PILOT may fly, and hiding the shape of the network
@@ -5498,6 +5517,10 @@ const publicRoute = (r, ranks, viewer) => {
         kind: r.kind === 'codeshare' ? 'codeshare' : 'own',
         partnerName: r.partnerName || '', partnerLogo: r.partnerLogo || '',
         minRank: r.minRank || '',
+        // v21. Sent to everyone who can see the route, locked or not. A stand is
+        // part of what the leg IS, and a pilot working toward a rank should be
+        // able to see the whole of the flight they are working toward.
+        departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
         locked,
         // How much further this particular pilot has to fly. Shown rather than
         // hidden on purpose: "unlocks in 12h" is the thing that makes a rank
@@ -6038,6 +6061,42 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
 
+/**
+ * The stands at an airport, for the two gate boxes on the route form. v21.
+ *
+ * The same source the event gate board already uses — OpenStreetMap, cached for
+ * a day, with our own gate dataset behind it — so a stand typed onto a route and
+ * a stand claimed on an event board are the same names out of the same place.
+ *
+ * A SUGGESTION AND NOT A LIST TO PICK FROM. The field stays free text: OSM does
+ * not have every stand at every field, and a VA that cannot publish "C 51"
+ * because a volunteer has not mapped it yet would rightly give up on the whole
+ * feature. This only saves them typing where we happen to know the answer.
+ *
+ * Staff-only, because it is an authoring aid that reaches a third party — and
+ * because nothing a pilot sees needs it: a route arrives carrying its stands.
+ * An unreachable Overpass is an empty list and a 200, never an error: the form
+ * has to keep working when the suggestion cannot be made.
+ */
+app.get('/api/crew/:slug/airport-gates/:icao', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    const icao = String(req.params.icao || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    if (!/^[A-Z0-9]{3,4}$/.test(icao)) return res.json({ icao: '', gates: [], source: 'none' });
+    try {
+        const gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor, localAirportGates);
+        res.json({
+            icao,
+            // Names only. The form wants something to offer, not map pins.
+            gates: (gates || []).map((g) => gateName(g && g.ref)).filter(Boolean).slice(0, 400),
+            source: 'osm',
+        });
+    } catch (err) {
+        console.warn('airport gates: lookup failed —', err?.message || err);
+        res.json({ icao, gates: [], source: 'unavailable' });
+    }
+});
+
 // ---- Roster and routes as CSV ----
 //
 // A VA's data being in the VA's own database settles who owns it; being able to
@@ -6182,6 +6241,7 @@ app.get('/api/crew/:slug/routes.csv', async (req, res) => {
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
             kind: r.kind || 'own', partnerName: r.partnerName || '',
             partnerLogo: r.partnerLogo || '', minRank: r.minRank || '',
+            departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
         })));
     } catch (err) { crewFail(res, err, { log: 'routes export error', message: 'Could not export the routes.' }); }
 });
@@ -6198,6 +6258,7 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
                 id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
                 aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
                 kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
+                departureGate: r.departureGate, arrivalGate: r.arrivalGate,
             })),
             create: (values) => store.createRoute(cleanRoute(values)),
             update: (id, values, before) => store.updateRoute(id, cleanRoute({ ...before, ...values })),
@@ -6346,12 +6407,19 @@ app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
             id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
             kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
+            // Carried so an update merges onto them rather than over them. An
+            // update writes `cleanRoute({ ...before, ...values })`, and a gate
+            // missing from `before` would come back as '' — a VA who set their
+            // stands by hand and then pulled ten more legs off the library
+            // would have lost every one of them.
+            departureGate: r.departureGate, arrivalGate: r.arrivalGate,
         }));
 
         // `present` names every field the library actually has an opinion about.
-        // Leaving minRank and partnerLogo out of it is deliberate: the library
-        // knows nothing about either, and a row that claimed to know would blank
-        // a rank gate the VA had set on a leg they are re-importing.
+        // Leaving minRank, partnerLogo and the gates out of it is deliberate:
+        // the library knows nothing about any of them, and a row that claimed to
+        // know would blank a rank gate — or a stand — the VA had set on a leg
+        // they are re-importing.
         const plan = crewCsv.planRows(crewCsv.ROUTES_SPEC, rows, existing, {
             present: new Set(['flightNumber', 'origin', 'destination', 'aircraft',
                 'distanceNm', 'notes', 'active', 'kind', 'partnerName']),
