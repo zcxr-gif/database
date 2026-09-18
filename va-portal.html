@@ -766,13 +766,28 @@
             </div>
             <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
                 <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> <span data-i18n="team.add">Add a staff member</span></p>
-                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-5 gap-3">
                     <input id="tmName" type="text" placeholder="Display name" data-i18n-ph="team.namePh" class="field sm:col-span-1">
                     <input id="tmUser" type="text" placeholder="Username" data-i18n-ph="team.userPh" required class="field sm:col-span-1">
                     <input id="tmPass" type="text" placeholder="Password (min 8)" data-i18n-ph="team.passPh" required class="field sm:col-span-1">
+                    <select id="tmRole" class="field sm:col-span-1">
+                        <option value="staff" data-i18n="team.roleStaff">Staff — portal access</option>
+                        <option value="pilot" data-i18n="team.rolePilot">Pilot — crew centre only</option>
+                    </select>
                     <button type="submit" class="btn sm:col-span-1" data-i18n="team.addBtn">Add member</button>
                 </form>
                 <p id="teamMsg" class="hidden text-sm font-medium mt-3"></p>
+            </div>
+            <!-- FIND THE PERSON FIRST. This list is every account on the VA —
+                 office staff and crew-centre pilots together — so on an airline
+                 with a hundred pilots, changing one teammate's role meant
+                 scrolling past all of them. -->
+            <div class="surface rounded-2xl px-4 py-2.5 mb-3 flex items-center gap-3">
+                <i data-lucide="search" class="w-4 h-4 text-zinc-400 shrink-0"></i>
+                <input id="teamSearch" type="search" autocomplete="off" placeholder="Search name, username or role…"
+                    data-i18n-ph="team.searchPh"
+                    class="flex-1 min-w-0 bg-transparent text-sm focus:outline-none placeholder:text-zinc-400">
+                <span id="teamCount" class="text-xs text-zinc-400 shrink-0 tabular-nums"></span>
             </div>
             <div id="teamList" class="space-y-2"></div>
         </section>
@@ -2389,35 +2404,130 @@
         }
 
         // ---------- Team (owner) ----------
+        // Everyone on the VA, as last loaded. Held so the search box filters
+        // without a round trip per keystroke.
+        let TEAM = [];
+
         async function loadTeam() {
             try {
                 const { team } = await api('/team');
-                const members = team.filter(t => t.role !== 'owner');
-                const ownerRow = team.find(t => t.role === 'owner');
-                let html = '';
-                if (ownerRow) html += teamRow(ownerRow, true);
-                if (!members.length) html += `<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">${esc(t('team.empty'))}</div>`;
-                else html += members.map(m => teamRow(m, false)).join('');
-                $('teamList').innerHTML = html;
-                drawIcons();
+                TEAM = team || [];
+                renderTeam();
             } catch (err) {
+                TEAM = [];
                 $('teamList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+                $('teamCount').textContent = '';
             }
         }
 
+        const roleLabel = (r) => (r === 'owner' ? t('team.owner')
+            : r === 'pilot' ? t('team.rolePilotShort') : t('team.roleStaffShort'));
+
+        function renderTeam() {
+            const q = ($('teamSearch').value || '').trim().toLowerCase();
+            // Name, username and role together — whichever of the three the
+            // owner happens to know is the one that finds the person.
+            const match = (m) => !q || [m.displayName, m.username, m.role, roleLabel(m.role)]
+                .some(v => String(v || '').toLowerCase().includes(q));
+
+            const ownerRow = TEAM.find(m => m.role === 'owner');
+            const members = TEAM.filter(m => m.role !== 'owner' && match(m));
+            // The owner row is the anchor of this screen, so it stays put unless
+            // the search genuinely excludes it.
+            const showOwner = ownerRow && match(ownerRow);
+
+            $('teamCount').textContent = q
+                ? t('team.countFiltered', { n: members.length + (showOwner ? 1 : 0), total: TEAM.length })
+                : t('team.count', { n: TEAM.length });
+
+            let html = '';
+            if (showOwner) html += teamRow(ownerRow, true);
+            if (!members.length) {
+                html += `<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">${
+                    esc(q ? t('team.noMatch') : t('team.empty'))}</div>`;
+            } else html += members.map(m => teamRow(m, false)).join('');
+            $('teamList').innerHTML = html;
+            drawIcons();
+        }
+
         function teamRow(m, isOwner) {
+            /* THE ROLE IS A CONTROL, NOT A LABEL.
+             *
+             * This row showed nothing about the role at all — office staff and
+             * crew-centre pilots looked identical — and there was no way to
+             * move anybody between them. Both directions are ordinary: a pilot
+             * who joins the office needs the inbox, somebody leaving the office
+             * goes back on the line.
+             *
+             * Owner is not in this picker. Handing the VA over is a swap, so it
+             * is its own button with its own confirmation. */
+            const rolePicker = isOwner
+                ? `<span class="text-[10px] uppercase tracking-wide px-2 py-1 rounded-lg bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 font-semibold">${esc(t('team.owner'))}</span>`
+                : `<select onchange="setMemberRole('${m.id}', this.value, this)" title="${esc(t('team.roleTitle'))}"
+                        class="text-xs font-semibold px-2 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-transparent hover:border-zinc-300 dark:hover:border-zinc-600 focus:outline-none">
+                        <option value="staff"${m.role === 'staff' ? ' selected' : ''}>${esc(t('team.roleStaffShort'))}</option>
+                        <option value="pilot"${m.role === 'pilot' ? ' selected' : ''}>${esc(t('team.rolePilotShort'))}</option>
+                    </select>`;
+            // Only an ACTIVE staff teammate can be handed the VA: a pilot has
+            // never opened this portal, and a disabled account cannot sign in
+            // to receive it. The server refuses both; the button simply is not
+            // offered, which is the kinder half of the same rule.
+            const canOwn = !isOwner && m.role === 'staff' && m.active;
             return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
                 <div class="min-w-0">
-                    <p class="font-semibold text-sm truncate">${esc(m.displayName)} ${isOwner ? `<span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">${esc(t('team.owner'))}</span>` : ''}</p>
+                    <p class="font-semibold text-sm truncate">${esc(m.displayName)}</p>
                     <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
                 </div>
-                ${isOwner ? '' : `<div class="flex items-center gap-1.5">
+                <div class="flex items-center gap-1.5 shrink-0">
+                    ${rolePicker}
+                    ${isOwner ? '' : `
+                    ${canOwn ? `<button onclick="makeOwner('${m.id}')" title="${esc(t('team.makeOwnerTitle'))}" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">${esc(t('team.makeOwner'))}</button>` : ''}
                     <button onclick="resetMember('${m.id}')" title="${esc(t('team.reset'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
                     <button onclick="toggleMember('${m.id}', ${!m.active})" title="${m.active ? esc(t('team.disable')) : esc(t('team.enable'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${m.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
-                    <button onclick="deleteMember('${m.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-                </div>`}
+                    <button onclick="deleteMember('${m.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>`}
+                </div>
             </div>`;
         }
+
+        /** Move a teammate between staff and pilot. */
+        async function setMemberRole(id, role, el) {
+            const m = TEAM.find(x => x.id === id);
+            if (!m || m.role === role) return;
+            try {
+                await api('/team/' + id, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ role }),
+                });
+                loadTeam();
+            } catch (err) {
+                // Put the picker back rather than leave it showing a role the
+                // account has not got.
+                if (el) el.value = m.role;
+                alert(err.message);
+            }
+        }
+
+        /**
+         * Hand the VA over.
+         *
+         * One-way from this screen: the moment it lands the caller is staff and
+         * this tab is not theirs, so the page is reloaded and the portal
+         * re-decides what they may see. Confirmed with the teammate's name in
+         * the sentence, because "are you sure?" is not a question anybody reads.
+         */
+        async function makeOwner(id) {
+            const m = TEAM.find(x => x.id === id);
+            if (!m) return;
+            if (!confirm(t('team.confirmOwner', { name: m.displayName || m.username }))) return;
+            try {
+                await api('/team/' + id + '/transfer-owner', { method: 'POST' });
+                alert(t('team.ownerDone', { name: m.displayName || m.username }));
+                location.reload();
+            } catch (err) { alert(err.message); }
+        }
+
+        // Local to what is already loaded: a redraw, not a refetch.
+        $('teamSearch').addEventListener('input', renderTeam);
 
         $('teamForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -2425,7 +2535,10 @@
             try {
                 await api('/team', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ displayName: $('tmName').value, username: $('tmUser').value, password: $('tmPass').value }),
+                    body: JSON.stringify({
+                        displayName: $('tmName').value, username: $('tmUser').value,
+                        password: $('tmPass').value, role: $('tmRole').value,
+                    }),
                 });
                 $('teamForm').reset();
                 flash('teamMsg', t('team.added'), true);
