@@ -363,8 +363,22 @@ function registerAuthRoutes(app) {
             const { role, active, displayName, password } = req.body || {};
             const isSelf = String(user._id) === String(req.staff._id);
 
+            /* A ROLE WE DO NOT RECOGNISE IS A REFUSAL, NOT A NO-OP.
+             *
+             * `role` used to be applied only where ROLES included it and
+             * otherwise dropped in silence — so a typo, or a client sending
+             * `owner` because it assumed that was a thing, came back 200 with
+             * the account unchanged. The screen then showed the new role until
+             * the next reload put it back, which is the one failure mode worse
+             * than an error: a confirmation that is not true. */
+            if (role !== undefined && !ROLES.includes(role)) {
+                return res.status(400).json({ error: `Unknown role. One of: ${ROLES.join(', ')}.` });
+            }
+
             // Guard: never let an admin lock themselves out or demote/disable the
-            // last remaining active admin.
+            // last remaining active admin. Stepping DOWN is allowed — that is
+            // how a workspace is handed over — as long as somebody else is
+            // still holding the door open.
             if ((role && role !== 'admin') || active === false) {
                 if (user.role === 'admin') {
                     const otherActiveAdmins = await StaffUser.countDocuments({
@@ -376,7 +390,8 @@ function registerAuthRoutes(app) {
                 }
             }
 
-            if (ROLES.includes(role)) user.role = role;
+            const roleChanged = role !== undefined && role !== user.role;
+            if (role !== undefined) user.role = role;
             if (typeof active === 'boolean') user.active = active;
             if (typeof displayName === 'string') user.displayName = displayName;
             if (password) {
@@ -386,7 +401,10 @@ function registerAuthRoutes(app) {
                 user.passwordHash = await bcrypt.hash(password, 12);
             }
             await user.save();
-            res.json({ user: publicUser(user), self: isSelf });
+            // `self` + `roleChanged` together are what tell a client it has
+            // just changed its OWN role — the hand-over case, where the page it
+            // is standing on is no longer a page it may open.
+            res.json({ user: publicUser(user), self: isSelf, roleChanged });
         } catch (err) {
             console.error('Update user error:', err);
             res.status(500).json({ error: 'Could not update user.' });
