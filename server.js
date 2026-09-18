@@ -12865,6 +12865,17 @@ app.get('/api/crew/:slug/staff-openings', async (req, res) => {
         // Separately from the gate: a staff member WITHOUT team.manage is still
         // staff, and the gate hands back no principal when it refuses.
         const who = verifyCrewRequest(req);
+        // Not public. A job advert names the airline's own permission structure
+        // — what each role can do, in plain words — which is the airline's
+        // business and its pilots', and nobody else's. Unlike the pilot join
+        // form, which exists to be found by strangers, this one is for people
+        // who are already flying here.
+        if (!who) {
+            return res.status(401).json({
+                error: 'Sign in to see what your airline is looking for.',
+                code: 'not_authenticated',
+            });
+        }
         const viewer = await crewViewer(req, store);
         const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
 
@@ -12924,8 +12935,12 @@ app.post('/api/crew/:slug/staff-openings', async (req, res) => {
         });
     }
     try {
-        const ad = await VirtualAirlineAd.findOne({ slug: String(req.params.slug || '').toLowerCase() })
-            || await VirtualAirlineAd.findOne({ callsign: String(req.params.slug || '').toUpperCase() });
+        // Resolved the same way every other crew route resolves a slug — by
+        // slug then callsign, approved only — but as a live document, because
+        // this one saves.
+        const raw = String(req.params.slug || '').toLowerCase();
+        const ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            || await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' });
         if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
 
         const cleaned = crewStaffApps.sanitizeOpenings(req.body && req.body.openings, ad.staffRoles || []);
@@ -12955,7 +12970,11 @@ app.post('/api/crew/:slug/staff-openings', async (req, res) => {
         ad.staffOpenings = cleaned;
         await ad.save();
         res.set('Cache-Control', 'no-store');
-        res.json({ openings: cleaned.map(o => dressOpening(o, ad)) });
+        // With `roleId`, which the pilot-facing view deliberately withholds.
+        // The editor needs it back: ids are minted here, and an editor that had
+        // to guess which role a returned job pointed at would re-mint them on
+        // the next save and orphan every application against them.
+        res.json({ openings: cleaned.map(o => ({ ...dressOpening(o, ad), roleId: o.roleId })) });
     } catch (err) { crewFail(res, err, { log: 'staff openings save error', message: 'Could not save the openings.' }); }
 });
 
@@ -13122,13 +13141,34 @@ app.patch('/api/crew/:slug/staff-applications/:id', async (req, res) => {
                 permissions: [], byName: by, store,
             });
         } catch (err) {
-            if (err && err.code === 'already_staff') return res.status(409).json({ error: err.message });
+            // ALREADY STAFF IS NOT A DEAD END. Two ways to get here: somebody
+            // promoted them by hand while their application sat in the queue,
+            // or the account write below succeeded on an earlier press and the
+            // row update did not (see the order note further down). Both mean
+            // the same thing — they have the job — so the row is closed rather
+            // than left pending for a reviewer to press accept at forever.
+            if (err && err.code === 'already_staff') {
+                const done = await store.updateStaffApplication(existing._id, {
+                    status: 'accepted', staffMessage: message, decidedBy: by, decidedAt: new Date(),
+                });
+                return res.json(withDrift(store, {
+                    application: crewStaffApps.staffApplicationView(done),
+                    note: err.message,
+                }));
+            }
             if (err && err.code === 'not_on_roster') {
                 return res.status(409).json({ error: 'That pilot has left the roster. Decline this one.' });
             }
             throw err;
         }
 
+        // THE ACCOUNT FIRST, THE ROW SECOND, and that order is the safe one.
+        // Two things can go wrong here and only one of them is recoverable: an
+        // account that exists against a row still marked pending is fixed by
+        // pressing accept again (which answers "@name is already staff" and
+        // says exactly what happened), where a row marked accepted with no
+        // account behind it is a person told they got the job and no way for
+        // anybody to notice they cannot sign in.
         const saved = await store.updateStaffApplication(existing._id, {
             status: 'accepted', staffMessage: message, decidedBy: by, decidedAt: new Date(),
         });

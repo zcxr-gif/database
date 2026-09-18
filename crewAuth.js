@@ -2564,14 +2564,6 @@ function registerCrewAuthRoutes(app) {
             // it was inventing its own wording for the catalogue's labels —
             // see capabilitySummary.
             canSummary: capabilitySummary(caps),
-            // And the two facts that decide whether "No role" is reassuring or
-            // alarming. A staff member with no assignment holds nearly
-            // everything (see effectiveCaps), which is the single most misread
-            // thing on the team screen; sending it as a flag means the row can
-            // say so instead of rendering an empty space.
-            unassignedStaff: p.role === 'staff' && !isOwner
-                && !((va && va.staffAssignments) || []).some(a =>
-                    String((a && a.username) || '').toLowerCase() === String(p.uname || '').toLowerCase()),
             // Websites are always available: every VA has an address at
             // inflight.info/va/<slug> whether or not this deployment hands out
             // subdomains, so the crew centre's Website tile is never hidden.
