@@ -424,8 +424,92 @@ async function fetchAirportGates(icaoCode, coordsFor, localGatesFor) {
     return gates;
 }
 
+/* =============================================================================
+ * EVENT ARTWORK, AND WHEN IT STOPS BEING OURS TO KEEP
+ *
+ * A VA used to be asked for a banner *URL*, which meant every one of them went
+ * and found somewhere else to host a picture — Discord's CDN, an imgur link, a
+ * Google Drive share — and roughly half of those were dead by the time anyone
+ * scrolled back to the event. Now they upload it and we hold it.
+ *
+ * Holding it means agreeing to let it go. An event is a thing that happens on a
+ * date and is then over; keeping its artwork forever would mean an airline that
+ * runs a weekly fly-in quietly accrues a picture a week, in our bucket, for as
+ * long as they exist. So the artwork has a life: the event, plus a week to look
+ * back at it, and then the object is deleted and the row's `bannerUrl` cleared.
+ *
+ * TWO RULES, AND THEY ARE THE WHOLE SAFETY PROPERTY.
+ *
+ * 1. WE ONLY EVER DELETE WHAT WE HOST. A VA who pasted a link to their own
+ *    website's artwork years ago still has that link; `hostedBanner` is what
+ *    keeps a sweep away from it. Deleting somebody else's URL is impossible,
+ *    but *clearing the row* would still vandalise their event, so the check
+ *    gates both halves.
+ *
+ * 2. AN EVENT WITH NO DATE IS NEVER SWEPT. That is a draft somebody is part way
+ *    through writing, and its picture is the one they just uploaded. An
+ *    expiry rule that could not tell those apart would delete work in progress.
+ *
+ * Pure, so the rule can be tested without a bucket or a database.
+ * =========================================================================== */
+
+// The event, then a week. Long enough that "look what we flew on Saturday"
+// still has a picture on the following weekend; short enough that a weekly
+// fly-in does not leave a year of artwork behind it.
+const EVENT_ART_GRACE_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * When the event itself finished, in ms — or null when it has no date at all.
+ *
+ * `endsAt` where the VA gave one, because a fly-in published as 18:00–23:00 is
+ * not over at 18:00. `startsAt` otherwise, which is what most events carry.
+ */
+function eventEndedAt(event) {
+    const e = event || {};
+    const at = when(e.endsAt) || when(e.startsAt);
+    return at ? at.getTime() : null;
+}
+
+/**
+ * Is this banner one WE are storing?
+ *
+ * `bucketHost` is the hostname our uploads land on; a deployment with no bucket
+ * configured passes nothing, and then nothing is ever hosted — which is the
+ * right answer, because a sweep that cannot tell must not delete.
+ *
+ * Compared on the parsed hostname rather than by prefix: a string that merely
+ * *starts with* our bucket URL can be spoofed by a query string, and one that
+ * merely *contains* it can be spoofed by a path.
+ */
+function hostedBanner(url, bucketHost) {
+    const host = String(bucketHost || '').trim().toLowerCase();
+    if (!host) return false;
+    const s = String(url || '').trim();
+    if (!/^https:\/\//i.test(s)) return false;
+    try { return new URL(s).hostname.toLowerCase() === host; } catch { return false; }
+}
+
+/**
+ * Has this event's artwork outlived the event?
+ *
+ * False for anything we do not host, for anything with no date, and for
+ * anything still inside its grace — so a caller can hand it every event a VA
+ * has and act on what comes back true.
+ */
+function bannerExpired(event, { now = Date.now(), graceMs = EVENT_ART_GRACE_MS, bucketHost = '' } = {}) {
+    const e = event || {};
+    if (!hostedBanner(e.bannerUrl, bucketHost)) return false;
+    const ended = eventEndedAt(e);
+    if (ended === null) return false;
+    return (ended + Math.max(0, graceMs)) < now;
+}
+
 module.exports = {
     sanitizeEvent,
+    EVENT_ART_GRACE_MS,
+    eventEndedAt,
+    hostedBanner,
+    bannerExpired,
     sanitizeSignupPatch,
     publicEvent,
     publicSignup,

@@ -834,9 +834,11 @@ async function deactivateRepAccount(ad, discordUserId, { actorName = 'Inflight B
  * @param {Function} [deps.deleteVaImage]     (s3Client, url) => Promise — deletes one S3 object
  * @param {Object} [deps.s3Client]            S3 client for image/attachment deletes
  * @param {Function} [deps.isDiscordWebhookUrl] (url) => boolean — validates before we DELETE it
+ * @param {Function} [deps.crewEventArt]      (ad) => Promise<string[]> — the event banners WE host
+ *                                            for this VA, read from their own crew database
  * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number, webhook:boolean}>}
  */
-async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl } = {}) {
+async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl, crewEventArt } = {}) {
     const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0, site: false, webhook: false };
     if (!ad || !ad._id) return counts;
     const vaAdId = ad._id;
@@ -904,6 +906,28 @@ async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client,
                 counts.site = true;
             }
         } catch (e) { console.error('purgeVaData website:', e.message); }
+    }
+
+    /* THE ARTWORK ON THEIR CREW CENTER'S EVENTS.
+     *
+     * Event banners are uploaded to our storage but the rows that point at them
+     * live in the VA's OWN database, which is theirs and is not ours to touch.
+     * That is what makes this the one place they can be collected: the daily
+     * artwork sweep walks the VAs we know about, and after a purge this VA is
+     * not one of them — so anything not deleted here is orphaned for good.
+     *
+     * `crewEventArt` is injected rather than imported, for the reason every
+     * other dependency here is: this module knows nothing about crew stores,
+     * and a caller that has not got one simply does not pass it. It returns
+     * only the URLs we HOST — a link a VA pasted to their own website is not
+     * ours to delete, on this path any more than on the sweep.
+     */
+    if (typeof crewEventArt === 'function' && deleteVaImage && s3Client) {
+        try {
+            for (const url of (await crewEventArt(ad)) || []) {
+                await deleteVaImage(s3Client, url); counts.images += 1;
+            }
+        } catch (e) { console.error('purgeVaData event art:', e.message); }
     }
 
     // Finally the flight-events webhook — deleted at Discord, so the VA's own

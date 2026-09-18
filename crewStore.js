@@ -1902,6 +1902,30 @@ class SupabaseStore {
             return (rows || []).map(eventFromRow);
         });
     }
+    /**
+     * Events that finished a while ago and still carry artwork. v21.
+     *
+     * What the artwork sweep reads. Narrow on purpose: a VA with four hundred
+     * events has four hundred rows nothing needs, and the sweep runs over every
+     * VA we have. The filter is `starts_at` because that is the indexed column
+     * and an event cannot END before it starts — so this is a superset of what
+     * is actually expired, and crewEvents.bannerExpired makes the real decision
+     * (including on `ends_at`, and on whether the picture is even ours).
+     *
+     * `banner_url: 'neq.'` is "not the empty string", the same filter the
+     * linked-pilot lookup uses. Almost every event has no banner at all.
+     */
+    listEventsWithBanner({ startedBefore, limit = 500 } = {}) {
+        return this.events(async () => {
+            const params = {
+                ...this.scope, order: 'starts_at.asc', limit,
+                banner_url: 'neq.',
+            };
+            if (startedBefore) params.starts_at = `lt.${new Date(startedBefore).toISOString()}`;
+            const rows = await this.db.select('crew_events', params);
+            return (rows || []).map(eventFromRow);
+        });
+    }
     getEvent(id) { return this.events(() => this.one('crew_events', this.ident(id), eventFromRow)); }
     createEvent(data) {
         return this.events(async () => {
@@ -3264,6 +3288,7 @@ class LegacyStore {
             { status: 409, code: 'store_events_unsupported' }));
     }
     listEvents() { return this.events(); }
+    listEventsWithBanner() { return this.events(); }
     getEvent() { return this.events(); }
     createEvent() { return this.events(); }
     updateEvent() { return this.events(); }
