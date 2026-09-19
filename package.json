@@ -21,7 +21,9 @@
     "test:featured": "node scripts/test-crew-featured.js",
     "test:clubs": "node scripts/test-crew-clubs.js",
     "test:streaks": "node scripts/test-crew-streaks.js",
-    "test:badges": "node scripts/test-crew-badges.js"
+    "test:badges": "node scripts/test-crew-badges.js",
+    "test:portal": "node scripts/test-va-portal-owner.js",
+    "test:portal:browser": "node scripts/test-va-portal-mobile.js && node scripts/test-va-submissions-mobile.js"
   },
   "keywords": [],
   "author": "Antony",

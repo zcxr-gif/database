@@ -2269,7 +2269,36 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         try {
             const account = await VaPortalAccount.findById(req.params.id);
             if (!account) return res.status(404).json({ error: 'Account not found.' });
-            const { active, displayName, password, role } = req.body || {};
+            const { active, displayName, password, role, username } = req.body || {};
+
+            /* RENAMING AN ACCOUNT.
+             *
+             * The oversight UI could create an account and could not correct it:
+             * a username typed wrong at provisioning time, or auto-derived from
+             * a VA that has since rebranded, was permanent, and the only way out
+             * was to delete the account and hand out fresh credentials. So the
+             * username is editable here, under the same rules the create path
+             * uses — normalized, and unique across every portal account.
+             *
+             * This runs before the role swap below so a taken username fails the
+             * whole request instead of leaving a half-applied promotion behind.
+             */
+            let renamedFrom = null;
+            if (typeof username === 'string' && username.trim()) {
+                const uname = username.toLowerCase().trim()
+                    .replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+                if (uname.length < 3) {
+                    return res.status(400).json({ error: 'Username must be at least 3 characters.' });
+                }
+                if (uname !== account.username) {
+                    if (await VaPortalAccount.exists({ username: uname, _id: { $ne: account._id } })) {
+                        return res.status(409).json({ error: 'That username is already taken.' });
+                    }
+                    renamedFrom = account.username;
+                    account.username = uname;
+                }
+            }
+
             if (typeof active === 'boolean') account.active = active;
             if (typeof displayName === 'string') account.displayName = displayName;
 
@@ -2318,7 +2347,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 action: 'account.update',
                 detail: demoted
                     ? `Made @${account.username} owner — @${demoted.username} is now staff`
-                    : `Updated @${account.username}`,
+                    : renamedFrom
+                        ? `Renamed @${renamedFrom} to @${account.username}`
+                        : `Updated @${account.username}`,
             });
             res.json({ account: publicAccount(account), demoted });
         } catch (err) {
