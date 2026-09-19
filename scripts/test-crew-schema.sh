@@ -179,6 +179,7 @@ cat > "$DIR/rls.sql" <<'SQL'
 insert into crew_staff_applications (va_slug, position, pilot_name) values ('ba','PIREP reviewer','Rae');
 set role anon;
 select 'anon_staff_apps=' || count(*) from crew_staff_applications;
+select 'anon_quiz_attempts=' || count(*) from crew_quiz_attempts;
 select 'anon_applicants=' || count(*) from crew_applications;
 select 'anon_inbox=' || count(*) from crew_notifications;
 select 'anon_logins=' || count(*) from crew_accounts;
@@ -201,6 +202,7 @@ refused() {
         step "✗" "$2 — it was not refused"; fails=$((fails+1)); fi
 }
 refused crew_staff_applications "staff applications are unreachable"
+refused crew_quiz_attempts      "quiz results and their links are unreachable"
 refused crew_applications       "pilot applications are unreachable"
 refused crew_notifications      "a pilot's inbox is unreachable"
 refused crew_accounts           "password hashes are unreachable"
