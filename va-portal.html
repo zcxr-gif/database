@@ -766,7 +766,11 @@
             </div>
             <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
                 <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> <span data-i18n="team.add">Add a staff member</span></p>
-                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-5 gap-3">
+                <!-- Two across on a tablet, five on a desktop. Five sharing
+                     640px is ~115px a field, which is narrower than the word
+                     "Password" — adding the role select made a four-column row
+                     that already only just fitted into one that did not. -->
+                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
                     <input id="tmName" type="text" placeholder="Display name" data-i18n-ph="team.namePh" class="field sm:col-span-1">
                     <input id="tmUser" type="text" placeholder="Username" data-i18n-ph="team.userPh" required class="field sm:col-span-1">
                     <input id="tmPass" type="text" placeholder="Password (min 8)" data-i18n-ph="team.passPh" required class="field sm:col-span-1">
@@ -774,7 +778,7 @@
                         <option value="staff" data-i18n="team.roleStaff">Staff — portal access</option>
                         <option value="pilot" data-i18n="team.rolePilot">Pilot — crew centre only</option>
                     </select>
-                    <button type="submit" class="btn sm:col-span-1" data-i18n="team.addBtn">Add member</button>
+                    <button type="submit" class="btn sm:col-span-2 lg:col-span-1" data-i18n="team.addBtn">Add member</button>
                 </form>
                 <p id="teamMsg" class="hidden text-sm font-medium mt-3"></p>
             </div>
@@ -2473,12 +2477,26 @@
             // to receive it. The server refuses both; the button simply is not
             // offered, which is the kinder half of the same rule.
             const canOwn = !isOwner && m.role === 'staff' && m.active;
-            return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
+            /* STACKED ON A PHONE, SIDE BY SIDE FROM 640px.
+             *
+             * These rows used to carry three icon buttons and nothing else, so
+             * a name and a shrink-0 action group fitted on one line. The role
+             * picker and Make owner take that group past 270px, which on a
+             * 390px screen left the NAME 30 pixels — narrower than two
+             * characters, and truncated. The row it happened to was the active
+             * staff one: the person you would hand the VA to is exactly whose
+             * name you could no longer read.
+             *
+             * So the name gets its own line below `sm`, and the actions wrap
+             * rather than squeeze — `flex-wrap` instead of a shrink-0 group
+             * that wins every fight with the text beside it.
+             */
+            return `<div class="surface rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div class="min-w-0">
                     <p class="font-semibold text-sm truncate">${esc(m.displayName)}</p>
                     <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
                 </div>
-                <div class="flex items-center gap-1.5 shrink-0">
+                <div class="flex items-center flex-wrap gap-1.5 sm:shrink-0">
                     ${rolePicker}
                     ${isOwner ? '' : `
                     ${canOwn ? `<button onclick="makeOwner('${m.id}')" title="${esc(t('team.makeOwnerTitle'))}" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">${esc(t('team.makeOwner'))}</button>` : ''}
