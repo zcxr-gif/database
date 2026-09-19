@@ -15,6 +15,7 @@
     "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js",
     "test:staff-pilot": "node scripts/test-crew-staff-pilot.js",
     "test:staff-apps": "node scripts/test-crew-staff-apps.js",
+    "test:quizzes": "node scripts/test-crew-quizzes.js",
     "test:schema-sql": "bash scripts/test-crew-schema.sh",
     "test:forgot": "node scripts/test-crew-password-reset.js",
     "test:routes": "node scripts/test-route-library.js",

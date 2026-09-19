@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 21;
+const EXPECTED_SCHEMA_VERSION = 22;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -179,6 +179,14 @@ const PASSWORD_RESET_SCHEMA_VERSION = 19;
 // update button itself, rather than reporting a broken store over a VA whose
 // roster, routes and flights are all answering perfectly.
 const STAFF_APPS_SCHEMA_VERSION = 20;
+
+// The version that introduced crew_quiz_attempts. Its own constant like events,
+// the links board, check-rides and the hiring queue, and for the same reason: a
+// pilot sitting a quiz is a whole feature a pre-v22 project has not got a table
+// for, and — because the crew centre's entry gate is read off those rows — a VA
+// on an older project must be told the gate cannot hold rather than shown a
+// door it has nowhere to record anybody walking through.
+const QUIZZES_SCHEMA_VERSION = 22;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -1208,6 +1216,66 @@ const staffAppToRow = (a) => {
     pick(a, out, 'staffMessage', 'staff_message', (v) => str(v, 1000));
     pick(a, out, 'decidedBy', 'decided_by', (v) => str(v, 80));
     pick(a, out, 'decidedAt', 'decided_at', (v) => (v ? new Date(v).toISOString() : null));
+    return out;
+};
+
+// v22. One pilot sitting one quiz.
+//
+// `quizTitle`, `passMark` and `maxAttempts` are COPIES of the quiz as it stood
+// when the attempt was issued, and that is the point: a quiz can be renamed,
+// re-marked or deleted while somebody is half way through it, and a result
+// reading "(deleted) — 7/10 against a pass mark of (gone)" is not a record of
+// anything. What the pilot sat is frozen here; the questions are re-read from
+// the airline's record at the moment of marking, because a paper must be marked
+// against the answers the airline holds now.
+//
+// `token` is the link. It is a secret in the sense that holding one is how a
+// pilot reaches their own attempt, so it is never listed to anybody but the
+// pilot it belongs to -- see myAttemptView in crewQuizzes.js.
+const quizAttemptFromRow = (r) => r && {
+    _id: r.id,
+    quizId: r.quiz_id || '',
+    quizTitle: r.quiz_title || '',
+    token: r.token || '',
+    memberId: r.member_id || null,
+    pilotName: r.pilot_name || '',
+    callsign: r.callsign || '',
+    status: r.status || 'issued',
+    gate: r.gate === true,
+    score: Number(r.score) || 0,
+    total: Number(r.total) || 0,
+    passMark: Number(r.pass_mark) || 0,
+    attemptsUsed: Number(r.attempts_used) || 0,
+    maxAttempts: Number(r.max_attempts) || 0,
+    answers: Array.isArray(r.answers) ? r.answers : [],
+    note: r.note || '',
+    issuedBy: r.issued_by || '',
+    startedAt: date(r.started_at),
+    submittedAt: date(r.submitted_at),
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const QUIZ_ATTEMPT_STATUSES = ['issued', 'started', 'passed', 'failed', 'revoked'];
+const quizAttemptToRow = (a) => {
+    const out = {};
+    pick(a, out, 'quizId', 'quiz_id', (v) => str(v, 40));
+    pick(a, out, 'quizTitle', 'quiz_title', (v) => str(v, 120));
+    pick(a, out, 'token', 'token', (v) => str(v, 64));
+    pick(a, out, 'memberId', 'member_id', (v) => v || null);
+    pick(a, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
+    pick(a, out, 'callsign', 'callsign', (v) => str(v, 40));
+    pick(a, out, 'status', 'status', (v) => (QUIZ_ATTEMPT_STATUSES.includes(v) ? v : 'issued'));
+    pick(a, out, 'gate', 'gate', (v) => v === true);
+    pick(a, out, 'score', 'score', (v) => int(v, 0, 1000));
+    pick(a, out, 'total', 'total', (v) => int(v, 0, 1000));
+    pick(a, out, 'passMark', 'pass_mark', (v) => int(v, 0, 100));
+    pick(a, out, 'attemptsUsed', 'attempts_used', (v) => int(v, 0, 1000));
+    pick(a, out, 'maxAttempts', 'max_attempts', (v) => int(v, 0, 1000));
+    pick(a, out, 'answers', 'answers', (v) => (Array.isArray(v) ? v : []));
+    pick(a, out, 'note', 'note', (v) => str(v, 500));
+    pick(a, out, 'issuedBy', 'issued_by', (v) => str(v, 80));
+    pick(a, out, 'startedAt', 'started_at', (v) => (v ? new Date(v).toISOString() : null));
+    pick(a, out, 'submittedAt', 'submitted_at', (v) => (v ? new Date(v).toISOString() : null));
     return out;
 };
 
@@ -2548,6 +2616,70 @@ class SupabaseStore {
         });
     }
 
+    // --- Quizzes (v22) ---
+    //
+    // The quizzes themselves are config and live on the VA's record beside the
+    // rank ladder and the staff openings. What is here is the sitting of one:
+    // who was sent which quiz, what they answered and what it came to.
+    async quizzes(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError
+                && (err.code === 'store_schema_missing' || err.code === 'store_schema_outdated')) {
+                throw new CrewStoreError(
+                    'This crew centre\u2019s project cannot record quiz results yet. Re-run the setup SQL (Settings \u2192 Data store) to add them.',
+                    { status: 409, code: 'store_quizzes_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Attempts, newest first — which is what both screens want. Staff read this
+     * as "who has been sent what lately", and a pilot's own view is almost
+     * always about the one they were just given.
+     *
+     * `memberId` narrows it to one pilot, which is all a signed-in pilot may
+     * see, and the filter is applied in the query so the rest of the airline's
+     * results never leave Postgres.
+     */
+    listQuizAttempts({ memberId = '', quizId = '', status = '', limit = 300 } = {}) {
+        return this.quizzes(async () => {
+            const q = { ...this.scope, order: 'created_at.desc', limit };
+            if (memberId) q.member_id = `eq.${memberId}`;
+            if (quizId) q.quiz_id = `eq.${quizId}`;
+            if (status) q.status = `eq.${status}`;
+            const rows = await this.db.select('crew_quiz_attempts', q);
+            return (rows || []).map(quizAttemptFromRow);
+        });
+    }
+    getQuizAttempt(id) {
+        return this.quizzes(() => this.one('crew_quiz_attempts', this.ident(id), quizAttemptFromRow));
+    }
+    /** The link, resolved. The token is unique per project by index. */
+    getQuizAttemptByToken(token) {
+        return this.quizzes(() => this.one('crew_quiz_attempts',
+            { ...this.scope, token: `eq.${String(token || '')}` }, quizAttemptFromRow));
+    }
+    createQuizAttempt(data) {
+        return this.quizzes(async () => {
+            const [row] = await this.db.insert('crew_quiz_attempts',
+                { va_slug: this.slug, ...quizAttemptToRow(data) });
+            return quizAttemptFromRow(row);
+        });
+    }
+    updateQuizAttempt(id, patch) {
+        return this.quizzes(async () => {
+            const [row] = await this.db.update('crew_quiz_attempts', this.ident(id), quizAttemptToRow(patch));
+            return row ? quizAttemptFromRow(row) : null;
+        });
+    }
+    deleteQuizAttempt(id) {
+        return this.quizzes(async () => {
+            await this.db.remove('crew_quiz_attempts', this.ident(id));
+            return true;
+        });
+    }
+
     /* --- Leave of absence (v15) ---
      *
      * Two codes collapse into one here, and deliberately. A project that has
@@ -2873,6 +3005,11 @@ class SupabaseStore {
                 // has nowhere to record an application against, rather than
                 // taking an application it is about to lose.
                 staffApps: version >= STAFF_APPS_SCHEMA_VERSION,
+                // v22. Whether this project can hold a quiz result. The gate in
+                // front of the crew centre is read off these rows, so a VA on an
+                // older project is told the quizzes cannot run at all rather
+                // than being handed a lock whose key it cannot record.
+                quizzes: version >= QUIZZES_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -2894,6 +3031,7 @@ class SupabaseStore {
                 shop: false,
                 passwordResets: false,
                 staffApps: false,
+                quizzes: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -3399,6 +3537,21 @@ class LegacyStore {
     createStaffApplication() { return this.staffApps(); }
     updateStaffApplication() { return this.staffApps(); }
     deleteStaffApplication() { return this.staffApps(); }
+
+    // v22. Same answer, same reason: a legacy VA has no project of its own to
+    // hold a quiz result in, and a crew centre gate read off rows that cannot
+    // exist would lock every pilot out with nothing anybody could do about it.
+    quizzes() {
+        throw new CrewStoreError(
+            'This crew centre is not on its own database yet, so it cannot run quizzes. Connect a Supabase project in Settings \u2192 Data store.',
+            { status: 409, code: 'store_quizzes_missing' });
+    }
+    listQuizAttempts() { return this.quizzes(); }
+    getQuizAttempt() { return this.quizzes(); }
+    getQuizAttemptByToken() { return this.quizzes(); }
+    createQuizAttempt() { return this.quizzes(); }
+    updateQuizAttempt() { return this.quizzes(); }
+    deleteQuizAttempt() { return this.quizzes(); }
 
     // v15. Leave was never built on the retiring managed path. `status = 'loa'`
     // can still be set by hand on a managed roster — that column is as old as

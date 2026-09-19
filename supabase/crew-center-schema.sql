@@ -1270,7 +1270,7 @@ alter table crew_notifications drop constraint if exists crew_notifications_kind
 alter table crew_notifications add constraint crew_notifications_kind_check
     check (kind in ('message','application','promotion','booking',
                     'event','document','checkride','system',
-                    'flight_approved','flight_rejected','flight_edited','order'));
+                    'flight_approved','flight_rejected','flight_edited','order','quiz'));
 
 -- The inbox itself: one pilot's messages, newest first.
 create index if not exists crew_notifications_account_idx
@@ -1595,6 +1595,74 @@ create unique index if not exists crew_staff_applications_open_idx
     where status = 'pending' and member_id is not null;
 
 -- ----------------------------------------------------------------------------
+-- v22. QUIZZES — one pilot sitting one quiz.
+--
+-- The quizzes themselves are NOT here. A quiz is config, like the rank ladder,
+-- the join form and the staff openings, so it lives on the VA's own record with
+-- them and is edited in one place. What is here is the sitting of one: who was
+-- sent which quiz, what they answered, and what it came to.
+--
+-- THE ANSWER KEY IS NOT IN THIS TABLE EITHER. `answers` is what the pilot
+-- picked; the marking happens on the backend against the airline's own copy of
+-- the questions. Nothing a browser can reach has ever held the right answers.
+--
+-- WHY SO MANY COPIES (quiz_title, pass_mark, max_attempts). A quiz can be
+-- renamed, re-marked or deleted while somebody is half way through it. A result
+-- that reads "(deleted) — 7/10 against a pass mark of (gone)" is not a record of
+-- anything, so what the pilot sat is frozen on the row. Same reasoning as
+-- crew_staff_applications.position.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_quiz_attempts (
+    id           uuid primary key default gen_random_uuid(),
+    va_slug      text not null,
+    quiz_id      text not null default '',
+    quiz_title   text not null default '',
+    -- The link. Holding one is how a pilot reaches their own attempt, so it is
+    -- unique per project and is never listed to anybody but the pilot it
+    -- belongs to. It is not a credential on its own: the backend still checks
+    -- that the signed-in caller is the pilot the attempt names.
+    token        text not null default '',
+    member_id    uuid references crew_members (id) on delete cascade,
+    pilot_name   text not null default '',
+    callsign     text not null default '',
+    -- 'issued'  staff sent it and nobody has opened it
+    -- 'started' opened, not yet handed in
+    -- 'passed' / 'failed' marked
+    -- 'revoked' staff took the link back
+    status       text not null default 'issued'
+                 check (status in ('issued','started','passed','failed','revoked')),
+    -- Whether THIS attempt is the one standing between the pilot and the crew
+    -- centre. Held on the row rather than derived, so that turning the gate off
+    -- — or pointing it at a different quiz — does not rewrite the history of
+    -- who was once held at the door.
+    gate         boolean not null default false,
+    score        int not null default 0,
+    total        int not null default 0,
+    pass_mark    int not null default 0,
+    attempts_used int not null default 0,
+    max_attempts  int not null default 0,
+    -- What they picked, in the order they were asked: [{ id, chosen, right }, …].
+    answers      jsonb not null default '[]'::jsonb,
+    -- What staff said when they sent it, or when they gave somebody another go.
+    note         text not null default '',
+    issued_by    text not null default '',
+    started_at   timestamptz,
+    submitted_at timestamptz,
+    created_at   timestamptz not null default now(),
+    updated_at   timestamptz not null default now()
+);
+-- The staff queue: what has been sent lately, and what is still outstanding.
+create index if not exists crew_quiz_attempts_va_idx
+    on crew_quiz_attempts (va_slug, status, created_at desc);
+-- One pilot's own results, which is what the gate is read off on every sign-in.
+create index if not exists crew_quiz_attempts_member_idx
+    on crew_quiz_attempts (va_slug, member_id, created_at desc);
+-- The link, resolved in one hop. Unique because a token that matched two rows
+-- would be a pilot opening somebody else's paper.
+create unique index if not exists crew_quiz_attempts_token_idx
+    on crew_quiz_attempts (token) where token <> '';
+
+-- ----------------------------------------------------------------------------
 -- Buying something.
 --
 -- One function, one transaction, and every check inside it. The order of the
@@ -1835,7 +1903,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_shop_items','crew_shop_orders','crew_staff_applications','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests','crew_shop_items','crew_shop_orders','crew_staff_applications','crew_quiz_attempts','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -2043,7 +2111,8 @@ declare
         'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
         'crew_events','crew_event_signups','crew_announcements','crew_schedules',
         'crew_bookings','crew_documents','crew_notifications','crew_links','crew_training_requests',
-        'crew_shop_items','crew_shop_orders','crew_staff_applications','crew_schema_info'];
+        'crew_shop_items','crew_shop_orders','crew_staff_applications','crew_quiz_attempts',
+        'crew_schema_info'];
     t              text;
     rel            regclass;
     tbl_bytes      bigint;
@@ -2149,6 +2218,7 @@ alter table crew_training_requests enable row level security;
 alter table crew_shop_items    enable row level security;
 alter table crew_shop_orders   enable row level security;
 alter table crew_staff_applications enable row level security;
+alter table crew_quiz_attempts enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -2286,6 +2356,15 @@ revoke all on crew_training_requests from anon, authenticated;
 -- knows whether the caller is the applicant or the person reviewing them.
 revoke all on crew_staff_applications from anon, authenticated;
 
+-- v22. Quiz attempts, same treatment and the same reason twice over. A row names
+-- one pilot and carries what they answered and whether they passed — and it
+-- carries the token that opens their paper. There is no filter one shared
+-- browser credential could be scoped by, so the table gets no policy above and
+-- no grant here; every read goes through the backend against a signed-in session
+-- that knows whether the caller is the pilot sitting it or the staff member who
+-- sent it.
+revoke all on crew_quiz_attempts from anon, authenticated;
+
 -- v15. The shelf is readable with the browser key, because it is a shop window:
 -- a VA's own website should be able to show what its pilots can earn without
 -- asking us for anything. Only the items, and only the ones that are on sale --
@@ -2364,5 +2443,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 21)
+insert into crew_schema_info (id, version) values (1, 22)
 on conflict (id) do update set version = excluded.version, updated_at = now();

@@ -71,6 +71,7 @@ const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordIn
 // Openings and staff applications — see the head of that file for why hiring is
 // gated on team.manage rather than on a capability of its own.
 const crewStaffApps = require('./crewStaffApps');
+const crewQuizzes = require('./crewQuizzes');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -557,6 +558,80 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             questions: [String], minHours: Number, open: Boolean,
         }],
         default: [],
+    },
+    // v22. QUIZZES the airline sets its pilots — an induction on the SOP, a
+    // check that somebody has read the handbook, whatever the VA wants to be
+    // sure of before it hands over a callsign.
+    //
+    // Config, held here beside the openings and the rank ladder for the same
+    // reason they are: it is the airline describing itself, and it is edited in
+    // one place. The SITTINGS of a quiz are the pilots' own answers and live in
+    // the VA's project (crew_quiz_attempts, v22). See crewQuizzes.js.
+    //
+    // `correct` IS THE ANSWER KEY and never leaves this process: every route
+    // that hands a quiz to a taker runs it through crewQuizzes.publicQuiz,
+    // which strips it. Marking happens on the server, against this copy.
+    //
+    // NOTE the `{ type: ... }` wrapping, and that no field inside is called
+    // `type` — see the crewFleet note below for what happens when one is.
+    crewQuizzes: {
+        type: [{
+            _id: false, id: String, title: String, blurb: String, banner: String,
+            passMark: Number, maxAttempts: Number, open: Boolean, active: Boolean,
+            questions: [{ _id: false, id: String, text: String, options: [String], correct: Number }],
+        }],
+        default: [],
+    },
+    // The door. When `enabled`, a pilot of this airline sees a locked crew
+    // centre until they have passed the quiz `quizId` names — normally one
+    // staff sent them a link to, which is the flow this was built for.
+    //
+    // It is deliberately narrow. It holds PILOTS, never staff (the person who
+    // would unlock it must not be behind it), and it fails open on anything it
+    // cannot establish — a deleted quiz, an unreachable project. A crew centre
+    // locked because a database was slow is an outage the airline did not ask
+    // for; see the head of crewQuizzes.js.
+    crewQuizGate: {
+        type: new mongoose.Schema({
+            enabled: { type: Boolean, default: false },
+            quizId: { type: String, trim: true, default: '' },
+            // What the pilot reads on the locked screen, in the airline's own
+            // words. Without one they get ours, which says to expect a link.
+            message: { type: String, trim: true, default: '' },
+            // Whether a pilot may start the entry quiz themselves rather than
+            // waiting to be sent one. Off by default.
+            allowSelfStart: { type: Boolean, default: false },
+        }, { _id: false }),
+        default: () => ({}),
+    },
+    // The airline's own pictures over the screens pilots meet it on: the jobs
+    // board and the quizzes. Decoration, and optional — a VA that sets neither
+    // gets the plain headings it has always had.
+    crewBanners: {
+        type: new mongoose.Schema({
+            apply: { type: String, trim: true, default: '' },
+            quiz: { type: String, trim: true, default: '' },
+        }, { _id: false }),
+        default: () => ({}),
+    },
+    // Reminding staff that somebody is waiting on them — applications, staff
+    // applications, quizzes sent and never opened. Off unless a VA asks for it.
+    //
+    // `lastSentAt` is the stamp the hourly sweep reads so a digest goes out
+    // every `everyHours` at most, and only when there is something to say. Kept
+    // on the record rather than in memory because the process restarts and a
+    // reminder that repeated on every deploy is a reminder people mute.
+    crewStaffReminders: {
+        type: new mongoose.Schema({
+            enabled: { type: Boolean, default: false },
+            everyHours: { type: Number, default: 24 },
+            afterHours: { type: Number, default: 24 },
+            applications: { type: Boolean, default: true },
+            staffApplications: { type: Boolean, default: true },
+            quizzes: { type: Boolean, default: true },
+            lastSentAt: { type: Date, default: null },
+        }, { _id: false }),
+        default: () => ({}),
     },
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
@@ -2359,6 +2434,146 @@ async function runRetentionSweepAll({ now = Date.now() } = {}) {
             }
         } catch (err) {
             console.error(`[retention] ${va.slug || va._id} sweep failed:`, err && err.message);
+        }
+    }
+    return totals;
+}
+
+/* =============================================================================
+ * REMINDING STAFF THAT SOMEBODY IS WAITING
+ *
+ * The thing that actually goes wrong at a volunteer airline is not that staff
+ * refuse to do the work — it is that nothing anywhere says the work is there.
+ * An application filed on a Tuesday is a row in a queue nobody opens, and the
+ * pilot who filed it concludes, reasonably, that the airline is dead.
+ *
+ * So: a digest, to the channel staff already read, listing what has been
+ * waiting and for how long. Off unless a VA switches it on.
+ *
+ * THREE RULES, and each is about not becoming noise:
+ *
+ *   NOTHING WAITING, NOTHING SENT. A reminder that arrives on the hour whether
+ *   or not there is anything to say is a reminder people mute, and a muted
+ *   channel is worse than no channel.
+ *
+ *   NOTHING TOO FRESH. `afterHours` is how long something has to have been
+ *   sitting before it counts. Staff have not failed to answer an application
+ *   that landed four minutes ago.
+ *
+ *   ONE DIGEST, NOT ONE PER ROW. Everything waiting goes in a single post, so a
+ *   backlog of thirty is one message rather than thirty.
+ *
+ * `lastSentAt` lives on the VA's record rather than in memory, because the
+ * process restarts and a reminder that repeated on every deploy is exactly the
+ * noise the rules above exist to prevent.
+ * ========================================================================== */
+
+const REMINDER_COLOR = 0x2563EB;
+
+/** "3 days" / "7 hours" — how long the oldest thing has been sitting. */
+function waitingText(since, now) {
+    const ms = now - new Date(since || now).getTime();
+    const hours = Math.floor(ms / 3600000);
+    if (hours < 1) return 'under an hour';
+    if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'}`;
+    return `${Math.floor(hours / 24)} days`;
+}
+
+/**
+ * Run the reminder for one VA.
+ *
+ * `dryRun` does everything except write and post and returns the same shape,
+ * which is what the preview endpoint is: an owner switching this on should be
+ * able to see what the first digest would say before their crew does.
+ */
+async function runStaffReminderSweep(va, { dryRun = false, now = Date.now() } = {}) {
+    const rules = crewQuizzes.sanitizeReminders(va.crewStaffReminders || {});
+    const out = { slug: va.slug || String(va._id), rules, dryRun, lines: [], sent: false, skipped: '' };
+    if (!rules.enabled) { out.skipped = 'not enabled'; return out; }
+
+    const lastSent = va.crewStaffReminders && va.crewStaffReminders.lastSentAt
+        ? new Date(va.crewStaffReminders.lastSentAt).getTime() : 0;
+    const due = !lastSent || (now - lastSent) >= rules.everyHours * 3600000;
+    if (!due && !dryRun) { out.skipped = 'not due yet'; return out; }
+
+    let store;
+    try { store = await crewStore.forVa(va); } catch (err) {
+        out.skipped = `no store (${err && err.code ? err.code : 'error'})`;
+        return out;
+    }
+
+    const cutoff = now - rules.afterHours * 3600000;
+    const older = (rows, stampKey = 'createdAt') => rows
+        .filter(r => new Date(r[stampKey] || 0).getTime() <= cutoff)
+        .sort((a, b) => new Date(a[stampKey] || 0) - new Date(b[stampKey] || 0));
+
+    // Each of the three is asked for separately and each failure is survivable:
+    // a project that cannot answer about quizzes should still get told about the
+    // applications, because the point is the reminder, not the completeness.
+    if (rules.applications) {
+        const rows = await store.listApplications({ status: 'pending', limit: 300 }).catch(() => []);
+        const due2 = older(rows);
+        if (due2.length) {
+            out.lines.push(`**${due2.length}** membership application${due2.length === 1 ? '' : 's'} waiting — the oldest for ${waitingText(due2[0].createdAt, now)}.`);
+        }
+    }
+    if (rules.staffApplications) {
+        const rows = await store.listStaffApplications({ status: 'pending', limit: 300 }).catch(() => []);
+        const due2 = older(rows);
+        if (due2.length) {
+            out.lines.push(`**${due2.length}** staff application${due2.length === 1 ? '' : 's'} waiting — the oldest for ${waitingText(due2[0].createdAt, now)}.`);
+        }
+    }
+    if (rules.quizzes) {
+        const rows = await store.listQuizAttempts({ limit: 300 }).catch(() => []);
+        // Sent and never opened, which is the one nobody chases: the pilot is
+        // waiting on nothing and staff think it is done.
+        const open = older(rows.filter(a => a.status === 'issued' || a.status === 'started'));
+        if (open.length) {
+            out.lines.push(`**${open.length}** quiz link${open.length === 1 ? '' : 's'} sent and not handed in — the oldest ${waitingText(open[0].createdAt, now)} ago.`);
+        }
+    }
+
+    if (!out.lines.length) { out.skipped = 'nothing waiting'; return out; }
+    if (dryRun) return out;
+
+    const hook = await crewWebhookUrlFor(va._id, 'recruitment').catch(() => '');
+    if (hook) {
+        await postCrewNotice(hook, {
+            title: '⏰ Waiting on the team',
+            description: out.lines.join('\n'),
+            color: REMINDER_COLOR,
+        }).catch(() => {});
+    }
+    // Stamped whether or not the webhook answered. A VA with no webhook
+    // configured has nothing to receive this, and retrying every hour forever
+    // would mean reading three tables an hour for a post that cannot land.
+    await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { 'crewStaffReminders.lastSentAt': new Date(now) } })
+        .catch(() => {});
+    out.sent = true;
+    return out;
+}
+
+/** Every VA that has switched it on. Serial, like the roster sweep, and why. */
+async function runStaffReminderSweepAll({ now = Date.now() } = {}) {
+    let vas = [];
+    try {
+        vas = await VirtualAirlineAd.find({
+            status: 'approved',
+            'crewStaffReminders.enabled': true,
+        }).select(crewStore.SELECT + ' crewStaffReminders').lean();
+    } catch (err) {
+        console.error('[reminders] could not list VAs:', err && err.message);
+        return { vas: 0, sent: 0 };
+    }
+    const totals = { vas: 0, sent: 0 };
+    for (const va of vas) {
+        try {
+            const r = await runStaffReminderSweep(va, { now });
+            totals.vas += 1;
+            if (r.sent) totals.sent += 1;
+        } catch (err) {
+            console.error(`[reminders] ${va.slug || va._id} failed:`, err && err.message);
         }
     }
     return totals;
@@ -13163,7 +13378,7 @@ app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
 // store-backed `va` above does not carry.
 async function crewTeamDoc(slug) {
     const raw = String(slug || '').trim().toLowerCase();
-    const sel = 'slug callsign staffRoles staffAssignments staffOpenings';
+    const sel = 'slug callsign staffRoles staffAssignments staffOpenings crewBanners';
     let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return ad;
@@ -13234,6 +13449,9 @@ app.get('/api/crew/:slug/staff-openings', async (req, res) => {
         res.set('Cache-Control', 'no-store');
         res.json(withDrift(store, {
             openings,
+            // v22. The airline's own picture over its jobs board, where it has
+            // set one. Decoration, and empty for every VA that has not.
+            banner: crewQuizzes.sanitizeBanners(ad.crewBanners || {}).apply,
             canHire,
             supported: !!schema.staffApps,
             hours: viewer ? viewer.hours : 0,
@@ -13527,6 +13745,624 @@ app.patch('/api/crew/:slug/staff-applications/:id', async (req, res) => {
             keptTheirLogin: out.keptTheirLogin,
         }));
     } catch (err) { crewFail(res, err, { log: 'staff application decide error', message: 'Could not decide that application.' }); }
+});
+
+/* ===========================================================================
+ * QUIZZES — what the airline wants somebody to know, and the door it can put
+ * in front of its own crew centre.
+ *
+ * Three groups of routes, gated on three different things, and the split is the
+ * point:
+ *
+ *   BUILDING a quiz, setting the banners, choosing whether the door is shut and
+ *   who gets reminded is `settings.recruitment` — the capability that already
+ *   means "decide how people get in here".
+ *
+ *   SENDING somebody a quiz and reading what came back is `applications.review`
+ *   — the capability that already means "decide about a person". Handing a
+ *   pilot a paper and marking it is that, not config.
+ *
+ *   SITTING one needs no capability at all, only a signed-in pilot holding a
+ *   link that names them. The token is not a credential on its own: every route
+ *   below re-checks that the caller IS the pilot the attempt names, so a
+ *   forwarded link opens nothing.
+ *
+ * THE ANSWER KEY NEVER LEAVES THIS PROCESS. Every quiz handed to a taker goes
+ * through crewQuizzes.publicQuiz, which strips `correct`; marking is
+ * crewQuizzes.grade, here, against the airline's own copy. See the head of
+ * crewQuizzes.js.
+ * ======================================================================== */
+
+// The VA's own record — the quizzes, the gate, the banners and the reminder
+// settings, none of which the store-backed `va` carries.
+async function crewQuizDoc(slug) {
+    const raw = String(slug || '').trim().toLowerCase();
+    const sel = 'slug callsign name crewQuizzes crewQuizGate crewBanners crewStaffReminders';
+    let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
+    if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
+    return ad;
+}
+
+// The same document, live, for the routes that save.
+async function crewQuizDocLive(slug) {
+    const raw = String(slug || '').trim().toLowerCase();
+    return (await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }))
+        || (await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }));
+}
+
+/** Where a pilot opens the quiz they were sent. */
+const quizLinkFor = (slug, token) =>
+    `${SITE_ORIGIN}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}?quiz=${encodeURIComponent(token)}`;
+
+/**
+ * Everything a screen needs to draw the quizzes, for whoever is asking.
+ *
+ * One route rather than a pilot one and a staff one, in the mould of
+ * /training: the two screens overlap almost entirely, and `canManage` is what
+ * decides whether the answer key and the queue come with it.
+ */
+app.get('/api/crew/:slug/quizzes', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewQuizDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const who = verifyCrewRequest(req);
+        // Not public, and for the same reason the jobs board is not: a quiz is
+        // the airline's own words to its own crew, and an open endpoint would
+        // hand every question it asks to anybody who typed the slug.
+        if (!who) {
+            return res.status(401).json({ error: 'Sign in to see your airline’s quizzes.', code: 'not_authenticated' });
+        }
+        const isStaff = !!(who && (who.role === 'staff' || who.role === 'owner'));
+        const build = await requireCap(req, req.params.slug, 'settings.recruitment');
+        const review = await requireCap(req, req.params.slug, 'applications.review');
+        const canBuild = !build.error;
+        const canReview = !review.error;
+
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        const gate = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const banners = crewQuizzes.sanitizeBanners(ad.crewBanners || {});
+
+        // Whether this project can hold a result at all. Asked before anything
+        // is drawn, so a VA on a pre-v22 schema gets the update prompt rather
+        // than a paper that would throw when it was handed in.
+        const schema = await store.health().catch(() => ({ quizzes: false }));
+
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+
+        let mine = [];
+        if (myId && schema.quizzes) {
+            mine = await store.listQuizAttempts({ memberId: myId, limit: 100 })
+                .then(rows => rows.map(crewQuizzes.myAttemptView))
+                .catch(() => []);
+        }
+        // The badge, for the people who send them out: papers sent and not yet
+        // handed in.
+        let outstanding = 0;
+        if (canReview && schema.quizzes) {
+            outstanding = await store.listQuizAttempts({ limit: 300 })
+                .then(rows => rows.filter(a => a.status === 'issued' || a.status === 'started').length)
+                .catch(() => 0);
+        }
+
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            // Staff building them get the answer key; nobody else ever does.
+            quizzes: quizzes
+                .filter(q => canBuild || canReview || (q.active && (q.open || mine.some(a => a.quizId === q.id))))
+                .map(q => crewQuizzes.publicQuiz(q, { withAnswers: canBuild })),
+            banners,
+            gate: crewQuizzes.gateState({ gate, quizzes, attempts: mine, isStaff }),
+            gateConfig: canBuild ? gate : null,
+            reminders: canBuild ? crewQuizzes.sanitizeReminders(ad.crewStaffReminders || {}) : null,
+            canBuild,
+            canReview,
+            canManage: canBuild || canReview,
+            supported: !!schema.quizzes,
+            isStaff,
+            mine,
+            outstanding,
+        }));
+    } catch (err) { crewFail(res, err, { log: 'quizzes read error', message: 'Could not read the quizzes.' }); }
+});
+
+/**
+ * Saving the airline's side of it — the quizzes, the door, the banners and the
+ * reminders, in one PUT-shaped POST like the openings editor beside it.
+ *
+ * Each part is optional and only what was sent is written, so the reminders
+ * screen saving does not have to send back a quiz bank it never read.
+ */
+app.post('/api/crew/:slug/quizzes', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to edit the quizzes.',
+        });
+    }
+    try {
+        const ad = await crewQuizDocLive(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+        const body = req.body || {};
+
+        if (body.quizzes !== undefined) {
+            const cleaned = crewQuizzes.sanitizeQuizzes(body.quizzes);
+            if (!cleaned) return res.status(400).json({ error: 'Send the quizzes as a list.' });
+            ad.crewQuizzes = cleaned;
+        }
+        if (body.banners !== undefined) ad.crewBanners = crewQuizzes.sanitizeBanners(body.banners);
+        if (body.reminders !== undefined) {
+            const before = ad.crewStaffReminders || {};
+            ad.crewStaffReminders = {
+                ...crewQuizzes.sanitizeReminders(body.reminders),
+                // Never taken from the client: it is the sweep's own stamp, and
+                // a form that could rewind it could make the digest repeat.
+                lastSentAt: before.lastSentAt || null,
+            };
+        }
+        // The gate is sanitised against the quizzes AS THEY WILL BE after this
+        // save, not as they were — so deleting the quiz the door names in the
+        // same breath turns the door off rather than locking the airline out.
+        if (body.gate !== undefined) {
+            ad.crewQuizGate = crewQuizzes.sanitizeGate(body.gate, ad.crewQuizzes || []);
+        } else if (body.quizzes !== undefined) {
+            ad.crewQuizGate = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, ad.crewQuizzes || []);
+        }
+
+        await ad.save();
+        res.set('Cache-Control', 'no-store');
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        res.json({
+            quizzes: quizzes.map(q => crewQuizzes.publicQuiz(q, { withAnswers: true })),
+            banners: crewQuizzes.sanitizeBanners(ad.crewBanners || {}),
+            gateConfig: crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes),
+            reminders: crewQuizzes.sanitizeReminders(ad.crewStaffReminders || {}),
+        });
+    } catch (err) { crewFail(res, err, { log: 'quizzes save error', message: 'Could not save the quizzes.' }); }
+});
+
+/* ---- What the reminder would say, and sending one now -------------------- */
+//
+// The preview is the whole of the reassurance this feature needs: an owner
+// about to switch on something that posts in their Discord should be able to
+// read the first post before their crew does. `dryRun` means it reads the three
+// queues and writes nothing — no post, no stamp — so pressing it twice changes
+// nothing at all.
+app.get('/api/crew/:slug/staff-reminders/preview', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await crewQuizDocLive(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew centre not found.' });
+        const out = await runStaffReminderSweep(va, { dryRun: true });
+        res.set('Cache-Control', 'no-store');
+        res.json({ lines: out.lines, skipped: out.skipped, rules: out.rules });
+    } catch (err) { crewFail(res, err, { log: 'reminder preview error', message: 'Could not work out what is waiting.' }); }
+});
+
+// And the same thing for real, off a button, for the airline that wants to
+// nudge its team now rather than at the next tick.
+app.post('/api/crew/:slug/staff-reminders/send', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await crewQuizDocLive(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew centre not found.' });
+        const out = await runStaffReminderSweep(va, { dryRun: false });
+        res.set('Cache-Control', 'no-store');
+        res.json({ sent: out.sent, lines: out.lines, skipped: out.skipped });
+    } catch (err) { crewFail(res, err, { log: 'reminder send error', message: 'Could not send the reminder.' }); }
+});
+
+/**
+ * A banner, off the staff member's own computer.
+ *
+ * Same upload path as the event picture and the crew badge, so a VA gets the
+ * same resizing and the same bucket rather than a third way to store an image.
+ * `slot` says what it is for: the jobs board, the quizzes generally, or one
+ * named quiz.
+ */
+app.post('/api/crew/:slug/quizzes/banner', upload.single('image'), async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+        const ad = await crewQuizDocLive(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const slot = String((req.body && req.body.slot) || '').trim().slice(0, 60);
+        const quizId = slot.startsWith('quiz:') ? slot.slice(5) : '';
+        if (!['apply', 'quiz'].includes(slot) && !quizId) {
+            return res.status(400).json({ error: 'Say which banner this is for.' });
+        }
+
+        let url;
+        try {
+            url = await uploadVaImage(s3Client, req.file, String(ad._id), 'banner');
+        } catch (err) {
+            // A bad file is the file's fault, not ours — same handling as the
+            // event picture: sharp throws on a PDF renamed .png, and letting
+            // that fall through would report it as our outage.
+            if (err && err.status) return res.status(err.status).json({ error: err.message });
+            console.warn('quiz banner: could not read the upload —', err && err.message);
+            return res.status(400).json({ error: 'That file could not be read as an image. Try a JPG, PNG or GIF.' });
+        }
+
+        if (quizId) {
+            const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+            const quiz = quizzes.find(q => q.id === quizId);
+            if (!quiz) return res.status(404).json({ error: 'That quiz no longer exists.' });
+            quiz.banner = url;
+            ad.crewQuizzes = quizzes;
+        } else {
+            const banners = crewQuizzes.sanitizeBanners(ad.crewBanners || {});
+            banners[slot] = url;
+            ad.crewBanners = banners;
+        }
+        await ad.save();
+        res.set('Cache-Control', 'no-store');
+        res.json({ url, slot });
+    } catch (err) { crewFail(res, err, { log: 'quiz banner error', message: 'Could not upload that banner.' }); }
+});
+
+/* ---- Sending somebody a quiz ------------------------------------------- */
+//
+// The row is minted here and the LINK is what staff hand over, so the pilot's
+// half needs nothing but the URL. The same link is also posted to their inbox,
+// because a link pasted in Discord is a link that scrolls.
+app.post('/api/crew/:slug/quiz-attempts', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to send quizzes.',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewQuizDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        const quiz = quizzes.find(q => q.id === String((req.body || {}).quizId || ''));
+        if (!quiz) return res.status(404).json({ error: 'That quiz no longer exists.' });
+        if (!crewQuizzes.isReady(quiz)) {
+            return res.status(409).json({ error: `“${quiz.title}” has no questions in it yet.` });
+        }
+
+        const memberId = String((req.body || {}).memberId || '').trim();
+        if (!memberId) return res.status(400).json({ error: 'Say which pilot this is for.' });
+        const member = await store.getMember(memberId);
+        if (!member) return res.status(404).json({ error: 'That pilot is not on the roster.' });
+
+        // One live paper per pilot per quiz. Sending a second link while the
+        // first is unopened would leave the pilot two doors to the same room
+        // and staff a queue with the same name in it twice.
+        const existing = await store.listQuizAttempts({ memberId, quizId: quiz.id, limit: 50 });
+        const live = existing.find(a => a.status === 'issued' || a.status === 'started');
+        if (live) {
+            return res.status(409).json({
+                error: `${member.name || 'That pilot'} already has a link for “${quiz.title}”.`,
+                code: 'already_issued',
+                link: quizLinkFor(va.slug || req.params.slug, live.token),
+            });
+        }
+        if (existing.some(a => a.status === 'passed')) {
+            return res.status(409).json({ error: `${member.name || 'That pilot'} has already passed “${quiz.title}”.` });
+        }
+
+        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const saved = await store.createQuizAttempt({
+            quizId: quiz.id,
+            quizTitle: quiz.title,
+            token: crewQuizzes.attemptToken(),
+            memberId,
+            pilotName: member.name || '',
+            callsign: member.callsign || '',
+            status: 'issued',
+            // Whether this paper is the one standing between them and the crew
+            // centre — frozen on the row, so turning the door off later does not
+            // rewrite who was once held at it.
+            gate: !!(gateCfg.enabled && gateCfg.quizId === quiz.id),
+            passMark: quiz.passMark,
+            maxAttempts: quiz.maxAttempts,
+            note: String((req.body || {}).note || '').trim().slice(0, 500),
+            issuedBy: (gate.p && (gate.p.name || gate.p.uname)) || '',
+        });
+
+        const link = quizLinkFor(va.slug || req.params.slug, saved.token);
+        // Into the pilot's own inbox, where a link does not scroll away.
+        notifyPilot(va, member, {
+            kind: 'quiz',
+            title: `Your airline has sent you a quiz: ${quiz.title}`,
+            body: saved.note || `Open it when you have a few minutes. You need ${quiz.passMark}% to pass.`,
+            linkUrl: link,
+            senderName: va.name || '',
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.status(201).json(withDrift(store, { attempt: crewQuizzes.attemptView(saved), link }));
+    } catch (err) { crewFail(res, err, { log: 'quiz issue error', message: 'Could not send that quiz.' }); }
+});
+
+/* ---- The queue ---------------------------------------------------------- */
+app.get('/api/crew/:slug/quiz-attempts', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to read quiz results.',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const status = crewQuizzes.ATTEMPT_STATUSES.includes(String(req.query.status || ''))
+            ? String(req.query.status) : '';
+        const rows = await store.listQuizAttempts({ status, limit: 300 });
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            attempts: rows.map(a => ({
+                ...crewQuizzes.attemptView(a),
+                // Staff need the link back — they are the ones who hand it over,
+                // and a link they cannot recover is a link they have to reissue.
+                link: a.status === 'issued' || a.status === 'started'
+                    ? quizLinkFor(va.slug || req.params.slug, a.token) : '',
+            })),
+        }));
+    } catch (err) { crewFail(res, err, { log: 'quiz attempts list error', message: 'Could not load the quiz results.' }); }
+});
+
+/* ---- Taking a link back, giving another go, opening the door by hand ---- */
+app.patch('/api/crew/:slug/quiz-attempts/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to decide quiz results.',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getQuizAttempt(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'That quiz result no longer exists.' });
+        const action = String((req.body || {}).action || '').trim();
+        const note = String((req.body || {}).note || '').trim().slice(0, 500);
+        const by = (gate.p && (gate.p.name || gate.p.uname)) || '';
+
+        if (action === 'revoke') {
+            const saved = await store.updateQuizAttempt(existing._id, { status: 'revoked', note, issuedBy: by });
+            return res.json(withDrift(store, { attempt: crewQuizzes.attemptView(saved) }));
+        }
+
+        // Another go. A NEW TOKEN, not the old one: the point of reissuing is
+        // usually that the first link went somewhere it should not have, and a
+        // retry that kept the link would keep the problem.
+        if (action === 'reissue') {
+            const saved = await store.updateQuizAttempt(existing._id, {
+                status: 'issued', token: crewQuizzes.attemptToken(),
+                attemptsUsed: 0, score: 0, total: 0, answers: [],
+                note, issuedBy: by, startedAt: null, submittedAt: null,
+            });
+            const link = quizLinkFor(va.slug || req.params.slug, saved.token);
+            const member = existing.memberId ? await store.getMember(existing.memberId).catch(() => null) : null;
+            if (member) {
+                notifyPilot(va, member, {
+                    kind: 'quiz',
+                    title: `Another go at ${existing.quizTitle}`,
+                    body: note || 'Your staff have given you another attempt.',
+                    linkUrl: link,
+                    senderName: va.name || '',
+                });
+            }
+            return res.json(withDrift(store, { attempt: crewQuizzes.attemptView(saved), link }));
+        }
+
+        // Opening the door by hand. Recorded as a pass with the marks it
+        // actually has, because a staff member saying "you are fine, come in"
+        // is a decision the record should show as theirs rather than as a
+        // score the pilot never got.
+        if (action === 'unlock') {
+            const saved = await store.updateQuizAttempt(existing._id, {
+                status: 'passed', note: note || 'Cleared by staff.', issuedBy: by, submittedAt: new Date(),
+            });
+            const member = existing.memberId ? await store.getMember(existing.memberId).catch(() => null) : null;
+            if (member) {
+                notifyPilot(va, member, {
+                    kind: 'quiz',
+                    title: `You’re through — ${existing.quizTitle}`,
+                    body: note || 'Your staff have cleared you. The crew centre is open.',
+                    senderName: va.name || '',
+                });
+            }
+            return res.json(withDrift(store, { attempt: crewQuizzes.attemptView(saved) }));
+        }
+
+        return res.status(400).json({ error: 'Say whether to withdraw it, give another go, or clear them.' });
+    } catch (err) { crewFail(res, err, { log: 'quiz attempt decide error', message: 'Could not update that quiz result.' }); }
+});
+
+/* ---- Sitting one -------------------------------------------------------- */
+//
+// Both halves — reading the paper and handing it in — resolve the token and
+// then CHECK THE CALLER IS THE PILOT IT NAMES. The token alone opens nothing:
+// links get forwarded, pasted into Discord and screenshotted, and a paper
+// somebody else can sit is not a record of anything.
+async function resolveAttempt(req, res) {
+    const { va, store } = await resolveCrewStore(req.params.slug);
+    const ad = await crewQuizDoc(req.params.slug);
+    if (!ad) { res.status(404).json({ error: 'Crew centre not found.' }); return null; }
+
+    const viewer = await crewViewer(req, store);
+    if (!viewer || !viewer.memberId) {
+        res.status(401).json({ error: 'Sign in as a pilot of this airline to take a quiz.', code: 'not_authenticated' });
+        return null;
+    }
+    const attempt = await store.getQuizAttemptByToken(String(req.params.token || ''));
+    if (!attempt || String(attempt.memberId || '') !== String(viewer.memberId)) {
+        // The same answer for "no such link" and "not your link", deliberately:
+        // telling a stranger that a token is real but belongs to somebody else
+        // is telling them something they have no business knowing.
+        res.status(404).json({ error: 'That quiz link is not yours, or is no longer valid.' });
+        return null;
+    }
+    const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+    const quiz = quizzes.find(q => q.id === attempt.quizId) || null;
+    return { va, store, ad, quizzes, quiz, attempt, viewer };
+}
+
+app.get('/api/crew/:slug/quiz/:token', async (req, res) => {
+    try {
+        const ctx = await resolveAttempt(req, res);
+        if (!ctx) return;
+        const { store, ad, quiz, attempt } = ctx;
+
+        const refusal = crewQuizzes.takeFailure(quiz, attempt);
+        // A refusal is still a 200 with the paper's state on it: the pilot's
+        // screen has to draw "you passed this in March" and "you are out of
+        // goes" as well as a live paper, and neither of those is an error.
+        const started = !refusal && attempt.status === 'issued'
+            ? await store.updateQuizAttempt(attempt._id, { status: 'started', startedAt: new Date() }).catch(() => null)
+            : null;
+
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            // Without the answer key. Always. See the head of this section.
+            quiz: quiz ? crewQuizzes.publicQuiz(quiz) : null,
+            banner: (quiz && quiz.banner) || crewQuizzes.sanitizeBanners(ad.crewBanners || {}).quiz || '',
+            attempt: crewQuizzes.myAttemptView(started || attempt),
+            refusal,
+        }));
+    } catch (err) { crewFail(res, err, { log: 'quiz read error', message: 'Could not open that quiz.' }); }
+});
+
+app.post('/api/crew/:slug/quiz/:token', async (req, res) => {
+    try {
+        const ctx = await resolveAttempt(req, res);
+        if (!ctx) return;
+        const { va, store, ad, quizzes, quiz, attempt } = ctx;
+
+        const refusal = crewQuizzes.takeFailure(quiz, attempt);
+        if (refusal) return res.status(409).json({ error: refusal });
+
+        // Marked HERE, against the airline's own copy of the questions, and
+        // marked against the quiz as it stands now — a question the airline has
+        // since corrected is marked correctly. The pass mark is the one from the
+        // row, because that is the bar the pilot was told they had to clear.
+        const bar = Number(attempt.passMark) || quiz.passMark;
+        const result = crewQuizzes.grade({ ...quiz, passMark: bar }, (req.body || {}).answers);
+        const used = (Number(attempt.attemptsUsed) || 0) + 1;
+        const max = Number(attempt.maxAttempts) || 0;
+        // A failed paper with goes left stays open, so the pilot can sit it
+        // again on the same link. Out of goes, it is closed and only staff can
+        // give another.
+        const status = result.passed ? 'passed' : 'failed';
+
+        const saved = await store.updateQuizAttempt(attempt._id, {
+            status,
+            score: result.score,
+            total: result.total,
+            attemptsUsed: used,
+            // What they picked, not what was right. A row that carried the
+            // answer key would put it one leak away from every pilot.
+            answers: result.marks.map(m => ({ id: m.id, chosen: m.chosen, right: m.right })),
+            submittedAt: new Date(),
+        });
+
+        // The gate, recomputed from what is now on the record — so the pilot's
+        // screen can unlock itself the moment they pass rather than after a
+        // reload.
+        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const mine = await store.listQuizAttempts({ memberId: String(attempt.memberId), limit: 100 })
+            .then(rows => rows.map(crewQuizzes.myAttemptView)).catch(() => []);
+
+        // Staff hear the result down the recruitment feed the applications
+        // already use — same people, same channel. Fire-and-forget, always: a
+        // paper that was marked must never be reported as a failure because the
+        // notice about it could not be sent.
+        crewWebhookUrlFor(va._id, 'recruitment')
+            .then(url => postCrewNotice(url, {
+                title: result.passed ? '✅ Quiz passed' : '📝 Quiz not passed',
+                description: `**${attempt.pilotName || 'A pilot'}** scored **${result.score}/${result.total}** (${result.percent}%) on **${attempt.quizTitle}**.`,
+                color: result.passed ? 0x16A34A : 0xD97706,
+            }))
+            .catch(() => {});
+
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            attempt: crewQuizzes.myAttemptView(saved),
+            score: result.score,
+            total: result.total,
+            percent: result.percent,
+            passed: result.passed,
+            passMark: bar,
+            attemptsLeft: max > 0 ? Math.max(0, max - used) : -1,
+            gate: crewQuizzes.gateState({ gate: gateCfg, quizzes, attempts: mine, isStaff: false }),
+        }));
+    } catch (err) { crewFail(res, err, { log: 'quiz submit error', message: 'Could not mark that quiz.' }); }
+});
+
+/**
+ * Starting one yourself, where the airline allows it.
+ *
+ * Only ever the quiz the gate names, and only when `allowSelfStart` is on: this
+ * is the escape hatch for an airline that wants an induction everybody sits
+ * without staff having to hand out forty links, not a way to sit any quiz on
+ * demand. Everything else still goes out as a link.
+ */
+app.post('/api/crew/:slug/quiz-attempts/self', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewQuizDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+
+        const viewer = await crewViewer(req, store);
+        if (!viewer || !viewer.memberId) {
+            return res.status(401).json({ error: 'Sign in as a pilot of this airline.', code: 'not_authenticated' });
+        }
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const wanted = String((req.body || {}).quizId || '');
+        const quiz = quizzes.find(q => q.id === wanted);
+        if (!quiz || !crewQuizzes.isReady(quiz)) return res.status(404).json({ error: 'That quiz no longer exists.' });
+
+        const selfServe = quiz.active && quiz.open;
+        const entry = gateCfg.enabled && gateCfg.quizId === quiz.id && gateCfg.allowSelfStart;
+        if (!selfServe && !entry) {
+            return res.status(403).json({ error: 'Your staff send this one out. Ask them for a link.' });
+        }
+
+        const existing = await store.listQuizAttempts({ memberId: viewer.memberId, quizId: quiz.id, limit: 50 });
+        const live = existing.find(a => a.status === 'issued' || a.status === 'started');
+        if (live) {
+            return res.json(withDrift(store, { attempt: crewQuizzes.myAttemptView(live) }));
+        }
+        if (existing.some(a => a.status === 'passed')) {
+            return res.status(409).json({ error: 'You have already passed this one.' });
+        }
+        // A failed paper with goes left is reopened rather than duplicated —
+        // otherwise a pilot pressing "try again" would collect a row per go and
+        // their staff would read the queue as five people waiting.
+        const spent = existing.find(a => a.status === 'failed');
+        if (spent) {
+            const failure = crewQuizzes.takeFailure(quiz, spent);
+            if (failure) return res.status(409).json({ error: failure });
+            const reopened = await store.updateQuizAttempt(spent._id, { status: 'started', startedAt: new Date() });
+            return res.json(withDrift(store, { attempt: crewQuizzes.myAttemptView(reopened) }));
+        }
+
+        const member = await store.getMember(viewer.memberId).catch(() => null);
+        const saved = await store.createQuizAttempt({
+            quizId: quiz.id, quizTitle: quiz.title, token: crewQuizzes.attemptToken(),
+            memberId: viewer.memberId,
+            pilotName: (member && member.name) || '',
+            callsign: (member && member.callsign) || '',
+            status: 'started', startedAt: new Date(),
+            gate: !!entry,
+            passMark: quiz.passMark, maxAttempts: quiz.maxAttempts,
+            issuedBy: '',
+        });
+        res.set('Cache-Control', 'no-store');
+        res.status(201).json(withDrift(store, { attempt: crewQuizzes.myAttemptView(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'quiz self-start error', message: 'Could not start that quiz.' }); }
 });
 
 // ---- Public statistics ----
@@ -17108,7 +17944,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -17261,6 +18097,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 },
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
                 requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
+                // v22. The airline's own picture over its join form, when it
+                // has set one. Public like everything else in this block —
+                // the join page is meant to be found by strangers.
+                banner: crewQuizzes.sanitizeBanners(ad.crewBanners || {}).apply,
                 emailEnabled: !!ad.crewEmailConfigured,
                 // The VA's default Discord invite. Public by nature (it is
                 // meant to be shared) and read by the dashboard so the accept
@@ -21215,6 +22055,34 @@ if (String(process.env.EVENT_ART_SWEEP_DISABLED || '').toLowerCase() !== '1') {
         } finally { sweepingArt = false; }
     };
     setTimeout(() => { sweepArt(); setInterval(sweepArt, EVENT_ART_SWEEP_MS).unref(); }, EVENT_ART_FIRST_RUN_MS).unref();
+}
+
+// ---- The staff reminder, on a timer ----
+//
+// Hourly, because a VA can ask for a digest as often as every hour and the
+// sweep is what honours that; the per-VA `everyHours` floor is what actually
+// decides when one goes out, so this tick is cheap on an airline that asked for
+// a daily one — it reads a stamp and stops.
+//
+// Re-running is safe by construction: `lastSentAt` is written in the same pass,
+// so a second run inside the window sends nothing. Waits fifteen minutes after
+// boot, later than either sweep above, so a deploy does not do all three at
+// once. REMINDER_SWEEP_DISABLED=1 turns it off.
+const REMINDER_SWEEP_MS = 3600 * 1000;
+const REMINDER_FIRST_RUN_MS = 15 * 60 * 1000;
+if (String(process.env.REMINDER_SWEEP_DISABLED || '').toLowerCase() !== '1') {
+    let reminding = false;
+    const remind = async () => {
+        if (reminding) return console.warn('[reminders] previous run still going — skipping this tick');
+        reminding = true;
+        try {
+            const t = await runStaffReminderSweepAll();
+            if (t.sent) console.log(`[reminders] ${t.sent} digest(s) out of ${t.vas} VA(s)`);
+        } catch (err) {
+            console.error('[reminders] run failed:', err && err.message);
+        } finally { reminding = false; }
+    };
+    setTimeout(() => { remind(); setInterval(remind, REMINDER_SWEEP_MS).unref(); }, REMINDER_FIRST_RUN_MS).unref();
 }
 
 // Boot the live diagnostics sampler and feed it the two external state sources

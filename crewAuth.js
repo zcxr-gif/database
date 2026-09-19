@@ -36,6 +36,7 @@ const crewInvite = require('./crewInvite');
 // Openings only — the applications themselves are server.js's business. This
 // module does not require crewAuth back, so there is no cycle.
 const crewStaffApps = require('./crewStaffApps');
+const crewQuizzes = require('./crewQuizzes');
 // The pilot-facing privacy notice. Only the version and where to read it are
 // needed here — the words live in crewTermsContent.js and are served by their
 // own public route, because a document you have to be signed in to read is one
@@ -1156,7 +1157,7 @@ async function resolveVa(slug) {
     const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = `${crewStore.SELECT} staffRoles staffAssignments staffOpenings`;
+    const sel = `${crewStore.SELECT} staffRoles staffAssignments staffOpenings crewQuizzes crewQuizGate`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
         .select(sel).lean();
     if (!va) {
@@ -2586,6 +2587,20 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
            off the first and the Discord controls off the second. */
         let pilotSide = { applies: p.kind === 'va', ready: p.kind === 'crew', memberId: null };
         let terms = crewTermsState('', false);
+        /* THE DOOR. v22.
+           A VA can hold its crew centre shut until a pilot has passed the quiz
+           its staff sent them. /me is where that is answered, because /me is
+           what every page asks before it draws anything — and because the
+           answer has to be the DATABASE's rather than the session's, exactly
+           like the password nag above: a gate a pilot could clear by reloading
+           is not a gate.
+
+           IT FAILS OPEN. No gate, a deleted quiz, a store that will not answer
+           — all of them come back unlocked. A crew centre locked because a
+           database was slow is an outage the airline did not ask for and cannot
+           explain; see the head of crewQuizzes.js. Staff are never held at it
+           either: the person who would unlock it must not be behind it. */
+        let quizGate = crewQuizzes.gateState({});
         if ((p.kind === 'crew' || p.kind === 'va') && va) {
             discord.available = crewDiscord.configured();
             try {
@@ -2605,6 +2620,27 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                         discord.avatar = crewDiscord.avatarUrl({ id: account.discordId, avatar: account.discordAvatar });
                     }
                 }
+                // Only ever asked when the airline has actually shut the door,
+                // so a VA that has never touched this pays nothing for it.
+                const quizzes = crewQuizzes.sanitizeQuizzes(va.crewQuizzes || []) || [];
+                const gateCfg = crewQuizzes.sanitizeGate(va.crewQuizGate || {}, quizzes);
+                if (gateCfg.enabled) {
+                    const memberId = p.kind === 'crew'
+                        ? (account && account.memberId) || null
+                        : (pilotSide.memberId || null);
+                    let attempts = [];
+                    if (memberId) {
+                        attempts = await store.listQuizAttempts({ memberId: String(memberId), limit: 50 })
+                            .then(rows => rows.map(crewQuizzes.myAttemptView))
+                            .catch(() => []);
+                    }
+                    quizGate = crewQuizzes.gateState({
+                        gate: gateCfg, quizzes, attempts,
+                        // A staff login is never gated, and neither is a pilot
+                        // whose account we could not resolve — see above.
+                        isStaff: p.kind !== 'crew' || isOwner || caps.length > 0 || !memberId,
+                    });
+                }
             } catch { /* unreachable store — don't block "who am I" on it */ }
         }
         res.set('Cache-Control', 'no-store');
@@ -2616,6 +2652,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
             discord,
             pilotSide,
             terms,
+            quizGate,
             caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
             // Keyed on the capability rather than on being the owner, or a
             // chief of staff would be told they may manage the team and then
