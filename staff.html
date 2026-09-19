@@ -413,6 +413,19 @@
                     </button>
                 </div>
                 <div class="surface rounded-2xl overflow-hidden">
+                    <!-- FIND THE PERSON FIRST.
+                         Changing somebody's role starts with finding their row,
+                         and on a workspace with thirty accounts that meant
+                         reading thirty rows. Filters on name, username and role
+                         together, so "rep" finds every VA rep and "ant" finds
+                         Antony — whichever of the two you happen to know. -->
+                    <div class="flex items-center gap-3 px-5 py-3 border-b border-zinc-100 dark:border-zinc-800">
+                        <i data-lucide="search" class="w-4 h-4 text-zinc-400 shrink-0"></i>
+                        <input id="userSearch" type="search" autocomplete="off"
+                            placeholder="Search name, username or role…"
+                            class="flex-1 min-w-0 bg-transparent text-sm focus:outline-none placeholder:text-zinc-400">
+                        <span id="userCount" class="text-xs text-zinc-400 shrink-0 tabular-nums"></span>
+                    </div>
                     <div class="overflow-x-auto">
                         <table class="w-full text-sm">
                             <thead class="text-zinc-400 dark:text-zinc-500 border-b border-zinc-100 dark:border-zinc-800">
@@ -990,19 +1003,73 @@
         function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
         function fmtDate(d) { return d ? new Date(d).toLocaleDateString(undefined, { day:'numeric', month:'short', year:'numeric' }) : '—'; }
 
+        // Every account the workspace has, as last loaded. Kept so the search
+        // box can filter without going back to the server on every keystroke —
+        // this is a staff list, not a dataset.
+        let USERS = [];
+
         async function loadUsers() {
             const { ok, data } = await api('/api/auth/users');
             const body = document.getElementById('usersBody');
-            if (!ok) { body.innerHTML = '<tr><td colspan="5" class="px-5 py-8 text-center text-zinc-400">Could not load users.</td></tr>'; return; }
-            body.innerHTML = data.users.map(u => {
+            if (!ok) { USERS = []; body.innerHTML = '<tr><td colspan="5" class="px-5 py-8 text-center text-zinc-400">Could not load users.</td></tr>'; return; }
+            USERS = data.users || [];
+            renderUsers();
+        }
+
+        /* WHO IS LEFT TO PROMOTE.
+         *
+         * The backend refuses to demote or disable the last active admin — the
+         * lockout guard — and the picker has to say so BEFORE the click rather
+         * than as an error afterwards. Counted here rather than asked for,
+         * because the list this is counting is the list on screen. */
+        const activeAdmins = () => USERS.filter(u => u.role === 'admin' && u.active).length;
+
+        function renderUsers() {
+            const body = document.getElementById('usersBody');
+            const q = (document.getElementById('userSearch').value || '').trim().toLowerCase();
+            // Name, username and role label together: whichever of the three
+            // the person searching happens to know is the one that works.
+            const shown = q
+                ? USERS.filter(u => [u.displayName, u.username, u.role, roleLabel(u.role)]
+                    .some(v => String(v || '').toLowerCase().includes(q)))
+                : USERS.slice();
+
+            const count = document.getElementById('userCount');
+            count.textContent = q
+                ? `${shown.length} of ${USERS.length}`
+                : `${USERS.length} account${USERS.length === 1 ? '' : 's'}`;
+
+            if (!shown.length) {
+                body.innerHTML = `<tr><td colspan="5" class="px-5 py-8 text-center text-zinc-400">${
+                    USERS.length ? 'Nobody matches that.' : 'No staff accounts yet.'}</td></tr>`;
+                return;
+            }
+
+            // Counted once for the whole table, not once per row.
+            const admins = activeAdmins();
+
+            body.innerHTML = shown.map(u => {
                 const isSelf = u.id === currentUser.id;
-                const roleBadge = u.role === 'admin'
-                    ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">admin</span>'
-                    : u.role === 'va_rep'
-                    ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-100 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300">VA rep</span>'
-                    : u.role === 'graphic_designer'
-                    ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-violet-100 dark:bg-violet-950/60 text-violet-700 dark:text-violet-300">Designer</span>'
-                    : '<span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">staff</span>';
+                /* THE ROLE IS A PICKER, NOT A CYCLE.
+                 *
+                 * This was one shield button that moved a person to the next
+                 * role along, so making somebody an admin meant pressing it
+                 * three times and reading a tooltip to know where you were in
+                 * the loop — and pressing it once more on an admin demoted
+                 * them. Four options, each one click, and the one it is on is
+                 * the one selected.
+                 *
+                 * It is enabled on your OWN row too, which is the whole of
+                 * handing the workspace over: you promote them, then you step
+                 * down. Hiding it there — as the shield button did — meant the
+                 * second half was impossible from this screen. */
+                const lastAdmin = u.role === 'admin' && u.active && admins <= 1;
+                const roleCell = `<select ${lastAdmin ? 'disabled' : ''} onchange="setRole('${u.id}', this.value, this)"
+                        title="${lastAdmin ? 'The last active admin cannot be demoted — promote somebody else first.' : 'Change this account’s role'}"
+                        class="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-zinc-100/70 dark:bg-zinc-800/70 border border-transparent hover:border-zinc-300 dark:hover:border-zinc-600 focus:outline-none focus:ring-4 focus:ring-zinc-900/5 dark:focus:ring-white/5 transition disabled:opacity-60 disabled:cursor-not-allowed">
+                        ${['admin', 'staff', 'va_rep', 'graphic_designer'].map(r =>
+                            `<option value="${r}"${u.role === r ? ' selected' : ''}>${esc(roleLabel(r))}</option>`).join('')}
+                    </select>${lastAdmin ? '<div class="text-[11px] text-zinc-400 mt-1">Last admin</div>' : ''}`;
                 const statusBadge = u.active
                     ? '<span class="inline-flex items-center gap-1.5 text-zinc-600 dark:text-zinc-300 font-medium"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Active</span>'
                     : '<span class="inline-flex items-center gap-1.5 text-zinc-400"><span class="w-1.5 h-1.5 rounded-full bg-zinc-400"></span>Disabled</span>';
@@ -1019,14 +1086,13 @@
                             </div>
                         </div>
                     </td>
-                    <td class="px-5 py-3.5">${roleBadge}</td>
+                    <td class="px-5 py-3.5">${roleCell}</td>
                     <td class="px-5 py-3.5">${statusBadge}</td>
                     <td class="px-5 py-3.5 hidden sm:table-cell text-zinc-500 dark:text-zinc-400">${fmtDate(u.lastLoginAt)}</td>
                     <td class="px-5 py-3.5">
                         <div class="flex items-center justify-end gap-1">
                             ${iconBtn('key-round', 'Reset password', `resetPw('${u.id}','${esc(u.username)}')`)}
                             ${isSelf ? '' :
-                                iconBtn('shield', 'Cycle role (staff → VA rep → Designer → admin)', `cycleRole('${u.id}','${u.role}')`) +
                                 iconBtn(u.active ? 'ban' : 'badge-check', u.active ? 'Disable' : 'Enable', `toggleActive('${u.id}',${u.active})`) +
                                 iconBtn('trash-2', 'Delete', `delUser('${u.id}','${esc(u.username)}')`, true)
                             }
@@ -1041,12 +1107,54 @@
             const { ok, data } = await api('/api/auth/users/' + id, { method: 'PATCH', body: JSON.stringify(payload) });
             if (!ok) alert((data && data.error) || 'Update failed.');
             loadUsers();
+            return ok;
         }
-        // Cycle staff → va_rep → graphic_designer → admin → staff.
-        function cycleRole(id, role) {
-            const next = { staff: 'va_rep', va_rep: 'graphic_designer', graphic_designer: 'admin', admin: 'staff' };
-            patchUser(id, { role: next[role] || 'staff' });
+
+        /**
+         * Move one account to one role.
+         *
+         * Two of the four moves are worth stopping for, and both are about
+         * ADMIN — the role that can manage accounts, so it is the only one
+         * where a mis-click costs something that cannot be undone from this
+         * screen:
+         *
+         *   • promoting somebody to admin hands them your own powers,
+         *     including the power to remove you.
+         *   • demoting YOURSELF is stepping down. It is the second half of
+         *     handing the workspace over, so it must be possible — but it
+         *     takes this section away the moment it lands, so the page is
+         *     reloaded rather than left showing controls that will now 403.
+         *
+         * The select is put back on a refusal rather than left showing a role
+         * the account has not got.
+         */
+        async function setRole(id, role, el) {
+            const u = USERS.find(x => x.id === id);
+            if (!u || u.role === role) return;
+            const who = u.displayName || u.username;
+            const isSelf = id === currentUser.id;
+
+            let confirmed = true;
+            if (role === 'admin') {
+                confirmed = confirm(
+                    `Make "${who}" an admin?\n\n`
+                    + 'Admins can manage every staff account — including creating, '
+                    + 'disabling and deleting others, and changing your own role.');
+            } else if (isSelf) {
+                confirmed = confirm(
+                    `Step down from admin to ${roleLabel(role)}?\n\n`
+                    + 'You will lose access to staff accounts immediately, and only '
+                    + 'another admin will be able to give it back.');
+            }
+            if (!confirmed) { el.value = u.role; return; }
+
+            const ok = await patchUser(id, { role });
+            if (!ok) { el.value = u.role; return; }
+            // Our own role changed: the page we are standing on is no longer
+            // the page we are entitled to. Reload and let the server decide.
+            if (isSelf) location.reload();
         }
+
         function toggleActive(id, active) { patchUser(id, { active: !active }); }
         function resetPw(id, username) {
             const pw = prompt(`New password for "${username}" (min 8 chars):`);
@@ -1060,6 +1168,10 @@
             if (!ok) alert((data && data.error) || 'Delete failed.');
             loadUsers();
         }
+
+        // Filtering is local to what is already loaded, so this redraws rather
+        // than refetches — a staff list is tens of rows, not thousands.
+        document.getElementById('userSearch').addEventListener('input', renderUsers);
 
         // ---- Create user modal ----
         function openCreate() { show('createModal'); drawIcons(); document.getElementById('newUsername').focus(); }

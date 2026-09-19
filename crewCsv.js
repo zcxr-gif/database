@@ -112,6 +112,13 @@ const ROUTES_SPEC = {
         // Named, not numeric: the VA's own rank names are what they think in,
         // and the hours behind them are set once on the ladder.
         { key: 'minRank', header: 'minRank', aliases: ['rank', 'opensat', 'requiredrank'], type: 'text', max: 40 },
+        // v21. The stands. A VA laying a network out in a spreadsheet is exactly
+        // the VA who has the gate numbers in a column already, and typing two
+        // hundred of them into the form one leg at a time is the reason they
+        // would not bother. The aliases cover what a real airline's own
+        // schedule export calls them.
+        { key: 'departureGate', header: 'departureGate', aliases: ['depgate', 'gate', 'originGate', 'depStand', 'stand'], type: 'text', max: 12 },
+        { key: 'arrivalGate', header: 'arrivalGate', aliases: ['arrGate', 'destinationGate', 'arrStand'], type: 'text', max: 12 },
     ],
     // A flight number is the airline's own identifier for a leg, so it wins.
     // Falling back to the city pair is right for the many VAs that do not

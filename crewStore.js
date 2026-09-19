@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 20;
+const EXPECTED_SCHEMA_VERSION = 21;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -206,7 +206,11 @@ const STAFF_APPS_SCHEMA_VERSION = 20;
 // supabase/crew-center-schema.sql. Add a column there, add it here.
 // ---------------------------------------------------------------------------
 const LATE_COLUMNS = {
-    crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
+    // v21. A gate is decoration on a leg that is otherwise complete: drop it and
+    // the route is still the route, flown between the same two airports. Exactly
+    // the test in the note above, and the reason the stands are droppable where
+    // the Discord columns below are not.
+    crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank', 'departure_gate', 'arrival_gate']),
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id', 'edited_at', 'edited_by']),
@@ -268,6 +272,8 @@ const DRIFT_LABELS = {
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
     'crew_routes.min_rank': 'rank-gated routes',
+    'crew_routes.departure_gate': 'the gates a route is flown between',
+    'crew_routes.arrival_gate': 'the gates a route is flown between',
     // No crew_accounts.discord_* here: they are not droppable, so nothing can
     // ever report them as dropped. See LATE_COLUMNS.
     'crew_accounts.portal_account_id': 'a staff member’s own pilot account',
@@ -538,6 +544,10 @@ const routeFromRow = (r) => r && {
     partnerName: r.partner_name || '',
     partnerLogo: r.partner_logo || '',
     minRank: r.min_rank || '',
+    // v21. Empty on every route a VA has not set them on, which is the default
+    // and the common case — gate-to-gate is something an airline opts into.
+    departureGate: r.departure_gate || '',
+    arrivalGate: r.arrival_gate || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -559,6 +569,11 @@ const routeToRow = (r) => {
         return /^https:\/\//i.test(s) ? s : '';
     });
     pick(r, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    // A stand is short and the VA types it by hand, so it is bounded and
+    // otherwise left alone — every airport names its gates differently and a
+    // pattern strict enough to be useful would reject somebody's real terminal.
+    pick(r, out, 'departureGate', 'departure_gate', (v) => str(v, 12));
+    pick(r, out, 'arrivalGate', 'arrival_gate', (v) => str(v, 12));
     return out;
 };
 
@@ -1883,6 +1898,30 @@ class SupabaseStore {
             const params = { ...this.scope, order: 'starts_at.asc.nullslast,created_at.desc', limit };
             if (status) params.status = `eq.${status}`;
             if (upcomingOnly) params.starts_at = `gte.${new Date(Date.now() - 12 * 3600 * 1000).toISOString()}`;
+            const rows = await this.db.select('crew_events', params);
+            return (rows || []).map(eventFromRow);
+        });
+    }
+    /**
+     * Events that finished a while ago and still carry artwork. v21.
+     *
+     * What the artwork sweep reads. Narrow on purpose: a VA with four hundred
+     * events has four hundred rows nothing needs, and the sweep runs over every
+     * VA we have. The filter is `starts_at` because that is the indexed column
+     * and an event cannot END before it starts — so this is a superset of what
+     * is actually expired, and crewEvents.bannerExpired makes the real decision
+     * (including on `ends_at`, and on whether the picture is even ours).
+     *
+     * `banner_url: 'neq.'` is "not the empty string", the same filter the
+     * linked-pilot lookup uses. Almost every event has no banner at all.
+     */
+    listEventsWithBanner({ startedBefore, limit = 500 } = {}) {
+        return this.events(async () => {
+            const params = {
+                ...this.scope, order: 'starts_at.asc', limit,
+                banner_url: 'neq.',
+            };
+            if (startedBefore) params.starts_at = `lt.${new Date(startedBefore).toISOString()}`;
             const rows = await this.db.select('crew_events', params);
             return (rows || []).map(eventFromRow);
         });
@@ -3249,6 +3288,7 @@ class LegacyStore {
             { status: 409, code: 'store_events_unsupported' }));
     }
     listEvents() { return this.events(); }
+    listEventsWithBanner() { return this.events(); }
     getEvent() { return this.events(); }
     createEvent() { return this.events(); }
     updateEvent() { return this.events(); }

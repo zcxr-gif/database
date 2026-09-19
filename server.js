@@ -2010,6 +2010,9 @@ function postRouteNotice(va, event, route, actor, before) {
             ['origin', 'Origin'], ['destination', 'Destination'], ['aircraft', 'Aircraft'],
             ['flightNumber', 'Flight number'], ['kind', 'Type'], ['minRank', 'Rank required'],
             ['partnerName', 'Partner'], ['active', 'Published'],
+            // v21. A stand moving is worth a line: pilots who fly the leg
+            // regularly park on it from memory.
+            ['departureGate', 'Departure gate'], ['arrivalGate', 'Arrival gate'],
         ];
         for (const [key, label] of watch) {
             if (String(before[key] ?? '') !== String(route[key] ?? '')) {
@@ -2031,6 +2034,12 @@ function postRouteNotice(va, event, route, actor, before) {
                     : { name: 'Type', value: 'Own metal', inline: true },
                 route.minRank ? { name: 'Opens at', value: String(route.minRank), inline: true } : null,
                 route.distanceNm ? { name: 'Distance', value: `${Math.round(route.distanceNm)} nm`, inline: true } : null,
+                // Only when the VA set one. A "Gates: — → —" field on every
+                // route notice would be a column of nothing for the airlines
+                // that do not publish stands.
+                (route.departureGate || route.arrivalGate)
+                    ? { name: 'Gates', value: `${route.departureGate || '—'} → ${route.arrivalGate || '—'}`, inline: true }
+                    : null,
             ].filter(Boolean),
         }))
         .catch(() => {});
@@ -2350,6 +2359,126 @@ async function runRetentionSweepAll({ now = Date.now() } = {}) {
             }
         } catch (err) {
             console.error(`[retention] ${va.slug || va._id} sweep failed:`, err && err.message);
+        }
+    }
+    return totals;
+}
+
+/* =============================================================================
+ * THE EVENT-ARTWORK SWEEP
+ *
+ * The other half of "upload it and we'll hold it". A VA uploads a banner, we
+ * store it, and when the event is over plus a week's grace the object is
+ * deleted and the row's `bannerUrl` cleared. Without this, an airline running a
+ * weekly fly-in accrues a picture a week in our bucket for as long as they
+ * exist, and nobody ever goes back to tidy one up.
+ *
+ * WHAT IT WILL NOT TOUCH, and each of these is deliberate:
+ *
+ *   • anything we do not host. A banner URL a VA pasted in from their own
+ *     website years ago is theirs; we cannot delete it and we must not blank
+ *     the row either, which would vandalise their event to no purpose.
+ *   • an event with no date. That is a draft somebody is part way through
+ *     writing, and the picture is the one they just uploaded.
+ *   • an event still inside its grace. "Look what we flew on Saturday" needs
+ *     its picture on the following weekend.
+ *
+ * crewEvents.bannerExpired holds all three rules and is pure, so what gets
+ * deleted is decided somewhere a test can reach without a bucket.
+ *
+ * THE ROW IS CLEARED FIRST, and only then the object. The other order leaves an
+ * event pointing at a picture that is already gone — a broken image on a public
+ * calendar, which is worse than an object nobody collected. A delete that fails
+ * costs us storage; a row that fails to clear costs the VA their page.
+ * =========================================================================== */
+async function runEventArtSweep(va, { dryRun = false, now = Date.now(), graceMs } = {}) {
+    const out = { slug: va.slug || String(va._id), dryRun, cleared: 0, checked: 0, failed: 0, skipped: '' };
+
+    const bucketHost = eventArtHost();
+    if (!bucketHost) { out.skipped = 'no bucket configured'; return out; }
+
+    let store;
+    try { store = await crewStore.forVa(va); } catch (err) {
+        out.skipped = `no store (${err && err.code ? err.code : 'error'})`;
+        return out;
+    }
+
+    // Everything that started before the grace window even opened. A superset
+    // of what is expired — the real decision, including `endsAt`, is below.
+    let events = [];
+    try {
+        events = await store.listEventsWithBanner({
+            startedBefore: now - (graceMs === undefined ? crewEvents.EVENT_ART_GRACE_MS : graceMs),
+        });
+    } catch (err) {
+        // A project with no events tables, or one that is unreachable, is not a
+        // failure worth reporting once per VA per day. It is simply a crew
+        // center with no artwork for us to be holding.
+        out.skipped = `no events (${err && err.code ? err.code : 'error'})`;
+        return out;
+    }
+
+    out.checked = events.length;
+    for (const e of events) {
+        if (!crewEvents.bannerExpired(e, { now, graceMs, bucketHost })) continue;
+        if (dryRun) { out.cleared += 1; continue; }
+        try {
+            await store.updateEvent(e._id, { bannerUrl: '' });
+            await dropEventArt(e.bannerUrl);
+            out.cleared += 1;
+        } catch (err) {
+            out.failed += 1;
+            console.warn(`[event-art] ${out.slug}: could not clear ${e._id} —`, err && err.message);
+        }
+    }
+    return out;
+}
+
+/**
+ * Every event banner WE host for this VA, whatever its date.
+ *
+ * Only used on the purge path, where the VA is going and the question is not
+ * "has this event finished" but "what of theirs are we still holding". The
+ * hosted check is the same one the sweep uses: a URL a VA pasted to their own
+ * website is not ours to delete on any path.
+ *
+ * Never throws. A purge that fell over because a departing VA's Supabase was
+ * unreachable would leave far more behind than a few pictures.
+ */
+async function hostedEventArtFor(va) {
+    const bucketHost = eventArtHost();
+    if (!bucketHost || !va) return [];
+    try {
+        const store = await crewStore.forVa(va);
+        const events = await store.listEventsWithBanner({ limit: 2000 });
+        return (events || [])
+            .map((e) => e.bannerUrl)
+            .filter((u) => crewEvents.hostedBanner(u, bucketHost));
+    } catch { return []; }
+}
+
+async function runEventArtSweepAll({ now = Date.now(), dryRun = false } = {}) {
+    const totals = { vas: 0, cleared: 0, failed: 0 };
+    if (!eventArtHost()) return totals;
+    let vas = [];
+    try {
+        vas = await VirtualAirlineAd.find({ status: 'approved' }).select(crewStore.SELECT).lean();
+    } catch (err) {
+        console.error('[event-art] could not list VAs:', err && err.message);
+        return totals;
+    }
+    for (const va of vas) {
+        try {
+            const r = await runEventArtSweep(va, { now, dryRun });
+            if (r.skipped) continue;
+            totals.vas += 1;
+            totals.cleared += r.cleared;
+            totals.failed += r.failed;
+            if (r.cleared || r.failed) {
+                console.log(`[event-art] ${r.slug}: ${r.checked} checked, ${r.cleared} cleared, ${r.failed} failed`);
+            }
+        } catch (err) {
+            console.error(`[event-art] ${va.slug || va._id} sweep failed:`, err && err.message);
         }
     }
     return totals;
@@ -3137,7 +3266,8 @@ startDiscordBot(
       // Discord channel/role + the ad doc itself.
       // CrewSite so a purge also takes the VA's website and every picture they
       // uploaded onto our storage with it — see purgeVaData.
-      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, CrewSite: vaSites.CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl }) }
+      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, CrewSite: vaSites.CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl,
+          crewEventArt: hostedEventArtFor }) }
 );
 // ---------------------
 
@@ -5483,8 +5613,18 @@ const cleanRoute = (b) => {
         partnerName: kind === 'codeshare' ? String(b.partnerName || '').trim().slice(0, 60) : '',
         partnerLogo: kind === 'codeshare' && /^https:\/\//i.test(logo) ? logo : '',
         minRank: String(b.minRank || '').trim().slice(0, 40),
+        // v21. The stands. Optional, VA-set, and deliberately not validated
+        // against anything: gate names are a fact about a real terminal and no
+        // two airports agree on their shape. Trimmed, collapsed and upper-cased
+        // so "a12" and "A 12 " are the same stand rather than two, and bounded
+        // at 12 characters, which holds the longest real one ("PIER C 51").
+        departureGate: gateName(b.departureGate),
+        arrivalGate: gateName(b.arrivalGate),
     };
 };
+// Shared by the route handlers and the CSV import, so a gate typed into a
+// spreadsheet lands the same way as one typed into the form.
+const gateName = (v) => String(v || '').trim().replace(/\s+/g, ' ').toUpperCase().slice(0, 12);
 // `viewer` carries the hours of the pilot asking, when there is one, so a route
 // can say whether it is open to them. Staff and the public get `locked: false`
 // — the gate is about what a PILOT may fly, and hiding the shape of the network
@@ -5498,6 +5638,10 @@ const publicRoute = (r, ranks, viewer) => {
         kind: r.kind === 'codeshare' ? 'codeshare' : 'own',
         partnerName: r.partnerName || '', partnerLogo: r.partnerLogo || '',
         minRank: r.minRank || '',
+        // v21. Sent to everyone who can see the route, locked or not. A stand is
+        // part of what the leg IS, and a pilot working toward a rank should be
+        // able to see the whole of the flight they are working toward.
+        departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
         locked,
         // How much further this particular pilot has to fly. Shown rather than
         // hidden on purpose: "unlocks in 12h" is the thing that makes a rank
@@ -6038,6 +6182,42 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
 
+/**
+ * The stands at an airport, for the two gate boxes on the route form. v21.
+ *
+ * The same source the event gate board already uses — OpenStreetMap, cached for
+ * a day, with our own gate dataset behind it — so a stand typed onto a route and
+ * a stand claimed on an event board are the same names out of the same place.
+ *
+ * A SUGGESTION AND NOT A LIST TO PICK FROM. The field stays free text: OSM does
+ * not have every stand at every field, and a VA that cannot publish "C 51"
+ * because a volunteer has not mapped it yet would rightly give up on the whole
+ * feature. This only saves them typing where we happen to know the answer.
+ *
+ * Staff-only, because it is an authoring aid that reaches a third party — and
+ * because nothing a pilot sees needs it: a route arrives carrying its stands.
+ * An unreachable Overpass is an empty list and a 200, never an error: the form
+ * has to keep working when the suggestion cannot be made.
+ */
+app.get('/api/crew/:slug/airport-gates/:icao', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    const icao = String(req.params.icao || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    if (!/^[A-Z0-9]{3,4}$/.test(icao)) return res.json({ icao: '', gates: [], source: 'none' });
+    try {
+        const gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor, localAirportGates);
+        res.json({
+            icao,
+            // Names only. The form wants something to offer, not map pins.
+            gates: (gates || []).map((g) => gateName(g && g.ref)).filter(Boolean).slice(0, 400),
+            source: 'osm',
+        });
+    } catch (err) {
+        console.warn('airport gates: lookup failed —', err?.message || err);
+        res.json({ icao, gates: [], source: 'unavailable' });
+    }
+});
+
 // ---- Roster and routes as CSV ----
 //
 // A VA's data being in the VA's own database settles who owns it; being able to
@@ -6182,6 +6362,7 @@ app.get('/api/crew/:slug/routes.csv', async (req, res) => {
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
             kind: r.kind || 'own', partnerName: r.partnerName || '',
             partnerLogo: r.partnerLogo || '', minRank: r.minRank || '',
+            departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
         })));
     } catch (err) { crewFail(res, err, { log: 'routes export error', message: 'Could not export the routes.' }); }
 });
@@ -6198,6 +6379,7 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
                 id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
                 aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
                 kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
+                departureGate: r.departureGate, arrivalGate: r.arrivalGate,
             })),
             create: (values) => store.createRoute(cleanRoute(values)),
             update: (id, values, before) => store.updateRoute(id, cleanRoute({ ...before, ...values })),
@@ -6346,12 +6528,19 @@ app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
             id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
             kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
+            // Carried so an update merges onto them rather than over them. An
+            // update writes `cleanRoute({ ...before, ...values })`, and a gate
+            // missing from `before` would come back as '' — a VA who set their
+            // stands by hand and then pulled ten more legs off the library
+            // would have lost every one of them.
+            departureGate: r.departureGate, arrivalGate: r.arrivalGate,
         }));
 
         // `present` names every field the library actually has an opinion about.
-        // Leaving minRank and partnerLogo out of it is deliberate: the library
-        // knows nothing about either, and a row that claimed to know would blank
-        // a rank gate the VA had set on a leg they are re-importing.
+        // Leaving minRank, partnerLogo and the gates out of it is deliberate:
+        // the library knows nothing about any of them, and a row that claimed to
+        // know would blank a rank gate — or a stand — the VA had set on a leg
+        // they are re-importing.
         const plan = crewCsv.planRows(crewCsv.ROUTES_SPEC, rows, existing, {
             present: new Set(['flightNumber', 'origin', 'destination', 'aircraft',
                 'distanceNm', 'notes', 'active', 'kind', 'partnerName']),
@@ -10047,13 +10236,46 @@ app.delete('/api/crew/:slug/events/:id', async (req, res) => {
         // an id nobody recognises.
         const existing = await store.getEvent(req.params.id).catch(() => null);
         await store.deleteEvent(req.params.id);   // signups cascade with it
+        // And the artwork, if it was ours. Nothing will ever ask for it again —
+        // the row that pointed at it is gone, so leaving the object behind is
+        // paying to store a picture with no way left to look at it.
+        if (existing) await dropEventArt(existing.bannerUrl);
         if (existing && existing.status === 'published') postEventNotice(va, 'removed', existing, gate.p);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'event delete error', message: 'Could not remove the event.' }); }
 });
 
-// Event artwork. Same upload path as the crew badge, so a VA gets the same
-// resizing and the same bucket rather than a second way to store an image.
+/* ---- Event artwork ------------------------------------------------------
+ *
+ * A VA uploads the picture; we hold it, and we let it go when the event is
+ * over. Before this the form asked for a URL, which meant every airline went
+ * and found somewhere else to host a banner — a Discord CDN link, an imgur
+ * page, a Drive share — and a good half of those were dead by the time anyone
+ * scrolled back to the event. An event with a broken image reads as an airline
+ * that has stopped caring, which is the opposite of what the picture is for.
+ *
+ * Same upload path as the crew badge, so a VA gets the same resizing (and the
+ * same animated-WebP handling, because a moving banner is half the appeal) and
+ * the same bucket, rather than a second way to store an image.
+ *
+ * `eventArtHost` is the hostname our uploads land on, and it is what separates
+ * a picture we may delete from a link a VA pasted years ago. Derived from the
+ * same two environment variables the URL is built from, so the two cannot
+ * drift; empty when the deployment has no bucket, and then nothing is ever
+ * considered ours — a sweep that cannot tell must not delete.
+ */
+const eventArtHost = () => (process.env.AWS_S3_BUCKET_NAME && process.env.AWS_REGION
+    ? `${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com`.toLowerCase()
+    : '');
+// Drop an event's picture from the bucket, but only ever one of ours. Never
+// throws and never reports: the row is what the crew center reads, and an
+// orphaned object is a tidiness problem where a failed request is a broken
+// screen.
+const dropEventArt = async (url) => {
+    if (!crewEvents.hostedBanner(url, eventArtHost())) return false;
+    try { await deleteVaImage(s3Client, url); return true; } catch { return false; }
+};
+
 app.post('/api/crew/:slug/events/:id/banner', upload.single('image'), async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'events.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -10065,11 +10287,53 @@ app.post('/api/crew/:slug/events/:id/banner', upload.single('image'), async (req
 
         const slug = String(req.params.slug || '').toLowerCase();
         const va = await VirtualAirlineAd.findOne({ slug }).select('_id').lean();
-        const url = await uploadVaImage(s3Client, req.file, va ? String(va._id) : slug, 'banner');
+
+        /* A BAD FILE IS THE FILE'S FAULT, NOT OURS.
+         *
+         * Everything here runs through sharp, which throws on a PDF renamed
+         * .png as readily as on a corrupt JPEG, and tags an animation too long
+         * to re-encode with a 413 and a sentence worth reading. Letting all of
+         * that fall through to the generic handler turned "your file is not an
+         * image" into a 500, which reads as our outage and leaves the staff
+         * member with nothing to try differently. */
+        let url;
+        try {
+            url = await uploadVaImage(s3Client, req.file, va ? String(va._id) : slug, 'banner');
+        } catch (err) {
+            if (err && err.status) return res.status(err.status).json({ error: err.message });
+            console.warn('event banner: could not read the upload —', err && err.message);
+            return res.status(400).json({ error: 'That file could not be read as an image. Try a JPG, PNG or GIF.' });
+        }
         const saved = await store.updateEvent(event._id, { bannerUrl: url });
+        // The one it replaced, AFTER the row points at the new one. Do it the
+        // other way round and a failed write leaves an event whose picture has
+        // already been deleted — the one outcome worse than an extra object in
+        // a bucket.
+        if (event.bannerUrl && event.bannerUrl !== url) await dropEventArt(event.bannerUrl);
         res.set('Cache-Control', 'no-store');
         res.json(withDrift(store, { url, event: publicEvent(saved, { canManage: true }) }));
     } catch (err) { crewFail(res, err, { log: 'event banner error', message: 'Could not upload the event image.' }); }
+});
+
+/**
+ * Take the picture off an event.
+ *
+ * The row is cleared either way — a VA who wants the banner gone gets it gone,
+ * whether we host it or somebody else does. Only the object behind it is
+ * conditional, and that is the whole of rule one.
+ */
+app.delete('/api/crew/:slug/events/:id/banner', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const event = await store.getEvent(req.params.id);
+        if (!event) return res.status(404).json({ error: 'Event not found.' });
+        const saved = await store.updateEvent(event._id, { bannerUrl: '' });
+        await dropEventArt(event.bannerUrl);
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, { event: publicEvent(saved, { canManage: true }) }));
+    } catch (err) { crewFail(res, err, { log: 'event banner remove error', message: 'Could not remove the event image.' }); }
 });
 
 /* ---- Signing up ---------------------------------------------------------
@@ -20575,6 +20839,31 @@ vaGroupFlights.registerGroupFlightRoutes(app, { VirtualAirlineAd, VaEvent, requi
 // central feed, and then ERASES that day's raw takeoff/landing records.
 vaStats.start();
 
+/* An upload that was refused before the handler ever saw it.
+ *
+ * multer throws its own error for a file over the 15MB ceiling, and nothing
+ * caught it — so the one thing a person is most likely to do wrong (pick the
+ * original photograph rather than a web-sized copy) produced Express's default
+ * HTML 500. Every uploader on this platform reads JSON and reported "that
+ * didn't work" with no reason attached, on the one failure with an obvious
+ * remedy.
+ *
+ * Registered before express.static so it wraps every upload route above it, and
+ * it only claims multer's errors — anything else is passed on untouched.
+ */
+app.use((err, req, res, next) => {
+    if (!err || err.name !== 'MulterError') return next(err);
+    const message = err.code === 'LIMIT_FILE_SIZE'
+        ? 'That file is too big. The limit is 15 MB — try a web-sized copy.'
+        : err.code === 'LIMIT_UNEXPECTED_FILE'
+            ? 'That file was sent under a name this page does not accept.'
+            : 'That upload could not be read.';
+    console.warn(`upload refused [${err.code}] on ${req.method} ${req.path}`);
+    // 413 only for the one that genuinely is too large; the rest are a
+    // malformed request, which is a 400.
+    res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: message, code: err.code });
+});
+
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS
 app.use(express.static(__dirname));
@@ -20891,6 +21180,41 @@ if (String(process.env.RETENTION_SWEEP_DISABLED || '').toLowerCase() !== '1') {
         } finally { sweeping = false; }
     };
     setTimeout(() => { sweep(); setInterval(sweep, RETENTION_SWEEP_MS).unref(); }, RETENTION_FIRST_RUN_MS).unref();
+}
+
+// ---- The event-artwork sweep, on a timer ----
+//
+// Daily, and for the same reason the roster sweep is six-hourly: the rule is
+// "the event, plus a week", so running it more often cannot change an outcome.
+// It would only mean reading every VA's events table more times for the same
+// answer. A picture that should have gone at 02:00 going at 14:00 is the same
+// deletion.
+//
+// Re-running is safe by construction: the row is cleared in the same pass, so
+// the second run does not see the event at all.
+//
+// It waits ten minutes after boot — a little longer than the roster sweep, so a
+// deploy does not do both at once — and EVENT_ART_SWEEP_DISABLED=1 turns it
+// off. Nothing happens at all on a deployment with no bucket configured, which
+// is what runEventArtSweepAll checks first.
+const EVENT_ART_SWEEP_MS = 24 * 3600 * 1000;
+const EVENT_ART_FIRST_RUN_MS = 10 * 60 * 1000;
+if (String(process.env.EVENT_ART_SWEEP_DISABLED || '').toLowerCase() !== '1') {
+    let sweepingArt = false;
+    const sweepArt = async () => {
+        if (sweepingArt) return console.warn('[event-art] previous sweep still running — skipping this tick');
+        sweepingArt = true;
+        const started = Date.now();
+        try {
+            const t = await runEventArtSweepAll();
+            if (t.cleared || t.failed) {
+                console.log(`[event-art] swept ${t.vas} VA(s) in ${Math.round((Date.now() - started) / 1000)}s — ${t.cleared} cleared, ${t.failed} failed`);
+            }
+        } catch (err) {
+            console.error('[event-art] sweep failed:', err && err.message);
+        } finally { sweepingArt = false; }
+    };
+    setTimeout(() => { sweepArt(); setInterval(sweepArt, EVENT_ART_SWEEP_MS).unref(); }, EVENT_ART_FIRST_RUN_MS).unref();
 }
 
 // Boot the live diagnostics sampler and feed it the two external state sources

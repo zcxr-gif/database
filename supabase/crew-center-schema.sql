@@ -487,6 +487,23 @@ create table if not exists crew_routes (
     partner_name  text not null default '',
     partner_logo  text not null default '',
     min_rank      text not null default '',
+    -- ------------------------------------------------------------------------
+    -- v21. The stands the leg is flown between.
+    --
+    -- A route already says which airports; this says where on them. Free text
+    -- and not a reference to anything, because a gate is a fact about a real
+    -- terminal ("A12", "T2 B34", "Pier C 51") and no two airports name theirs
+    -- the same way. There is no table of gates to join to, and inventing one
+    -- would mean a VA could not publish a stand we had not heard of.
+    --
+    -- Both optional and both default to empty, which is what nearly every
+    -- existing route will stay: the VA that cares about gate-to-gate sets them
+    -- and the rest never see the fields. Nothing is enforced against them — a
+    -- pilot parking on the wrong stand is not a rule the crew center polices,
+    -- it is the detail that makes the leg feel flown rather than logged.
+    -- ------------------------------------------------------------------------
+    departure_gate text not null default '',
+    arrival_gate   text not null default '',
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now()
 );
@@ -507,6 +524,13 @@ exception
 end $$;
 -- The network map and the route panel both split on this.
 create index if not exists crew_routes_kind_idx on crew_routes (va_slug, kind) where active;
+-- v21. Added separately for the same reason the v5 columns are: a project
+-- provisioned at v1–v20 picks the stands up on a re-run rather than needing the
+-- table rebuilt. No index — nothing looks a route up by its gate, and nothing
+-- should: it is something a route CARRIES, not something the network is
+-- searched by.
+alter table crew_routes add column if not exists departure_gate text not null default '';
+alter table crew_routes add column if not exists arrival_gate   text not null default '';
 
 -- ----------------------------------------------------------------------------
 -- Flight reports. Either captured automatically from a linked pilot's real
@@ -2340,5 +2364,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 20)
+insert into crew_schema_info (id, version) values (1, 21)
 on conflict (id) do update set version = excluded.version, updated_at = now();

@@ -2394,6 +2394,15 @@ button.shot, a.shot { cursor: pointer; text-decoration: none; width: 100%; }
   border-radius: var(--radius-pill); border: 1px solid var(--line);
   font-size: .72rem; letter-spacing: .02em; color: var(--muted);
 }
+/* The stand, under the airport it belongs to. Deliberately NOT a column of its
+   own: the headings live in the page's own markup so a VA can rename them, and
+   a sixth cell here would land under a heading that is not there on every site
+   already published. Under the code is also where it reads correctly — a gate
+   only means anything next to the airport it is at. */
+.routes__gate {
+  display: block; margin-top: .1rem;
+  font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
+}
 .routes__none td { color: var(--muted); white-space: normal; }
 .routes__pager { display: flex; align-items: center; justify-content: center; gap: 1rem; }
 .routes__page {
@@ -3387,13 +3396,19 @@ const SITE_JS = `/* Your site's own script.
         return (a.from || '').localeCompare(b.from || '')
             || (a.to || '').localeCompare(b.to || '');
       },
-      find: function (r) { return [r.from, r.to, r.flight, r.aircraft, r.partner]; },
+      find: function (r) { return [r.from, r.to, r.flight, r.aircraft, r.partner, r.departureGate, r.arrivalGate]; },
       row: function (r) {
         var share = r.codeshare
           ? '<span class="routes__share">' + (r.partner ? esc(r.partner) : 'Codeshare') + '</span>' : '';
+        // The stand goes under its airport, and only when the airline has set
+        // one. Most VAs publish none, and an empty line under every code would
+        // be a whole extra row of nothing on a two-hundred-leg timetable.
+        var gate = function (g) {
+          return g ? '<span class="routes__gate">Gate ' + esc(g) + '</span>' : '';
+        };
         return '<td><span class="routes__code">' + esc(r.flight || '—') + '</span>' + share + '</td>'
-          + '<td><span class="routes__code">' + esc(r.from) + '</span></td>'
-          + '<td><span class="routes__code">' + esc(r.to) + '</span></td>'
+          + '<td><span class="routes__code">' + esc(r.from) + '</span>' + gate(r.departureGate) + '</td>'
+          + '<td><span class="routes__code">' + esc(r.to) + '</span>' + gate(r.arrivalGate) + '</td>'
           + '<td>' + esc(r.aircraft || '') + '</td>'
           + '<td class="routes__num">' + (r.distanceNm ? esc(Math.round(r.distanceNm).toLocaleString()) + ' nm' : '') + '</td>';
       },

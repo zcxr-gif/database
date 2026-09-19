@@ -834,9 +834,11 @@ async function deactivateRepAccount(ad, discordUserId, { actorName = 'Inflight B
  * @param {Function} [deps.deleteVaImage]     (s3Client, url) => Promise — deletes one S3 object
  * @param {Object} [deps.s3Client]            S3 client for image/attachment deletes
  * @param {Function} [deps.isDiscordWebhookUrl] (url) => boolean — validates before we DELETE it
+ * @param {Function} [deps.crewEventArt]      (ad) => Promise<string[]> — the event banners WE host
+ *                                            for this VA, read from their own crew database
  * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number, webhook:boolean}>}
  */
-async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl } = {}) {
+async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client, isDiscordWebhookUrl, crewEventArt } = {}) {
     const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0, site: false, webhook: false };
     if (!ad || !ad._id) return counts;
     const vaAdId = ad._id;
@@ -904,6 +906,28 @@ async function purgeVaData(ad, { EmbedConfig, CrewSite, deleteVaImage, s3Client,
                 counts.site = true;
             }
         } catch (e) { console.error('purgeVaData website:', e.message); }
+    }
+
+    /* THE ARTWORK ON THEIR CREW CENTER'S EVENTS.
+     *
+     * Event banners are uploaded to our storage but the rows that point at them
+     * live in the VA's OWN database, which is theirs and is not ours to touch.
+     * That is what makes this the one place they can be collected: the daily
+     * artwork sweep walks the VAs we know about, and after a purge this VA is
+     * not one of them — so anything not deleted here is orphaned for good.
+     *
+     * `crewEventArt` is injected rather than imported, for the reason every
+     * other dependency here is: this module knows nothing about crew stores,
+     * and a caller that has not got one simply does not pass it. It returns
+     * only the URLs we HOST — a link a VA pasted to their own website is not
+     * ours to delete, on this path any more than on the sweep.
+     */
+    if (typeof crewEventArt === 'function' && deleteVaImage && s3Client) {
+        try {
+            for (const url of (await crewEventArt(ad)) || []) {
+                await deleteVaImage(s3Client, url); counts.images += 1;
+            }
+        } catch (e) { console.error('purgeVaData event art:', e.message); }
     }
 
     // Finally the flight-events webhook — deleted at Discord, so the VA's own
@@ -2004,7 +2028,36 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (account.role === 'owner') {
                 return res.status(400).json({ error: 'The owner account cannot be edited here.' });
             }
-            const { active, displayName, password } = req.body || {};
+            const { active, displayName, password, role } = req.body || {};
+
+            /* MOVING SOMEBODY BETWEEN STAFF AND PILOT.
+             *
+             * This endpoint had no `role` at all, so an account was stuck in
+             * whatever it was created as for the rest of its life: a pilot who
+             * joined the office could not be given the inbox, and a departing
+             * teammate could not be put back on the line. The two roles are not
+             * a hierarchy — staff see the VA's portal, pilots see the crew
+             * center — so this is a sideways move, and both directions are
+             * ordinary.
+             *
+             * `owner` is deliberately NOT accepted here. Ownership is a swap,
+             * not a field: somebody has to stop being the owner in the same
+             * breath, and doing it in two PATCHes leaves a VA with two owners
+             * or none. That is what /transfer-owner below is for.
+             */
+            if (role !== undefined) {
+                if (role === 'owner') {
+                    return res.status(400).json({
+                        error: 'Use “Make owner” to hand the account over — ownership is a transfer, not a role change.',
+                        code: 'use_transfer',
+                    });
+                }
+                if (!['staff', 'pilot'].includes(role)) {
+                    return res.status(400).json({ error: 'A team member is either staff or a pilot.' });
+                }
+                account.role = role;
+            }
+
             if (typeof active === 'boolean') account.active = active;
             if (typeof displayName === 'string') account.displayName = displayName;
             if (password) {
@@ -2024,6 +2077,85 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal team update error:', err);
             res.status(500).json({ error: 'Could not update the account.' });
+        }
+    });
+
+    /* =====================================================================
+     * HANDING THE VA OVER
+     *
+     * There was no way to do this at all. `POST /team` refuses to mint a second
+     * owner, `PATCH /team/:id` had no role field and refuses to touch the owner
+     * row, and the Discord provisioner returns the existing owner account
+     * rather than making another — so once a VA's owner account existed, that
+     * person was the owner for good. A VA whose founder left had to ask
+     * Inflight staff to go in and edit the database.
+     *
+     * OWNERSHIP IS A SWAP, NOT A FIELD. Exactly one account per VA holds it, so
+     * handing it over is two writes that have to be thought of as one:
+     *
+     *   1. the new owner is promoted FIRST.
+     *   2. the old owner is demoted to staff second.
+     *
+     * That order is chosen for what it does when the second write fails. This
+     * way a VA briefly has two owners, which is visible, fixable from either
+     * account and fixable by Inflight. The other order leaves a VA with NO
+     * owner, which nobody on the VA's side can undo — nobody left holds the
+     * endpoint that would fix it. Two owners beats none, every time.
+     *
+     * The outgoing owner keeps a working account, as staff. Handing over the
+     * airline should not log you out of it.
+     * =================================================================== */
+    app.post('/api/va-portal/team/:id/transfer-owner', requirePortalOwner, async (req, res) => {
+        try {
+            const target = await VaPortalAccount.findById(req.params.id).catch(() => null);
+            if (!target || String(target.vaAdId) !== String(req.portal.vaAdId)) {
+                return res.status(404).json({ error: 'Team member not found.' });
+            }
+            if (String(target._id) === String(req.portal._id)) {
+                return res.status(400).json({ error: 'You already own this VA.' });
+            }
+            if (!target.active) {
+                return res.status(400).json({ error: 'Enable that account before handing the VA over to it.' });
+            }
+            // A pilot signs in at the crew center and has never seen this
+            // portal. Make them staff first — one deliberate step — so nobody
+            // hands an airline to somebody who cannot open the door.
+            if (target.role !== 'staff') {
+                return res.status(400).json({
+                    error: 'Only a staff teammate can be made owner. Change their role to staff first.',
+                    code: 'staff_only',
+                });
+            }
+
+            // `req.portal` is the live document the guard resolved, so the
+            // outgoing owner is already in hand — no second lookup to get out
+            // of step with what was just authenticated.
+            const actor = req.portal.displayName || req.portal.username;
+            const previousUsername = req.portal.username;
+
+            target.role = 'owner';
+            await target.save();
+            req.portal.role = 'staff';
+            await req.portal.save();
+
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: actor, actorRole: 'owner',
+                action: 'team.transferOwner',
+                detail: `Handed the VA to @${target.username} — @${previousUsername} is now staff`,
+            });
+
+            res.json({
+                account: publicAccount(target),
+                // The caller is not the owner any more, so the screen they are
+                // standing on is not one they may use. Said plainly rather than
+                // left for the next 403 to discover.
+                you: publicAccount(req.portal),
+                steppedDown: true,
+            });
+        } catch (err) {
+            console.error('VA portal owner transfer error:', err);
+            res.status(500).json({ error: 'Could not hand the VA over.' });
         }
     });
 
@@ -2140,7 +2272,38 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const { active, displayName, password, role } = req.body || {};
             if (typeof active === 'boolean') account.active = active;
             if (typeof displayName === 'string') account.displayName = displayName;
-            if (PORTAL_ROLES.includes(role)) account.role = role;
+
+            /* EXACTLY ONE OWNER PER VA, ON THIS PATH TOO.
+             *
+             * Creating an account guards this — `POST /admin/accounts` answers
+             * 409 on a VA that already has an owner — but promoting one here
+             * did not, so an oversight edit could quietly leave a VA with two
+             * people holding it. Two owners is not a tidy state: each can
+             * disable the other, and `provisionOwnerAccount` picks whichever
+             * `findOne` happens to return.
+             *
+             * So a promotion here is the same swap the VA's own transfer makes:
+             * the sitting owner is put back to staff, in the same order and for
+             * the same reason — a VA briefly with two owners is fixable, a VA
+             * with none is not.
+             */
+            let demoted = null;
+            if (PORTAL_ROLES.includes(role)) {
+                if (role === 'owner' && account.role !== 'owner') {
+                    const sitting = await VaPortalAccount.findOne({
+                        vaAdId: account.vaAdId, role: 'owner', _id: { $ne: account._id },
+                    });
+                    account.role = 'owner';
+                    await account.save();
+                    if (sitting) {
+                        sitting.role = 'staff';
+                        await sitting.save();
+                        demoted = publicAccount(sitting);
+                    }
+                } else {
+                    account.role = role;
+                }
+            }
             if (password) {
                 if (String(password).length < 8) {
                     return res.status(400).json({ error: 'Password must be at least 8 characters.' });
@@ -2152,9 +2315,12 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             logActivity({
                 vaAdId: account.vaAdId, vaName: account.vaName,
                 actorName: req.staff.displayName || req.staff.username, actorRole: 'inflight-staff',
-                action: 'account.update', detail: `Updated @${account.username}`,
+                action: 'account.update',
+                detail: demoted
+                    ? `Made @${account.username} owner — @${demoted.username} is now staff`
+                    : `Updated @${account.username}`,
             });
-            res.json({ account: publicAccount(account) });
+            res.json({ account: publicAccount(account), demoted });
         } catch (err) {
             console.error('VA portal admin update account error:', err);
             res.status(500).json({ error: 'Could not update the account.' });
