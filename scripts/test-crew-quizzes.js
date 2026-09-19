@@ -47,6 +47,15 @@ ok('a question with one option is dropped', () => {
     assert.strictEqual(q.questions[0].text, 'fine');
 });
 
+ok('a question with nothing marked right is dropped, not marked for them', () => {
+    // The builder sends -1 when no option is ticked. Clamping that to 0 would
+    // fail every taker against an answer the airline never chose.
+    const [q] = Q.sanitizeQuizzes([{ title: 'x', questions: [
+        { text: 'nothing ticked', options: ['a', 'b'], correct: -1 },
+    ] }]);
+    assert.strictEqual(q.questions.length, 0);
+});
+
 ok('a right answer that is not one of the options is dropped', () => {
     const [q] = Q.sanitizeQuizzes([{ title: 'x', questions: [
         { text: 'pointing at nothing', options: ['a', 'b'], correct: 7 },

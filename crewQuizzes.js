@@ -94,8 +94,13 @@ function sanitizeQuestion(q, i) {
     const options = (Array.isArray(q && q.options) ? q.options : [])
         .map((o) => clean(o, 200)).filter(Boolean).slice(0, MAX_OPTIONS);
     if (!text || options.length < MIN_OPTIONS) return null;
-    const correct = int(q && q.correct, 0, options.length - 1, -1);
-    if (correct < 0) return null;
+    // NOT `int` with a fallback: that CLAMPS, so a question with nothing marked
+    // (the builder sends -1 for "no option is ticked") would arrive as "the
+    // first one is right" and quietly mark every taker against an answer the
+    // airline never chose. Out of range is dropped, which is the same treatment
+    // as a right answer pointing at an option that is not there.
+    const correct = Math.round(Number(q && q.correct));
+    if (!Number.isFinite(correct) || correct < 0 || correct >= options.length) return null;
     return {
         id: clean(q && q.id, 40) || `q${i + 1}`,
         text,
