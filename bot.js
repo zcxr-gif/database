@@ -3578,6 +3578,13 @@ client.on('interactionCreate', async (interaction) => {
 
                     await interaction.message.reply(`✅ **${ad.name}** approved by <@${interaction.user.id}>.\n• Role: ${role ? `<@&${role.id}>` : '—'}\n• Channel: ${channel ? `<#${channel.id}>` : '—'}`).catch(() => {});
 
+                    // The portal login is named after the VA's OWNER, so resolve
+                    // them BEFORE provisioning rather than after: `ad.ownerName`
+                    // was captured when they applied and goes stale the moment
+                    // they rename themselves on Discord. Same fetch that DMs them
+                    // below, just moved up — no extra call.
+                    const owner = ad.ownerId ? await client.users.fetch(ad.ownerId).catch(() => null) : null;
+
                     // Provision the VA's self-service Partnership Portal account
                     // (idempotent). The plaintext password is only returned the very
                     // first time, so we only DM credentials on initial creation.
@@ -3587,6 +3594,7 @@ client.on('interactionCreate', async (interaction) => {
                             const { created, username, password } = await provisionVaPortalAccount(ad, {
                                 createdVia: 'bot',
                                 createdByName: `Bot (approved by ${interaction.user.username})`,
+                                discordUsername: owner ? owner.username : '',
                             });
                             if (created && password) {
                                 portalLine = `\n\n🔐 **Your VA Partnership Portal is ready.**\n` +
@@ -3604,9 +3612,8 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     }
 
-                    if (ad.ownerId) {
-                        const owner = await client.users.fetch(ad.ownerId).catch(() => null);
-                        if (owner) await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.${portalLine}`).catch(() => {});
+                    if (owner) {
+                        await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.${portalLine}`).catch(() => {});
                     }
 
                     // If the VA already shipped a banner + logo (e.g. submitted via

@@ -665,11 +665,13 @@ async function uniqueUsernameFrom(base) {
  * @param {Object} [opts]
  * @param {string} [opts.createdVia='bot']
  * @param {string} [opts.createdByName='Inflight Bot']
+ * @param {string} [opts.discordUsername] the owner's Discord username, when the
+ *   caller holds a fresher one than `ad.ownerName`
  * @returns {{account: Object, created: boolean, username: string, password: string|null}}
  */
 async function provisionOwnerAccount(ad, opts = {}) {
     if (!ad || !ad._id) throw new Error('provisionOwnerAccount requires a VA ad with an _id.');
-    const { createdVia = 'bot', createdByName = 'Inflight Bot' } = opts;
+    const { createdVia = 'bot', createdByName = 'Inflight Bot', discordUsername = '' } = opts;
 
     const existing = await VaPortalAccount.findOne({ vaAdId: ad._id, role: 'owner' });
     if (existing) {
@@ -681,12 +683,32 @@ async function provisionOwnerAccount(ad, opts = {}) {
         return { account: existing, created: false, username: existing.username, password: null };
     }
 
-    const username = await uniqueUsernameFrom(ad.name);
+    /* THE LOGIN IS A PERSON'S, NOT THE AIRLINE'S.
+     *
+     * This built the username from the VA's name, so the owner of AFKLM Virtual
+     * signed in as @afklmva while the account displayed "jpp370" — their Discord
+     * name — right beside it. Two names for one person, and the one they had to
+     * type was the one nothing else called them. It also collides by design:
+     * somebody who runs two VAs got two logins named after airlines, neither
+     * recognisably theirs.
+     *
+     * The rep path (provisionRepAccount) has always keyed off the Discord
+     * username. This is the same rule for owners, with the VA name kept only as
+     * the fallback for an ad that has no Discord owner at all — an
+     * admin-authored listing, where `ownerName` is the schema's 'Unknown'
+     * placeholder rather than anybody's name.
+     */
+    const ownerName = String(ad.ownerName || '').trim();
+    const base = discordUsername
+        || (ownerName && ownerName.toLowerCase() !== 'unknown' ? ownerName : '')
+        || ad.name;
+    const username = await uniqueUsernameFrom(base);
     const password = generatePassword();
     const passwordHash = await bcrypt.hash(password, 12);
     const account = await VaPortalAccount.create({
         username,
-        displayName: ad.ownerName || ad.name || username,
+        // 'Unknown' is the ad schema's placeholder, not a name to show anybody.
+        displayName: (ownerName.toLowerCase() === 'unknown' ? '' : ownerName) || ad.name || username,
         passwordHash,
         role: 'owner',
         vaAdId: ad._id,
@@ -2269,7 +2291,36 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         try {
             const account = await VaPortalAccount.findById(req.params.id);
             if (!account) return res.status(404).json({ error: 'Account not found.' });
-            const { active, displayName, password, role } = req.body || {};
+            const { active, displayName, password, role, username } = req.body || {};
+
+            /* RENAMING AN ACCOUNT.
+             *
+             * The oversight UI could create an account and could not correct it:
+             * a username typed wrong at provisioning time, or auto-derived from
+             * a VA that has since rebranded, was permanent, and the only way out
+             * was to delete the account and hand out fresh credentials. So the
+             * username is editable here, under the same rules the create path
+             * uses — normalized, and unique across every portal account.
+             *
+             * This runs before the role swap below so a taken username fails the
+             * whole request instead of leaving a half-applied promotion behind.
+             */
+            let renamedFrom = null;
+            if (typeof username === 'string' && username.trim()) {
+                const uname = username.toLowerCase().trim()
+                    .replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+                if (uname.length < 3) {
+                    return res.status(400).json({ error: 'Username must be at least 3 characters.' });
+                }
+                if (uname !== account.username) {
+                    if (await VaPortalAccount.exists({ username: uname, _id: { $ne: account._id } })) {
+                        return res.status(409).json({ error: 'That username is already taken.' });
+                    }
+                    renamedFrom = account.username;
+                    account.username = uname;
+                }
+            }
+
             if (typeof active === 'boolean') account.active = active;
             if (typeof displayName === 'string') account.displayName = displayName;
 
@@ -2318,7 +2369,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 action: 'account.update',
                 detail: demoted
                     ? `Made @${account.username} owner — @${demoted.username} is now staff`
-                    : `Updated @${account.username}`,
+                    : renamedFrom
+                        ? `Renamed @${renamedFrom} to @${account.username}`
+                        : `Updated @${account.username}`,
             });
             res.json({ account: publicAccount(account), demoted });
         } catch (err) {

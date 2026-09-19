@@ -282,6 +282,41 @@ the portal Compliance tab**). When the Terms change:
 Partners can always read the Terms at **`/terms`** (public page) or download the
 **[PDF](/VA-Advertisement-Terms.pdf)** — both are linked from their portal.
 
+### 7.5 Portal accounts & handing a VA over
+
+**Where:** the same staff console (`yoursite.com/va-submissions`) → **Accounts**
+tab. Every portal login across every partner VA is listed there.
+
+**What a login is called.** When the bot provisions a VA on approval, the owner's
+login is named after **their Discord username** (the reps' always were). Older
+owner accounts were named after the *VA* instead — so a row can read `jpp370`
+over `@afklmva`. Those can be corrected one at a time below, or in bulk with
+`node scripts/rename-va-portal-logins.js` (reports what it would change; add
+`--apply` to write it). A username is a credential — **tell the owner before you
+change theirs**, since nothing else will.
+
+**Finding one person.** The search box matches display name, `@username`, VA name
+and who created the account; the three dropdowns narrow by VA, by role
+(Owner / Staff / Pilot) and by state (Active / Disabled / Never signed in). The
+counter beside the list shows how much of the roster you are looking at.
+
+**Editing somebody.** The pencil on a row opens their details: display name,
+username, role, and a new password. Change what you need and **Save changes** —
+blank fields are left alone, and a password must be at least 8 characters.
+Renaming is safe: usernames are normalised (lowercased, spaces to hyphens) and
+refused if somebody else already holds the name.
+
+**Handing ownership over.** A VA has **exactly one** owner. Open the account that
+should hold it and press **Make owner** (or set their role to Owner and save) —
+the sitting owner is moved to **Staff** in the same action, and the confirm
+names who that is before anything happens. The swap is recorded in the Activity
+tab. Use this when a VA's founder leaves rather than editing the database.
+
+- **Disabling** an owner locks that VA out of its own portal until it is undone —
+  the console warns you before it does.
+- **Deleting** is permanent and does not free the VA's submissions or warnings;
+  prefer Disable unless the account was created in error.
+
 ---
 
 ## 8. Day-to-Day Workflows (the tool: `/va-ads`)

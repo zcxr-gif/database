@@ -7,11 +7,24 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script>tailwind.config = { darkMode: 'class' };</script>
+    <script>
+        // Applied before first paint so the page never flashes light on a dark
+        // session. Same 'theme' key and same dark-unless-told-otherwise default
+        // as the staff hub, so navigating between panels keeps one theme.
+        (function () {
+            try { document.documentElement.classList.toggle('dark', localStorage.getItem('theme') !== 'light'); }
+            catch { document.documentElement.classList.add('dark'); }
+        })();
+    </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
         :root { color-scheme: light dark; }
         * { -webkit-tap-highlight-color: transparent; }
-        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        /* The page is a single column of cards — nothing should ever scroll the
+           viewport sideways. Long words (usernames, links, VA names) wrap
+           instead of pushing the layout wider than the phone. */
+        html, body { max-width: 100%; overflow-x: hidden; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; overflow-wrap: anywhere; }
         [data-lucide] { width: 1.15em; height: 1.15em; }
         svg.lucide { stroke-width: 1.75; }
         .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
@@ -29,9 +42,25 @@
         .btn { background: #18181b; color: #fff; padding: .55rem .9rem; border-radius: .7rem; font-size: .875rem; font-weight: 600; transition: .15s; }
         .dark .btn { background: #fafafa; color: #18181b; }
         .btn:hover { opacity: .9; } .btn:active { transform: scale(.98); }
-        .tab { padding: .5rem .9rem; border-radius: .7rem; font-size: .875rem; font-weight: 600; color: #71717a; transition: .15s; }
+        .tab { padding: .5rem .9rem; border-radius: .7rem; font-size: .875rem; font-weight: 600; color: #71717a; transition: .15s; white-space: nowrap; flex: 0 0 auto; }
         .tab.active { background: #18181b; color: #fff; }
         .dark .tab.active { background: #fafafa; color: #18181b; }
+        /* Five tabs are wider than a phone. Scroll the strip itself rather than
+           letting it stretch the page (which is what made the whole view pan). */
+        .hscroll { overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+        .hscroll::-webkit-scrollbar { display: none; }
+        /* Filter controls: share the row on desktop, wrap to a readable width on
+           a phone instead of overflowing it. */
+        .filter { flex: 1 1 9rem; min-width: 0; }
+        @media (min-width: 640px) { .filter { flex: 0 1 14rem; } }
+        .chip { font-size: .75rem; font-weight: 600; padding: .3rem .6rem; border-radius: .5rem; border: 1px solid rgb(228 228 231); transition: .15s; }
+        .dark .chip { border-color: rgb(63 63 70); }
+        .chip:hover { background: rgba(244,244,245,.8); }
+        .dark .chip:hover { background: rgba(39,39,42,.8); }
+        .chip.on { background: #18181b; color: #fff; border-color: #18181b; }
+        .dark .chip.on { background: #fafafa; color: #18181b; border-color: #fafafa; }
+        summary::-webkit-details-marker { display: none; }
+        details[open] summary [data-lucide="chevron-down"], details[open] summary svg.lucide-chevron-down { transform: rotate(180deg); }
     </style>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
@@ -41,21 +70,24 @@
         <p class="text-sm font-medium">Loading…</p>
     </div>
 
-    <div id="app" class="hidden max-w-5xl mx-auto px-5 py-8">
+    <div id="app" class="hidden max-w-5xl mx-auto px-4 sm:px-5 py-6 sm:py-8">
         <!-- Header -->
-        <header class="flex items-center justify-between mb-6 fade-in">
-            <div class="flex items-center gap-3">
-                <a href="/staff" class="w-10 h-10 rounded-xl surface grid place-items-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition" title="Back to hub"><i data-lucide="arrow-left" class="w-5 h-5"></i></a>
-                <div>
+        <header class="flex items-start justify-between gap-3 mb-6 fade-in">
+            <div class="flex items-center gap-3 min-w-0">
+                <a href="/staff" class="w-10 h-10 shrink-0 rounded-xl surface grid place-items-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition" title="Back to hub"><i data-lucide="arrow-left" class="w-5 h-5"></i></a>
+                <div class="min-w-0">
                     <h1 class="text-lg font-bold tracking-tight leading-tight">VA Partnership Portal</h1>
                     <p class="text-xs text-zinc-500 dark:text-zinc-400">Submissions, accounts &amp; activity across every partner VA</p>
                 </div>
             </div>
-            <a href="/va-portal" target="_blank" class="hidden sm:flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition" title="Open the partner-facing portal"><i data-lucide="external-link" class="w-4 h-4"></i> Partner view</a>
+            <div class="flex items-center gap-1 shrink-0">
+                <a href="/va-portal" target="_blank" class="hidden sm:flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition px-2" title="Open the partner-facing portal"><i data-lucide="external-link" class="w-4 h-4"></i> Partner view</a>
+                <button onclick="toggleTheme()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition"><span id="themeIcon"></span></button>
+            </div>
         </header>
 
         <!-- Tabs -->
-        <div class="flex items-center gap-2 mb-6">
+        <div class="hscroll flex items-center gap-2 mb-6 -mx-4 px-4 sm:mx-0 sm:px-0">
             <button class="tab active" data-tab="submissions" onclick="switchTab('submissions')">Submissions</button>
             <button class="tab" data-tab="events" onclick="switchTab('events')">Events</button>
             <button class="tab" data-tab="warnings" onclick="switchTab('warnings')">Warnings</button>
@@ -65,16 +97,16 @@
 
         <!-- ===== SUBMISSIONS ===== -->
         <div id="tab-submissions">
-            <div class="flex flex-wrap items-center gap-2 mb-4">
-                <select id="fVa" class="field max-w-[14rem]" onchange="loadSubmissions()"><option value="">All VAs</option></select>
-                <select id="fStatus" class="field max-w-[10rem]" onchange="loadSubmissions()">
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+                <select id="fVa" class="field filter" onchange="loadSubmissions()"><option value="">All VAs</option></select>
+                <select id="fStatus" class="field filter" onchange="loadSubmissions()">
                     <option value="">Any status</option>
                     <option value="open">Open</option>
                     <option value="in_review">In review</option>
                     <option value="resolved">Resolved</option>
                     <option value="archived">Archived</option>
                 </select>
-                <select id="fCat" class="field max-w-[10rem]" onchange="loadSubmissions()">
+                <select id="fCat" class="field filter" onchange="loadSubmissions()">
                     <option value="">Any type</option>
                     <option value="document">Document</option>
                     <option value="request">Request</option>
@@ -83,7 +115,11 @@
                     <option value="feedback">Feedback</option>
                     <option value="other">Other</option>
                 </select>
-                <button onclick="loadSubmissions()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <button onclick="loadSubmissions()" class="w-9 h-9 shrink-0 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div class="relative mb-4">
+                <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none"></i>
+                <input id="fSubQ" type="search" class="field pl-9" placeholder="Search title, body or submitter…" oninput="renderSubs()" autocomplete="off">
             </div>
             <div id="subList" class="space-y-3"></div>
         </div>
@@ -91,8 +127,8 @@
         <!-- ===== EVENTS ===== -->
         <div id="tab-events" class="hidden">
             <div class="flex flex-wrap items-center gap-2 mb-4">
-                <select id="evVa" class="field max-w-[14rem]" onchange="loadEvents()"><option value="">All VAs</option></select>
-                <button onclick="loadEvents()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <select id="evVa" class="field filter" onchange="loadEvents()"><option value="">All VAs</option></select>
+                <button onclick="loadEvents()" class="w-9 h-9 shrink-0 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="evList" class="space-y-2"></div>
         </div>
@@ -132,39 +168,67 @@
 
             <!-- Warning history -->
             <div class="flex flex-wrap items-center gap-2 mb-4">
-                <select id="fWarnVa" class="field max-w-[14rem]" onchange="loadWarnings()"><option value="">All VAs</option></select>
-                <select id="fWarnStatus" class="field max-w-[10rem]" onchange="loadWarnings()">
+                <select id="fWarnVa" class="field filter" onchange="loadWarnings()"><option value="">All VAs</option></select>
+                <select id="fWarnStatus" class="field filter" onchange="loadWarnings()">
                     <option value="">Any status</option>
                     <option value="active">Active</option>
                     <option value="rescinded">Rescinded</option>
                 </select>
-                <button onclick="loadWarnings()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <button onclick="loadWarnings()" class="w-9 h-9 shrink-0 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="warnList" class="space-y-3"></div>
         </div>
 
         <!-- ===== ACCOUNTS ===== -->
         <div id="tab-accounts" class="hidden">
-            <div class="surface rounded-2xl p-6 mb-5">
-                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> Create a portal account</p>
-                <form id="acctForm" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <!-- Folded away by default: on this tab the job is usually finding an
+                 existing account, not minting a new one. -->
+            <details id="acctCreate" class="surface rounded-2xl mb-5 overflow-hidden">
+                <summary class="p-5 cursor-pointer select-none text-sm font-semibold flex items-center gap-2 list-none">
+                    <i data-lucide="user-plus" class="w-4 h-4"></i> Create a portal account
+                    <i data-lucide="chevron-down" class="w-4 h-4 ml-auto text-zinc-400"></i>
+                </summary>
+                <form id="acctForm" class="grid grid-cols-1 sm:grid-cols-2 gap-3 px-5 pb-5">
                     <select id="naVa" class="field" required><option value="">Select VA…</option></select>
                     <select id="naRole" class="field">
                         <option value="owner">Owner</option>
                         <option value="staff">Staff</option>
+                        <option value="pilot">Pilot</option>
                     </select>
                     <input id="naName" type="text" placeholder="Display name (optional)" class="field">
                     <input id="naUser" type="text" placeholder="Username (optional — auto from VA name)" class="field">
                     <input id="naPass" type="text" placeholder="Password (optional — auto-generated)" class="field sm:col-span-2">
-                    <div class="sm:col-span-2 flex items-center gap-3">
+                    <div class="sm:col-span-2 flex items-center gap-3 flex-wrap">
                         <button type="submit" class="btn">Create account</button>
                         <p id="acctMsg" class="hidden text-sm font-medium"></p>
                     </div>
                 </form>
+            </details>
+
+            <!-- Find one person -->
+            <div class="relative mb-2">
+                <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none"></i>
+                <input id="aq" type="search" class="field pl-9" placeholder="Search by name, @username or VA…" oninput="renderAccounts()" autocomplete="off">
             </div>
-            <div class="flex items-center justify-between mb-3">
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+                <select id="aVa" class="field filter" onchange="renderAccounts()"><option value="">All VAs</option></select>
+                <select id="aRole" class="field filter" onchange="renderAccounts()">
+                    <option value="">Any role</option>
+                    <option value="owner">Owner</option>
+                    <option value="staff">Staff</option>
+                    <option value="pilot">Pilot</option>
+                </select>
+                <select id="aState" class="field filter" onchange="renderAccounts()">
+                    <option value="">Any state</option>
+                    <option value="active">Active</option>
+                    <option value="disabled">Disabled</option>
+                    <option value="never">Never signed in</option>
+                </select>
+                <button onclick="loadAccounts()" class="w-9 h-9 shrink-0 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div class="flex items-center justify-between gap-3 mb-3">
                 <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Portal accounts</h2>
-                <button onclick="loadAccounts()" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <span id="acctCount" class="text-xs text-zinc-400"></span>
             </div>
             <div id="acctList" class="space-y-2"></div>
         </div>
@@ -186,6 +250,19 @@
         let vas = [];
 
         const $ = (id) => document.getElementById(id);
+
+        // ---------- Theme ----------
+        function setThemeIcon() {
+            const dark = document.documentElement.classList.contains('dark');
+            $('themeIcon').innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`;
+            if (window.lucide) lucide.createIcons();
+        }
+        function toggleTheme() {
+            const dark = !document.documentElement.classList.contains('dark');
+            try { localStorage.setItem('theme', dark ? 'dark' : 'light'); } catch {}
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
         const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
         const fmtDate = (d) => new Date(d).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
         const flash = (id, text, ok) => { const el = $(id); el.textContent = text; el.classList.remove('hidden','text-rose-500','text-emerald-500'); el.classList.add(ok ? 'text-emerald-500' : 'text-rose-500'); };
@@ -227,17 +304,19 @@
                 $('naVa').innerHTML = '<option value="">Select VA…</option>' + opts;
                 $('wVa').innerHTML = '<option value="">Select VA…</option>' + opts;
                 $('fWarnVa').innerHTML = '<option value="">All VAs</option>' + opts;
+                $('aVa').innerHTML = '<option value="">All VAs</option>' + opts;
                 await loadTos();
                 $('bootLoader').classList.add('hidden');
                 $('app').classList.remove('hidden');
                 lucide.createIcons();
+                setThemeIcon();
                 loadSubmissions();
                 // Deep links (e.g. from the VA Ads Manager "Warn" button):
                 // ?tab=warnings&va=<id> opens the Warnings tab with the VA preselected.
                 const q = new URLSearchParams(location.search);
                 const va = q.get('va');
                 if (va) {
-                    ['fVa','evVa','wVa','fWarnVa'].forEach(id => { const el = $(id); if (el && [...el.options].some(o => o.value === va)) el.value = va; });
+                    ['fVa','evVa','wVa','fWarnVa','aVa'].forEach(id => { const el = $(id); if (el && [...el.options].some(o => o.value === va)) el.value = va; });
                 }
                 const tab = q.get('tab');
                 if (tab && ['submissions','events','warnings','accounts','activity'].includes(tab)) switchTab(tab);
@@ -250,6 +329,8 @@
         }
 
         // ---------- Submissions ----------
+        let submissions = [];
+
         async function loadSubmissions() {
             const params = new URLSearchParams();
             if ($('fVa').value) params.set('vaAdId', $('fVa').value);
@@ -257,16 +338,26 @@
             if ($('fCat').value) params.set('category', $('fCat').value);
             $('subList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
             try {
-                const { submissions } = await api('/submissions?' + params.toString());
-                if (!submissions.length) {
-                    $('subList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No submissions match.</div>';
-                    return;
-                }
-                $('subList').innerHTML = submissions.map(renderSub).join('');
-                lucide.createIcons();
+                const data = await api('/submissions?' + params.toString());
+                submissions = data.submissions || [];
+                renderSubs();
             } catch (err) {
                 if (err.message !== 'auth') $('subList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
+        }
+
+        // The server already applied the VA / status / type filters; the text box
+        // narrows what came back, so typing never costs a round trip.
+        function renderSubs() {
+            const q = $('fSubQ').value.trim().toLowerCase();
+            const rows = !q ? submissions : submissions.filter(s =>
+                [s.title, s.body, s.vaName, s.submittedByName].some(v => String(v || '').toLowerCase().includes(q)));
+            if (!rows.length) {
+                $('subList').innerHTML = `<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">${q ? 'No submissions match that search.' : 'No submissions match.'}</div>`;
+                return;
+            }
+            $('subList').innerHTML = rows.map(renderSub).join('');
+            lucide.createIcons();
         }
 
         function renderSub(s) {
@@ -444,30 +535,172 @@
         }
 
         // ---------- Accounts ----------
+        let accounts = [];
+        // Ids of the cards whose editor is open, kept across a re-render so
+        // saving one account does not collapse the row you are working in.
+        const openAcct = new Set();
+
+        const ROLE_STYLE = {
+            owner: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300',
+            staff: 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300',
+            pilot: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
+        };
+        const ownerOf = (vaAdId) => accounts.find(a => a.role === 'owner' && String(a.vaAdId) === String(vaAdId));
+
         async function loadAccounts() {
             $('acctList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
             try {
-                const { accounts } = await api('/accounts');
-                if (!accounts.length) { $('acctList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No portal accounts yet.</div>'; return; }
-                $('acctList').innerHTML = accounts.map(renderAcct).join('');
-                lucide.createIcons();
+                const data = await api('/accounts');
+                accounts = data.accounts || [];
+                renderAccounts();
             } catch (err) {
                 if (err.message !== 'auth') $('acctList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
         }
 
+        // Every account is already in memory, so finding one person is a filter
+        // over `accounts` rather than a request — search, VA, role and state all
+        // narrow the same list.
+        function renderAccounts() {
+            const q = $('aq').value.trim().toLowerCase();
+            const va = $('aVa').value, role = $('aRole').value, state = $('aState').value;
+            const rows = accounts.filter(a => {
+                if (va && String(a.vaAdId) !== va) return false;
+                if (role && a.role !== role) return false;
+                if (state === 'active' && !a.active) return false;
+                if (state === 'disabled' && a.active) return false;
+                if (state === 'never' && a.lastLoginAt) return false;
+                if (!q) return true;
+                return [a.displayName, a.username, a.vaName, a.createdByName]
+                    .some(v => String(v || '').toLowerCase().includes(q));
+            });
+            $('acctCount').textContent = rows.length === accounts.length
+                ? `${accounts.length} account${accounts.length === 1 ? '' : 's'}`
+                : `${rows.length} of ${accounts.length}`;
+            if (!accounts.length) { $('acctList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No portal accounts yet.</div>'; return; }
+            if (!rows.length) { $('acctList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No account matches those filters.</div>'; return; }
+            $('acctList').innerHTML = rows.map(renderAcct).join('');
+            lucide.createIcons();
+        }
+
         function renderAcct(a) {
-            return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
-                <div class="min-w-0">
-                    <p class="font-semibold text-sm truncate">${esc(a.displayName)} <span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">${esc(a.role)}</span> ${a.active ? '' : '<span class="text-[10px] text-rose-500 ml-1">disabled</span>'}</p>
-                    <p class="text-xs text-zinc-400">@${esc(a.username)} · ${esc(a.vaName||'—')} · ${a.lastLoginAt ? 'last in ' + fmtDate(a.lastLoginAt) : 'never signed in'} · via ${esc(a.createdVia)}</p>
+            const open = openAcct.has(a.id);
+            // `canPromote` is the button; `sitting` is only the warning that
+            // somebody currently holds the VA. A VA with no owner still needs a
+            // way to be given one.
+            const canPromote = a.role !== 'owner';
+            const sitting = canPromote ? ownerOf(a.vaAdId) : null;
+            const roleOpts = ['owner','staff','pilot']
+                .map(r => `<option value="${r}" ${a.role===r?'selected':''}>${r[0].toUpperCase()+r.slice(1)}</option>`).join('');
+            return `<div class="surface rounded-2xl p-4">
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1">
+                        <p class="font-semibold text-sm flex items-center gap-2 flex-wrap">
+                            <span class="min-w-0">${esc(a.displayName)}</span>
+                            <span class="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${ROLE_STYLE[a.role]||''}">${esc(a.role)}</span>
+                            ${a.active ? '' : '<span class="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400">disabled</span>'}
+                            ${a.mustChangePassword ? '<span class="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">temp password</span>' : ''}
+                        </p>
+                        <p class="text-xs text-zinc-400 mt-0.5">@${esc(a.username)} · ${esc(a.vaName||'—')} · ${a.lastLoginAt ? 'last in ' + fmtDate(a.lastLoginAt) : 'never signed in'} · via ${esc(a.createdVia)}</p>
+                    </div>
+                    <div class="flex items-center gap-1.5 shrink-0">
+                        <button onclick="toggleAcctEditor('${a.id}')" title="Edit account" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 ${open ? 'text-zinc-900 dark:text-zinc-100 bg-zinc-100 dark:bg-zinc-800' : 'text-zinc-500'}"><i data-lucide="pencil" class="w-4 h-4"></i></button>
+                        <button onclick="toggleAcct('${a.id}', ${!a.active})" title="${a.active ? 'Disable' : 'Enable'}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${a.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
+                        <button onclick="deleteAcct('${a.id}')" title="Delete" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                    </div>
                 </div>
-                <div class="flex items-center gap-1.5">
-                    <button onclick="resetAcct('${a.id}')" title="Reset password" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
-                    <button onclick="toggleAcct('${a.id}', ${!a.active})" title="${a.active ? 'Disable' : 'Enable'}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${a.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
-                    <button onclick="deleteAcct('${a.id}')" title="Delete" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-                </div>
+                ${!open ? '' : `<div class="mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800 space-y-3">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <label class="block">
+                            <span class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Display name</span>
+                            <input class="field mt-1" data-ac-name="${a.id}" value="${esc(a.displayName)}" maxlength="80">
+                        </label>
+                        <label class="block">
+                            <span class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Username</span>
+                            <input class="field mt-1" data-ac-user="${a.id}" value="${esc(a.username)}" autocapitalize="off" autocorrect="off" spellcheck="false">
+                        </label>
+                        <label class="block">
+                            <span class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Role</span>
+                            <select class="field mt-1" data-ac-role="${a.id}">${roleOpts}</select>
+                        </label>
+                        <label class="block">
+                            <span class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">New password</span>
+                            <input class="field mt-1" data-ac-pass="${a.id}" type="text" placeholder="Leave blank to keep" autocomplete="new-password">
+                        </label>
+                    </div>
+                    ${sitting ? `<p class="text-xs text-zinc-500 dark:text-zinc-400 flex items-start gap-1.5"><i data-lucide="info" class="w-3.5 h-3.5 mt-0.5 shrink-0"></i><span>${esc(a.vaName||'This VA')} is owned by <b>${esc(sitting.displayName)}</b> (@${esc(sitting.username)}). Handing ownership here moves them to staff — a VA always has exactly one owner.</span></p>` : ''}
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <button onclick="saveAcct('${a.id}')" class="btn">Save changes</button>
+                        ${canPromote ? `<button onclick="transferOwnership('${a.id}')" class="chip inline-flex items-center gap-1.5"><i data-lucide="crown" class="w-3.5 h-3.5"></i> Make owner</button>` : ''}
+                        <button onclick="toggleAcctEditor('${a.id}')" class="chip">Close</button>
+                        <p class="hidden text-sm font-medium" data-ac-msg="${a.id}"></p>
+                    </div>
+                </div>`}
             </div>`;
+        }
+
+        function toggleAcctEditor(id) {
+            if (openAcct.has(id)) openAcct.delete(id); else openAcct.add(id);
+            renderAccounts();
+        }
+
+        const acctMsgFor = (id) => document.querySelector(`[data-ac-msg="${id}"]`);
+        function acctFlash(id, text, ok) {
+            const el = acctMsgFor(id);
+            if (!el) { if (!ok) alert(text); return; }
+            el.textContent = text;
+            el.classList.remove('hidden', 'text-rose-500', 'text-emerald-500');
+            el.classList.add(ok ? 'text-emerald-500' : 'text-rose-500');
+        }
+
+        // One save for everything the editor shows. The role is sent only when it
+        // actually changed, so an ordinary rename never trips the owner swap.
+        async function saveAcct(id) {
+            const a = accounts.find(x => x.id === id);
+            if (!a) return;
+            const displayName = document.querySelector(`[data-ac-name="${id}"]`).value.trim();
+            const username = document.querySelector(`[data-ac-user="${id}"]`).value.trim();
+            const role = document.querySelector(`[data-ac-role="${id}"]`).value;
+            const password = document.querySelector(`[data-ac-pass="${id}"]`).value;
+            if (password && password.length < 8) { acctFlash(id, 'Password must be at least 8 characters.', false); return; }
+
+            const body = {};
+            if (displayName && displayName !== a.displayName) body.displayName = displayName;
+            if (username && username !== a.username) body.username = username;
+            if (role !== a.role) body.role = role;
+            if (password) body.password = password;
+            if (!Object.keys(body).length) { acctFlash(id, 'Nothing to save.', true); return; }
+
+            if (body.role === 'owner') {
+                const sitting = ownerOf(a.vaAdId);
+                if (sitting && !confirm(`Make @${username || a.username} the owner of ${a.vaName || 'this VA'}? @${sitting.username} becomes staff.`)) return;
+            }
+            try {
+                const { demoted } = await api('/accounts/' + id, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+                });
+                await loadAccounts();
+                acctFlash(id, demoted ? `Saved — @${demoted.username} is now staff.` : 'Saved.', true);
+            } catch (err) { if (err.message !== 'auth') acctFlash(id, err.message, false); }
+        }
+
+        // The same swap as picking "Owner" in the role select, as a one-click
+        // action for the case people actually come to this tab for.
+        async function transferOwnership(id) {
+            const a = accounts.find(x => x.id === id);
+            if (!a) return;
+            const sitting = ownerOf(a.vaAdId);
+            const msg = sitting
+                ? `Hand ownership of ${a.vaName || 'this VA'} to @${a.username}? @${sitting.username} becomes staff and loses owner-only controls.`
+                : `Make @${a.username} the owner of ${a.vaName || 'this VA'}?`;
+            if (!confirm(msg)) return;
+            try {
+                const { demoted } = await api('/accounts/' + id, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'owner' }),
+                });
+                await loadAccounts();
+                acctFlash(id, demoted ? `@${a.username} is now owner — @${demoted.username} moved to staff.` : `@${a.username} is now owner.`, true);
+            } catch (err) { if (err.message !== 'auth') { if (!acctMsgFor(id)) alert(err.message); else acctFlash(id, err.message, false); } }
         }
 
         $('acctForm').addEventListener('submit', async (e) => {
@@ -490,18 +723,17 @@
         });
 
         async function toggleAcct(id, active) {
+            const a = accounts.find(x => x.id === id);
+            if (a && a.role === 'owner' && !active
+                && !confirm(`Disable @${a.username}? They are the owner of ${a.vaName || 'this VA'} and nobody else can run its portal until this is undone.`)) return;
             try { await api('/accounts/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }); loadAccounts(); }
             catch (err) { if (err.message !== 'auth') alert(err.message); }
         }
-        async function resetAcct(id) {
-            const password = prompt('New password (min 8 characters):');
-            if (!password) return;
-            try { await api('/accounts/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); alert('Password updated.'); }
-            catch (err) { if (err.message !== 'auth') alert(err.message); }
-        }
         async function deleteAcct(id) {
-            if (!confirm('Delete this portal account permanently?')) return;
-            try { await api('/accounts/' + id, { method: 'DELETE' }); loadAccounts(); }
+            const a = accounts.find(x => x.id === id);
+            const who = a ? `@${a.username}${a.role === 'owner' ? ` — the owner of ${a.vaName || 'this VA'}` : ''}` : 'this portal account';
+            if (!confirm(`Delete ${who} permanently? This cannot be undone.`)) return;
+            try { await api('/accounts/' + id, { method: 'DELETE' }); openAcct.delete(id); loadAccounts(); }
             catch (err) { if (err.message !== 'auth') alert(err.message); }
         }
 

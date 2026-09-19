@@ -82,9 +82,9 @@ const doc = (o) => ({
     _id: o.id, username: o.username, displayName: o.displayName || o.username,
     role: o.role, vaAdId: o.vaAdId || VA, vaName: 'Test VA',
     active: o.active !== false, passwordHash: 'x', createdVia: 'owner',
-    stored: { role: o.role, active: o.active !== false },
+    stored: { role: o.role, active: o.active !== false, username: o.username },
     saves: 0,
-    async save() { this.saves += 1; this.stored = { role: this.role, active: this.active }; },
+    async save() { this.saves += 1; this.stored = { role: this.role, active: this.active, username: this.username }; },
 });
 
 /**
@@ -93,7 +93,7 @@ const doc = (o) => ({
  * `failSaveFor` makes one account's write throw, which is how the ordering
  * property is actually observed rather than asserted about in a comment.
  */
-async function run(key, { team, actor, params = {}, body = {}, failSaveFor = null }) {
+async function run(key, { team, actor, params = {}, body = {}, failSaveFor = null, taken = [] }) {
     const rows = team.map(doc);
     for (const r of rows) {
         if (r._id === failSaveFor) r.save = async () => { throw new Error('write failed'); };
@@ -105,7 +105,9 @@ async function run(key, { team, actor, params = {}, body = {}, failSaveFor = nul
         if (q._id && q._id.$ne && String(r._id) === String(q._id.$ne)) return false;
         return true;
     }) || null;
-    VaPortalAccount.exists = async () => null;
+    // `taken` is the set of usernames some OTHER account already holds, which is
+    // the only thing the rename path asks this for.
+    VaPortalAccount.exists = async (q) => (q && q.username && taken.includes(q.username) ? { _id: 'x' } : null);
 
     const handlers = routes[key];
     const handler = handlers[handlers.length - 1];
@@ -265,6 +267,68 @@ const ADMIN_PATCH = 'PATCH /api/va-portal/admin/accounts/:id';
             r.roleOf('s1') === 'pilot' && r.roleOf('o1') === 'owner',
             [r.roleOf('s1'), r.roleOf('o1')]);
         check('…and reports nobody demoted', !r.body.demoted, r.body && r.body.demoted);
+    }
+
+    /* --------------------------------------------- correcting a username
+     *
+     * The oversight UI could mint an account and could not fix one: a username
+     * typed wrong, or auto-derived from a VA that has since rebranded, was
+     * permanent, and the way out was to delete the person and reissue their
+     * credentials. So PATCH takes a username — under the create path's rules,
+     * and before the owner swap, so a name that is already taken fails the
+     * whole request instead of leaving half a promotion behind.
+     */
+    const nameOf = (r, id) => r.by(id).stored.username;
+    {
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' }, body: { username: 'Robin Wright' },
+        });
+        check('a username can be corrected', r.status === 200 && nameOf(r, 's1') === 'robin-wright',
+            [r.status, nameOf(r, 's1')]);
+    }
+    {
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' },
+            body: { username: 'founder' }, taken: ['founder'],
+        });
+        check('…but not onto one somebody else holds', r.status === 409, [r.status, r.body]);
+        check('…leaving the account as it was', nameOf(r, 's1') === 'mate', nameOf(r, 's1'));
+    }
+    {
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' }, body: { username: 'ab' },
+        });
+        check('…and not onto one too short to be a login', r.status === 400, [r.status, r.body]);
+    }
+    {
+        // The ordering property, on this path: a rename that cannot land must not
+        // get as far as promoting anyone, or the VA is left with two owners for
+        // a request that reported failure.
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' },
+            body: { username: 'founder', role: 'owner' }, taken: ['founder'],
+        });
+        check('a rejected rename never promotes anybody',
+            r.status === 409 && r.owners() === 1 && r.roleOf('o1') === 'owner',
+            [r.status, r.owners(), r.roleOf('o1')]);
+    }
+    {
+        // Renaming the account being promoted: both land, and the demotion still
+        // reads against the name the account ends up with.
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' },
+            body: { username: 'robin', role: 'owner' },
+        });
+        check('a rename and a handover in one request both land',
+            nameOf(r, 's1') === 'robin' && r.roleOf('s1') === 'owner' && r.owners() === 1,
+            [nameOf(r, 's1'), r.roleOf('s1'), r.owners()]);
+    }
+    {
+        const r = await run(ADMIN_PATCH, {
+            team: [OWNER, MATE], actor: 'o1', params: { id: 's1' }, body: { displayName: 'Robin R.' },
+        });
+        check('an edit that names no username leaves it alone',
+            r.status === 200 && nameOf(r, 's1') === 'mate', [r.status, nameOf(r, 's1')]);
     }
 
     console.log(`${pass} passed, ${fails.length} failed`);
