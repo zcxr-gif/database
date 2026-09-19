@@ -287,6 +287,14 @@ Partners can always read the Terms at **`/terms`** (public page) or download the
 **Where:** the same staff console (`yoursite.com/va-submissions`) → **Accounts**
 tab. Every portal login across every partner VA is listed there.
 
+**What a login is called.** When the bot provisions a VA on approval, the owner's
+login is named after **their Discord username** (the reps' always were). Older
+owner accounts were named after the *VA* instead — so a row can read `jpp370`
+over `@afklmva`. Those can be corrected one at a time below, or in bulk with
+`node scripts/rename-va-portal-logins.js` (reports what it would change; add
+`--apply` to write it). A username is a credential — **tell the owner before you
+change theirs**, since nothing else will.
+
 **Finding one person.** The search box matches display name, `@username`, VA name
 and who created the account; the three dropdowns narrow by VA, by role
 (Owner / Staff / Pilot) and by state (Active / Disabled / Never signed in). The

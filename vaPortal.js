@@ -665,11 +665,13 @@ async function uniqueUsernameFrom(base) {
  * @param {Object} [opts]
  * @param {string} [opts.createdVia='bot']
  * @param {string} [opts.createdByName='Inflight Bot']
+ * @param {string} [opts.discordUsername] the owner's Discord username, when the
+ *   caller holds a fresher one than `ad.ownerName`
  * @returns {{account: Object, created: boolean, username: string, password: string|null}}
  */
 async function provisionOwnerAccount(ad, opts = {}) {
     if (!ad || !ad._id) throw new Error('provisionOwnerAccount requires a VA ad with an _id.');
-    const { createdVia = 'bot', createdByName = 'Inflight Bot' } = opts;
+    const { createdVia = 'bot', createdByName = 'Inflight Bot', discordUsername = '' } = opts;
 
     const existing = await VaPortalAccount.findOne({ vaAdId: ad._id, role: 'owner' });
     if (existing) {
@@ -681,12 +683,32 @@ async function provisionOwnerAccount(ad, opts = {}) {
         return { account: existing, created: false, username: existing.username, password: null };
     }
 
-    const username = await uniqueUsernameFrom(ad.name);
+    /* THE LOGIN IS A PERSON'S, NOT THE AIRLINE'S.
+     *
+     * This built the username from the VA's name, so the owner of AFKLM Virtual
+     * signed in as @afklmva while the account displayed "jpp370" — their Discord
+     * name — right beside it. Two names for one person, and the one they had to
+     * type was the one nothing else called them. It also collides by design:
+     * somebody who runs two VAs got two logins named after airlines, neither
+     * recognisably theirs.
+     *
+     * The rep path (provisionRepAccount) has always keyed off the Discord
+     * username. This is the same rule for owners, with the VA name kept only as
+     * the fallback for an ad that has no Discord owner at all — an
+     * admin-authored listing, where `ownerName` is the schema's 'Unknown'
+     * placeholder rather than anybody's name.
+     */
+    const ownerName = String(ad.ownerName || '').trim();
+    const base = discordUsername
+        || (ownerName && ownerName.toLowerCase() !== 'unknown' ? ownerName : '')
+        || ad.name;
+    const username = await uniqueUsernameFrom(base);
     const password = generatePassword();
     const passwordHash = await bcrypt.hash(password, 12);
     const account = await VaPortalAccount.create({
         username,
-        displayName: ad.ownerName || ad.name || username,
+        // 'Unknown' is the ad schema's placeholder, not a name to show anybody.
+        displayName: (ownerName.toLowerCase() === 'unknown' ? '' : ownerName) || ad.name || username,
         passwordHash,
         role: 'owner',
         vaAdId: ad._id,
