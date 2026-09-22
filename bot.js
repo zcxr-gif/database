@@ -497,8 +497,30 @@ async function postToChannel(channelId, payload) {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+            GallerySubmission,
             provisionVaPortalAccount, provisionVaPortalRepAccount,
             deactivateVaPortalRepAccount, purgeVaData } = models;
+
+    // A review card carries its submission id in the footer, because the footer
+    // is the only thing that survives the days a card can sit in the channel.
+    const submissionIdFrom = (footerText) =>
+        (String(footerText || '').match(/Sub: ([a-f0-9]{24})/) || [])[1] || null;
+
+    // Close the row the submitter reads. Never allowed to break a review: a
+    // decision that reached Discord has happened whether or not we recorded it.
+    const closeSubmission = async (footerText, fields) => {
+        if (!GallerySubmission) return;
+        const id = submissionIdFrom(footerText);
+        if (!id) return;
+        try {
+            await GallerySubmission.updateOne(
+                { _id: id, status: 'pending' },
+                { $set: { reviewedAt: new Date(), ...fields } },
+            );
+        } catch (err) {
+            console.error('Submission status update failed:', err.message);
+        }
+    };
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -3163,6 +3185,15 @@ client.on('interactionCreate', async (interaction) => {
                         updateData, { upsert: true }
                     );
 
+                    // Tell whoever sent it. A web submitter has no DM channel to
+                    // be messaged on, so their copy of this is the row.
+                    await closeSubmission(footerText, {
+                        status: 'approved',
+                        reason: '',
+                        reviewedBy: interaction.user.username,
+                        photoUrl: permanentUrl,
+                    });
+
                     // Remove the overwritten image from storage (after the DB is updated)
                     if (replacedUrl && replacedUrl !== permanentUrl) await deleteImageFromS3(replacedUrl);
 
@@ -3998,6 +4029,14 @@ client.on('interactionCreate', async (interaction) => {
                 const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
                 // Grab the image being rejected so we can show it to the user.
                 const rejectedImageUrl = oldEmbed.image?.url || interaction.message.attachments.first()?.url;
+
+                // The same reason staff just typed is what the submitter reads in
+                // the gallery — one decision, one wording, not two.
+                await closeSubmission(oldEmbed.footer?.text, {
+                    status: 'rejected',
+                    reason,
+                    reviewedBy: interaction.user.username,
+                });
 
                 // Keep the photo visible on the admin message (don't null it) so the
                 // record of what was rejected stays intact.
@@ -5088,7 +5127,8 @@ client.on('interactionCreate', async (interaction) => {
     //     display name carried in the footer for the approval handler to use.
     _submitWebAircraftReviewImpl = async ({
         aircraftType, liveryName, tailNumber,
-        imageBuffer, collaboratorId, collaboratorName, pilotId, ifUsername, sourceSite,
+        imageBuffer, collaboratorId, collaboratorName, pilotId, ifUsername,
+        submissionId, sourceSite,
     }) => {
         if (!client || !client.isReady || !client.isReady()) {
             throw new Error('Discord bot not ready');
@@ -5175,6 +5215,8 @@ client.on('interactionCreate', async (interaction) => {
         if (!hasDiscordId) footer += ` | Collab: ${safeName}`;
         if (safePilotId) footer += ` | Pilot: ${safePilotId}`;
         if (safeIfUser) footer += ` | IF: ${safeIfUser}`;
+        const safeSubmission = String(submissionId || '').replace(/[^a-f0-9]/gi, '').slice(0, 24);
+        if (safeSubmission) footer += ` | Sub: ${safeSubmission}`;
         if (safeSource) footer += ` | Src: ${safeSource}`;
         finalEmbed.setFooter({ text: footer });
 

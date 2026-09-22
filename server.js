@@ -369,6 +369,39 @@ GalleryLikeSchema.index({ pilotId: 1 });
 
 const GalleryLike = mongoose.model('GalleryLike', GalleryLikeSchema);
 
+/* What happened to a photo somebody sent in.
+ *
+ * Until now a web submission vanished into the Discord review queue: approved
+ * it appeared in the gallery, rejected it appeared nowhere, and either way the
+ * person who sent it was never told. DM submitters at least got a message back;
+ * anybody uploading from the site got silence.
+ *
+ * One row per photo (each image gets its own review card, so each is decided on
+ * its own), created when it is sent and closed when staff press a button. The
+ * id rides the review card's footer, which is the only thing that survives the
+ * days a card can sit in the channel.
+ */
+const GallerySubmissionSchema = new mongoose.Schema({
+    pilotId: { type: String, default: null },        // null for an anonymous upload
+    contributorName: { type: String, default: 'Anonymous' },
+    ifUsername: { type: String, default: null },
+    aircraftType: { type: String, required: true },
+    liveryName: { type: String, required: true },
+    tailNumber: { type: String, default: '' },
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    reason: { type: String, default: '' },           // why it was declined
+    reviewedBy: { type: String, default: null },     // the staff member's name
+    reviewedAt: { type: Date, default: null },
+    photoUrl: { type: String, default: null },       // where it landed, once approved
+    sourceSite: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+});
+// "What happened to mine" is the only read path that matters.
+GallerySubmissionSchema.index({ pilotId: 1, createdAt: -1 });
+GallerySubmissionSchema.index({ status: 1, createdAt: -1 });
+
+const GallerySubmission = mongoose.model('GallerySubmission', GallerySubmissionSchema);
+
 /* =========================
  * NEW: GATES SCHEMA
  * ========================= */
@@ -3506,6 +3539,8 @@ startDiscordBot(
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
     { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+      // Closed by the approve/reject buttons so the submitter learns the outcome.
+      GallerySubmission,
       provisionVaPortalAccount: provisionOwnerAccount,
       // Per-rep portal accounts, managed alongside /va_addrep and /va_removerep.
       provisionVaPortalRepAccount: provisionRepAccount,
@@ -17295,17 +17330,46 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         let routed = 0;
         for (const file of files) {
             const imageBuffer = await optimizeAircraftImageBuffer(file);
-            await submitWebAircraftReview({
+
+            // The row exists before the card does: if posting to Discord fails,
+            // the submitter still has a record of what they sent rather than a
+            // photo that silently never existed.
+            const submission = await GallerySubmission.create({
+                pilotId: pilot ? pilot.pilotId : null,
+                contributorName: collabName,
+                ifUsername: pilot ? pilot.ifUsername : null,
                 aircraftType: matched.type,
                 liveryName: matched.livery,
-                tailNumber: matched.tail,
-                imageBuffer,
-                collaboratorId: collabId,
-                collaboratorName: collabName,
-                pilotId: pilot ? pilot.pilotId : null,
-                ifUsername: pilot ? pilot.ifUsername : null,
+                tailNumber: matched.tail || '',
                 sourceSite: site,
             });
+
+            try {
+                await submitWebAircraftReview({
+                    aircraftType: matched.type,
+                    liveryName: matched.livery,
+                    tailNumber: matched.tail,
+                    imageBuffer,
+                    collaboratorId: collabId,
+                    collaboratorName: collabName,
+                    pilotId: pilot ? pilot.pilotId : null,
+                    ifUsername: pilot ? pilot.ifUsername : null,
+                    submissionId: String(submission._id),
+                    sourceSite: site,
+                });
+            } catch (err) {
+                // Nobody will ever press a button on a card that was never
+                // posted, so close the row here instead of leaving it pending
+                // for good.
+                await GallerySubmission.updateOne({ _id: submission._id }, {
+                    $set: {
+                        status: 'rejected',
+                        reason: 'This photo could not be sent for review — please try again.',
+                        reviewedAt: new Date(),
+                    },
+                }).catch(() => {});
+                throw err;
+            }
             routed++;
         }
 
@@ -17423,6 +17487,28 @@ app.post('/api/gallery/likes/:photoId', galleryAccounts.attachPilot, async (req,
     } catch (error) {
         console.error('Gallery like error:', error);
         res.status(500).json({ message: 'Could not save your like.' });
+    }
+});
+
+// What happened to the photos this pilot sent in — the whole point of keeping
+// the rows. Anonymous uploads have no account to show them to, so they are not
+// readable here at all.
+app.get('/api/gallery/submissions', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Not signed in.' });
+    try {
+        const rows = await GallerySubmission.find({ pilotId: req.pilot.pilotId })
+            .sort({ createdAt: -1 })
+            .limit(60)
+            .select('aircraftType liveryName tailNumber status reason reviewedAt photoUrl createdAt')
+            .lean();
+
+        const counts = { pending: 0, approved: 0, rejected: 0 };
+        rows.forEach((row) => { counts[row.status] = (counts[row.status] || 0) + 1; });
+
+        res.json({ submissions: rows, counts });
+    } catch (error) {
+        console.error('Gallery submissions error:', error);
+        res.status(500).json({ message: 'Could not load your submissions.' });
     }
 });
 
