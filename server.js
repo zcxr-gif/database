@@ -348,6 +348,27 @@ CommunityAircraftSchema.index({ 'imageContributors.pilotId': 1 });
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
+/* A like is one pilot on one photo.
+ *
+ * The photo id is the gallery's own `<recordId>-<slot>`, not a database id:
+ * a photo is a SLOT inside an aircraft record, and slots are what people
+ * actually look at and like. The unique index is the whole rule — a second
+ * like from the same account is the same row, so a toggle cannot double-count
+ * and a retry cannot inflate anything.
+ *
+ * Likes require an account (galleryAccounts.js). Without one there is nothing
+ * to key on but an IP, which is not a person.
+ */
+const GalleryLikeSchema = new mongoose.Schema({
+    photoId: { type: String, required: true },
+    pilotId: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+});
+GalleryLikeSchema.index({ photoId: 1, pilotId: 1 }, { unique: true });
+GalleryLikeSchema.index({ pilotId: 1 });
+
+const GalleryLike = mongoose.model('GalleryLike', GalleryLikeSchema);
+
 /* =========================
  * NEW: GATES SCHEMA
  * ========================= */
@@ -17349,6 +17370,59 @@ app.get('/api/gallery/me', galleryAccounts.attachPilot, async (req, res) => {
     } catch (error) {
         console.error('Gallery /me error:', error);
         res.status(500).json({ message: 'Could not read your gallery account.' });
+    }
+});
+
+// The gallery's photo ids: `<mongo id>-<slot>` for aircraft, `apt-<ICAO>` for
+// airports. Anything else is not a photo this site can show.
+const GALLERY_PHOTO_ID = /^[A-Za-z0-9_-]{3,64}$/;
+
+// Every like count in one call. The gallery holds the whole photo list in
+// memory already, so it wants the counts the same way rather than one request
+// per tile; `mine` comes back only for a signed-in caller.
+app.get('/api/gallery/likes', galleryAccounts.attachPilot, async (req, res) => {
+    try {
+        const [totals, mine] = await Promise.all([
+            GalleryLike.aggregate([{ $group: { _id: '$photoId', n: { $sum: 1 } } }]),
+            req.pilot
+                ? GalleryLike.find({ pilotId: req.pilot.pilotId }).select('photoId').lean()
+                : Promise.resolve([]),
+        ]);
+
+        const counts = {};
+        totals.forEach((row) => { counts[row._id] = row.n; });
+
+        res.json({ counts, mine: mine.map((row) => row.photoId) });
+    } catch (error) {
+        console.error('Gallery likes error:', error);
+        res.status(500).json({ message: 'Could not load likes.' });
+    }
+});
+
+// Toggle. Returns the state the caller should now show, and the live count —
+// so two people liking at once cannot leave either of them with a stale number.
+app.post('/api/gallery/likes/:photoId', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Sign in to like a photo.' });
+
+    const photoId = String(req.params.photoId || '');
+    if (!GALLERY_PHOTO_ID.test(photoId)) return res.status(400).json({ message: 'Unknown photo.' });
+
+    try {
+        const existing = await GalleryLike.findOneAndDelete({ photoId, pilotId: req.pilot.pilotId });
+        if (!existing) {
+            // Upsert rather than create: a double tap races itself, and the
+            // unique index would otherwise turn the second one into a 500.
+            await GalleryLike.updateOne(
+                { photoId, pilotId: req.pilot.pilotId },
+                { $setOnInsert: { createdAt: new Date() } },
+                { upsert: true },
+            );
+        }
+        const count = await GalleryLike.countDocuments({ photoId });
+        res.json({ liked: !existing, count });
+    } catch (error) {
+        console.error('Gallery like error:', error);
+        res.status(500).json({ message: 'Could not save your like.' });
     }
 });
 
