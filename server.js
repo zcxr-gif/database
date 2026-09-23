@@ -260,6 +260,7 @@ process.on('uncaughtException', (err) => {
 
 // IMPORT THE BOT
 const { startDiscordBot, submitWebAircraftReview, resolveAircraftMatch, getBotStats } = require('./bot');
+const galleryAccounts = require('./galleryAccounts');
 
 // Live backend diagnostics (memory / CPU / event-loop / per-route timing).
 // Powers the /diagnostics terminal. Kept intentionally low-overhead.
@@ -317,11 +318,20 @@ const CommunityAircraftSchema = new mongoose.Schema({
     imageContributors: {
         type: [{
             name: { type: String, default: "System" },
-            id: { type: String, default: null }
+            id: { type: String, default: null },
+            // The tracker account behind the credit, when the photo was
+            // submitted (or later claimed) by somebody signed in. `name` stays
+            // the display credit; these are what make two photos the same
+            // person. See galleryAccounts.js.
+            pilotId: { type: String, default: null },
+            ifUsername: { type: String, default: null }
         }],
         default: [],
         _id: false
     },
+    // Legacy top-level mirrors of slot 0, alongside contributorName/Id.
+    contributorPilotId: { type: String, default: null },
+    contributorIfUsername: { type: String, default: null },
     needsUpdate: { type: Boolean, default: false }, // NEW: Flag for image updates
     uploadedAt: { type: Date, default: Date.now }
 });
@@ -332,8 +342,65 @@ CommunityAircraftSchema.index({ contributorName: 1 });
 CommunityAircraftSchema.index({ aircraftType: 1, liveryName: 1 });
 CommunityAircraftSchema.index({ needsUpdate: 1 });
 CommunityAircraftSchema.index({ uploadedAt: -1 });
+// "Show me my photos" and the claim sweep both look up by account.
+CommunityAircraftSchema.index({ contributorPilotId: 1 });
+CommunityAircraftSchema.index({ 'imageContributors.pilotId': 1 });
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
+
+/* A like is one pilot on one photo.
+ *
+ * The photo id is the gallery's own `<recordId>-<slot>`, not a database id:
+ * a photo is a SLOT inside an aircraft record, and slots are what people
+ * actually look at and like. The unique index is the whole rule — a second
+ * like from the same account is the same row, so a toggle cannot double-count
+ * and a retry cannot inflate anything.
+ *
+ * Likes require an account (galleryAccounts.js). Without one there is nothing
+ * to key on but an IP, which is not a person.
+ */
+const GalleryLikeSchema = new mongoose.Schema({
+    photoId: { type: String, required: true },
+    pilotId: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+});
+GalleryLikeSchema.index({ photoId: 1, pilotId: 1 }, { unique: true });
+GalleryLikeSchema.index({ pilotId: 1 });
+
+const GalleryLike = mongoose.model('GalleryLike', GalleryLikeSchema);
+
+/* What happened to a photo somebody sent in.
+ *
+ * Until now a web submission vanished into the Discord review queue: approved
+ * it appeared in the gallery, rejected it appeared nowhere, and either way the
+ * person who sent it was never told. DM submitters at least got a message back;
+ * anybody uploading from the site got silence.
+ *
+ * One row per photo (each image gets its own review card, so each is decided on
+ * its own), created when it is sent and closed when staff press a button. The
+ * id rides the review card's footer, which is the only thing that survives the
+ * days a card can sit in the channel.
+ */
+const GallerySubmissionSchema = new mongoose.Schema({
+    pilotId: { type: String, default: null },        // null for an anonymous upload
+    contributorName: { type: String, default: 'Anonymous' },
+    ifUsername: { type: String, default: null },
+    aircraftType: { type: String, required: true },
+    liveryName: { type: String, required: true },
+    tailNumber: { type: String, default: '' },
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    reason: { type: String, default: '' },           // why it was declined
+    reviewedBy: { type: String, default: null },     // the staff member's name
+    reviewedAt: { type: Date, default: null },
+    photoUrl: { type: String, default: null },       // where it landed, once approved
+    sourceSite: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+});
+// "What happened to mine" is the only read path that matters.
+GallerySubmissionSchema.index({ pilotId: 1, createdAt: -1 });
+GallerySubmissionSchema.index({ status: 1, createdAt: -1 });
+
+const GallerySubmission = mongoose.model('GallerySubmission', GallerySubmissionSchema);
 
 /* =========================
  * NEW: GATES SCHEMA
@@ -3472,6 +3539,8 @@ startDiscordBot(
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
     { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+      // Closed by the approve/reject buttons so the submitter learns the outcome.
+      GallerySubmission,
       provisionVaPortalAccount: provisionOwnerAccount,
       // Per-rep portal accounts, managed alongside /va_addrep and /va_removerep.
       provisionVaPortalRepAccount: provisionRepAccount,
@@ -3608,8 +3677,21 @@ const getEntryContributors = (entry) => {
     const stored = Array.isArray(entry.imageContributors) ? entry.imageContributors : [];
     return images.map((_, i) => {
         const c = stored[i];
-        if (c && (c.name || c.id)) return { name: c.name || "System", id: c.id || null };
-        return { name: entry.contributorName || "System", id: entry.contributorId || null };
+        // pilotId/ifUsername travel with the credit — see galleryAccounts.js.
+        if (c && (c.name || c.id)) {
+            return {
+                name: c.name || "System",
+                id: c.id || null,
+                pilotId: c.pilotId || null,
+                ifUsername: c.ifUsername || null,
+            };
+        }
+        return {
+            name: entry.contributorName || "System",
+            id: entry.contributorId || null,
+            pilotId: entry.contributorPilotId || null,
+            ifUsername: entry.contributorIfUsername || null,
+        };
     });
 };
 
@@ -3619,6 +3701,8 @@ const syncPrimaryContributor = (entry) => {
     if (Array.isArray(entry.imageContributors) && entry.imageContributors.length > 0) {
         entry.contributorName = entry.imageContributors[0].name || "System";
         entry.contributorId = entry.imageContributors[0].id || null;
+        entry.contributorPilotId = entry.imageContributors[0].pilotId || null;
+        entry.contributorIfUsername = entry.imageContributors[0].ifUsername || null;
     }
 };
 
@@ -17214,11 +17298,31 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         // aircraft): normalize the type/livery and auto-fill the tail if missing.
         const matched = await resolveAircraftMatch(rawType, rawLivery, rawTail);
 
+        // Who is submitting. An Authorization header is a tracker sign-in: it is
+        // checked against Supabase and whatever comes back outranks anything the
+        // browser claimed, so a signed-in submission cannot be credited to
+        // somebody else by editing the form. See galleryAccounts.js.
+        const pilot = await galleryAccounts.identify(req.get('authorization'));
+
+        // The tracker's own upload restriction applies here too — the gallery
+        // must not be a second door into what somebody was barred from.
+        if (pilot && pilot.blocked) {
+            cleanupTempFiles(files);
+            return res.status(403).json({
+                message: pilot.blocked.reason
+                    ? `Uploads are restricted on your account: ${pilot.blocked.reason}`
+                    : 'Uploads are currently restricted on your account.',
+                blocked: true,
+            });
+        }
+
         // Collaborator identity supplied by the submitting site. A numeric id is
         // treated as a linked Discord account; the name is the human-readable
         // credit shown/used when there is no linked id.
         const collabId = /^\d{5,}$/.test(String(collaboratorId || '')) ? String(collaboratorId) : null;
-        const collabName = (collaboratorName || collaborator || '').trim().slice(0, 60) || 'Anonymous';
+        const collabName = (pilot && galleryAccounts.creditName(pilot))
+            || (collaboratorName || collaborator || '').trim().slice(0, 60)
+            || 'Anonymous';
         const site = (sourceSite || req.get('origin') || '').toString().trim().slice(0, 80) || null;
 
         // Optimize + route each image one at a time — the sharp queue serializes
@@ -17226,15 +17330,46 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         let routed = 0;
         for (const file of files) {
             const imageBuffer = await optimizeAircraftImageBuffer(file);
-            await submitWebAircraftReview({
+
+            // The row exists before the card does: if posting to Discord fails,
+            // the submitter still has a record of what they sent rather than a
+            // photo that silently never existed.
+            const submission = await GallerySubmission.create({
+                pilotId: pilot ? pilot.pilotId : null,
+                contributorName: collabName,
+                ifUsername: pilot ? pilot.ifUsername : null,
                 aircraftType: matched.type,
                 liveryName: matched.livery,
-                tailNumber: matched.tail,
-                imageBuffer,
-                collaboratorId: collabId,
-                collaboratorName: collabName,
+                tailNumber: matched.tail || '',
                 sourceSite: site,
             });
+
+            try {
+                await submitWebAircraftReview({
+                    aircraftType: matched.type,
+                    liveryName: matched.livery,
+                    tailNumber: matched.tail,
+                    imageBuffer,
+                    collaboratorId: collabId,
+                    collaboratorName: collabName,
+                    pilotId: pilot ? pilot.pilotId : null,
+                    ifUsername: pilot ? pilot.ifUsername : null,
+                    submissionId: String(submission._id),
+                    sourceSite: site,
+                });
+            } catch (err) {
+                // Nobody will ever press a button on a card that was never
+                // posted, so close the row here instead of leaving it pending
+                // for good.
+                await GallerySubmission.updateOne({ _id: submission._id }, {
+                    $set: {
+                        status: 'rejected',
+                        reason: 'This photo could not be sent for review — please try again.',
+                        reviewedAt: new Date(),
+                    },
+                }).catch(() => {});
+                throw err;
+            }
             routed++;
         }
 
@@ -17243,6 +17378,8 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
             message: 'Submitted for review.',
             images: routed,
             matched: { aircraftType: matched.type, liveryName: matched.livery, tailNumber: matched.tail },
+            creditedTo: collabName,
+            signedIn: !!pilot,
         });
     } catch (error) {
         cleanupTempFiles(files);
@@ -17252,6 +17389,154 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         }
         console.error('Community submission error:', error);
         return res.status(500).json({ message: 'Server error during submission.' });
+    }
+});
+
+/* ===========================================================================
+ * Gallery accounts — a photo belongs to a tracker account, not to a name
+ * ===========================================================================
+ *
+ *   GET  /api/gallery/me     who the caller is, and how many photos are theirs
+ *   POST /api/gallery/claim  bind the photos already credited to their name
+ *
+ * The rules for both live in galleryAccounts.js, where they are pure and
+ * tested (scripts/test-gallery-accounts.js); these routes only fetch and write.
+ */
+
+// Photos already bound to this account, by either the slot or the legacy mirror.
+const galleryOwnedQuery = (pilotId) => ({
+    $or: [{ contributorPilotId: pilotId }, { 'imageContributors.pilotId': pilotId }],
+});
+
+// A credit is free text, so it can contain regex metacharacters.
+const galleryEscapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+app.get('/api/gallery/me', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Not signed in.' });
+    try {
+        const owned = await CommunityAircraft.find(galleryOwnedQuery(req.pilot.pilotId))
+            .select('imageContributors contributorPilotId')
+            .lean();
+
+        res.json({
+            pilotId: req.pilot.pilotId,
+            handle: req.pilot.handle,
+            displayName: req.pilot.displayName,
+            ifUsername: req.pilot.ifUsername,
+            ifVerified: req.pilot.ifVerified,
+            avatarUrl: req.pilot.avatarUrl,
+            profileUrl: req.pilot.profileUrl,
+            blocked: req.pilot.blocked || null,
+            credit: galleryAccounts.creditName(req.pilot),
+            photos: galleryAccounts.countOwnedPhotos(owned, req.pilot.pilotId),
+            profilesConfigured: galleryAccounts.isConfigured().profiles,
+        });
+    } catch (error) {
+        console.error('Gallery /me error:', error);
+        res.status(500).json({ message: 'Could not read your gallery account.' });
+    }
+});
+
+// The gallery's photo ids: `<mongo id>-<slot>` for aircraft, `apt-<ICAO>` for
+// airports. Anything else is not a photo this site can show.
+const GALLERY_PHOTO_ID = /^[A-Za-z0-9_-]{3,64}$/;
+
+// Every like count in one call. The gallery holds the whole photo list in
+// memory already, so it wants the counts the same way rather than one request
+// per tile; `mine` comes back only for a signed-in caller.
+app.get('/api/gallery/likes', galleryAccounts.attachPilot, async (req, res) => {
+    try {
+        const [totals, mine] = await Promise.all([
+            GalleryLike.aggregate([{ $group: { _id: '$photoId', n: { $sum: 1 } } }]),
+            req.pilot
+                ? GalleryLike.find({ pilotId: req.pilot.pilotId }).select('photoId').lean()
+                : Promise.resolve([]),
+        ]);
+
+        const counts = {};
+        totals.forEach((row) => { counts[row._id] = row.n; });
+
+        res.json({ counts, mine: mine.map((row) => row.photoId) });
+    } catch (error) {
+        console.error('Gallery likes error:', error);
+        res.status(500).json({ message: 'Could not load likes.' });
+    }
+});
+
+// Toggle. Returns the state the caller should now show, and the live count —
+// so two people liking at once cannot leave either of them with a stale number.
+app.post('/api/gallery/likes/:photoId', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Sign in to like a photo.' });
+
+    const photoId = String(req.params.photoId || '');
+    if (!GALLERY_PHOTO_ID.test(photoId)) return res.status(400).json({ message: 'Unknown photo.' });
+
+    try {
+        const existing = await GalleryLike.findOneAndDelete({ photoId, pilotId: req.pilot.pilotId });
+        if (!existing) {
+            // Upsert rather than create: a double tap races itself, and the
+            // unique index would otherwise turn the second one into a 500.
+            await GalleryLike.updateOne(
+                { photoId, pilotId: req.pilot.pilotId },
+                { $setOnInsert: { createdAt: new Date() } },
+                { upsert: true },
+            );
+        }
+        const count = await GalleryLike.countDocuments({ photoId });
+        res.json({ liked: !existing, count });
+    } catch (error) {
+        console.error('Gallery like error:', error);
+        res.status(500).json({ message: 'Could not save your like.' });
+    }
+});
+
+// What happened to the photos this pilot sent in — the whole point of keeping
+// the rows. Anonymous uploads have no account to show them to, so they are not
+// readable here at all.
+app.get('/api/gallery/submissions', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Not signed in.' });
+    try {
+        const rows = await GallerySubmission.find({ pilotId: req.pilot.pilotId })
+            .sort({ createdAt: -1 })
+            .limit(60)
+            .select('aircraftType liveryName tailNumber status reason reviewedAt photoUrl createdAt')
+            .lean();
+
+        const counts = { pending: 0, approved: 0, rejected: 0 };
+        rows.forEach((row) => { counts[row.status] = (counts[row.status] || 0) + 1; });
+
+        res.json({ submissions: rows, counts });
+    } catch (error) {
+        console.error('Gallery submissions error:', error);
+        res.status(500).json({ message: 'Could not load your submissions.' });
+    }
+});
+
+app.post('/api/gallery/claim', galleryAccounts.attachPilot, async (req, res) => {
+    if (!req.pilot) return res.status(401).json({ message: 'Not signed in.' });
+
+    const names = galleryAccounts.identityNames(req.pilot);
+    if (!names.length) {
+        return res.json({ claimed: 0, records: 0, names: [], message: 'This account has no name to match against yet.' });
+    }
+
+    try {
+        // Anchored and case-insensitive: "Ian" must not pull in "Ian Simpson".
+        const nameMatch = names.map((n) => new RegExp(`^${galleryEscapeRegex(n)}$`, 'i'));
+        const candidates = await CommunityAircraft.find({
+            $or: [
+                { 'imageContributors.name': { $in: nameMatch } },
+                { contributorName: { $in: nameMatch } },
+            ],
+        }).select('contributorName contributorPilotId imageContributors').lean();
+
+        const { claimed, writes } = galleryAccounts.planClaim(candidates, req.pilot);
+        if (writes.length) await CommunityAircraft.bulkWrite(writes, { ordered: false });
+
+        res.json({ claimed, records: writes.length, names });
+    } catch (error) {
+        console.error('Gallery claim error:', error);
+        res.status(500).json({ message: 'Could not claim your photos.' });
     }
 });
 

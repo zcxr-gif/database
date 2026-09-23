@@ -497,8 +497,30 @@ async function postToChannel(channelId, payload) {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+            GallerySubmission,
             provisionVaPortalAccount, provisionVaPortalRepAccount,
             deactivateVaPortalRepAccount, purgeVaData } = models;
+
+    // A review card carries its submission id in the footer, because the footer
+    // is the only thing that survives the days a card can sit in the channel.
+    const submissionIdFrom = (footerText) =>
+        (String(footerText || '').match(/Sub: ([a-f0-9]{24})/) || [])[1] || null;
+
+    // Close the row the submitter reads. Never allowed to break a review: a
+    // decision that reached Discord has happened whether or not we recorded it.
+    const closeSubmission = async (footerText, fields) => {
+        if (!GallerySubmission) return;
+        const id = submissionIdFrom(footerText);
+        if (!id) return;
+        try {
+            await GallerySubmission.updateOne(
+                { _id: id, status: 'pending' },
+                { $set: { reviewedAt: new Date(), ...fields } },
+            );
+        } catch (err) {
+            console.error('Submission status update failed:', err.message);
+        }
+    };
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -1331,8 +1353,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const stored = (entry && Array.isArray(entry.imageContributors)) ? entry.imageContributors : [];
         return imgs.map((_, i) => {
             const c = stored[i];
-            if (c && (c.name || c.id)) return { name: c.name || 'System', id: c.id || null };
-            return { name: (entry && entry.contributorName) || 'System', id: (entry && entry.contributorId) || null };
+            // The account fields ride along with the credit: a reorder or an
+            // insert moves other people's slots around, and rebuilding them
+            // without pilotId would quietly unlink their photos.
+            if (c && (c.name || c.id)) {
+                return {
+                    name: c.name || 'System',
+                    id: c.id || null,
+                    pilotId: c.pilotId || null,
+                    ifUsername: c.ifUsername || null,
+                };
+            }
+            return {
+                name: (entry && entry.contributorName) || 'System',
+                id: (entry && entry.contributorId) || null,
+                pilotId: (entry && entry.contributorPilotId) || null,
+                ifUsername: (entry && entry.contributorIfUsername) || null,
+            };
         });
     };
 
@@ -1829,6 +1866,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         entry.imageUrl = images[0] || null;
         entry.contributorName = contributors[0]?.name || entry.contributorName || 'System';
         entry.contributorId = contributors[0]?.id || null;
+        entry.contributorPilotId = contributors[0]?.pilotId || null;
+        entry.contributorIfUsername = contributors[0]?.ifUsername || null;
         await entry.save();
     };
 
@@ -3090,6 +3129,9 @@ client.on('interactionCreate', async (interaction) => {
                     // display name carried in the footer with no Discord id.
                     const isDiscordId = /^\d{5,}$/.test(String(targetUserId));
                     const footerCollab = footerText.match(/Collab: ([^|]+?)\s*(?:\||$)/)?.[1]?.trim();
+                    // The tracker account behind the submission, if it had one.
+                    const footerPilotId = footerText.match(/Pilot: ([^|]+?)\s*(?:\||$)/)?.[1]?.trim() || null;
+                    const footerIfUser = footerText.match(/IF: ([^|]+?)\s*(?:\||$)/)?.[1]?.trim() || null;
                     let member = null;
                     let contributorName = null;
                     let contributorId = null;
@@ -3106,7 +3148,12 @@ client.on('interactionCreate', async (interaction) => {
                     // slot only — adding/replacing/inserting a photo must not overwrite
                     // the contributor(s) of the other images. An insert carries each
                     // existing photo's credit down with it.
-                    const slotContributor = { name: contributorName, id: contributorId };
+                    const slotContributor = {
+                        name: contributorName,
+                        id: contributorId,
+                        pilotId: footerPilotId,
+                        ifUsername: footerIfUser,
+                    };
 
                     const slotIndex = placement.slotIndex;
                     const replacedUrl = applyAircraftPlacement(images, contributors, placement, permanentUrl, slotContributor);
@@ -3120,6 +3167,8 @@ client.on('interactionCreate', async (interaction) => {
                     const updateData = {
                         contributorName: primaryContributor.name,
                         contributorId: primaryContributor.id,
+                        contributorPilotId: primaryContributor.pilotId || null,
+                        contributorIfUsername: primaryContributor.ifUsername || null,
                         aircraftType: typeField,
                         liveryName: liveryField,
                         imageUrls: images,
@@ -3135,6 +3184,15 @@ client.on('interactionCreate', async (interaction) => {
                         { aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") }, liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") } },
                         updateData, { upsert: true }
                     );
+
+                    // Tell whoever sent it. A web submitter has no DM channel to
+                    // be messaged on, so their copy of this is the row.
+                    await closeSubmission(footerText, {
+                        status: 'approved',
+                        reason: '',
+                        reviewedBy: interaction.user.username,
+                        photoUrl: permanentUrl,
+                    });
 
                     // Remove the overwritten image from storage (after the DB is updated)
                     if (replacedUrl && replacedUrl !== permanentUrl) await deleteImageFromS3(replacedUrl);
@@ -3971,6 +4029,14 @@ client.on('interactionCreate', async (interaction) => {
                 const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
                 // Grab the image being rejected so we can show it to the user.
                 const rejectedImageUrl = oldEmbed.image?.url || interaction.message.attachments.first()?.url;
+
+                // The same reason staff just typed is what the submitter reads in
+                // the gallery — one decision, one wording, not two.
+                await closeSubmission(oldEmbed.footer?.text, {
+                    status: 'rejected',
+                    reason,
+                    reviewedBy: interaction.user.username,
+                });
 
                 // Keep the photo visible on the admin message (don't null it) so the
                 // record of what was rejected stays intact.
@@ -5061,7 +5127,8 @@ client.on('interactionCreate', async (interaction) => {
     //     display name carried in the footer for the approval handler to use.
     _submitWebAircraftReviewImpl = async ({
         aircraftType, liveryName, tailNumber,
-        imageBuffer, collaboratorId, collaboratorName, sourceSite,
+        imageBuffer, collaboratorId, collaboratorName, pilotId, ifUsername,
+        submissionId, sourceSite,
     }) => {
         if (!client || !client.isReady || !client.isReady()) {
             throw new Error('Discord bot not ready');
@@ -5137,8 +5204,19 @@ client.on('interactionCreate', async (interaction) => {
         // Footer carries the same Msg pointer the approval/reject handlers parse.
         // No `Ch:` (there's no submitter DM channel to notify). For the id-less
         // case we append `Collab:` so approval can credit the external identity.
+        // A tracker account, when the submitter was signed in. It rides the
+        // footer like the rest of the identity because the footer is the only
+        // thing that survives from here to the approval handler — the card may
+        // sit in the admin channel for days, across restarts.
+        const safePilotId = String(pilotId || '').replace(/[^0-9a-f-]/gi, '').slice(0, 40);
+        const safeIfUser = String(ifUsername || '').replace(/[|\r\n]+/g, ' ').trim().slice(0, 40);
+
         let footer = `Pending | User: ${buttonToken} | Msg: ${publicMsg.id}`;
         if (!hasDiscordId) footer += ` | Collab: ${safeName}`;
+        if (safePilotId) footer += ` | Pilot: ${safePilotId}`;
+        if (safeIfUser) footer += ` | IF: ${safeIfUser}`;
+        const safeSubmission = String(submissionId || '').replace(/[^a-f0-9]/gi, '').slice(0, 24);
+        if (safeSubmission) footer += ` | Sub: ${safeSubmission}`;
         if (safeSource) footer += ` | Src: ${safeSource}`;
         finalEmbed.setFooter({ text: footer });
 
