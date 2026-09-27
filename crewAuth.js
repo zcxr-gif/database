@@ -135,6 +135,9 @@ const LOGIN_BACKDROPS = ['auto', 'banner', 'aurora', 'grid', 'horizon', 'paper']
 // How a topic opens in the crew center: a slide-over on the dashboard, or a
 // page of its own with its own link. Mirrors CrewTopics.MODES in the tracker.
 const CREW_TOPIC_MODES = ['sheet', 'page'];
+// The crew center's interfaces. Kept in step with SKINS in the tracker's
+// crewSkin.js — a value that file does not know is a look nobody can draw.
+const CREW_UIS = ['essential', 'aurora', 'navigator'];
 
 const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
 const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
@@ -1370,7 +1373,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ui', 'ranks', 'roles', 'fleet', 'social', 'hero'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             // Openings ride with the team, not with recruitment. A job advert
             // for a staff role points AT a staff role and hands out its
@@ -1447,6 +1450,17 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                     return res.status(400).json({ error: 'Unknown way of opening topics.' });
                 }
                 ad.crewTopicMode = mode;
+            }
+            // Which interface the crew wears. The picker in Settings has been
+            // posting this since the second look shipped and nothing here read
+            // it, so an owner's choice was applied to their own screen and to
+            // nobody else's. Crew default only, like topicMode above.
+            if (typeof req.body?.ui === 'string') {
+                const ui = req.body.ui.toLowerCase();
+                if (!CREW_UIS.includes(ui)) {
+                    return res.status(400).json({ error: 'Unknown interface.' });
+                }
+                ad.crewUi = ui;
             }
             if (typeof req.body?.loginLook === 'string') {
                 const look = req.body.loginLook.toLowerCase();
@@ -1620,6 +1634,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
                 loginLook: ad.loginLook || 'center', loginBackdrop: ad.loginBackdrop || 'auto',
                 topicMode: ad.crewTopicMode || 'sheet',
+                ui: ad.crewUi || '',
                 country: ad.country || '',
                 ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 partners: ad.crewPartners || [],
