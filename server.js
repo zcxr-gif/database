@@ -553,6 +553,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // and only the crew's default — a device that has picked for itself keeps
     // its choice. See crewTopicWindows.js in the tracker.
     crewTopicMode: { type: String, default: 'sheet' },
+    // Which interface the crew center wears: 'essential' (the original),
+    // 'aurora' (dark glass) or 'navigator' (a sidebar app shell). Only the
+    // crew's default — a pilot who switches on their own device keeps their
+    // choice. See crewSkin.js in the tracker. '' = never chosen (essential).
+    crewUi: { type: String, default: '' },
     // Owner/staff-chosen accent for the crew center + login. Overrides the accent
     // otherwise derived from the VA's embed config. '' = fall back to that.
     crewAccent: { type: String, trim: true, default: '' },
@@ -18229,7 +18234,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewUi crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -18333,6 +18338,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             // reason the layout is: the crew center reads it before it has a
             // session, and it decides how the page is laid out on first paint.
             topicMode: ad.crewTopicMode || 'sheet',
+            // The crew's interface. Public for the same first-paint reason:
+            // this was saved by the picker in Settings and then never sent
+            // back, so an owner's choice reached nobody but the owner.
+            ui: ad.crewUi || '',
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
