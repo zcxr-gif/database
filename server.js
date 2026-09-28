@@ -272,6 +272,24 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors()); // Allow all origins
+
+// Requests currently being handled, so the memory watchdog near the end of this
+// file can say WHAT was running when memory climbed. The container's OOM kill is
+// a SIGKILL — nothing gets logged after it — so this has to be written down
+// before the kill, not after. Mounted ahead of the body parsers so an oversized
+// upload is on the list while it is still being read. Bounded by concurrency.
+const inflightRequests = new Map();   // req -> { method, url, at, bytes }
+app.use((req, res, next) => {
+    inflightRequests.set(req, {
+        method: req.method,
+        url: String(req.originalUrl || req.url).slice(0, 160),
+        at: Date.now(),
+        bytes: Number(req.headers['content-length']) || 0,
+    });
+    res.on('close', () => inflightRequests.delete(req));
+    next();
+});
+
 // Body size limits.
 //
 // Only trail uploads are genuinely large, so only /api/trails gets the big
@@ -22256,10 +22274,23 @@ app.get(/(.*)/, requireAuthPage, (req, res) => {
 // of the configured cap, emit a loud WARN — turning a silent kill into a visible
 // pre-crash trail that points at what was growing. Set MEMORY_LIMIT_MB to the
 // container's memory cap to enable the threshold warning (logging runs regardless).
-const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || 0;
-const MEMORY_WARN_RATIO = 0.85;
-// Past this share of the cap the image caches are dropped. Above the warn ratio
-// on purpose: a warning is "watch this", and this is "we are about to be killed".
+//
+// Unset, the cap is read from the container's cgroup, so the warnings work
+// without anyone remembering to configure them.
+const detectCgroupLimitMb = () => {
+    for (const file of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+        try {
+            const bytes = Number(fs.readFileSync(file, 'utf8').trim());
+            // "max", or v1's "unlimited" sentinel near 2^63, means no cap.
+            if (Number.isFinite(bytes) && bytes > 0 && bytes < 2 ** 50) return Math.floor(bytes / 1048576);
+        } catch { /* not this cgroup version */ }
+    }
+    return 0;
+};
+const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || detectCgroupLimitMb();
+console.log(`[mem] memory cap: ${MEMORY_LIMIT_MB ? MEMORY_LIMIT_MB + 'MB' : 'unknown (set MEMORY_LIMIT_MB)'}`);
+// Past this share of the cap the image caches are dropped. Above the watchdog's
+// alert ratio on purpose: an alert is "watch this", this is "about to be killed".
 const MEMORY_SHED_RATIO = 0.92;
 const mb = (bytes) => Math.round(bytes / 1024 / 1024);
 
@@ -22326,14 +22357,54 @@ setInterval(() => {
     const rssMb = mb(m.rss);
     const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
         + ` external=${mb(m.external)}MB${imageCacheLine()}`;
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO) {
-        shedImageCaches(rssMb);
-    } else if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
-        console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
-    } else {
-        console.log(line);
-    }
+    console.log(line);
 }, 5 * 60 * 1000).unref();
+
+/*
+ * The watchdog. The 5-minute line above cannot see a kill that builds in under
+ * a minute — which is what the logs show: an ordinary line, then "Killed" 40
+ * seconds later. So RSS is checked every 5 seconds (process.memoryUsage.rss()
+ * is a single syscall), and once it is high, or jumps sharply, each tick logs
+ * the breakdown AND every request in flight, oldest first. The last of these
+ * lines before a "Killed" names what was running when memory ran out.
+ */
+const WATCHDOG_MS = 5000;
+const WATCHDOG_ALERT_RATIO = 0.70;
+const WATCHDOG_JUMP_MB = 100;         // growth within one tick worth reporting
+const SHED_MIN_GAP_MS = 30 * 1000;
+let watchdogLastRssMb = 0;
+let lastShedAt = 0;
+
+const inflightLine = () => {
+    const now = Date.now();
+    const list = [...inflightRequests.values()].sort((a, b) => a.at - b.at);
+    const shown = list.slice(0, 15).map((r) => {
+        const body = r.bytes ? ` body=${Math.round(r.bytes / 1024)}KB` : '';
+        return `${r.method} ${r.url} ${((now - r.at) / 1000).toFixed(1)}s${body}`;
+    });
+    const more = list.length > shown.length ? ` (+${list.length - shown.length} more)` : '';
+    return `${list.length} in flight${list.length ? ': ' + shown.join(' | ') : ''}${more}`;
+};
+
+setInterval(() => {
+    const rssMb = mb(process.memoryUsage.rss());
+    const jumped = watchdogLastRssMb && rssMb - watchdogLastRssMb >= WATCHDOG_JUMP_MB;
+    const high = MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * WATCHDOG_ALERT_RATIO;
+    watchdogLastRssMb = rssMb;
+    if (!high && !jumped) return;
+
+    const m = process.memoryUsage();
+    const pct = MEMORY_LIMIT_MB ? ` (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}% of ${MEMORY_LIMIT_MB}MB)` : '';
+    console.warn(
+        `⚠️  [mem-watch] rss=${rssMb}MB${pct}${jumped ? ' JUMP' : ''} heapUsed=${mb(m.heapUsed)}MB`
+        + ` external=${mb(m.external)}MB arrayBuffers=${mb(m.arrayBuffers)}MB${imageCacheLine()}`
+        + ` — ${inflightLine()}`,
+    );
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO && Date.now() - lastShedAt >= SHED_MIN_GAP_MS) {
+        lastShedAt = Date.now();
+        shedImageCaches(rssMb);
+    }
+}, WATCHDOG_MS).unref();
 
 // ---- The roster sweep, on a timer ----
 //
