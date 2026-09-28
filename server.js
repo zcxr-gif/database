@@ -272,9 +272,18 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors()); // Allow all origins
-// Increase limit for JSON body (trails can be large)
-app.use(express.json({ limit: '100mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+// Body size limits.
+//
+// Only trail uploads are genuinely large, so only /api/trails gets the big
+// ceiling. It used to be 100 MB on EVERY route, which let any unauthenticated
+// POST make the process buffer 100 MB and then JSON.parse it — several hundred
+// MB of heap and seconds of pinned CPU per request, and a handful at once is
+// past the container's cap. Everything else here is small JSON (the largest,
+// a VA site, is capped at 2 MB by vaSites.js); files arrive through multer.
+// Mounted first: express.json skips a body that has already been parsed.
+app.use('/api/trails', express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 // Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
 app.set('trust proxy', 1);
@@ -16561,6 +16570,7 @@ app.post('/api/gates/import', requireAuth, upload.single('file'), async (req, re
 
         if (bulkOps.length > 0) {
             await AirportGate.bulkWrite(bulkOps);
+            _allGatesCache = { at: 0, body: null };   // see GET /api/gates
             res.json({ message: `✅ Successfully imported gates for ${bulkOps.length} airports into MongoDB.` });
         } else {
             res.status(400).json({ message: 'Could not parse airport codes from the provided JSON structure.' });
@@ -16590,11 +16600,25 @@ app.get('/api/gates/:icao', async (req, res) => {
     }
 });
 
-// GET: Fetch all gates (Use with caution if dataset is massive)
+// GET: Fetch all gates
+//
+// The whole collection, public and unauthenticated. Built once and served from
+// the serialized string for a few minutes: uncached, every hit materialized
+// every gate document plus its JSON copy, and a burst of hits held one of each
+// per request at the same time. Concurrent misses share one build.
+const ALL_GATES_TTL_MS = 5 * 60 * 1000;
+let _allGatesCache = { at: 0, body: null };
+let _allGatesInflight = null;
+
 app.get('/api/gates', async (req, res) => {
     try {
-        const allGates = await AirportGate.find({}).lean();
-        res.json(allGates);
+        if (!_allGatesCache.body || Date.now() - _allGatesCache.at >= ALL_GATES_TTL_MS) {
+            _allGatesInflight = _allGatesInflight || AirportGate.find({}).lean()
+                .then((rows) => { _allGatesCache = { at: Date.now(), body: JSON.stringify(rows) }; })
+                .finally(() => { _allGatesInflight = null; });
+            await _allGatesInflight;
+        }
+        res.type('application/json').send(_allGatesCache.body);
     } catch (error) {
         console.error('Global Gates Fetch Error:', error);
         res.status(500).json({ message: 'Failed to fetch global gates dataset.' });
@@ -16708,18 +16732,53 @@ app.get('/api/leaderboard/top', async (req, res) => {
 /* =========================
  * IMAGE PROXY FOR SCREENSHOTS
  * ========================= */
+// Bounded on every axis, because each unbounded one was a way to hold memory
+// or a socket forever: no timeout meant a stalled upstream kept its socket
+// open indefinitely; a client that hung up left the upstream stream paused
+// (pipe() unpipes but never destroys the source), so it leaked; and an
+// upstream reset mid-body emitted 'error' on a stream nobody listened to —
+// an uncaught exception.
+const IMAGE_PROXY_TIMEOUT_MS = 15 * 1000;
+const IMAGE_PROXY_MAX_BYTES = 15 * 1024 * 1024;
+
 app.get('/api/image-proxy', async (req, res) => {
     const imageUrl = req.query.url;
-    if (!imageUrl) {
+    if (!imageUrl || typeof imageUrl !== 'string') {
         return res.status(400).send('No URL provided');
     }
+    if (!/^https?:\/\//i.test(imageUrl)) {
+        return res.status(400).send('Only http(s) URLs can be proxied');
+    }
+
+    const controller = new AbortController();
+    res.on('close', () => controller.abort());
 
     try {
         // Fetch the external image as a stream
         const response = await axios({
             method: 'get',
             url: imageUrl,
-            responseType: 'stream'
+            responseType: 'stream',
+            timeout: IMAGE_PROXY_TIMEOUT_MS,
+            signal: controller.signal,
+            maxRedirects: 3,
+        });
+
+        const declared = Number(response.headers['content-length']);
+        if (Number.isFinite(declared) && declared > IMAGE_PROXY_MAX_BYTES) {
+            response.data.destroy();
+            return res.status(413).send('Image too large');
+        }
+
+        let seen = 0;
+        response.data.on('data', (chunk) => {
+            seen += chunk.length;
+            if (seen > IMAGE_PROXY_MAX_BYTES) response.data.destroy(new Error('image exceeds size cap'));
+        });
+        response.data.on('error', (err) => {
+            console.error('Image Proxy stream error:', err.message);
+            if (!res.headersSent) res.status(502).send('Failed to fetch image');
+            else res.destroy();
         });
 
         // 1. Force Allow Origin * (The magic permission slip)
@@ -16736,8 +16795,9 @@ app.get('/api/image-proxy', async (req, res) => {
         response.data.pipe(res);
 
     } catch (error) {
+        if (controller.signal.aborted) return; // the client left; nobody to answer
         console.error("Image Proxy Error:", error.message);
-        res.status(500).send('Failed to fetch image');
+        if (!res.headersSent) res.status(500).send('Failed to fetch image');
     }
 });
 
@@ -17052,13 +17112,18 @@ app.get('/api/aircraft/lookup', async (req, res) => {
 
         // 3. Build the MongoDB Query
         let query = {};
-        if (finalType) query.aircraftType = { $regex: finalType, $options: 'i' };
-        if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
+        // Escaped: these arrive from the open internet, and as raw patterns a
+        // `type=.` matched the whole collection and a crafted one could spin
+        // the database's regex engine.
+        const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (finalType) query.aircraftType = { $regex: escapeRe(finalType), $options: 'i' };
+        if (finalLivery) query.liveryName = { $regex: escapeRe(finalLivery), $options: 'i' };
         if (finalTail) query.tailNumber = finalTail;
 
         // .lean(): results are only inspected and serialized (no doc methods),
-        // so return plain objects and skip Mongoose hydration.
-        const results = await CommunityAircraft.find(query).lean();
+        // so return plain objects and skip Mongoose hydration. Capped: one
+        // result is returned, so loading every partial match was pure waste.
+        const results = await CommunityAircraft.find(query).limit(200).lean();
 
         // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
