@@ -98,9 +98,10 @@
                                class="w-full pl-9 pr-3 h-10 rounded-xl surface text-sm outline-none focus:ring-2 focus:ring-zinc-900/10 dark:focus:ring-white/10">
                     </div>
                     <select id="kindFilter" onchange="renderUploads()" class="h-10 px-3 rounded-xl surface text-sm outline-none">
-                        <option value="">Avatars and banners</option>
+                        <option value="">All pictures</option>
                         <option value="avatar">Avatars only</option>
                         <option value="banner">Banners only</option>
+                        <option value="window">Window photos only</option>
                     </select>
                     <label class="h-10 px-3 rounded-xl surface text-sm inline-flex items-center gap-2 cursor-pointer select-none">
                         <input id="onlyFlagged" type="checkbox" onchange="load()" class="accent-rose-600">
@@ -348,6 +349,10 @@ function applyReveal() {
 function toggleReveal() { REVEALED = !REVEALED; applyReveal(); }
 
 /* ---- Pictures --------------------------------------------------------- */
+// Window photos are the Pro picture behind the flight window everyone sees
+// for that pilot's flight: tall, like the window itself.
+const KIND_LABEL = { avatar: 'Avatar', banner: 'Banner', window: 'Window photo' };
+const KIND_ASPECT = { avatar: 'aspect-square', banner: 'aspect-[16/7]', window: 'aspect-[9/16]' };
 function visibleUploads() {
     const q = $('q').value.trim().toLowerCase();
     const kind = $('kindFilter').value;
@@ -379,12 +384,12 @@ function renderUploads() {
 
         return `
         <div class="surface rounded-2xl overflow-hidden flex flex-col">
-            <div class="relative ${i.kind === 'banner' ? 'aspect-[16/7]' : 'aspect-square'} checker overflow-hidden cursor-zoom-in"
+            <div class="relative ${KIND_ASPECT[i.kind] || 'aspect-square'} checker overflow-hidden cursor-zoom-in"
                  onclick="this.querySelector('img') && this.querySelector('img').classList.toggle('shown')">
                 <img src="${esc(i.url)}" alt="" loading="lazy" class="veil w-full h-full object-contain"
                      onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'w-full h-full grid place-items-center text-[11px] text-zinc-400',textContent:'image unavailable'}))">
                 ${flags.length ? `<div class="absolute top-2 left-2 flex flex-wrap gap-1 max-w-[calc(100%-1rem)]">${flags.join('')}</div>` : ''}
-                <span class="absolute bottom-2 right-2 px-1.5 py-0.5 rounded-md bg-zinc-900/70 text-white text-[10px] font-semibold">${i.kind === 'avatar' ? 'Avatar' : 'Banner'}</span>
+                <span class="absolute bottom-2 right-2 px-1.5 py-0.5 rounded-md bg-zinc-900/70 text-white text-[10px] font-semibold">${esc(KIND_LABEL[i.kind] || i.kind)}</span>
             </div>
             <div class="p-3 flex-1 flex flex-col gap-1">
                 <p class="text-sm font-semibold truncate">@${esc(i.handle)}</p>
@@ -457,7 +462,7 @@ function renderRecord() {
             <i data-lucide="trash-2" class="w-4 h-4 mt-0.5 text-zinc-400 shrink-0"></i>
             <div class="min-w-0 flex-1">
                 <p class="text-sm">
-                    <span class="font-semibold">${esc(a.kind)}</span>
+                    <span class="font-semibold">${esc(KIND_LABEL[a.kind] || a.kind)}</span>
                     <span class="text-zinc-500 dark:text-zinc-400"> from </span>
                     <span class="font-medium">@${esc(a.handle || 'a deleted account')}</span>
                 </p>
@@ -476,9 +481,9 @@ function renderRecord() {
 function openPanel(n) {
     TARGET = (renderUploads._rows || [])[n];
     if (!TARGET) return;
-    $('panelSub').textContent = `${TARGET.kind} on @${TARGET.handle}`;
+    $('panelSub').textContent = `${KIND_LABEL[TARGET.kind] || TARGET.kind} on @${TARGET.handle}`;
     $('panelPreview').innerHTML = `
-        <div class="rounded-xl overflow-hidden checker aspect-[16/9] cursor-zoom-in"
+        <div class="rounded-xl overflow-hidden checker ${TARGET.kind === 'window' ? 'aspect-[9/16] max-h-[340px] mx-auto' : 'aspect-[16/9]'} cursor-zoom-in"
              onclick="this.querySelector('img') && this.querySelector('img').classList.toggle('shown')">
             <img src="${esc(TARGET.url)}" alt="" class="veil w-full h-full object-contain">
         </div>
