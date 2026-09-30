@@ -94,6 +94,15 @@ const LEVELS = [
 ];
 const LEVEL_KEYS = LEVELS.map((l) => l.key);
 
+// The pictures a pilot can upload. 'window' is the flight-window photo, which
+// admin_pilot_takedown already accepts and keeps in the banners bucket.
+const KINDS = [
+    { key: 'avatar', label: 'Avatar' },
+    { key: 'banner', label: 'Banner' },
+    { key: 'window', label: 'Window photo' },
+];
+const KIND_KEYS = KINDS.map((k) => k.key);
+
 /* ===========================================================================
  * Talking to Supabase
  * ======================================================================== */
@@ -211,7 +220,10 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
         (req.staff && (req.staff.displayName || req.staff.username)) || 'Inflight staff';
 
     // --- The feed -----------------------------------------------------------
-    // Every avatar and banner on the platform, newest-changed first, each with
+    // Every avatar, banner and flight-window photo on the platform (the
+    // window photo is the Pro picture a pilot puts behind the flight window
+    // everyone else sees — supabase/sql/pilot-window-style.sql in the tracker
+    // repo), newest-changed first, each with
     // the pilot's standing attached.
     app.get('/api/pilot-moderation/uploads', requireAuth, needsKey, async (req, res) => {
         try {
@@ -225,6 +237,7 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
             res.json({
                 categories: CATEGORIES,
                 levels: LEVELS,
+                kinds: KINDS,
                 items: (rows || []).map((r) => ({
                     userId: r.user_id,
                     handle: r.handle || '',
@@ -265,8 +278,8 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
         try {
             const { userId, kind, category, note, warn } = req.body || {};
             if (!userId) return res.status(400).json({ error: 'Which pilot is required.' });
-            if (kind !== 'avatar' && kind !== 'banner') {
-                return res.status(400).json({ error: 'kind must be avatar or banner.' });
+            if (!KIND_KEYS.includes(kind)) {
+                return res.status(400).json({ error: 'kind must be avatar, banner or window.' });
             }
             if (category && !CATEGORY_KEYS.includes(category)) {
                 return res.status(400).json({ error: 'Unknown reason.' });
@@ -397,6 +410,7 @@ module.exports = {
     registerPilotModerationRoutes,
     CATEGORIES,
     LEVELS,
+    KINDS,
     isConfigured,
     publicUrl,
 };
