@@ -1,6 +1,6 @@
 'use strict';
 // Conformance test for crewCodeshare.js and the codeshare half of
-// crewNetworkRoutes.js — two crew centres agreeing to sell each other's flights.
+// crewNetworkRoutes.js — two crew centres agreeing to fly each other's routes.
 //
 // The properties worth protecting are the ones that would put a flight on sale
 // that nobody agreed to, or take away a VA's own work:
@@ -9,7 +9,7 @@
 //     never a codeshare of a codeshare (a third airline's route)
 //   * each side can only narrow what the other allows; nothing widens by edit
 //   * a sync writes only what the partner owns (number, airports, aircraft,
-//     distance) — the seller's rank gate, notes and gates survive it
+//     distance) — the flying airline's rank gate, notes and gates survive it
 //   * a pre-v23 project never has rows deleted on a guess
 //   * ending an agreement removes the copies from both networks, and only the
 //     copies — a codeshare somebody typed by hand stays
@@ -97,7 +97,7 @@ console.log('the sync plan');
     const p = C.planSync({ source: edited, existing: held, partner });
     T('a renumbered leg is an edit, not a new leg', [p.create.length, p.update.length], [0, 1]);
     T('…writing only what the partner owns', Object.keys(p.update[0].values).sort(), ['aircraft', 'flightNumber']);
-    T('…so the seller’s rank gate and notes survive', [p.update[0].before.minRank, p.update[0].before.notes], ['Captain', 'Our words']);
+    T('…so the flying airline’s rank gate and notes survive', [p.update[0].before.minRank, p.update[0].before.notes], ['Captain', 'Our words']);
 
     const dropped = C.planSync({ source: [src[1]], existing: held, partner });
     T('a leg the partner withdrew is removed', dropped.remove, ['m1']);
@@ -129,7 +129,7 @@ console.log('one side of the table');
     const theirs = C.view(doc, 'BOREALIS');
     T('the asker sees an outgoing request it can withdraw', [mine.direction, mine.canWithdraw, mine.canAccept], ['outgoing', true, false]);
     T('the asked sees an incoming one it can accept', [theirs.direction, theirs.canAccept, theirs.canWithdraw], ['incoming', true, false]);
-    T('"what I sell" is my wish inside their allowance', [mine.iTake, theirs.iTake], [{ mode: 'selected', routeIds: ['b1', 'b2'] }, { mode: 'selected', routeIds: ['a1'] }]);
+    T('"what I fly" is my wish inside their allowance', [mine.iTake, theirs.iTake], [{ mode: 'selected', routeIds: ['b1', 'b2'] }, { mode: 'selected', routeIds: ['a1'] }]);
     T('…and the wish is kept as it was made', mine.iWant.mode, 'all');
     T('a stranger sees nothing', C.view(doc, 'somebody'), null);
 }
@@ -292,14 +292,14 @@ function fakeApp() {
     const inbox = await app.call('GET', '/api/crew/borealis/codeshare', { as: 'borealis' });
     T('the partner sees it waiting', [inbox.json.incoming, inbox.json.agreements[0].message], [1, 'Fancy it?']);
 
-    // Borealis lets Aurora sell only BR1, and takes only AU1 of the two offered.
+    // Borealis lets Aurora fly only BR1, and takes only AU1 of the two offered.
     const acc = await app.call('POST', `/api/crew/borealis/codeshare/${id}/accept`, {
         as: 'borealis', body: { offer: { mode: 'selected', routeIds: ['b1'] }, take: { mode: 'selected', routeIds: ['a1', 'a3'] }, reply: 'Deal.' },
     });
     T('accepted', acc.json.agreement.status, 'active');
     const codeshares = (s) => stores[s].routes.filter((r) => r.kind === 'codeshare' && r.partnerSlug).map((r) => `${r.flightNumber}:${r.partnerName}`).sort();
-    T('Aurora now sells exactly what Borealis allowed', codeshares('aurora'), ['BR1:Borealis Virtual']);
-    T('Borealis sells what it took of what was offered (a draft cannot sneak in)', codeshares('borealis'), ['AU1:Aurora Virtual']);
+    T('Aurora now flies exactly what Borealis allowed', codeshares('aurora'), ['BR1:Borealis Virtual']);
+    T('Borealis flies what it took of what was offered (a draft cannot sneak in)', codeshares('borealis'), ['AU1:Aurora Virtual']);
 
     // Aurora puts the codeshare behind a rank; Borealis then renumbers the leg.
     const copy = stores.aurora.routes.find((r) => r.partnerSlug === 'borealis');
@@ -316,7 +316,7 @@ function fakeApp() {
 
     // Aurora narrows its own half.
     await app.call('PATCH', `/api/crew/aurora/codeshare/${id}`, { as: 'aurora', body: { take: { mode: 'selected', routeIds: ['b2', 'b3'] } } });
-    T('narrowing what I sell takes the rest away — and cannot reach their codeshare', codeshares('aurora'), ['BR2:Borealis Virtual']);
+    T('narrowing what I fly takes the rest away — and cannot reach their codeshare', codeshares('aurora'), ['BR2:Borealis Virtual']);
 
     const done = await app.call('POST', `/api/crew/borealis/codeshare/${id}/end`, { as: 'borealis' });
     T('ended', done.json.agreement.status, 'ended');

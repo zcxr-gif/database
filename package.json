@@ -28,7 +28,8 @@
     "test:csv": "node scripts/test-crew-csv.js",
     "test:codeshare": "node scripts/test-crew-codeshare.js",
     "test:goals": "node scripts/test-crew-goals.js",
-    "test:design": "node scripts/test-crew-design.js"
+    "test:design": "node scripts/test-crew-design.js",
+    "test:external": "node scripts/test-crew-external.js"
   },
   "keywords": [],
   "author": "Antony",
