@@ -90,7 +90,7 @@ console.log('\n a workbook');
     T('every usable tab is read', p.create.map((r) => `${r.sheet}:${r.values.flightNumber}`),
         ['Europe:EY11', 'Europe:EY12', 'Americas:EY101', 'Americas:EY102']);
     T('…a tab that is not a table is skipped, not failed',
-        p.sheets.map((s) => s.skipped || 'read'), ['none of its columns look like ours', 'read', 'read', 'it is empty']);
+        p.sheets.map((s) => s.skipped || 'read'), ['it isn’t laid out as a table', 'read', 'read', 'it is empty']);
     T('…the header can sit below a title', p.sheets[1].headerRow, 3);
     T('…a pasted-in second header is not a route', p.errors, []);
     T('…airports written with their names still read', `${p.create[3].values.origin}-${p.create[3].values.destination}`, 'KJFK-OMAA');
@@ -101,6 +101,55 @@ console.log('\n a workbook');
 
     const none = crewCsv.planImport(crewCsv.ROUTES_SPEC, [{ name: 'x', csv: 'a,b\n1,2\n' }], []);
     T('a workbook with nothing of ours is refused with its tabs listed', [!!none.error, none.sheets.length], [true, 1]);
+}
+
+console.log('\n almost any sheet');
+{
+    const iata = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'flight,from,to\nEY101,AUH,JFK\n', []);
+    T('three-letter codes become ICAO', `${iata.create[0].values.origin}-${iata.create[0].values.destination}`, 'OMAA-KJFK');
+
+    const pair = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'Flight,Route,Equipment\nEY101,OMAA-KJFK,A380\nEY102,KJFK → OMAA,A380\n', []);
+    T('a leg in one "route" column is both airports',
+        pair.create.map((r) => `${r.values.origin}-${r.values.destination}`), ['OMAA-KJFK', 'KJFK-OMAA']);
+    T('…and says it read them that way', pair.sheets[0].columns.find((c) => c.header === 'Route').key, crewCsv.TO_PAIR);
+
+    const bare = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'EY101,OMAA,KJFK,B787-9\nEY102,KJFK,OMAA,B787-9\n', []);
+    T('a file with no header row keeps its first row', bare.create.length, 2);
+    T('…and works out the columns from what is in them',
+        bare.create.map((r) => `${r.values.flightNumber}:${r.values.origin}-${r.values.destination}`), ['EY101:OMAA-KJFK', 'EY102:KJFK-OMAA']);
+    T('…calling them what a spreadsheet would', bare.sheets[0].preview.headers, ['Column A', 'Column B', 'Column C', 'Column D']);
+    const fleetToo = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'EY101,AUH-JFK,A380\nEY102,JFK-AUH,A380\nEY103,AUH-LHR,A380\n', []);
+    T('an aircraft column is not mistaken for flight numbers',
+        fleetToo.sheets[0].columns.map((c) => c.key), ['flightNumber', crewCsv.TO_PAIR, '']);
+
+    const units = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'from,to,distance\nOMAA,KJFK,"5,960 nm"\nOMAA,EGLL,"5,500 km"\n', []);
+    T('distances with units are nautical miles', units.create.map((r) => r.values.distanceNm), [5960, 2970]);
+
+    const typo = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'from,to\nOMAA,KJFQ\n', []);
+    T('an airport nobody has heard of still imports', typo.create.length, 1);
+    T('…but is flagged', [typo.warningCount, typo.sheets[0].preview.rows[0].cells[1].w], [1, 'KJFQ isn’t in our airport list — check it’s right']);
+}
+
+console.log('\n the preview');
+{
+    const existing = [{ id: 'r1', flightNumber: 'EY11', origin: 'OMAA', destination: 'EGLL', aircraft: 'A380' }];
+    const csv = 'routeNumber,depICAO,arrICAO,aircraft\nEY11,OMAA,EGLL,A380\nEY12,EGLL,OMAA,B787-9\nEY11,OMAA,EGLL,B777\nEY13,OMAA,Tokyo,A320\nEY14,AUH,LHR,A320\nEY14,AUH,LHR,A320\n';
+    const p = crewCsv.planImport(crewCsv.ROUTES_SPEC, csv, existing);
+    const rows = p.sheets[0].preview.rows;
+    T('every row says what will happen to it', rows.map((r) => r.status),
+        ['unchanged', 'create', 'update', 'error', 'create', 'merged']);
+    T('…an update names what changes', rows[2].changes, ['aircraft']);
+    T('…a bad cell carries its own message, in their column name', rows[3].cells[2].e, 'arrICAO “Tokyo” is not an airport code');
+    T('…a cell we changed shows what it became', [rows[4].cells[1].r, rows[4].cells[2].r], ['OMAA', 'EGLL']);
+    T('…a repeated line points at the one it joins', rows[5].message, 'same route as row 6 — combined with it');
+    T('the columns are listed with what each became', p.sheets[0].preview.targets, ['flightNumber', 'origin', 'destination', 'aircraft']);
+
+    const many = 'from,to\n' + Array.from({ length: 80 }, (_, i) => (i === 70 ? 'OMAA,Nowhere' : 'OMAA,EGLL')).join('\n');
+    const big = crewCsv.planImport(crewCsv.ROUTES_SPEC, many, []).sheets[0].preview;
+    T('a long sheet shows its first rows and every problem', [big.rows.length, big.rows[big.rows.length - 1].line, big.more], [31, 72, 49]);
+
+    const none = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'Alpha,Beta\nfoo,bar\n', []);
+    T('an unreadable sheet is still shown, so it can be mapped', none.sheets[0].preview.rows[0].cells.map((c) => c.v), ['foo', 'bar']);
 }
 
 console.log('\n exporting in their shape');
@@ -116,6 +165,9 @@ console.log('\n exporting in their shape');
         crewCsv.planImport(crewCsv.ROUTES_SPEC, out.join('\n'), rows).unchanged, 1);
     const noId = crewCsv.toCsv(crewCsv.ROUTES_SPEC, rows, layout, { includeId: false }).replace(/^﻿/, '').split('\r\n')[0];
     T('the id can be left off', noId, 'routeNumber,depICAO,arrICAO,rank');
+    const paired = crewCsv.toCsv(crewCsv.ROUTES_SPEC, rows, [{ header: 'Flight', key: 'flightNumber' }, { header: 'Route', key: crewCsv.TO_PAIR }], { includeId: false })
+        .replace(/^\uFEFF/, '').split('\r\n');
+    T('a one-column leg goes back out as one column', paired, ['Flight,Route', 'EY11,OMAA-EGLL']);
     const junk = crewCsv.toCsv(crewCsv.ROUTES_SPEC, rows, [{ header: 'x', key: 'nope' }]).replace(/^﻿/, '').split('\r\n')[0];
     T('a layout of nothing we know falls back to ours', junk.split(',')[0], 'id');
 }

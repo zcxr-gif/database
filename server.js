@@ -6616,6 +6616,9 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
         unchanged: plan.unchanged,
         errors: plan.errors.slice(0, 50),
         errorCount: plan.errors.length,
+        // Rows that import but have something worth a second look — an
+        // airport code nobody has heard of. Never blocks.
+        warningCount: plan.warningCount || 0,
         matchedOn: plan.matchedOn,
         columns: plan.columns,
         missing: plan.missing,

@@ -64,6 +64,13 @@ const SAMPLE_CELLS = 40;
 // nothing, or appended to the notes so it is not lost.
 const IGNORE = '';
 const TO_NOTES = '+notes';
+// …or, for routes, read as both airports at once: "OMAA-KJFK".
+const TO_PAIR = '+pair';
+
+// How many rows of each tab the preview shows as they will be read, plus
+// every row with something wrong, up to the second cap.
+const PREVIEW_ROWS = 30;
+const PREVIEW_MAX = 150;
 
 const trim = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
 
@@ -126,7 +133,7 @@ const ROUTES_SPEC = {
         { key: 'origin', header: 'origin', aliases: ['from', 'dep', 'departure', 'depart', 'departs', 'departing', 'originicao'], type: 'icao', required: true },
         { key: 'destination', header: 'destination', aliases: ['to', 'arr', 'arrival', 'dest', 'arrive', 'arrives', 'arriving', 'destinationicao'], type: 'icao', required: true },
         { key: 'aircraft', header: 'aircraft', aliases: ['equipment', 'equip', 'aircrafttype', 'actype', 'plane', 'fleet'], type: 'text', max: 60 },
-        { key: 'distanceNm', header: 'distanceNm', aliases: ['distance', 'nm', 'distancenm', 'dist', 'distnm', 'nmi'], type: 'number', min: 0, max: 20000 },
+        { key: 'distanceNm', header: 'distanceNm', aliases: ['distance', 'nm', 'distancenm', 'dist', 'distnm', 'nmi'], type: 'number', min: 0, max: 20000, units: 'distance' },
         { key: 'notes', header: 'notes', aliases: ['note', 'remarks', 'remark', 'comments', 'comment', 'description'], type: 'text', max: 500 },
         { key: 'active', header: 'active', aliases: ['published', 'live', 'enabled', 'status', 'visible'], type: 'bool', default: true },
         // v5. A VA building a network in a spreadsheet is exactly the VA who
@@ -188,7 +195,15 @@ function resolveLayout(spec, layout, { includeId = true } = {}) {
     const out = [];
     const seen = new Set();
     for (const item of Array.isArray(layout) ? layout.slice(0, 60) : []) {
-        const col = byKey.get(String((item && item.key) || ''));
+        const key = String((item && item.key) || '');
+        // A sheet that keeps a leg in one "OMAA-KJFK" column gets it back
+        // that way.
+        if (key === TO_PAIR && byKey.has('origin') && byKey.has('destination') && !seen.has('origin') && !seen.has('destination')) {
+            seen.add('origin'); seen.add('destination');
+            out.push({ header: trim(item.header, 60) || 'route', pair: true });
+            continue;
+        }
+        const col = byKey.get(key);
         if (!col || seen.has(col.key)) continue;
         seen.add(col.key);
         out.push({ header: trim(item.header, 60) || col.header, col });
@@ -209,7 +224,9 @@ function toCsv(spec, rows, layout, opts) {
     const cols = resolveLayout(spec, layout, opts);
     // Arrays rather than objects, so a VA whose sheet names two columns the
     // same still gets both.
-    const data = (rows || []).map((row) => cols.map(({ col }) => cellFor(col, row[col.key])));
+    const data = (rows || []).map((row) => cols.map(({ col, pair }) => (pair
+        ? [row.origin, row.destination].filter(Boolean).join('-')
+        : cellFor(col, row[col.key]))));
     return BOM + Papa.unparse({ fields: cols.map((c) => c.header), data }, { newline: '\r\n' });
 }
 
@@ -249,6 +266,11 @@ function mapHeaders(spec, fields) {
 // time the way a logbook does.
 const DURATION = /^(\d+):([0-5]?\d)(?::[0-5]?\d)?$/;
 
+// A distance with its unit, as a person types it: "5,500 nm", "10186 km",
+// "6300 mi". Converted to nautical miles; a bare number already is.
+const DISTANCE = /^([\d.]+)\s*(nm|nmi|km|kms|mi|mile|miles)?$/i;
+const TO_NM = { nm: 1, nmi: 1, km: 1 / 1.852, kms: 1 / 1.852, mi: 0.868976, mile: 0.868976, miles: 0.868976 };
+
 // A cell that is an airport code: the whole cell, a name with the code in
 // brackets ("Abu Dhabi (OMAA)"), or a code and then the name after a dash,
 // slash or comma ("EGLL - London Heathrow"). A code followed by a bare space
@@ -261,16 +283,78 @@ const icaoOf = (text) => {
     return m ? m[1] : '';
 };
 
-function coerce(col, raw) {
+// Two airports in one cell, the way a schedule often writes a leg:
+// "OMAA-KJFK", "OMAA → KJFK", "AUH/JFK", "OMAA to KJFK".
+const PAIR = /^\s*([A-Za-z0-9]{3,4})\s*(?:-+>?|–|—|>|→|✈|\/|\bto\b|\s)\s*([A-Za-z0-9]{3,4})\s*$/i;
+
+// Headers that name a leg as a whole rather than one end of it.
+const PAIR_HEADERS = new Set(['route', 'routing', 'citypair', 'pair', 'sector', 'leg', 'fromto', 'deparr', 'origindestination', 'od', 'airports']);
+
+// What the airport list knows. Loaded on first use and kept; a missing file
+// leaves the lists empty, which only switches the "is this real?" checks off.
+let AIRPORTS = null;
+function airports() {
+    if (AIRPORTS) return AIRPORTS;
+    AIRPORTS = { iata: new Map(), icao: new Set() };
+    try {
+        for (const k of Object.keys(require('./data/airport-coords.json'))) if (k !== '_comment') AIRPORTS.icao.add(k);
+    } catch { /* optional */ }
+    try {
+        for (const [k, v] of Object.entries(require('./data/airport-iata.json'))) {
+            if (k === '_comment') continue;
+            AIRPORTS.iata.set(k, v);
+            AIRPORTS.icao.add(v);
+        }
+    } catch { /* optional */ }
+    return AIRPORTS;
+}
+
+// A code as the crew center stores it. Three letters are IATA and become the
+// ICAO code; a code nobody has heard of still goes in — small fields and
+// fictional airports are real to some VA — but is flagged so a typo ("OMMA")
+// is seen before it becomes a route.
+function airportCode(code) {
+    const a = airports();
+    if (code.length === 3) {
+        const icao = a.iata.get(code);
+        if (icao) return { value: icao };
+        return { value: code, warn: `${code} isn’t an airport code we know — the four-letter ICAO code is safest` };
+    }
+    if (a.icao.size && !a.icao.has(code)) return { value: code, warn: `${code} isn’t in our airport list — check it’s right` };
+    return { value: code };
+}
+
+const looksLikeAirport = (v) => {
+    const t = String(v || '').trim();
+    const a = airports();
+    if (/^[A-Z]{4}$/.test(t)) return !a.icao.size || a.icao.has(t);
+    return /^[A-Z]{3}$/.test(t) && a.iata.has(t);
+};
+
+function coercePair(raw, label) {
+    const text = String(raw == null ? '' : raw).trim();
+    if (!text) return { value: { origin: '', destination: '' } };
+    const m = text.match(PAIR);
+    if (!m) return { error: `${label} “${text.slice(0, 40)}” isn’t two airports, like OMAA-KJFK` };
+    const o = airportCode(m[1].toUpperCase());
+    const d = airportCode(m[2].toUpperCase());
+    return { value: { origin: o.value, destination: d.value }, warn: o.warn || d.warn };
+}
+
+// `label` is what the VA's file calls the column, so a message about their
+// "arrICAO" says arrICAO rather than our name for it.
+function coerce(col, raw, label = col.header) {
     const text = String(raw == null ? '' : raw).trim();
     switch (col.type) {
         case 'number': {
             if (text === '') return { value: 0 };
+            let n = NaN;
             const clock = col.duration && text.match(DURATION);
-            const n = clock
-                ? Math.round((Number(clock[1]) + Number(clock[2]) / 60) * 100) / 100
-                : Number(text.replace(/,/g, ''));
-            if (!Number.isFinite(n)) return { error: `${col.header} must be a number` };
+            const dist = col.units === 'distance' && text.replace(/,/g, '').match(DISTANCE);
+            if (clock) n = Math.round((Number(clock[1]) + Number(clock[2]) / 60) * 100) / 100;
+            else if (dist) n = Math.round(Number(dist[1]) * TO_NM[(dist[2] || 'nm').toLowerCase()]);
+            else n = Number(text.replace(/,/g, ''));
+            if (!Number.isFinite(n)) return { error: `${label} must be a number` };
             return { value: Math.max(col.min ?? -Infinity, Math.min(col.max ?? Infinity, n)) };
         }
         case 'bool': {
@@ -278,7 +362,7 @@ function coerce(col, raw) {
             const t = text.toLowerCase();
             if (TRUEISH.has(t)) return { value: true };
             if (FALSEISH.has(t)) return { value: false };
-            return { error: `${col.header} should be true or false` };
+            return { error: `${label} should be yes or no` };
         }
         case 'list':
             // Commas as well as semicolons on the way in: a hand-typed sheet
@@ -291,7 +375,7 @@ function coerce(col, raw) {
             if (text === '') return { value: col.default };
             const t = text.toLowerCase();
             if (!col.values.includes(t)) {
-                return { error: `${col.header} must be one of ${col.values.join(', ')}` };
+                return { error: `${label} must be one of ${col.values.join(', ')}` };
             }
             return { value: t };
         }
@@ -299,15 +383,38 @@ function coerce(col, raw) {
             if (!text) return { value: '' };
             // Stricter than it was: "Passenger" used to become "PASS".
             const code = icaoOf(text);
-            if (!code) return { error: `${col.header} “${text.slice(0, 40)}” is not an airport code` };
-            return { value: code };
+            if (!code) return { error: `${label} “${text.slice(0, 40)}” is not an airport code` };
+            return airportCode(code);
         }
         default:
             return { value: text.slice(0, col.max || 200) };
     }
 }
 
+// How a value we read is shown back in the preview.
+const shownAs = (col, v) => {
+    if (col.type === 'list') return (v || []).join('; ');
+    if (col.type === 'bool') return v ? 'yes' : 'no';
+    return v == null ? '' : String(v);
+};
+
 const cellText = (v) => String(v == null ? '' : v).trim();
+
+// "A", "B", … "AA": what a spreadsheet calls a column, for a file that does
+// not name its own.
+const columnLetter = (j) => {
+    let s = '';
+    for (let n = j + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+    return s;
+};
+
+// A flight number as airlines write them: EY101, 3L452, BAW123, EY5A.
+const FLIGHT_NO = /^(?=.*[A-Z])(?=.*\d)[A-Z0-9]{2,3}\d{1,4}[A-Z]?$/i;
+// …which an aircraft type also matches ("A380" could be airline A3, flight
+// 80). Types are told apart by their shape, and by repeating: a fleet column
+// says A380 twenty times, a flight-number column rarely says anything twice.
+const AIRCRAFT_TYPE = /^(A3\d\d|A2\d\d|B7\d\d|B7\dM?|E1[4-9]\d|E2\d\d|E[79]\d|CRJ\d*|DH8\w?|AT[47]\d|MD\d\d|C\d{3}|BCS\d)$/i;
+const distinctShare = (vals) => (vals.length ? new Set(vals.map((v) => v.toUpperCase())).size / vals.length : 0);
 
 /**
  * Decide what each column of one sheet is, then read its rows.
@@ -317,6 +424,11 @@ const cellText = (v) => String(v == null ? '' : v).trim();
  * column, because a header is a claim, not a fact: a "type" column full of
  * "Passenger" is not our own/codeshare `kind`, and trusting it would fail every
  * row in the file over a column the VA never meant for us.
+ *
+ * Columns nobody named usefully are then read by what is in them: codes that
+ * are airports, "OMAA-KJFK" pairs, flight numbers. And a sheet with no header
+ * row at all — the table starts on row 1 — gets "Column A", "Column B"… so
+ * its first row is kept as data and the VA can still say what each column is.
  */
 function readSheet(spec, byNorm, sheet, userMap) {
     const name = trim(sheet.name, 80) || 'Sheet';
@@ -326,13 +438,16 @@ function readSheet(spec, byNorm, sheet, userMap) {
     const grid = text.trim() ? (Papa.parse(text, { skipEmptyLines: false }).data || []) : [];
     const byKey = new Map(spec.columns.map((c) => [c.key, c]));
     const hasNotes = byKey.has('notes');
+    const hasPair = byKey.has('origin') && byKey.has('destination');
     const userTarget = (h) => {
         if (!userMap || !Object.prototype.hasOwnProperty.call(userMap, h)) return undefined;
         const t = String(userMap[h] ?? '');
         if (t === IGNORE) return IGNORE;
         if (t === TO_NOTES) return hasNotes ? TO_NOTES : IGNORE;
+        if (t === TO_PAIR) return hasPair ? TO_PAIR : IGNORE;
         return byKey.has(t) ? t : undefined;
     };
+    const keysOf = (t) => (t === TO_PAIR ? ['origin', 'destination'] : t && t !== TO_NOTES ? [t] : []);
 
     // The header row is the one, near the top, that names the most of our
     // columns. Ties go to the earliest.
@@ -342,47 +457,69 @@ function readSheet(spec, byNorm, sheet, userMap) {
         for (const cell of grid[r] || []) {
             const h = cellText(cell);
             const u = userTarget(h);
-            if (u !== undefined) { if (u && u !== TO_NOTES) keys.add(u); continue; }
+            if (u !== undefined) { keysOf(u).forEach((k) => keys.add(k)); continue; }
             const col = guessColumn(byNorm, h);
             if (col) keys.add(col.key);
+            else if (hasPair && PAIR_HEADERS.has(normalizeHeader(h))) keys.add(TO_PAIR);
         }
         if (keys.size > best) { best = keys.size; headerAt = r; }
     }
     const report = { name, headerRow: headerAt + 1, rows: 0, columns: [] };
+    const filled = (row) => (row || []).filter((c) => cellText(c)).length;
+    // Nothing we recognise: take the first row that looks like a table (two
+    // or more cells) as its headings anyway, so the VA can map them — unless
+    // that row is plainly data already, in which case there are no headings.
+    let headerless = false;
     if (headerAt < 0) {
-        report.skipped = grid.some((row) => row.some((c) => cellText(c)))
-            ? 'none of its columns look like ours'
-            : 'it is empty';
-        return { report, rows: [] };
+        const r = grid.slice(0, HEADER_SCAN_ROWS).findIndex((row) => filled(row) >= 2);
+        if (r < 0) {
+            report.skipped = grid.some((row) => filled(row)) ? 'it isn’t laid out as a table' : 'it is empty';
+            return { report, rows: [], preview: null };
+        }
+        headerAt = r;
+        headerless = (grid[r] || []).some((c) => looksLikeAirport(cellText(c)) || PAIR.test(cellText(c)));
+        report.headerRow = headerless ? 0 : r + 1;
     }
 
-    const headers = (grid[headerAt] || []).map(cellText);
-    const body = grid.slice(headerAt + 1);
+    const width = grid.reduce((w, row) => Math.max(w, (row || []).length), 0);
+    const headers = headerless
+        ? Array.from({ length: width }, (_, j) => `Column ${columnLetter(j)}`)
+        : Array.from({ length: width }, (_, j) => cellText((grid[headerAt] || [])[j]));
+    const body = grid.slice(headerless ? headerAt : headerAt + 1);
+    const firstLine = headerless ? headerAt + 1 : headerAt + 2;
     const sample = (j) => {
         const out = [];
         for (const row of body) {
-            const v = cellText(row[j]);
+            const v = cellText((row || [])[j]);
             if (v) out.push(v);
             if (out.length >= SAMPLE_CELLS) break;
         }
         return out;
     };
+    const share = (vals, test) => (vals.length ? vals.filter(test).length / vals.length : 0);
     const fits = (col, values) => !values.length
         || values.filter((v) => coerce(col, v).error).length * 2 <= values.length;
 
     const targets = headers.map(() => IGNORE);
     const taken = new Set();
+    const entries = [];
+    const claim = (j, t, source) => {
+        targets[j] = t;
+        keysOf(t).forEach((k) => taken.add(k));
+        if (entries[j]) { entries[j].key = t; entries[j].source = source; delete entries[j].reason; }
+    };
     headers.forEach((h, j) => {
-        if (!h) return;
-        const entry = { header: h, key: IGNORE, source: 'unknown', example: [...new Set(sample(j))].slice(0, 2).join(', ').slice(0, 60) };
+        const vals = sample(j);
+        if (!h && !vals.length) return;
+        const entry = { header: h, key: IGNORE, source: 'unknown', example: [...new Set(vals)].slice(0, 2).join(', ').slice(0, 60) };
+        entries[j] = entry;
         report.columns.push(entry);
+        if (!h) return;
         const u = userTarget(h);
         if (u !== undefined) {
             entry.source = 'you';
-            if (u && u !== TO_NOTES && taken.has(u)) { entry.reason = 'another column already fills this'; return; }
-            entry.key = u;
-            targets[j] = u;
-            if (u && u !== TO_NOTES) taken.add(u);
+            if (keysOf(u).some((k) => taken.has(k))) { entry.reason = 'another column already fills this'; return; }
+            claim(j, u, 'you');
             return;
         }
         const col = guessColumn(byNorm, h);
@@ -391,55 +528,63 @@ function readSheet(spec, byNorm, sheet, userMap) {
         // A column under our own exact name is ours, and a bad cell in it is
         // an error the VA should see. Only a guess gets second-guessed.
         const ours = normalizeHeader(h) === normalizeHeader(col.header);
-        if (!ours && !fits(col, sample(j))) { entry.reason = `its values don’t look like ${col.header}`; return; }
-        entry.key = col.key; entry.source = 'auto';
-        targets[j] = col.key;
-        taken.add(col.key);
+        if (!ours && !fits(col, vals)) { entry.reason = `its values don’t look like ${col.header}`; return; }
+        claim(j, col.key, 'auto');
     });
 
-    // Airports under a header we could not read — "A", "Leg start", a language
-    // we do not know — are still unmistakably airports. If exactly as many
-    // columns of bare codes are left over as airports are missing, take them
-    // in order: departure first, the way every schedule is written.
+    // Read the rest by what is in them. Only columns the VA has not ruled on,
+    // and only where the answer is unambiguous: exactly the right number of
+    // candidates, or none of it is guessed.
+    const open = (j) => headers[j] && targets[j] === IGNORE && userTarget(headers[j]) === undefined;
+    const openCols = headers.map((_, j) => j).filter(open);
     const needed = ['origin', 'destination'].filter((k) => byKey.has(k) && !taken.has(k));
     if (needed.length) {
-        const codes = [];
-        headers.forEach((h, j) => {
-            if (!h || targets[j] !== IGNORE || userTarget(h) !== undefined) return;
-            const vals = sample(j);
-            if (vals.length && vals.filter((v) => /^[A-Za-z]{4}$/.test(v)).length * 5 >= vals.length * 4) codes.push(j);
-        });
-        if (codes.length === needed.length) {
-            codes.forEach((j, n) => {
-                targets[j] = needed[n];
-                taken.add(needed[n]);
-                const entry = report.columns.find((c) => c.header === headers[j] && c.key === IGNORE);
-                if (entry) { entry.key = needed[n]; entry.source = 'auto'; delete entry.reason; }
-            });
-        }
+        const codes = openCols.filter((j) => share(sample(j), looksLikeAirport) >= 0.8);
+        if (codes.length === needed.length) codes.forEach((j, n) => claim(j, needed[n], 'contents'));
+    }
+    if (hasPair && !taken.has('origin') && !taken.has('destination')) {
+        const pairs = openCols.filter((j) => targets[j] === IGNORE
+            && share(sample(j), (v) => PAIR.test(v)) >= (PAIR_HEADERS.has(normalizeHeader(headers[j])) ? 0.5 : 0.8));
+        if (pairs.length === 1) claim(pairs[0], TO_PAIR, 'contents');
+    }
+    if (byKey.has('flightNumber') && !taken.has('flightNumber')) {
+        const nums = openCols.filter((j) => targets[j] === IGNORE
+            && share(sample(j), (v) => FLIGHT_NO.test(v) && !AIRCRAFT_TYPE.test(v) && !looksLikeAirport(v)) >= 0.8)
+            .map((j) => ({ j, unique: distinctShare(sample(j)) }))
+            .filter((c) => c.unique >= 0.6)
+            .sort((a, b) => b.unique - a.unique);
+        // One clear winner, or nothing.
+        if (nums.length === 1 || (nums.length > 1 && nums[0].unique > nums[1].unique)) claim(nums[0].j, 'flightNumber', 'contents');
     }
 
     if (![...taken].some((k) => k !== 'id')) {
-        report.skipped = 'none of its columns look like ours';
-        return { report, rows: [] };
+        report.skipped = 'none of its columns look like ours — pick what they are below';
+        return { report, rows: [], preview: { headers, targets, rows: previewRaw(body, firstLine) } };
     }
 
     const rows = [];
+    const preview = [];
     body.forEach((cells, i) => {
-        const line = headerAt + i + 2;
+        cells = cells || [];
+        const line = firstLine + i;
         const used = targets.map((t, j) => (t === IGNORE ? '' : cellText(cells[j])));
+        const info = headers.map((_, j) => { const v = cellText(cells[j]).slice(0, 80); return v ? { v } : {}; });
         // Blank as far as we are concerned — including a row that only has
         // something in a column nobody mapped, like a running total.
         if (used.every((v) => !v)) return;
         // The header again, from a sheet assembled by pasting tables together.
-        if (used.every((v, j) => !v || normalizeHeader(v) === normalizeHeader(headers[j]))) return;
+        if (!headerless && used.every((v, j) => !v || normalizeHeader(v) === normalizeHeader(headers[j]))) {
+            preview.push({ line, cells: info, status: 'skipped', message: 'the column headings again' });
+            return;
+        }
 
         const values = {};
         const extra = [];
         let id = '';
         let error = null;
+        let warn = null;
         targets.forEach((t, j) => {
-            if (error || t === IGNORE) return;
+            if (t === IGNORE) return;
             const raw = cells[j];
             if (t === TO_NOTES) {
                 const v = cellText(raw);
@@ -447,22 +592,45 @@ function readSheet(spec, byNorm, sheet, userMap) {
                 return;
             }
             if (t === 'id') { id = trim(raw, 64); return; }
-            const got = coerce(byKey.get(t), raw);
-            if (got.error) { error = got.error; return; }
-            values[t] = got.value;
+            const got = t === TO_PAIR ? coercePair(raw, headers[j]) : coerce(byKey.get(t), raw, headers[j]);
+            if (got.error) { info[j].e = got.error; error = error || got.error; return; }
+            if (got.warn) { info[j].w = got.warn; warn = warn || got.warn; }
+            let shown;
+            if (t === TO_PAIR) {
+                values.origin = got.value.origin;
+                values.destination = got.value.destination;
+                shown = got.value.origin ? `${got.value.origin} → ${got.value.destination}` : '';
+            } else {
+                values[t] = got.value;
+                shown = shownAs(byKey.get(t), got.value);
+            }
+            if (cellText(raw) && shown !== cellText(raw)) info[j].r = shown.slice(0, 80);
         });
         if (extra.length) {
             const lead = taken.has('notes') ? String(values.notes || '').trim() : '';
             values.notes = [lead, ...extra].filter(Boolean).join(' · ').slice(0, byKey.get('notes').max || 500);
         }
-        rows.push({ line, sheet: name, id, values, error });
+        const row = { line, sheet: name, id, values, error, warn };
+        rows.push(row);
+        preview.push({ line, cells: info, row });
     });
     report.rows = rows.length;
     report.keys = [...taken];
     report.layout = headers
         .map((h, j) => ({ header: h, key: targets[j] }))
-        .filter((c) => c.key && c.key !== TO_NOTES);
-    return { report, rows };
+        .filter((c) => c.header && c.key && c.key !== TO_NOTES);
+    return { report, rows, preview: { headers, targets, rows: preview } };
+}
+
+// The first rows of a sheet as they are, for a sheet we could not read yet —
+// seeing it is how the VA works out what to tell us.
+function previewRaw(body, firstLine) {
+    const out = [];
+    body.forEach((cells, i) => {
+        if (out.length >= PREVIEW_ROWS || !(cells || []).some((c) => cellText(c))) return;
+        out.push({ line: firstLine + i, cells: (cells || []).map((c) => { const v = cellText(c).slice(0, 80); return v ? { v } : {}; }), status: 'skipped' });
+    });
+    return out;
 }
 
 /**
@@ -490,11 +658,12 @@ function readSheet(spec, byNorm, sheet, userMap) {
 function planImport(spec, input, existing, { mapping, prepare } = {}) {
     const sheets = (Array.isArray(input) ? input : [{ name: 'CSV', csv: input }])
         .filter((s) => s && typeof s === 'object');
-    if (!sheets.some((s) => String(s.csv || '').replace(/^﻿/, '').trim())) return { error: 'That file is empty.' };
+    if (!sheets.some((s) => String(s.csv || '').replace(/^\uFEFF/, '').trim())) return { error: 'That file is empty.' };
 
     const byNorm = headerIndex(spec);
     const userMap = mapping && typeof mapping === 'object' && !Array.isArray(mapping) ? mapping : null;
     const reports = [];
+    const previews = [];
     const rows = [];
     const present = new Set();
     let layout = null;
@@ -505,6 +674,7 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
         }
         const got = readSheet(spec, byNorm, sheet, userMap);
         reports.push(got.report);
+        previews.push([got.report, got.preview]);
         if (!got.rows.length && got.report.skipped) continue;
         for (const k of got.report.keys || []) if (k !== 'id') present.add(k);
         if (!layout && got.report.layout && got.report.layout.length) layout = got.report.layout;
@@ -513,7 +683,24 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
             return { error: `That is more than ${MAX_ROWS} rows. Split it and import in parts.` };
         }
     }
+    const finishPreviews = () => {
+        for (const [report, preview] of previews) {
+            if (!preview) continue;
+            // The first rows as they come, then every row with a problem: the
+            // preview is for spotting what is wrong, so what is wrong is never
+            // the part that got cut off.
+            const flagged = (r) => r.status === 'error' || r.warn;
+            const keep = preview.rows.filter((r, i) => i < PREVIEW_ROWS || flagged(r)).slice(0, PREVIEW_MAX);
+            report.preview = {
+                headers: preview.headers,
+                targets: preview.targets,
+                more: preview.rows.length - keep.length,
+                rows: keep.map(({ row, ...r }) => r),
+            };
+        }
+    };
     if (!present.size) {
+        finishPreviews();
         return {
             error: `We couldn't find any recognisable columns. Name them in the first row — for example ${spec.columns.filter((c) => !c.readOnly).slice(0, 4).map((c) => c.header).join(', ')} — or pick what each column is below.`,
             sheets: reports,
@@ -521,9 +708,27 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
     }
     if (prepare) for (const row of rows) if (!row.error) row.values = prepare(row.values);
 
-    const plan = planRows(spec, rows, existing, { present, columns: [...present] });
+    // Each row's outcome lands on its preview line.
+    const outcome = new Map();
+    const plan = planRows(spec, rows, existing, {
+        present,
+        columns: [...present],
+        onRow: (row, what) => outcome.set(row, what),
+    });
     if (plan.error) return plan;
-    return { ...plan, sheets: reports, layout: layout || [] };
+    for (const [, preview] of previews) {
+        for (const r of (preview && preview.rows) || []) {
+            if (!r.row) continue;
+            const what = outcome.get(r.row) || {};
+            r.status = what.status || 'unchanged';
+            if (what.message) r.message = what.message;
+            if (what.changes) r.changes = what.changes;
+            if (r.row.warn) r.warn = r.row.warn;
+        }
+    }
+    finishPreviews();
+    const warningCount = rows.filter((r) => r.warn && !r.error).length;
+    return { ...plan, warningCount, sheets: reports, layout: layout || [] };
 }
 
 const matchKey = (rule, obj) => {
@@ -563,7 +768,10 @@ const pushIndex = (index, rule, key, row) => {
  *                distinction is what stops a six-column file blanking the other
  *                three (see the required-field rule below).
  */
-function planRows(spec, rows, existing, { present, columns } = {}) {
+function planRows(spec, rows, existing, { present, columns, onRow } = {}) {
+    // What happened to each row, for the preview. Optional: the library
+    // import and the tests have no use for it.
+    const told = onRow || (() => {});
     const headers = present || new Set(
         rows.flatMap((r) => Object.keys(r.values || {})),
     );
@@ -597,13 +805,15 @@ function planRows(spec, rows, existing, { present, columns } = {}) {
     rows.forEach((row) => {
         const { line, values } = row;
         const sheet = row.sheet;
-        if (row.error) { errors.push({ line, sheet, message: row.error }); return; }
+        if (row.error) { errors.push({ line, sheet, message: row.error }); told(row, { status: 'error', message: row.error }); return; }
 
         // Find it: by id if the row carried one, else by each rule in turn.
         const id = String(row.id || '');
         let target = id ? byId.get(id) : null;
         if (id && !target) {
-            errors.push({ line, sheet, message: `No pilot or route here with id ${id}. Clear the id column to add it as new.` });
+            const message = `No pilot or route here with id ${id}. Clear the id column to add it as new.`;
+            errors.push({ line, sheet, message });
+            told(row, { status: 'error', message });
             return;
         }
         // A row this same batch already asked us to create. It has no id yet —
@@ -618,6 +828,7 @@ function planRows(spec, rows, existing, { present, columns } = {}) {
                 const pending = (staged.get(rule).get(k) || []).find((p) => !guarded(spec, rule, values, p.values));
                 if (!pending) continue;
                 Object.assign(pending.values, values);
+                told(row, { status: 'merged', message: `same ${spec.name === 'roster' ? 'pilot' : 'route'} as ${pending.sheet && pending.sheet !== sheet ? `${pending.sheet} ` : ''}row ${pending.line} — combined with it` });
                 for (const r2 of spec.matchOn) {
                     const k2 = matchKey(r2, pending.values);
                     if (k2 && !(staged.get(r2).get(k2) || []).includes(pending)) pushIndex(staged, r2, k2, pending);
@@ -646,8 +857,9 @@ function planRows(spec, rows, existing, { present, columns } = {}) {
                     : String(before == null ? '' : before) === String(v == null ? '' : v);
                 if (!same) diff[key] = v;
             }
-            if (!Object.keys(diff).length) { unchanged++; return; }
-            update.push({ id: String(target.id), line, values: diff, before: target });
+            if (!Object.keys(diff).length) { unchanged++; told(row, { status: 'unchanged' }); return; }
+            update.push({ id: String(target.id), line, sheet, values: diff, before: target });
+            told(row, { status: 'update', changes: Object.keys(diff) });
         } else {
             // `required` is a rule about creating something, not about the file:
             // a VA correcting hours for existing pilots sends two columns and
@@ -656,23 +868,22 @@ function planRows(spec, rows, existing, { present, columns } = {}) {
             const missingRequired = spec.columns.find(
                 (c) => c.required && !String(values[c.key] || '').trim());
             if (missingRequired) {
-                errors.push({
-                    line,
-                    sheet,
-                    message: headers.has(missingRequired.key)
-                        ? `${missingRequired.header} is required to add a new ${spec.name === 'roster' ? 'pilot' : 'route'}`
-                        : `this row is new, so it needs a ${missingRequired.header} column`,
-                });
+                const message = headers.has(missingRequired.key)
+                    ? `${missingRequired.header} is required to add a new ${spec.name === 'roster' ? 'pilot' : 'route'}`
+                    : `this row is new, so it needs a ${missingRequired.header} column`;
+                errors.push({ line, sheet, message });
+                told(row, { status: 'error', message });
                 return;
             }
-            const row = { line, sheet, values };
-            create.push(row);
+            told(row, { status: 'create' });
+            const created = { line, sheet, values };
+            create.push(created);
             // Register the create row ITSELF, not a copy of its values, so a
             // later duplicate line merges into the thing that will actually be
             // written rather than into a snapshot nobody reads again.
             for (const rule of spec.matchOn) {
                 const k = matchKey(rule, values);
-                if (k) pushIndex(staged, rule, k, row);
+                if (k) pushIndex(staged, rule, k, created);
             }
         }
     });
@@ -690,6 +901,7 @@ module.exports = {
     mapHeaders,
     IGNORE,
     TO_NOTES,
+    TO_PAIR,
     MAX_SHEETS,
     ROSTER_SPEC,
     ROUTES_SPEC,
