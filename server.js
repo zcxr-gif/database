@@ -300,6 +300,9 @@ app.use((req, res, next) => {
 // a VA site, is capped at 2 MB by vaSites.js); files arrive through multer.
 // Mounted first: express.json skips a body that has already been parsed.
 app.use('/api/trails', express.json({ limit: '100mb' }));
+// A whole workbook — every tab of a VA's route spreadsheet, as CSV — is the
+// body of a roster or routes import, and a big network outgrows 5mb.
+app.use(/^\/api\/crew\/[^/]+\/(roster|routes)\/import$/, express.json({ limit: '25mb' }));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
@@ -6559,11 +6562,36 @@ app.get('/api/crew/:slug/airport-gates/:icao', async (req, res) => {
 
 const csvFilename = (slug, kind) => `${String(slug || 'crew').replace(/[^a-z0-9-]/gi, '')}-${kind}-${new Date().toISOString().slice(0, 10)}.csv`;
 
-function sendCsv(res, slug, kind, spec, rows) {
+// `?layout=[{"header":"depICAO","key":"origin"},…]` writes the file in the
+// VA's own column shape instead of ours; `&id=0` leaves the id column off it.
+function sendCsv(req, res, slug, kind, spec, rows) {
+    let layout = null;
+    try { layout = req.query.layout ? JSON.parse(String(req.query.layout)) : null; } catch { layout = null; }
     res.set('Content-Type', 'text/csv; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="${csvFilename(slug, kind)}"`);
     res.set('Cache-Control', 'no-store');
-    res.send(crewCsv.toCsv(spec, rows));
+    res.send(crewCsv.toCsv(spec, rows, layout, { includeId: req.query.id !== '0' }));
+}
+
+// Writes run a few at a time. One after another, a two-thousand-leg network
+// took long enough for the request to die at the proxy half-way through;
+// all at once, it would hammer the VA's database. Each row still succeeds or
+// fails on its own.
+async function eachLimited(items, limit, fn) {
+    let next = 0;
+    const worker = async () => { while (next < items.length) { const i = next++; await fn(items[i], i); } };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
+// The file, as the dashboard sends it: either `csv`, or `sheets` — one entry
+// per tab of a workbook or per file picked — so nothing about a workbook has
+// to be flattened before it arrives.
+function csvInput(body) {
+    if (Array.isArray(body?.sheets)) {
+        return body.sheets.slice(0, crewCsv.MAX_SHEETS + 20)
+            .map((s) => ({ name: String(s?.name || '').slice(0, 80), csv: String(s?.csv || '') }));
+    }
+    return String(body?.csv || '');
 }
 
 // Shared by both importers: plan it, and either report the plan or carry it out.
@@ -6571,12 +6599,15 @@ function sendCsv(res, slug, kind, spec, rows) {
 // The dry run is not an optimisation, it is the point — the dashboard shows a
 // VA what an upload would do before it touches a live roster, and the commit
 // replays that same plan rather than re-deciding.
-async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store }) {
-    const csvText = String(req.body?.csv || '');
-    if (!csvText.trim()) return res.status(400).json({ error: 'Attach a CSV file first.' });
+async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store, prepare }) {
+    const input = csvInput(req.body);
+    const empty = Array.isArray(input) ? !input.some((s) => s.csv.trim()) : !input.trim();
+    if (empty) return res.status(400).json({ error: 'Attach a CSV file first.' });
 
-    const plan = crewCsv.planImport(spec, csvText, existing);
-    if (plan.error) return res.status(400).json({ error: plan.error });
+    const mapping = req.body?.mapping && typeof req.body.mapping === 'object' ? req.body.mapping : null;
+    const plan = crewCsv.planImport(spec, input, existing, { mapping, prepare });
+    const fields = spec.columns.map((c) => ({ key: c.key, header: c.header, required: !!c.required }));
+    if (plan.error) return res.status(400).json({ error: plan.error, sheets: plan.sheets, fields });
 
     const summary = {
         kind,
@@ -6588,6 +6619,12 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
         matchedOn: plan.matchedOn,
         columns: plan.columns,
         missing: plan.missing,
+        // How each tab was read and what each of its columns was taken to be,
+        // so the VA can correct a guess and the dashboard can remember the
+        // shape for exporting back out.
+        sheets: plan.sheets,
+        layout: plan.layout,
+        fields,
         // A preview of what would change, so the confirm step can show the
         // first few rows rather than only a count.
         sample: {
@@ -6601,7 +6638,14 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
     // Refuse a file we could not fully read rather than applying the good half.
     // A partial import is the worst outcome available: the VA cannot tell what
     // landed, and re-uploading the fixed file re-applies everything that did.
-    if (plan.errors.length) {
+    //
+    // Unless they ask for it, having seen the list: a forty-tab workbook kept
+    // by hand always has a stray row somewhere, and "fix row 812 of the Asia
+    // tab before any of it can go in" is its own kind of worst outcome.
+    // `skipErrors` is only honoured alongside the exact error count the VA was
+    // shown, so a file that got worse between preview and apply is refused.
+    const skipping = req.body?.skipErrors === true && Number(req.body?.expectErrors) === plan.errors.length;
+    if (plan.errors.length && !skipping) {
         return res.status(400).json({
             error: `Fix the ${plan.errors.length} problem row${plan.errors.length === 1 ? '' : 's'} and import again — nothing has been changed.`,
             ...summary,
@@ -6610,18 +6654,18 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
 
     let created = 0; let updated = 0;
     const failures = [];
-    for (const row of plan.create) {
+    await eachLimited(plan.create, 6, async (row) => {
         try { await create(row.values); created++; } catch (err) {
-            failures.push({ line: row.line, message: err?.message || 'Could not add this row.' });
+            failures.push({ line: row.line, sheet: row.sheet, message: err?.message || 'Could not add this row.' });
         }
-    }
-    for (const row of plan.update) {
+    });
+    await eachLimited(plan.update, 6, async (row) => {
         try { await update(row.id, row.values, row.before); updated++; } catch (err) {
-            failures.push({ line: row.line, message: err?.message || 'Could not update this row.' });
+            failures.push({ line: row.line, sheet: row.sheet, message: err?.message || 'Could not update this row.' });
         }
-    }
+    });
     if (onDone) { try { onDone({ ...summary, created, updated }); } catch { /* never fail an import over a notice */ } }
-    res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures }));
+    res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures, skipped: skipping ? plan.errors.length : 0 }));
 }
 
 app.get('/api/crew/:slug/roster.csv', async (req, res) => {
@@ -6633,7 +6677,7 @@ app.get('/api/crew/:slug/roster.csv', async (req, res) => {
         // Exported from the stored row, not from publicMember: the point of an
         // export is to hand back everything, including the Infinite Flight link
         // that the roster screen never shows.
-        sendCsv(res, req.params.slug, 'roster', crewCsv.ROSTER_SPEC, (members || []).map((m) => ({
+        sendCsv(req, res, req.params.slug, 'roster', crewCsv.ROSTER_SPEC, (members || []).map((m) => ({
             id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
             aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
         })));
@@ -6660,6 +6704,9 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
                 id: m._id, name: m.name, callsign: shape(m.callsign), hours: m.hours, role: m.role,
                 aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
             })),
+            // The file's callsigns get the same shape before matching, so the
+            // comparison is like with like.
+            prepare: (values) => (values.callsign ? { ...values, callsign: shape(values.callsign) } : values),
             create: (values) => store.createMember({ ...cleanMember(values), callsign: shape(values.callsign) }),
             // Merge over what is already there before cleaning, exactly as the
             // roster editor's PATCH does — a file with six columns must not
@@ -6683,7 +6730,7 @@ app.get('/api/crew/:slug/routes.csv', async (req, res) => {
         // a value on the way back in — a VA who exported their network and
         // re-imported it unedited would have turned every codeshare into an own
         // route and dropped every rank gate. Export what import reads.
-        sendCsv(res, req.params.slug, 'routes', crewCsv.ROUTES_SPEC, (routes || []).map((r) => ({
+        sendCsv(req, res, req.params.slug, 'routes', crewCsv.ROUTES_SPEC, (routes || []).map((r) => ({
             id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
             kind: r.kind || 'own', partnerName: r.partnerName || '',

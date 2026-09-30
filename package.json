@@ -24,7 +24,8 @@
     "test:streaks": "node scripts/test-crew-streaks.js",
     "test:badges": "node scripts/test-crew-badges.js",
     "test:portal": "node scripts/test-va-portal-owner.js && node scripts/test-va-portal-naming.js && node scripts/test-va-portal-rename-plan.js",
-    "test:portal:browser": "node scripts/test-va-portal-mobile.js && node scripts/test-va-submissions-mobile.js"
+    "test:portal:browser": "node scripts/test-va-portal-mobile.js && node scripts/test-va-submissions-mobile.js",
+    "test:csv": "node scripts/test-crew-csv.js"
   },
   "keywords": [],
   "author": "Antony",
