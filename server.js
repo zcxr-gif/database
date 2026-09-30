@@ -823,6 +823,19 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     crewTours: { type: [mongoose.Schema.Types.Mixed], default: [] },
     crewChallenges: { type: [mongoose.Schema.Types.Mixed], default: [] },
     crewCodeshareOpen: { type: Boolean, default: true },
+    // ------------------------------------------------------------------------
+    // THE AIRLINE'S OWN LOOK (crewDesign.js). The artwork library, where each
+    // picture goes (hero, backdrop, section covers, the showcase), the theme
+    // file (colours, fonts, radius, gradient, sanitised custom CSS) and which
+    // interface the crew sees first. Mixed for the reason crewTours is: each
+    // is owned and re-sanitised on every read by the one module that knows it.
+    // `crewUi` is what the dashboard's interface picker has always sent as
+    // `ui` — and nothing ever stored until now.
+    // ------------------------------------------------------------------------
+    crewArtwork: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    crewArt: { type: mongoose.Schema.Types.Mixed, default: null },
+    crewTheme: { type: mongoose.Schema.Types.Mixed, default: null },
+    crewUi: { type: String, default: '' },
 
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
@@ -7054,6 +7067,13 @@ const crewNetwork = require('./crewNetworkRoutes')(app, {
 // A function declaration so the route handlers above can call it; by the time
 // any request arrives the registration below has run.
 function codeshareRoutesChanged(va) { try { crewNetwork.routesChanged(va); } catch { /* never fail a route edit over a partner */ } }
+
+// The airline's own look: artwork, section covers, theme file, interface.
+// See crewDesignRoutes.js.
+const crewDesignRoutes = require('./crewDesignRoutes')(app, {
+    VirtualAirlineAd, resolveCrewVa, requireCap, crewFail,
+    upload, s3Client, uploadVaImageMeta, deleteVaImage,
+});
 
 // ---- The noticeboard ----
 //
@@ -18432,7 +18452,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -18546,6 +18566,11 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             // Where the airline is based, when it has said. Public for the same
             // reason the fleet is: the feed and a hosted site draw it.
             hubs: crewNetwork.hubsOf(ad),
+            // The airline's own look: theme (null when unset, so crewBrand
+            // changes nothing), where its pictures go, the artwork library and
+            // which interface the crew sees first. Public, because all of it
+            // is paint for a page anybody can open.
+            ...crewDesignRoutes.publicDesign(ad),
             // The Instagram wall. Public because it is the one part of the crew
             // center whose entire purpose is to be looked at by people who are
             // not in the crew — and because a VA's own website should be able

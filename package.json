@@ -27,7 +27,8 @@
     "test:portal:browser": "node scripts/test-va-portal-mobile.js && node scripts/test-va-submissions-mobile.js",
     "test:csv": "node scripts/test-crew-csv.js",
     "test:codeshare": "node scripts/test-crew-codeshare.js",
-    "test:goals": "node scripts/test-crew-goals.js"
+    "test:goals": "node scripts/test-crew-goals.js",
+    "test:design": "node scripts/test-crew-design.js"
   },
   "keywords": [],
   "author": "Antony",

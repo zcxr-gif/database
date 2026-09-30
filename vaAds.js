@@ -29,7 +29,11 @@ const IMAGE_PROFILES = {
     // a headline, and a 1600px-wide hero on a 2x laptop is visibly soft. The
     // extra pixels cost about 40 KB after WebP and buy the one case where
     // softness would be obvious.
-    site:   { width: 2000, height: 2000, fit: 'inside' }
+    site:   { width: 2000, height: 2000, fit: 'inside' },
+    // An airline's own artwork for its crew centre — liveries, posters,
+    // wallpapers. Long edge capped like `site`, and a little larger, because
+    // a wallpaper is exactly the picture somebody opens full screen.
+    art:    { width: 2400, height: 2400, fit: 'inside' }
 };
 
 // Animated banners/logos are re-encoded as animated WebP, keeping EVERY frame
@@ -44,7 +48,8 @@ const ANIMATED_PROFILES = {
     // An animated picture on a website is a GIF somebody dropped in, and the
     // cost of one is measured in the frames nobody asked for. Same tight cap as
     // the rest: every frame is kept, at a size that encodes inside the request.
-    site:   { width: 720, height: 720, fit: 'inside' }
+    site:   { width: 720, height: 720, fit: 'inside' },
+    art:    { width: 960, height: 960, fit: 'inside' }
 };
 
 // Hard ceiling on total source pixels to decode for an animated upload
