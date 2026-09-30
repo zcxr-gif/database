@@ -2,7 +2,7 @@
 
 /*
  * crewCodeshare.js
- * Two crew centres agreeing to sell each other's flights.
+ * Two crew centres agreeing to fly each other's routes.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -10,13 +10,13 @@
  * with Borealis in Discord, then sat down and entered Borealis's network into
  * Aurora's crew centre one leg at a time — the name "Borealis Virtual" forty
  * times, the same logo URL forty times — and Borealis did the same the other
- * way. The day Borealis renumbered a flight, Aurora's copy went on selling the
+ * way. The day Borealis renumbered a flight, Aurora's copy went on offering the
  * old one, and nobody found out until a pilot flew it.
  *
  * Both airlines are already on this platform. So the deal can be made here:
  *
  *   1. Aurora opens Codeshare → Request, picks Borealis, ticks which Borealis
- *      routes it wants to sell (or "all of them") and, if it likes, which of
+ *      routes its pilots want to fly (or "all of them") and, if it likes, which of
  *      its own it offers back.
  *   2. Borealis sees the request in its own crew centre, can untick anything,
  *      and accepts or declines.
@@ -46,7 +46,7 @@
  * WHAT THE TAKER KEEPS
  * --------------------
  * The partner owns the leg: its number, its airports, its aircraft, its
- * distance. The airline selling it owns how it sells it: the rank gate, the
+ * distance. The airline flying it as a codeshare owns how its pilots see it: the rank gate, the
  * notes, whether it is published, the gates. A sync writes only the first set,
  * so a VA that puts Borealis's long-haul behind Captain does not find the gate
  * gone the next time Borealis edits the route.
@@ -72,7 +72,7 @@ const fold = (v) => String(v || '').trim().toLowerCase();
 
 /**
  * Which of a network one side takes: every eligible leg, a chosen few, or none.
- * `all` follows the network — a leg the partner adds tomorrow is sold tomorrow.
+ * `all` follows the network — a leg the partner adds tomorrow is flown tomorrow.
  * `selected` is exactly the ids listed, and a new leg waits to be ticked.
  */
 function cleanSelection(sel, fallback = 'none') {
@@ -91,7 +91,7 @@ const selectionEmpty = (s) => !s || s.mode === 'none';
 /**
  * A selection held inside a ceiling. The ceiling is what the airline that
  * OWNS the routes allows ("all", "these", "none"); the selection is what the
- * other airline asks to sell. The result is never wider than either — which is
+ * other airline asks to fly. The result is never wider than either — which is
  * the one rule that lets each side edit its half of an agreement alone.
  */
 function narrowSelection(sel, limit) {
@@ -104,7 +104,7 @@ function narrowSelection(sel, limit) {
     return cleanSelection({ mode: 'selected', routeIds: s.routeIds.filter((i) => allowed.has(i)) });
 }
 
-/** What a route has to be before anybody else may sell it. */
+/** What a route has to be before anybody else may fly it as a codeshare. */
 const shareable = (r) => !!r && r.active !== false && (r.kind || 'own') === 'own'
     && !!String(r.origin || '').trim() && !!String(r.destination || '').trim();
 
@@ -124,17 +124,17 @@ function selectRoutes(routes, selection) {
  * An agreement has a `from` (the airline that asked) and a `to` (the one that
  * was asked). Each side has two selections over the OTHER side's network:
  *
- *   takes  what it WANTS to sell — its own choice, kept as it was made, so
+ *   takes  what it WANTS to fly — its own choice, kept as it was made, so
  *          "all of it" stays "all of it" when the partner later opens up more
- *   limit  what the partner ALLOWS it to sell — the partner's choice
+ *   limit  what the partner ALLOWS it to fly — the partner's choice
  *
- * and what it actually sells is the one held inside the other (`selling`). The
+ * and what it actually flies is the one held inside the other (`flying`). The
  * rest of the product never has to think in from/to: `sideOf` answers "which
  * one is me", and `view` turns the document into "me" and "them".
  * ------------------------------------------------------------------------- */
 
-/** What one side actually sells: its wish, inside the partner's allowance. */
-const selling = (doc, side) => narrowSelection(doc && doc[`${side}Takes`], doc && doc[`${side}Limit`]);
+/** What one side actually flies: its wish, inside the partner's allowance. */
+const flying = (doc, side) => narrowSelection(doc && doc[`${side}Takes`], doc && doc[`${side}Limit`]);
 
 function sideOf(doc, slug) {
     const s = fold(slug);
@@ -172,10 +172,10 @@ function view(doc, slug, { linked = null } = {}) {
             logo: doc[`${them}Logo`] || '',
             callsign: doc[`${them}Callsign`] || '',
         },
-        // The partner's routes I sell, and my routes they sell — as sold, and
+        // The partner's routes my pilots fly, and my routes theirs fly — as flown, and
         // as each side asked and allowed, so the editor can show all three.
-        iTake: selling(doc, me),
-        theyTake: selling(doc, them),
+        iTake: flying(doc, me),
+        theyTake: flying(doc, them),
         iWant: takes(me),
         theyAllowMe: cleanSelection(doc[`${me}Limit`]),
         iAllowThem: cleanSelection(doc[`${them}Limit`]),
@@ -211,14 +211,14 @@ function requestProblem({ fromSlug, toSlug, take, offer, existing = [], partnerO
     if (a === b) return 'That is your own airline.';
     if (!partnerOpen) return 'That airline is not taking codeshare requests at the moment.';
     if (selectionEmpty(take) && selectionEmpty(offer)) {
-        return 'Pick at least one route — theirs to sell, or yours to offer them.';
+        return 'Pick at least one route — theirs to fly, or yours to offer them.';
     }
     const between = existing.filter((d) => {
         const pair = [fold(d.fromSlug), fold(d.toSlug)];
         return pair.includes(a) && pair.includes(b);
     });
     if (between.some((d) => d.status === 'active')) {
-        return 'You already codeshare with this airline. Change what you sell from the agreement itself.';
+        return 'You already codeshare with this airline. Change which routes you fly from the agreement itself.';
     }
     if (between.some((d) => d.status === 'pending')) {
         return 'There is already a request waiting between you and this airline.';
@@ -332,7 +332,7 @@ function planSync({ source = [], existing = [], partner = {}, schemaLinks = true
             create.push({
                 ...want,
                 // Written once, on the way in. After that the notes are the
-                // selling airline's own, like the rank gate.
+                // airline flying it as a codeshare, like the rank gate.
                 notes: `Operated by ${partnerName}.`,
                 active: true,
                 minRank: '',
@@ -429,7 +429,7 @@ module.exports = {
     cleanSelection,
     selectionEmpty,
     narrowSelection,
-    selling,
+    flying,
     shareable,
     selectRoutes,
     sideOf,

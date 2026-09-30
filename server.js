@@ -823,6 +823,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     crewTours: { type: [mongoose.Schema.Types.Mixed], default: [] },
     crewChallenges: { type: [mongoose.Schema.Types.Mixed], default: [] },
     crewCodeshareOpen: { type: Boolean, default: true },
+    // Codeshares with airlines NOT on this platform — their crew centre is
+    // vAMSYS, phpVMS, a sheet… Each carries the address we read their routes
+    // from and the private token of the feed they read ours from. Mixed, like
+    // the rest of this family: crewExternal.js owns and re-cleans the shape.
+    crewExternalPartners: { type: [mongoose.Schema.Types.Mixed], default: [] },
     // ------------------------------------------------------------------------
     // THE AIRLINE'S OWN LOOK (crewDesign.js). The artwork library, where each
     // picture goes (hero, backdrop, section covers, the showcase), the theme
@@ -7067,6 +7072,15 @@ const crewNetwork = require('./crewNetworkRoutes')(app, {
 // A function declaration so the route handlers above can call it; by the time
 // any request arrives the registration below has run.
 function codeshareRoutesChanged(va) { try { crewNetwork.routesChanged(va); } catch { /* never fail a route edit over a partner */ } }
+
+// Codeshares with airlines whose crew centre is somewhere else: their feed in,
+// ours out, re-read every six hours. See crewExternalRoutes.js.
+const crewExternalRoutes = require('./crewExternalRoutes')(app, {
+    mongoose, VirtualAirlineAd, resolveCrewVa, resolveCrewStore, requireCap, crewFail,
+    cleanRoute, publicRoute, eachLimited, crewCsv, crewWebhookUrlFor, postCrewNotice,
+    transport: axios, SITE_ORIGIN,
+});
+crewExternalRoutes.startAutoSync();
 
 // The airline's own look: artwork, section covers, theme file, interface.
 // See crewDesignRoutes.js.

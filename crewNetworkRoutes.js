@@ -4,7 +4,7 @@
  * crewNetworkRoutes.js
  * The HTTP half of four things that grow a VA's network beyond its own metal:
  *
- *   CODESHARE AGREEMENTS  one crew centre asking another to sell each other's
+ *   CODESHARE AGREEMENTS  one crew centre asking another to fly each other's
  *                         flights, and the sync that keeps the copies true
  *                         (crewCodeshare.js holds the rules)
  *   TOURS & CHALLENGES    what the airline sets its pilots to fly
@@ -82,7 +82,7 @@ module.exports = function registerCrewNetwork(app, deps) {
         toSlug: { type: String, lowercase: true, trim: true, index: true },
         toName: String, toLogo: String, toCallsign: String,
         status: { type: String, enum: crewCodeshare.STATUSES, default: 'pending', index: true },
-        // What each side sells of the OTHER side's network, and the most the
+        // What each side flies of the OTHER side's network, and the most the
         // owning side allows it to. See narrowSelection.
         fromTakes: selectionShape, fromLimit: selectionShape,
         toTakes: selectionShape, toLimit: selectionShape,
@@ -150,7 +150,7 @@ module.exports = function registerCrewNetwork(app, deps) {
             let source = [];
             if (doc.status === 'active') {
                 const { store: src } = await resolveCrewStore(sourceSlug);
-                source = crewCodeshare.selectRoutes(await src.listRoutes({ activeOnly: true }), crewCodeshare.selling(doc, side));
+                source = crewCodeshare.selectRoutes(await src.listRoutes({ activeOnly: true }), crewCodeshare.flying(doc, side));
             }
             const [existing, health] = await Promise.all([
                 taker.listRoutes({ limit: 5000 }),
@@ -183,7 +183,7 @@ module.exports = function registerCrewNetwork(app, deps) {
                 if (takerCard) {
                     tell(takerCard._id, {
                         title: `🔁 Codeshare with ${partner.name} updated`,
-                        description: 'Their network changed, so the flights you sell on it did too.',
+                        description: 'Their network changed, so the codeshares your pilots fly on it did too.',
                         color: 0x0EA5E9,
                         fields: [
                             { name: 'Added', value: String(done.created), inline: true },
@@ -343,7 +343,7 @@ module.exports = function registerCrewNetwork(app, deps) {
         };
     }
 
-    // ---- What a partner would let you sell ----
+    // ---- What a partner would let your pilots fly ----
     //
     // Only their own published legs — see crewCodeshare.shareable. The whole
     // public network is already on their crew centre for anybody to read, so
@@ -399,7 +399,7 @@ module.exports = function registerCrewNetwork(app, deps) {
                 fromVa: me._id, fromSlug: a.slug, fromName: a.name, fromLogo: a.logo, fromCallsign: a.callsign,
                 toVa: them._id, toSlug: b.slug, toName: b.name, toLogo: b.logo, toCallsign: b.callsign,
                 status: 'pending',
-                // What I asked to sell of theirs — capped, until they answer,
+                // What I asked to fly of theirs — capped, until they answer,
                 // at exactly that. They set the real ceiling when they accept.
                 fromTakes: take, fromLimit: take,
                 // What I offered them of mine: the ceiling, and by default what
@@ -416,7 +416,7 @@ module.exports = function registerCrewNetwork(app, deps) {
                 ].filter(Boolean).join('\n\n'),
                 color: 0xF59E0B,
                 fields: [
-                    { name: 'They would sell', value: take.mode === 'all' ? 'All of your routes' : take.mode === 'none' ? 'None of your routes' : `${take.routeIds.length} of your routes`, inline: true },
+                    { name: 'They would fly', value: take.mode === 'all' ? 'All of your routes' : take.mode === 'none' ? 'None of your routes' : `${take.routeIds.length} of your routes`, inline: true },
                     { name: 'They offer you', value: offer.mode === 'all' ? 'Their whole network' : offer.mode === 'none' ? 'Nothing in return' : `${offer.routeIds.length} of their routes`, inline: true },
                 ],
             });
@@ -437,10 +437,10 @@ module.exports = function registerCrewNetwork(app, deps) {
 
     // ---- Accepting (the airline that was asked) ----
     //
-    // `take`  — which of the asking airline's routes WE will sell, inside what
+    // `take`  — which of the asking airline's routes OUR pilots will fly, inside what
     //           they offered.
-    // `offer` — which of OUR routes they may sell. Anything we leave out of
-    //           their request is simply not sold.
+    // `offer` — which of OUR routes they may fly. Anything we leave out of
+    //           their request simply stays ours alone.
     app.post('/api/crew/:slug/codeshare/:id/accept', async (req, res) => {
         const gate = await requireCap(req, req.params.slug, 'routes.manage');
         if (gate.error) return denied(res, gate);
@@ -457,7 +457,7 @@ module.exports = function registerCrewNetwork(app, deps) {
             // What we want of theirs: by default, everything they offered.
             if (body.take !== undefined) doc.toTakes = crewCodeshare.cleanSelection(body.take);
             const plain = doc.toObject();
-            if (crewCodeshare.selectionEmpty(crewCodeshare.selling(plain, 'from')) && crewCodeshare.selectionEmpty(crewCodeshare.selling(plain, 'to'))) {
+            if (crewCodeshare.selectionEmpty(crewCodeshare.flying(plain, 'from')) && crewCodeshare.selectionEmpty(crewCodeshare.flying(plain, 'to'))) {
                 return res.status(400).json({ error: 'That would share nothing either way. Tick at least one route, or decline instead.' });
             }
             doc.status = 'active';
@@ -471,8 +471,8 @@ module.exports = function registerCrewNetwork(app, deps) {
                 description: [doc.reply ? `“${doc.reply}”` : '', 'Their flights are on your network now, marked as codeshares.'].filter(Boolean).join('\n\n'),
                 color: 0x16A34A,
                 fields: [
-                    { name: 'You now sell', value: String(sync.from.routes), inline: true },
-                    { name: 'They now sell', value: String(sync.to.routes), inline: true },
+                    { name: 'Your pilots now fly', value: String(sync.from.routes), inline: true },
+                    { name: 'Theirs now fly', value: String(sync.to.routes), inline: true },
                 ],
             });
             const fresh = await CrewCodeshare.findById(doc._id).lean();
@@ -524,8 +524,8 @@ module.exports = function registerCrewNetwork(app, deps) {
 
     // ---- Changing an active agreement — either side, its own half ----
     //
-    // `take`  narrows or widens what I sell of theirs, inside what they allow.
-    // `offer` changes what I allow them to sell of mine; their selection is
+    // `take`  narrows or widens what my pilots fly of theirs, inside what they allow.
+    // `offer` changes what I allow them to fly of mine; their selection is
     //         held inside it at once, and their copies follow.
     app.patch('/api/crew/:slug/codeshare/:id', async (req, res) => {
         const gate = await requireCap(req, req.params.slug, 'routes.manage');
@@ -566,7 +566,7 @@ module.exports = function registerCrewNetwork(app, deps) {
     // ---- Ending ----
     //
     // Either side may end it. The copies go from BOTH networks, because a
-    // codeshare nobody agreed to any more is a flight sold on somebody else's
+    // codeshare nobody agreed to any more is a flight flown on somebody else's
     // metal without their say. `keepRoutes` keeps THIS side's copies as
     // ordinary codeshares — unlinked, and no longer followed — for the airline
     // that wants to wind down on its own timetable. The other side's copies go
