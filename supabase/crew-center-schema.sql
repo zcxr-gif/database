@@ -531,6 +531,23 @@ create index if not exists crew_routes_kind_idx on crew_routes (va_slug, kind) w
 -- searched by.
 alter table crew_routes add column if not exists departure_gate text not null default '';
 alter table crew_routes add column if not exists arrival_gate   text not null default '';
+-- v23. Which partner airline a codeshare came from, and which of ITS routes.
+--
+-- A codeshare agreed through the crew centre (Routes → Codeshare → Request) is
+-- a copy of a leg in another VA's network. These two columns are what keep the
+-- copy honest: when the partner renumbers a flight, swaps the aircraft or drops
+-- the leg, the next sync finds this row by `source_route_id` and follows it,
+-- instead of leaving a codeshare on sale for a flight nobody operates any more.
+--
+-- `partner_slug` is the partner's crew-centre handle; `source_route_id` is the
+-- id of the route in THEIR project. Neither is a foreign key — the row it points
+-- at lives in somebody else's database — and both default to empty, which is
+-- every codeshare typed in by hand and every route the airline flies itself.
+-- Ending an agreement removes the rows that carry the partner's slug, and only
+-- those: a codeshare the VA added by hand is theirs and is never touched.
+alter table crew_routes add column if not exists partner_slug    text not null default '';
+alter table crew_routes add column if not exists source_route_id text not null default '';
+create index if not exists crew_routes_partner_idx on crew_routes (va_slug, partner_slug) where partner_slug <> '';
 
 -- ----------------------------------------------------------------------------
 -- Flight reports. Either captured automatically from a linked pilot's real
@@ -2443,5 +2460,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 22)
+insert into crew_schema_info (id, version) values (1, 23)
 on conflict (id) do update set version = excluded.version, updated_at = now();

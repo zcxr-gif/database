@@ -141,7 +141,7 @@ const ROUTES_SPEC = {
         // rank, so these belong in the file rather than being twenty clicks
         // afterwards.
         { key: 'kind', header: 'kind', aliases: ['type'], type: 'enum', values: ['own', 'codeshare'], default: 'own' },
-        { key: 'partnerName', header: 'partnerName', aliases: ['partner', 'operator'], type: 'text', max: 60 },
+        { key: 'partnerName', header: 'partnerName', aliases: ['partner', 'operator', 'operatedby', 'operatingairline', 'operatingcarrier', 'carrier', 'airline', 'partnerairline'], type: 'text', max: 60 },
         { key: 'partnerLogo', header: 'partnerLogo', aliases: ['partnerlogourl', 'logo'], type: 'text', max: 600 },
         // Named, not numeric: the VA's own rank names are what they think in,
         // and the hours behind them are set once on the ladder.
