@@ -1370,7 +1370,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero', 'ui'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             // Openings ride with the team, not with recruitment. A job advert
             // for a staff role points AT a staff role and hands out its
@@ -1447,6 +1447,16 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                     return res.status(400).json({ error: 'Unknown way of opening topics.' });
                 }
                 ad.crewTopicMode = mode;
+            }
+            // Which interface the crew sees first. The dashboard's picker has
+            // always sent this; until now nothing stored it, so the choice
+            // lived only on the owner's own device. See crewDesign.UIS.
+            if (typeof req.body?.ui === 'string') {
+                const ui = req.body.ui.toLowerCase();
+                if (!['essential', 'aurora', 'airline'].includes(ui)) {
+                    return res.status(400).json({ error: 'Unknown interface.' });
+                }
+                ad.crewUi = ui;
             }
             if (typeof req.body?.loginLook === 'string') {
                 const look = req.body.loginLook.toLowerCase();

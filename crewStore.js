@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 22;
+const EXPECTED_SCHEMA_VERSION = 23;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -188,6 +188,14 @@ const STAFF_APPS_SCHEMA_VERSION = 20;
 // door it has nowhere to record anybody walking through.
 const QUIZZES_SCHEMA_VERSION = 22;
 
+// The version that added crew_routes.partner_slug and source_route_id — what
+// ties a codeshare to the partner route it was copied from. NOT a feature
+// constant in the mould of quizzes: a v22 project still receives a partner's
+// routes, and still lists them as codeshares. What it cannot do is REMEMBER
+// which route each one came from, so the columns sit in LATE_COLUMNS and the
+// sync falls back to matching on flight number and airports. See crewCodeshare.js.
+const CODESHARE_LINK_SCHEMA_VERSION = 23;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -218,7 +226,7 @@ const LATE_COLUMNS = {
     // the route is still the route, flown between the same two airports. Exactly
     // the test in the note above, and the reason the stands are droppable where
     // the Discord columns below are not.
-    crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank', 'departure_gate', 'arrival_gate']),
+    crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank', 'departure_gate', 'arrival_gate', 'partner_slug', 'source_route_id']),
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id', 'edited_at', 'edited_by']),
@@ -282,6 +290,8 @@ const DRIFT_LABELS = {
     'crew_routes.min_rank': 'rank-gated routes',
     'crew_routes.departure_gate': 'the gates a route is flown between',
     'crew_routes.arrival_gate': 'the gates a route is flown between',
+    'crew_routes.partner_slug': 'codeshares that follow the partner’s own changes',
+    'crew_routes.source_route_id': 'codeshares that follow the partner’s own changes',
     // No crew_accounts.discord_* here: they are not droppable, so nothing can
     // ever report them as dropped. See LATE_COLUMNS.
     'crew_accounts.portal_account_id': 'a staff member’s own pilot account',
@@ -556,6 +566,10 @@ const routeFromRow = (r) => r && {
     // and the common case — gate-to-gate is something an airline opts into.
     departureGate: r.departure_gate || '',
     arrivalGate: r.arrival_gate || '',
+    // v23. Empty on every route that is not a codeshare agreed through the
+    // crew centre. See the columns' note in the schema.
+    partnerSlug: r.partner_slug || '',
+    sourceRouteId: r.source_route_id || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -582,6 +596,10 @@ const routeToRow = (r) => {
     // pattern strict enough to be useful would reject somebody's real terminal.
     pick(r, out, 'departureGate', 'departure_gate', (v) => str(v, 12));
     pick(r, out, 'arrivalGate', 'arrival_gate', (v) => str(v, 12));
+    // v23. A slug is our own alphabet; a source id is the partner project's
+    // uuid. Both are bounded rather than validated — neither is shown to anyone.
+    pick(r, out, 'partnerSlug', 'partner_slug', (v) => str(v, 80).toLowerCase());
+    pick(r, out, 'sourceRouteId', 'source_route_id', (v) => str(v, 64));
     return out;
 };
 
@@ -3010,6 +3028,12 @@ class SupabaseStore {
                 // older project is told the quizzes cannot run at all rather
                 // than being handed a lock whose key it cannot record.
                 quizzes: version >= QUIZZES_SCHEMA_VERSION,
+                // v23. Whether codeshares agreed with another crew centre can
+                // remember which partner route each one is. Not a gate — the
+                // agreement works either way — but the codeshare panel says so,
+                // because without it a partner's renumbered flight arrives as a
+                // new leg beside the old one rather than as an edit.
+                codeshareLinks: version >= CODESHARE_LINK_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -3814,5 +3838,6 @@ module.exports = {
     LEAVE_SCHEMA_VERSION,
     SHOP_SCHEMA_VERSION,
     STAFF_APPS_SCHEMA_VERSION,
+    CODESHARE_LINK_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

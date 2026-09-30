@@ -800,6 +800,43 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         default: [],
     },
 
+    // ------------------------------------------------------------------------
+    // HUBS the airline declares (crewNetworkRoutes.js). [{ icao, name, kind }],
+    // kind 'hub' | 'focus'. Empty means "work them out from the route map", which
+    // is what the public feed did before a VA could say.
+    //
+    // TOURS and CHALLENGES (crewGoals.js). Config, like the quizzes above: the
+    // airline describing what it wants flown. Progress is never stored — it is
+    // computed from approved flights on every read — so there is nothing about
+    // them in the VA's own project and no database update to run first.
+    //
+    // Mixed rather than declared sub-schemas, for the reason the crewFleet note
+    // spells out: mongoose silently drops any path a sub-schema forgot to
+    // declare, and both shapes are owned and re-sanitised on every read by
+    // their modules, which are the single place that knows them.
+    //
+    // crewCodeshareOpen: whether other airlines may send this one codeshare
+    // requests. The agreements themselves are their own collection
+    // (CrewCodeshare) because each belongs to two airlines at once.
+    // ------------------------------------------------------------------------
+    crewHubs: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    crewTours: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    crewChallenges: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    crewCodeshareOpen: { type: Boolean, default: true },
+    // ------------------------------------------------------------------------
+    // THE AIRLINE'S OWN LOOK (crewDesign.js). The artwork library, where each
+    // picture goes (hero, backdrop, section covers, the showcase), the theme
+    // file (colours, fonts, radius, gradient, sanitised custom CSS) and which
+    // interface the crew sees first. Mixed for the reason crewTours is: each
+    // is owned and re-sanitised on every read by the one module that knows it.
+    // `crewUi` is what the dashboard's interface picker has always sent as
+    // `ui` — and nothing ever stored until now.
+    // ------------------------------------------------------------------------
+    crewArtwork: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    crewArt: { type: mongoose.Schema.Types.Mixed, default: null },
+    crewTheme: { type: mongoose.Schema.Types.Mixed, default: null },
+    crewUi: { type: String, default: '' },
+
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
     // capture and its hours roll straight onto the roster.
@@ -1594,6 +1631,10 @@ const CrewRouteSchema = new mongoose.Schema({
     partnerName: { type: String, trim: true, default: '' },
     partnerLogo: { type: String, trim: true, default: '' },
     minRank:     { type: String, trim: true, default: '' },
+    // v23 mirror — which partner crew centre a codeshare was copied from, and
+    // which of its routes. See crewCodeshare.js.
+    partnerSlug:   { type: String, trim: true, lowercase: true, default: '' },
+    sourceRouteId: { type: String, trim: true, default: '' },
 }, { timestamps: true });
 const CrewRoute = mongoose.models.CrewRoute || mongoose.model('CrewRoute', CrewRouteSchema);
 
@@ -4940,11 +4981,14 @@ app.get('/api/crew/:slug/awards', async (req, res) => {
         const { store } = await resolveCrewStore(req.params.slug);
         const viewer = await crewViewer(req, store);
         const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        const va = await resolveCrewVa(req.params.slug);
         if (!myId) {
             // Staff, or a pilot whose login has never been linked to a roster
             // row. The shelf of things to come is a better answer to "what are
-            // awards?" than an empty panel, so it is still sent.
-            return res.json({ catalog: crewAwards.catalog(), earned: [], progress: {}, forName: '' });
+            // awards?" than an empty panel, so it is still sent — tours and
+            // challenges included, so the shelf says what the airline has set.
+            const goals = await crewNetwork.goalAwardsFor(va && va._id, []);
+            return res.json({ catalog: [...crewAwards.catalog(), ...goals.catalog], earned: [], progress: {}, forName: '' });
         }
         const member = await store.getMember(myId);
         // Every report, not only the approved ones: crewAwards filters, and
@@ -4952,10 +4996,13 @@ app.get('/api/crew/:slug/awards', async (req, res) => {
         // trips to answer one question.
         const pireps = await store.listPirepsForMember(myId, { limit: 5000 });
         const { earned, progress } = crewAwards.forMember({ member, pireps });
+        // A finished tour or a personal challenge is an award like any other,
+        // on the same shelf. See goalAwards in crewGoals.js.
+        const goals = await crewNetwork.goalAwardsFor(va && va._id, crewAwards.ownApproved(pireps, member));
         res.json({
-            catalog: crewAwards.catalog(),
-            earned,
-            progress,
+            catalog: [...crewAwards.catalog(), ...goals.catalog],
+            earned: [...earned, ...goals.earned],
+            progress: { ...progress, ...goals.progress },
             forName: (member && (member.name || member.callsign)) || '',
         });
     } catch (err) { crewFail(res, err, { log: 'awards read error', message: 'Those could not be counted up.' }); }
@@ -5011,7 +5058,10 @@ app.get('/api/crew/:slug/me/badges', async (req, res) => {
 
         const rank = crewRanks.memberRank(va.ranks, member.hours, member.checksPassed);
         const club = crewClubs.memberClub(clubsFor(va), member.hours);
-        const { earned } = crewAwards.forMember({ member, pireps });
+        const { earned: flown } = crewAwards.forMember({ member, pireps });
+        // Tours finished and challenges won sit in the row with the rest.
+        const goals = await crewNetwork.goalAwardsFor(va._id, crewAwards.ownApproved(pireps, member));
+        const earned = [...flown, ...goals.earned];
 
         res.set('Cache-Control', 'no-store');
         res.json({
@@ -5022,7 +5072,7 @@ app.get('/api/crew/:slug/me/badges', async (req, res) => {
                 // holdings above depend on there being a shop.
                 club,
                 earned,
-                catalog: crewAwards.catalog(),
+                catalog: [...crewAwards.catalog(), ...goals.catalog],
                 orders,
                 items: items.map(crewShop.publicItem),
             }),
@@ -5949,7 +5999,22 @@ const cleanRoute = (b) => {
         // at 12 characters, which holds the longest real one ("PIER C 51").
         departureGate: gateName(b.departureGate),
         arrivalGate: gateName(b.arrivalGate),
+        // v23. The link back to a partner crew centre's own route. Carried on a
+        // codeshare and cleared on anything else, like the partner details
+        // above — a leg the airline now flies itself is not somebody else's to
+        // renumber. Handlers never take these from a request body: they come
+        // from the stored row or from the codeshare sync, and nowhere else
+        // (see stripLink below).
+        partnerSlug: kind === 'codeshare' ? String(b.partnerSlug || '').trim().toLowerCase().slice(0, 80) : '',
+        sourceRouteId: kind === 'codeshare' ? String(b.sourceRouteId || '').trim().slice(0, 64) : '',
     };
+};
+// What a browser may NOT set on a route. A link is written by the codeshare
+// sync alone; a body that could claim one could have another airline's sync
+// delete the row, or make a hand-typed leg look like an agreed one.
+const stripLink = (b) => {
+    const { partnerSlug, sourceRouteId, ...rest } = b || {};
+    return rest;
 };
 // Shared by the route handlers and the CSV import, so a gate typed into a
 // spreadsheet lands the same way as one typed into the form.
@@ -5971,6 +6036,10 @@ const publicRoute = (r, ranks, viewer) => {
         // part of what the leg IS, and a pilot working toward a rank should be
         // able to see the whole of the flight they are working toward.
         departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
+        // v23. The partner's crew-centre handle when this codeshare was agreed
+        // through the crew centre, so a tile can link to the airline that
+        // actually flies it. Empty on everything else.
+        partnerSlug: r.kind === 'codeshare' ? (r.partnerSlug || '') : '',
         locked,
         // How much further this particular pilot has to fly. Shown rather than
         // hidden on purpose: "unlocks in 12h" is the thing that makes a rank
@@ -6093,9 +6162,9 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
         // crewStore.SELECT deliberately does not carry the partner list — every
         // crew request would pay for it. Fetched here, where it is used, the same
         // way the fleet is fetched for PIREP matching further down.
-        const declaredPartners = await VirtualAirlineAd.findById(va._id)
-            .select('crewPartners').lean()
-            .then((d) => (d && d.crewPartners) || []).catch(() => []);
+        const networkDoc = await VirtualAirlineAd.findById(va._id)
+            .select('crewPartners crewHubs').lean().catch(() => null);
+        const declaredPartners = (networkDoc && networkDoc.crewPartners) || [];
         const routes = await store.listRoutes();
         const viewer = await crewViewer(req, store);
         const out = routes.map((r) => publicRoute(r, va.ranks, viewer));
@@ -6117,6 +6186,9 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
             // on Delta's metal?"), and grouping it here means the front end
             // only has to draw it.
             partners: codesharePartners(out, declaredPartners),
+            // Where the airline says it is based. Empty when it has not said,
+            // and the map and the feed then work it out as they always have.
+            hubs: crewNetwork.hubsOf(networkDoc),
             // So a pilot's route list can say "unlocks at First Officer" using
             // the VA's own words rather than an hours figure.
             ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
@@ -6480,8 +6552,9 @@ app.post('/api/crew/:slug/routes', async (req, res) => {
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const r = await store.createRoute(cleanRoute(req.body));
+        const r = await store.createRoute(cleanRoute(stripLink(req.body)));
         postRouteNotice(va, 'added', r, gate.p);
+        codeshareRoutesChanged(va);
         res.status(201).json(withDrift(store, { route: publicRoute(r, va.ranks, null) }));
     } catch (err) { crewFail(res, err, { log: 'route add error', message: 'Could not add the route.' }); }
 });
@@ -6492,8 +6565,9 @@ app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const existing = await store.getRoute(req.params.id);
         if (!existing) return res.status(404).json({ error: 'Route not found.' });
-        const r = await store.updateRoute(req.params.id, cleanRoute({ ...existing, ...req.body }));
+        const r = await store.updateRoute(req.params.id, cleanRoute({ ...existing, ...stripLink(req.body) }));
         postRouteNotice(va, 'updated', r, gate.p, existing);
+        codeshareRoutesChanged(va);
         res.json(withDrift(store, { route: publicRoute(r, va.ranks, null) }));
     } catch (err) { crewFail(res, err, { log: 'route edit error', message: 'Could not update the route.' }); }
 });
@@ -6507,6 +6581,7 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
         const existing = await store.getRoute(req.params.id).catch(() => null);
         await store.deleteRoute(req.params.id);
         if (existing) postRouteNotice(va, 'removed', existing, gate.p);
+        codeshareRoutesChanged(va);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
@@ -6722,26 +6797,15 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'roster import error', message: 'Could not import the roster.' }); }
 });
 
-app.get('/api/crew/:slug/routes.csv', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'routes.manage');
-    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
-    try {
-        const { store } = await resolveCrewStore(req.params.slug);
-        const routes = await store.listRoutes();
-        // Every column the spec defines, including the v5 ones. Leaving them out
-        // wrote a file whose `kind` and `minRank` cells were blank, and blank is
-        // a value on the way back in — a VA who exported their network and
-        // re-imported it unedited would have turned every codeshare into an own
-        // route and dropped every rank gate. Export what import reads.
-        sendCsv(req, res, req.params.slug, 'routes', crewCsv.ROUTES_SPEC, (routes || []).map((r) => ({
-            id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
-            aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
-            kind: r.kind || 'own', partnerName: r.partnerName || '',
-            partnerLogo: r.partnerLogo || '', minRank: r.minRank || '',
-            departureGate: r.departureGate || '', arrivalGate: r.arrivalGate || '',
-        })));
-    } catch (err) { crewFail(res, err, { log: 'routes export error', message: 'Could not export the routes.' }); }
-});
+// Every column the spec defines, including the v5 ones. Leaving them out wrote
+// a file whose `kind` and `minRank` cells were blank, and blank is a value on
+// the way back in — a VA who exported their network and re-imported it
+// unedited would have turned every codeshare into an own route and dropped
+// every rank gate. Export what import reads.
+//
+// The query takes the slicing options too — `scope`, `partner`, `ids`,
+// `combined` — see EXPORTS in crewNetworkRoutes.js, which does the work.
+app.get('/api/crew/:slug/routes.csv', (req, res) => crewNetwork.sendExport(req, res, req.query));
 
 app.post('/api/crew/:slug/routes/import', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
@@ -6759,9 +6823,12 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
             })),
             create: (values) => store.createRoute(cleanRoute(values)),
             update: (id, values, before) => store.updateRoute(id, cleanRoute({ ...before, ...values })),
+            // A sheet with an `operator` column — several airlines in one file —
+            // sorts itself into own legs and codeshares. See importPrepare.
+            prepare: await crewNetwork.importPrepare(va),
             // One notice for the whole file. Posting per row would rate-limit a
             // VA importing a 200-route network and bury everything else.
-            onDone: (summary) => postRouteImportNotice(va, summary, gate.p),
+            onDone: (summary) => { postRouteImportNotice(va, summary, gate.p); codeshareRoutesChanged(va); },
         });
     } catch (err) { crewFail(res, err, { log: 'routes import error', message: 'Could not import the routes.' }); }
 });
@@ -6877,7 +6944,7 @@ app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
         // use, so a library route cannot reach the database in a shape a typed
         // one could not.
         const rows = incoming.map((r, i) => {
-            const values = cleanRoute({ ...r, active: publish });
+            const values = cleanRoute(stripLink({ ...r, active: publish }));
             return {
                 line: i + 1,
                 id: '',
@@ -6973,16 +7040,39 @@ app.post('/api/crew/:slug/routes/library-import', async (req, res) => {
             }
         }
         for (const row of plan.update) {
-            try { await store.updateRoute(row.id, cleanRoute({ ...row.before, ...row.values })); updated++; } catch (err) {
+            try { await store.updateRoute(row.id, cleanRoute({ ...row.before, ...stripLink(row.values) })); updated++; } catch (err) {
                 failures.push({ line: row.line, message: err?.message || 'Could not update this route.' });
             }
         }
         // One notice for the whole import, like the CSV path — a VA pulling in
         // four hundred legs must not post four hundred announcements.
         try { postRouteImportNotice(va, { ...summary, created, updated }, gate.p); } catch { /* never fail an import over a notice */ }
+        codeshareRoutesChanged(va);
 
         res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures }));
     } catch (err) { crewFail(res, err, { log: 'route library import error', message: 'Could not import those routes.' }); }
+});
+
+/* ---------------------------------------------------------------------------
+ * Codeshare agreements, tours & challenges, hubs and network exports.
+ * See crewNetworkRoutes.js — registered here, beside the route network they
+ * all grow out of, with the same helpers every crew route uses.
+ * ------------------------------------------------------------------------- */
+const crewNetwork = require('./crewNetworkRoutes')(app, {
+    mongoose, VirtualAirlineAd, crewStore, crewCsv, crewRanks,
+    resolveCrewVa, resolveCrewStore, requireCap, crewFail, withDrift, crewViewer,
+    cleanRoute, publicRoute, eachLimited, crewWebhookUrlFor, postCrewNotice, SITE_ORIGIN,
+});
+// A route changed on this airline: the partners that sell it follow, shortly.
+// A function declaration so the route handlers above can call it; by the time
+// any request arrives the registration below has run.
+function codeshareRoutesChanged(va) { try { crewNetwork.routesChanged(va); } catch { /* never fail a route edit over a partner */ } }
+
+// The airline's own look: artwork, section covers, theme file, interface.
+// See crewDesignRoutes.js.
+const crewDesignRoutes = require('./crewDesignRoutes')(app, {
+    VirtualAirlineAd, resolveCrewVa, requireCap, crewFail,
+    upload, s3Client, uploadVaImageMeta, deleteVaImage,
 });
 
 // ---- The noticeboard ----
@@ -18362,7 +18452,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -18473,6 +18563,14 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             // them flies. Sent with the branding because the crew centre, the
             // public feed and a hosted site all draw partner tiles from it.
             partners: Array.isArray(ad.crewPartners) ? ad.crewPartners : [],
+            // Where the airline is based, when it has said. Public for the same
+            // reason the fleet is: the feed and a hosted site draw it.
+            hubs: crewNetwork.hubsOf(ad),
+            // The airline's own look: theme (null when unset, so crewBrand
+            // changes nothing), where its pictures go, the artwork library and
+            // which interface the crew sees first. Public, because all of it
+            // is paint for a page anybody can open.
+            ...crewDesignRoutes.publicDesign(ad),
             // The Instagram wall. Public because it is the one part of the crew
             // center whose entire purpose is to be looked at by people who are
             // not in the crew — and because a VA's own website should be able
