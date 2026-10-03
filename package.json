@@ -30,7 +30,8 @@
     "test:codeshare": "node scripts/test-crew-codeshare.js",
     "test:goals": "node scripts/test-crew-goals.js",
     "test:design": "node scripts/test-crew-design.js",
-    "test:external": "node scripts/test-crew-external.js"
+    "test:external": "node scripts/test-crew-external.js",
+    "test:roster-sync": "node scripts/test-crew-roster-sync.js"
   },
   "keywords": [],
   "author": "Antony",

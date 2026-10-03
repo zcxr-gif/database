@@ -33,6 +33,7 @@ const { normalizeCardOptions } = require('./vaEventCard');
 // Shared roster helpers — same module the staff API uses, so a VA managing its
 // own roster and staff managing it see identical parsing/de-dupe/limits.
 const vaPilots = require('./vaPilots');
+const crewRosterSync = require('./crewRosterSync');
 // Single source of truth for the Terms version + the enforcement ladder, shared
 // with the Discord bot and the public Terms page so nothing drifts.
 const {
@@ -1605,6 +1606,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         try {
             if (!rosterReady(res)) return;
             if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            // Brings the list into line with the crew center roster (both
+            // ways) before it is shown — at most every few minutes per VA, and
+            // never holding the page longer than a few seconds.
+            await crewRosterSync.reconcileIfDue(req.portal.vaAdId);
             const out = await vaPilots.listPilots(VaPilot, req.portal.vaAdId, {
                 q: req.query.q, limit: req.query.limit, skip: req.query.skip,
             });
@@ -1626,11 +1631,13 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const input = (req.body && (req.body.usernames !== undefined ? req.body.usernames : req.body.username));
             const who = req.portal.displayName || req.portal.username;
             const out = await vaPilots.addPilots(VaPilot, req.portal.vaAdId, input, who);
+            const sync = await crewRosterSync.pushAdds(req.portal.vaAdId, input);
             logActivity({
                 vaAdId: ad._id, vaName: ad.name, actorName: who, actorRole: req.portal.role,
                 action: 'pilots.add', detail: `Added ${out.added} pilot${out.added === 1 ? '' : 's'} (skipped ${out.skipped})`,
             });
-            res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out });
+            const synced = sync.created ? ` ${sync.created} added to your crew center.` : '';
+            res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.${synced}`, ...out, crewCenter: sync });
         } catch (err) {
             console.error('VA portal pilots add error:', err);
             res.status(500).json({ error: 'Could not add pilots.' });
@@ -1643,7 +1650,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (!rosterReady(res)) return;
             if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
             const out = await vaPilots.removePilot(VaPilot, req.portal.vaAdId, req.params.pilotId);
-            res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out });
+            const sync = out.username ? await crewRosterSync.pushRemovals(req.portal.vaAdId, [out.username]) : null;
+            const message = !out.removed ? 'Pilot not found.'
+                : (sync && sync.purged ? 'Pilot removed here and from your crew center.' : 'Pilot removed.');
+            res.json({ message, ...out, crewCenter: sync });
         } catch (err) {
             console.error('VA portal pilots remove error:', err);
             res.status(500).json({ error: 'Could not remove the pilot.' });
@@ -1656,7 +1666,11 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (!rosterReady(res)) return;
             if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
             const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('name').lean();
+            const names = await crewRosterSync.portalUsernames(req.portal.vaAdId);
             const out = await vaPilots.clearPilots(VaPilot, req.portal.vaAdId);
+            // The crew center follows, pilot by pilot — one request per table
+            // per pilot, so it runs on after this replies.
+            crewRosterSync.pushRemovals(req.portal.vaAdId, names).catch(() => {});
             if (ad) logActivity({
                 vaAdId: ad._id, vaName: ad.name,
                 actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,

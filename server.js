@@ -84,6 +84,7 @@ const vaStats = require('./vaStats');
 // the two backends (their Postgres, or our legacy managed collections for VAs
 // that have not migrated yet) is answering. See crewStore.js.
 const crewStore = require('./crewStore');
+const crewRosterSync = require('./crewRosterSync');
 const { resolveGrade } = require('./ifGrade');
 
 // Pilot logins. A pilot's account is the VA's data like their hours are, so it
@@ -2899,6 +2900,11 @@ VaPilotSchema.index({ vaAdId: 1, usernameLower: 1 }, { unique: true });
 // index rather than riding the compound one above.
 VaPilotSchema.index({ usernameLower: 1 });
 const VaPilot = mongoose.models.VaPilot || mongoose.model('VaPilot', VaPilotSchema);
+// The portal list and the crew center roster are one list kept in two places:
+// every crew center roster change is carried over to VaPilot here, and the
+// roster routes push the other way. See crewRosterSync.js.
+crewRosterSync.configure({ VaPilot, VirtualAirlineAd });
+crewStore.onRosterChange(crewRosterSync.onCrewRosterChange);
 
 /* =========================
  * VA PARTNERSHIP TERMS ACCEPTANCE
@@ -19623,7 +19629,8 @@ app.post('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
         const input = (req.body && (req.body.usernames !== undefined ? req.body.usernames : req.body.username));
         const who = (req.staff && (req.staff.displayName || req.staff.username)) || 'staff';
         const out = await vaPilots.addPilots(VaPilot, ad._id, input, who);
-        res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out });
+        const sync = await crewRosterSync.pushAdds(ad._id, input);
+        res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out, crewCenter: sync });
     } catch (error) {
         console.error('VA Ad pilots add error:', error);
         res.status(500).json({ message: 'Server error while adding pilots.' });
@@ -19636,7 +19643,8 @@ app.delete('/api/va-ads/:id/pilots/:pilotId', requireAuth, async (req, res) => {
         const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
         const out = await vaPilots.removePilot(VaPilot, ad._id, req.params.pilotId);
-        res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out });
+        const sync = out.username ? await crewRosterSync.pushRemovals(ad._id, [out.username]) : null;
+        res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out, crewCenter: sync });
     } catch (error) {
         console.error('VA Ad pilots remove error:', error);
         res.status(500).json({ message: 'Server error while removing the pilot.' });
@@ -19648,7 +19656,11 @@ app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const names = await crewRosterSync.portalUsernames(ad._id);
         const out = await vaPilots.clearPilots(VaPilot, ad._id);
+        // Purging a whole crew center is one request per table per pilot, far
+        // longer than a reply should wait; it carries on after this answers.
+        crewRosterSync.pushRemovals(ad._id, names).catch(() => {});
         res.json({ message: `Cleared ${out.removed} pilot${out.removed === 1 ? '' : 's'}.`, ...out, total: 0 });
     } catch (error) {
         console.error('VA Ad pilots clear error:', error);
