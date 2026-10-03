@@ -105,6 +105,8 @@ const crewPasswordReset = require('./crewPasswordReset');
 const crewCsv = require('./crewCsv');
 // What the rank, role and joined columns of a roster from elsewhere mean here.
 const crewRosterCsv = require('./crewRosterCsv');
+// The setup guide's grading — what is done, what is next. See the module.
+const crewSetupGuide = require('./crewSetupGuide');
 const routeLibrary = require('./routeLibrary');
 
 // The VA's rank ladder. Rank is DERIVED from hours rather than stored, and it
@@ -14844,6 +14846,84 @@ app.get('/api/crew/:slug/stats', async (req, res) => {
 // ---- The VA's data store: health + migration ----
 // Is the VA's project reachable, provisioned and on the current schema? Backs
 // the tick (or the fix-this instruction) on the Settings → Data store screen.
+/* GET /api/crew/:slug/setup-guide  ->  crewSetupGuide.evaluate(...)
+ *
+ * Every setup step and how far along it is, graded from the VA's real data in
+ * one request so the guide never has to piece it together from eight. Any
+ * staff session may read it: it says what exists, never what is in it, and
+ * the dashboard only offers each action to someone allowed to take it.
+ *
+ * Never fails on the VA's database. An unreachable or half-built project is
+ * itself the answer to the first step, and every step that needs it reads
+ * "connect your database first" rather than the guide failing to draw.
+ */
+app.get('/api/crew/:slug/setup-guide', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const [hooks, staffAccounts] = await Promise.all([
+            VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl +crewWebhooks').lean().catch(() => null),
+            VaPortalAccount.countDocuments({ vaAdId: va._id, role: 'staff' }).catch(() => 0),
+        ]);
+
+        const storeState = { connected: crewStore.isConnected(va) };
+        let counts = null;
+        try {
+            const store = await crewStore.forVaOrNull(va);
+            const health = store ? await store.health() : null;
+            Object.assign(storeState, {
+                ok: !!(health && health.ok), provisioned: health ? health.provisioned !== false : false,
+                outdated: !!(health && health.outdated), error: health && !health.ok ? (health.error || health.message || '') : '',
+            });
+            if (store && health && health.ok) {
+                const [members, routes, accounts] = await Promise.all([
+                    store.listMembers().catch(() => []),
+                    store.listRoutes().catch(() => []),
+                    store.listAccounts().catch(() => []),
+                ]);
+                const byMember = new Map((accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a]));
+                const active = (members || []).filter((m) => m.status !== 'inactive');
+                counts = {
+                    members: (members || []).length,
+                    active: active.length,
+                    routes: (routes || []).length,
+                    withoutLogin: active.filter((m) => !byMember.has(String(m._id))).length,
+                    neverSignedIn: active.filter((m) => {
+                        const a = byMember.get(String(m._id));
+                        return a && !a.lastLoginAt && !a.portalAccountId;
+                    }).length,
+                };
+            }
+        } catch (err) {
+            storeState.ok = false;
+            storeState.error = err instanceof crewStore.CrewStoreError ? err.message : 'It did not answer.';
+        }
+
+        const out = crewSetupGuide.evaluate({
+            va: {
+                ...va,
+                crewWebhooks: (hooks && hooks.crewWebhooks) || {},
+                hasLegacyWebhook: !!(hooks && hooks.crewWebhookUrl),
+            },
+            store: storeState, counts, staffAccounts,
+        });
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ...out,
+            links: {
+                signIn: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`,
+                join: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}/join`,
+                // Absolute and from this request, for the reason the
+                // partnership route gives: the portal is served here, and the
+                // dashboard reading this is not.
+                vaPortal: `${`${req.protocol}://${req.get('host')}`.replace(/\/+$/, '')}/va-portal`,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew setup guide error', message: 'Could not load the setup guide.' }); }
+});
+
 app.get('/api/crew/:slug/store', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
