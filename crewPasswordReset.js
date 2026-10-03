@@ -263,6 +263,113 @@ function buildIssuedMessage({
 }
 
 // ---------------------------------------------------------------------------
+// Setup links. v22.
+//
+// A pilot who arrives on an IMPORTED roster has a login nobody has used, and
+// the old way to hand it over was a temporary password per pilot: twenty
+// passwords on a staff member's screen, pasted one at a time into twenty
+// Discord DMs, each one readable by anybody who sees the channel or the
+// screenshot. A setup link is the same machinery as a reset link — a hashed,
+// single-use token on the account — pointed at a pilot who has never had a
+// password rather than one who lost theirs. Nobody but the pilot ever knows
+// the password, because the pilot is the one who picks it.
+//
+// It lives longer than a reset link (days, not an hour) for the reason an
+// invitation does: it is handed over by a person, some time later, on
+// whatever channel reaches the pilot. It is still single-use, still replaced
+// by a newer one, and still dies the moment the password changes any other
+// way. `resetReason: 'setup'` is what tells the landing page to say "choose
+// your password" rather than "reset", and it never lands in the staff queue
+// because `resetNeedsStaff` stays false.
+// ---------------------------------------------------------------------------
+
+const SETUP_TTL_DAYS = (() => {
+    const n = parseInt(process.env.CREW_SETUP_TTL_DAYS, 10);
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 60) : 14;
+})();
+
+const SETUP = 'setup';
+
+/**
+ * Issue a setup link. With `keep` (a v24 project), the token is also kept
+ * readable as an INVITATION so staff can send it later, and any record of the
+ * previous one having been sent is cleared — it is a different link now.
+ */
+function setupPatch({ hash, token = '', keep = false }, now = new Date()) {
+    const out = {
+        resetTokenHash: String(hash || ''),
+        resetTokenExpiresAt: hash ? new Date(now.getTime() + SETUP_TTL_DAYS * 24 * 60 * MINUTE_MS) : null,
+        resetRequestedAt: null,
+        resetNeedsStaff: false,
+        resetReason: hash ? SETUP : '',
+    };
+    if (keep) Object.assign(out, { inviteLink: hash ? String(token || '') : '', inviteSentAt: null, inviteSentBy: '' });
+    return out;
+}
+
+const isSetup = (account) => !!account && account.resetReason === SETUP;
+
+/**
+ * The only correct way to ask "is there an invitation on this account?".
+ *
+ * The kept token is an invitation only while it is still THE link: it must
+ * hash to the stored hash, be a setup link, and be in date. A link replaced by
+ * a pilot's own reset request, used, or aged out is not one — whether or not
+ * anything got round to clearing the column — so a stale copy can never be
+ * shown to staff as something worth sending.
+ *
+ * @returns {{state: 'none'|'live'|'expired'|'claimed', token?: string,
+ *            expiresAt?: Date, sentAt?: Date|null, sentBy?: string}}
+ */
+function setupInvite(account, now = new Date()) {
+    if (!account) return { state: 'none' };
+    if (account.lastLoginAt) return { state: 'claimed' };
+    const token = String(account.inviteLink || '');
+    if (!token || !isSetup(account) || hashToken(token) !== String(account.resetTokenHash || '').toLowerCase()) {
+        return { state: 'none' };
+    }
+    const sent = { sentAt: asDate(account.inviteSentAt), sentBy: account.inviteSentBy || '' };
+    if (!isLive(account, now)) return { state: 'expired', expiresAt: asDate(account.resetTokenExpiresAt), ...sent };
+    return { state: 'live', token, expiresAt: asDate(account.resetTokenExpiresAt), ...sent };
+}
+
+/** Somebody copied it to send — or, with `sent: false`, did not after all. */
+const sentPatch = ({ sent = true, by = '' } = {}, now = new Date()) => (sent
+    ? { inviteSentAt: now, inviteSentBy: String(by || '').slice(0, 80) }
+    : { inviteSentAt: null, inviteSentBy: '' });
+
+/**
+ * The message a staff member pastes to a pilot whose login has just been set
+ * up. Plain text, like buildIssuedMessage, for the same reason. No password in
+ * it, which is the point: this one is safe to send in a channel somebody else
+ * can read, as long as the pilot uses it before anybody else does.
+ */
+function buildSetupMessage({
+    vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
+    password = '', signInUrl = '',
+} = {}) {
+    const who = String(name || '').trim();
+    const va = String(vaName || '').trim() || 'the crew';
+    const until = asDate(expiresAt);
+    const lines = [];
+    lines.push(who ? `${who} — your ${va} crew center login is ready.` : `Your ${va} crew center login is ready.`);
+    lines.push('');
+    if (username) lines.push(`  Username: ${username}`);
+    if (callsign) lines.push(`  Callsign: ${callsign}`);
+    if (link) {
+        lines.push('', 'Open this link to choose your password:', `  ${link}`);
+        lines.push('', `It works once${until ? `, until ${until.toISOString().slice(0, 10)}` : ''}. Your hours and rank have already been carried over.`);
+    } else {
+        // A project too old for links: the fallback is the temporary password
+        // every crew center has always handed out, with the same promise.
+        if (password) lines.splice(lines.length - (callsign ? 1 : 0), 0, `  Temporary password: ${password}`);
+        if (signInUrl) lines.push('', `Sign in: ${signInUrl}`);
+        lines.push('', 'You\'ll be asked to choose your own password the first time you sign in. Your hours and rank have already been carried over.');
+    }
+    return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Shapes handed out
 // ---------------------------------------------------------------------------
 
@@ -301,5 +408,11 @@ module.exports = {
     resetUrl,
     buildIssuedMessage,
     staffRequest,
+    SETUP_TTL_DAYS,
+    setupPatch,
+    isSetup,
+    setupInvite,
+    sentPatch,
+    buildSetupMessage,
     _reset,
 };

@@ -184,5 +184,85 @@ console.log('\n the roster');
     T('a name fixed against a callsign still updates that pilot', rename.update.map((u) => [u.id, u.values]), [['m1', { name: 'Ana Pena' }]]);
 }
 
+console.log('\n a roster from a Discord bot');
+{
+    // The columns a VA moving here actually arrives with.
+    const crewRosterCsv = require(path.join('..', 'crewRosterCsv.js'));
+    const BOT = [
+        'pilot,if username,callsign,rank,hours,role,joined',
+        'Elijah,Elijah.Kycz,001AG,First Officer,40.1,owner,2026-08-02',
+        'dakotahgo,dakotahgo,005AG,Trainee,4.2,admin,2026-08-23',
+        'Andrew Graham,AndrewGraham,100AG,First Officer,47.0,pilot,2026-08-29',
+        'Bizjetguy6,bizjetguy6,003AG,Second Officer,15.0,pilot,8/30/2026',
+        'znorth,Captain_zane,106AG,Captain,20.1,pilot,2026-09-26',
+        'SKY,SKY,808AG,First Officer,12,Pilot,',
+    ].join('\n');
+    const va = {
+        ranks: [
+            { name: 'Trainee', minHours: 0 }, { name: 'Second Officer', minHours: 15 },
+            { name: 'First Officer', minHours: 40, requiresCheck: true },
+        ],
+        roles: [{ name: 'Admin' }],
+    };
+    const { prepare, extra, ladder } = crewRosterCsv.prepareFor(va);
+    const p = crewCsv.planImport(crewCsv.ROSTER_SPEC, BOT, [], { prepare });
+    const cols = p.sheets[0].columns.map((c) => [c.header, c.key]);
+    T('every column is read', cols, [['pilot', 'name'], ['if username', 'ifcName'], ['callsign', 'callsign'],
+        ['rank', 'rank'], ['hours', 'hours'], ['role', 'role'], ['joined', 'joined']]);
+    T('the IF username lands on the pilot', p.create[0].values.ifcName, 'Elijah.Kycz');
+    T('join dates read, US slashes included', p.create.map((r) => r.values.joined),
+        ['2026-08-02', '2026-08-23', '2026-08-29', '2026-08-30', '2026-09-26', undefined]);
+    T('"pilot" is no role; a role the VA has takes its spelling', p.create.map((r) => r.values.role),
+        ['owner', 'Admin', '', '', '', '']);
+    T('rank kept only where it signs off a check-ride', p.create.map((r) => r.values.rank),
+        ['First Officer', undefined, 'First Officer', undefined, undefined, 'First Officer']);
+    const e = extra();
+    T('owner and admin are counted, not granted', e.staffRoleCount, 2);
+    T('a rank not on the ladder is named', e.unknownRanks, ['Captain']);
+    T('…and its row warned, not refused', p.errors.length, 0);
+    T('rank and hours that disagree are warned', p.warningCount, 2);
+    T('the check-ride is signed off on create', crewRosterCsv.importExtras(p.create[0].values, ladder, null),
+        { createdAt: '2026-08-02T00:00:00.000Z', checksPassed: ['First Officer'] });
+    T('…and added to, not replaced, on update',
+        crewRosterCsv.importExtras({ rank: 'First Officer' }, ladder, { checksPassed: ['Other'] }), { checksPassed: ['Other', 'First Officer'] });
+    T('…and not re-added', crewRosterCsv.importExtras({ rank: 'First Officer' }, ladder, { checksPassed: ['first officer'] }), {});
+
+    // Round trip: what export writes, import reads as unchanged.
+    const member = { _id: 'm1', name: 'Elijah', callsign: '001AG', hours: 40.1, role: 'owner', aircraft: [], status: 'active',
+        ifcName: 'Elijah.Kycz', ifUserId: '', checksPassed: ['First Officer'], createdAt: new Date('2026-08-02T00:00:00Z') };
+    const row = crewRosterCsv.csvRow(member, ladder, new Map([['m1', 'elijah']]));
+    T('export derives the rank and dates the row', [row.rank, row.joined, row.login], ['First Officer', '2026-08-02', 'elijah']);
+    const out = crewCsv.toCsv(crewCsv.ROSTER_SPEC, [row]);
+    const back = crewCsv.planImport(crewCsv.ROSTER_SPEC, out, [row], { prepare: crewRosterCsv.prepareFor(va).prepare });
+    T('an exported roster re-imports as a no-op', [back.create.length, back.update.length, back.unchanged, back.errors], [0, 0, 1, []]);
+    T('the login column is never read back', back.columns.includes('login'), false);
+    T('…nor reported missing', crewCsv.planImport(crewCsv.ROSTER_SPEC, 'name\nX\n', []).missing.includes('login'), false);
+
+    const dates = crewCsv.planImport(crewCsv.ROSTER_SPEC,
+        'name,joined\nA,31/12/2025\nB,2 Aug 2026\nC,2026-02-31\nD,2099-01-01\n', []);
+    T('day-first when the day says so; month names; impossible and future dates refused',
+        [dates.create.map((r) => r.values.joined), dates.errors.length], [['2025-12-31', '2026-08-02'], 2]);
+}
+
+console.log('\n several roster sheets at once');
+{
+    // Two files from two systems — or two tabs of one workbook — with
+    // different headings, one pilot in both, and a tab that is not a roster.
+    const crewRosterCsv = require(path.join('..', 'crewRosterCsv.js'));
+    const sheets = [
+        { name: 'Discord bot', csv: 'pilot,if username,callsign,rank,hours,role,joined\nSKY,SKY,808AG,First Officer,51.4,pilot,2026-08-23\nRT Carter,RTCarter1,004AG,First Officer,83.9,pilot,2026-08-19\n' },
+        { name: 'Old sheet', csv: 'Hawaiian Virtual roster\n\nPilot Name,Pilot ID,Flight Time,Status\nIsaac Crabtree,403AG,19:30,active\nSKY,808AG,51:24,active\n' },
+        { name: 'Notes', csv: 'Remember to post the event\n' },
+    ];
+    const { prepare } = crewRosterCsv.prepareFor({ ranks: [] });
+    const p = crewCsv.planImport(crewCsv.ROSTER_SPEC, sheets, [], { prepare });
+    T('every pilot once, across both sheets', p.create.map((r) => r.values.name).sort(), ['Isaac Crabtree', 'RT Carter', 'SKY']);
+    T('each sheet read under its own headings', p.sheets.map((s) => s.rows), [2, 2, 0]);
+    T('a title above the headings is skipped', p.sheets[1].headerRow, 3);
+    T('the pilot in both sheets is combined, later values winning', p.create.find((r) => r.values.name === 'SKY').values,
+        { name: 'SKY', ifcName: 'SKY', callsign: '808AG', hours: 51.4, role: '', joined: '2026-08-23', status: 'active' });
+    T('a tab that is not a roster is skipped, not refused', [!!p.sheets[2].skipped, p.errors.length], [true, 0]);
+}
+
 console.log(failures ? `\n${failures} check(s) failed\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

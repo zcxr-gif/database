@@ -428,6 +428,52 @@ const LIVE = () => ({
             COLS.every((c) => !late.includes(c)), late.trim());
     }
 
+    /* ======================================================================
+     * SETUP LINKS (v22). A first password for a pilot imported onto the
+     * roster: the reset machinery, living longer, and never in the queue.
+     * =================================================================== */
+    console.log('\nSetup links');
+    {
+        const now = new Date('2026-10-03T12:00:00Z');
+        const { token, hash } = R.mintToken();
+        const p = R.setupPatch({ hash }, now);
+        ok('a setup link stores the hash, never the token', p.resetTokenHash === hash && !JSON.stringify(p).includes(token));
+        ok('…lives for days, not an hour',
+            p.resetTokenExpiresAt - now === R.SETUP_TTL_DAYS * 24 * 60 * MINUTE, p.resetTokenExpiresAt);
+        ok('…is never put in front of staff as a request', p.resetNeedsStaff === false && p.resetRequestedAt === null);
+        const acct = { ...p };
+        ok('…is live, and known to be a setup', R.isLive(acct, now) && R.isSetup(acct));
+        ok('…and dead after its days', !R.isLive(acct, new Date(now.getTime() + (R.SETUP_TTL_DAYS * 24 * 60 + 1) * MINUTE)));
+        ok('a pilot asking for a reset replaces it with an ordinary one',
+            !R.isSetup({ ...acct, ...R.requestPatch({ hash: R.mintToken().hash }, now) }));
+        ok('setting the password clears it', !R.isSetup({ ...acct, ...R.clearPatch() }) && !R.isLive({ ...acct, ...R.clearPatch() }));
+        const msg = R.buildSetupMessage({ vaName: 'Hawaiian Virtual', name: 'SKY', username: 'sky', callsign: '808AG',
+            link: 'https://inflight.info/crew/hva?reset=' + token, expiresAt: p.resetTokenExpiresAt });
+        ok('the message carries the link and username, and no password',
+            msg.includes(token) && msg.includes('sky') && !/temporary password/i.test(msg), msg);
+        // v24. Kept as an invitation.
+        const kept = R.setupPatch({ hash, token, keep: true }, now);
+        const inv = R.setupInvite({ ...kept }, now);
+        ok('a kept setup link is a live invitation carrying the token', inv.state === 'live' && inv.token === token && !inv.sentAt, inv);
+        ok('…not kept, there is nothing to show', R.setupInvite({ ...p }, now).state === 'none');
+        const sentAcct = { ...kept, ...R.sentPatch({ by: 'Elijah' }, now) };
+        const sentInv = R.setupInvite(sentAcct, now);
+        ok('copying it records who and when', sentInv.sentBy === 'Elijah' && +sentInv.sentAt === +now, sentInv);
+        ok('…and that can be undone', !R.setupInvite({ ...sentAcct, ...R.sentPatch({ sent: false }) }, now).sentAt);
+        const again = R.mintToken();
+        ok('a fresh link forgets the old one was sent', !R.setupInvite({ ...sentAcct, ...R.setupPatch({ hash: again.hash, token: again.token, keep: true }, now) }, now).sentAt);
+        ok('a reset request kills the invitation even if the copy is still there',
+            R.setupInvite({ ...kept, ...R.requestPatch({ hash: R.mintToken().hash }, now) }, now).state === 'none');
+        ok('a used link is not an invitation', R.setupInvite({ ...kept, ...R.clearPatch() }, now).state === 'none');
+        ok('a pilot who signed in has claimed it', R.setupInvite({ ...kept, lastLoginAt: now }, now).state === 'claimed');
+        ok('an aged-out one is expired, with no token to send',
+            (() => { const x = R.setupInvite(kept, new Date(now.getTime() + (R.SETUP_TTL_DAYS + 1) * 24 * 60 * MINUTE)); return x.state === 'expired' && !x.token; })());
+        ok('a tampered copy that does not hash to the link is ignored', R.setupInvite({ ...kept, inviteLink: R.mintToken().token }, now).state === 'none');
+
+        const fallback = R.buildSetupMessage({ name: 'SKY', username: 'sky', password: 'Temp2345pass', signInUrl: 'https://x' });
+        ok('…or, on a project too old for links, the temporary password', fallback.includes('Temp2345pass') && fallback.includes('https://x'), fallback);
+    }
+
     console.log(`\n${pass} passed, ${fails.length} failed`);
     if (fails.length) { fails.forEach((f) => console.log('  ✗ ' + f)); process.exit(1); }
     process.exit(0);

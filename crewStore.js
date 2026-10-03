@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 23;
+const EXPECTED_SCHEMA_VERSION = 24;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -195,6 +195,12 @@ const QUIZZES_SCHEMA_VERSION = 22;
 // which route each one came from, so the columns sit in LATE_COLUMNS and the
 // sync falls back to matching on flight number and airports. See crewCodeshare.js.
 const CODESHARE_LINK_SCHEMA_VERSION = 23;
+
+// The version that keeps setup links readable as invitations, with who sent
+// each one (crew_accounts.invite_*). A gate in the mould of quizzes: on an
+// older project the links still work but exist only in the reply that minted
+// them, and "mark as sent" is refused rather than confirmed and not stored.
+const INVITES_SCHEMA_VERSION = 24;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -462,6 +468,14 @@ const memberToRow = (m) => {
     pick(m, out, 'checksPassed', 'checks_passed', (v) => (Array.isArray(v)
         ? [...new Set(v.map((c) => str(c, 40)).filter(Boolean))].slice(0, 40) : []));
     pick(m, out, 'retentionWarnedAt', 'retention_warned_at', (v) => (v ? new Date(v).toISOString() : null));
+    // v22. Writable only so a roster brought from elsewhere keeps the dates
+    // its pilots actually joined (see `joined` in crewCsv.js). Nothing else
+    // sets it, and an unreadable date is left out rather than written as now.
+    pick(m, out, 'createdAt', 'created_at', (v) => {
+        const d = v ? new Date(v) : null;
+        return d && !Number.isNaN(d.getTime()) ? d.toISOString() : undefined;
+    });
+    for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
     return out;
 };
 
@@ -505,6 +519,12 @@ const accountFromRow = (r) => r && {
     resetRequestedAt: date(r.reset_requested_at),
     resetNeedsStaff: !!r.reset_needs_staff,
     resetReason: r.reset_reason || '',
+    // v24. A setup link kept as an invitation, and who sent it. Only ever read
+    // through crewPasswordReset.setupInvite, which checks it is still the live
+    // link before calling it one.
+    inviteLink: r.invite_link || '',
+    inviteSentAt: date(r.invite_sent_at),
+    inviteSentBy: r.invite_sent_by || '',
     lastLoginAt: date(r.last_login_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -543,6 +563,10 @@ const accountToRow = (a) => {
     pick(a, out, 'resetRequestedAt', 'reset_requested_at', (v) => (date(v) ? date(v).toISOString() : null));
     pick(a, out, 'resetNeedsStaff', 'reset_needs_staff', (v) => !!v);
     pick(a, out, 'resetReason', 'reset_reason', (v) => str(v, 40));
+    // v24. base64url, 43 characters for 32 bytes; anything else is not a token.
+    pick(a, out, 'inviteLink', 'invite_link', (v) => (/^[A-Za-z0-9_-]{20,100}$/.test(String(v || '')) ? String(v) : ''));
+    pick(a, out, 'inviteSentAt', 'invite_sent_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(a, out, 'inviteSentBy', 'invite_sent_by', (v) => str(v, 80));
     return out;
 };
 
@@ -3034,6 +3058,8 @@ class SupabaseStore {
                 // because without it a partner's renumbered flight arrives as a
                 // new leg beside the old one rather than as an edit.
                 codeshareLinks: version >= CODESHARE_LINK_SCHEMA_VERSION,
+                // v24. Whether setup links can be kept as invitations.
+                invites: version >= INVITES_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -3056,6 +3082,7 @@ class SupabaseStore {
                 passwordResets: false,
                 staffApps: false,
                 quizzes: false,
+                invites: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -3643,6 +3670,7 @@ class LegacyStore {
             // the two methods that say so rather than answering nothing.
             ok: true, provisioned: true, managed: true, accounts: true, events: false,
             passwordResets: false,
+            invites: false,
             version: 0, expectedVersion: EXPECTED_SCHEMA_VERSION,
         };
     }
@@ -3839,5 +3867,6 @@ module.exports = {
     SHOP_SCHEMA_VERSION,
     STAFF_APPS_SCHEMA_VERSION,
     CODESHARE_LINK_SCHEMA_VERSION,
+    INVITES_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

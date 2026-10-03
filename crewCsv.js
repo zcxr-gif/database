@@ -114,8 +114,26 @@ const ROSTER_SPEC = {
         // spreadsheet and a hand edit.
         { key: 'aircraft', header: 'aircraft', aliases: ['fleet', 'typeratings', 'ratings', 'aircrafttypes'], type: 'list', max: 40, maxItems: 40 },
         { key: 'status', header: 'status', aliases: ['state'], type: 'enum', values: ['active', 'loa', 'inactive'], default: 'active' },
-        { key: 'ifcName', header: 'ifcName', aliases: ['ifc', 'ifcusername', 'communityname'], type: 'text', max: 60 },
+        // "IF username" is what the bots and sheets VAs arrive from call it.
+        { key: 'ifcName', header: 'ifcName', aliases: ['ifc', 'ifcusername', 'communityname', 'ifusername', 'ifname', 'infiniteflightusername', 'infiniteflightname'], type: 'text', max: 60 },
         { key: 'ifUserId', header: 'ifUserId', aliases: ['ifuserid', 'ifid'], type: 'text', max: 40 },
+        // v22. The three columns every roster a VA brings with them has, and
+        // which used to be dropped on the way in without a word.
+        //
+        // `rank` is never stored — rank is derived from hours (crewRanks.js).
+        // Export writes the rank the ladder gives; import reads it as the old
+        // system's record that the pilot HOLDS it, which is only news to us
+        // where a rung needs a check-ride: those get signed off. The server's
+        // `prepare` decides that, because only it knows the ladder.
+        { key: 'rank', header: 'rank', aliases: ['grade', 'pilotrank', 'currentrank'], type: 'text', max: 40 },
+        // `joined` is the roster row's created_at. It matters more than it
+        // looks: the retention sweep runs a new pilot's first-flight clock from
+        // it, so a roster imported without it puts every pilot on day one.
+        { key: 'joined', header: 'joined', aliases: ['joinedat', 'joindate', 'datejoined', 'membersince', 'since', 'hired', 'hiredate', 'startdate', 'enrolled', 'joinedon'], type: 'date' },
+        // Out only: the crew center login this pilot signs in with, so a VA can
+        // see in the sheet who has set theirs up. Ignored on the way back in —
+        // a username is not something a spreadsheet gets to change.
+        { key: 'login', header: 'login', aliases: ['loginusername', 'crewlogin'], type: 'text', exportOnly: true },
     ],
     // Callsign before name: an airline reassigns a callsign far less often than
     // it corrects the spelling of somebody's name.
@@ -386,9 +404,52 @@ function coerce(col, raw, label = col.header) {
             if (!code) return { error: `${label} “${text.slice(0, 40)}” is not an airport code` };
             return airportCode(code);
         }
+        case 'date': {
+            if (!text) return { value: '' };
+            const d = dateOf(text);
+            if (!d) return { error: `${label} “${text.slice(0, 40)}” is not a date` };
+            if (d > new Date(Date.now() + DAY_MS).toISOString().slice(0, 10)) return { error: `${label} ${d} is in the future` };
+            if (d < '2000-01-01') return { error: `${label} ${d} is too long ago` };
+            return { value: d };
+        }
         default:
             return { value: text.slice(0, col.max || 200) };
     }
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const pad2 = (n) => String(n).padStart(2, '0');
+const ymd = (y, m, d) => {
+    const t = new Date(Date.UTC(y, m - 1, d));
+    // Rejects 2026-02-31 rather than rolling it into March.
+    return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d
+        ? `${y}-${pad2(m)}-${pad2(d)}` : '';
+};
+
+/**
+ * A date cell, as a calendar day ("2026-08-02"), or '' when it is not one.
+ *
+ * ISO first, because it is unambiguous and what we export. Then slashes and
+ * dots, which are not: 03/04/2026 is March in the US and April everywhere else.
+ * A day over 12 settles it; when nothing does, it is read month-first, because
+ * that is what Excel and Google Sheets write when a workbook is turned into CSV
+ * (SheetJS's sheet_to_csv included), and those are where these files come from.
+ * Then anything Date can read with a month name in it ("2 Aug 2026").
+ */
+function dateOf(text) {
+    let m = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[T\s].*)?$/);
+    if (m) return ymd(+m[1], +m[2], +m[3]);
+    m = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})$/);
+    if (m) {
+        let [a, b, y] = [+m[1], +m[2], +m[3]];
+        if (y < 100) y += 2000;
+        return a > 12 ? ymd(y, b, a) : ymd(y, a, b);
+    }
+    if (/[a-z]{3}/i.test(text)) {
+        const t = new Date(`${text} UTC`);
+        if (!Number.isNaN(t.getTime())) return ymd(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+    }
+    return '';
 }
 
 // How a value we read is shown back in the preview.
@@ -592,6 +653,7 @@ function readSheet(spec, byNorm, sheet, userMap) {
                 return;
             }
             if (t === 'id') { id = trim(raw, 64); return; }
+            if (byKey.get(t) && byKey.get(t).exportOnly) return;
             const got = t === TO_PAIR ? coercePair(raw, headers[j]) : coerce(byKey.get(t), raw, headers[j]);
             if (got.error) { info[j].e = got.error; error = error || got.error; return; }
             if (got.warn) { info[j].w = got.warn; warn = warn || got.warn; }
@@ -661,6 +723,7 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
     if (!sheets.some((s) => String(s.csv || '').replace(/^\uFEFF/, '').trim())) return { error: 'That file is empty.' };
 
     const byNorm = headerIndex(spec);
+    const exportOnly = new Set(spec.columns.filter((c) => c.exportOnly).map((c) => c.key));
     const userMap = mapping && typeof mapping === 'object' && !Array.isArray(mapping) ? mapping : null;
     const reports = [];
     const previews = [];
@@ -676,7 +739,7 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
         reports.push(got.report);
         previews.push([got.report, got.preview]);
         if (!got.rows.length && got.report.skipped) continue;
-        for (const k of got.report.keys || []) if (k !== 'id') present.add(k);
+        for (const k of got.report.keys || []) if (k !== 'id' && !exportOnly.has(k)) present.add(k);
         if (!layout && got.report.layout && got.report.layout.length) layout = got.report.layout;
         rows.push(...got.rows);
         if (rows.length > MAX_ROWS) {
@@ -706,7 +769,9 @@ function planImport(spec, input, existing, { mapping, prepare } = {}) {
             sheets: reports,
         };
     }
-    if (prepare) for (const row of rows) if (!row.error) row.values = prepare(row.values);
+    // `prepare` gets the row too, so it can flag one for a second look
+    // (`row.warn`) — a rank that is not on the ladder, say. It never fails one.
+    if (prepare) for (const row of rows) if (!row.error) row.values = prepare(row.values, row);
 
     // Each row's outcome lands on its preview line.
     const outcome = new Map();
@@ -891,7 +956,7 @@ function planRows(spec, rows, existing, { present, columns, onRow } = {}) {
     return {
         create, update, unchanged, errors, matchedOn,
         columns: columns || [...headers],
-        missing: spec.columns.filter((c) => !c.readOnly && !headers.has(c.key)).map((c) => c.header),
+        missing: spec.columns.filter((c) => !c.readOnly && !c.exportOnly && !headers.has(c.key)).map((c) => c.header),
     };
 }
 

@@ -354,6 +354,25 @@ alter table crew_accounts add column if not exists reset_requested_at     timest
 alter table crew_accounts add column if not exists reset_needs_staff      boolean not null default false;
 alter table crew_accounts add column if not exists reset_reason           text not null default '';
 
+-- v24. Invitations for pilots brought in on an imported roster.
+--
+-- A setup link (reset_reason = 'setup') used to exist in readable form for
+-- exactly one HTTP response, and a roster of forty pilots is not handed over in
+-- one sitting: staff send them over days, on Discord, often two of them
+-- working through the same list. So the link is kept, readable by staff, until
+-- it is used or replaced — the same trade crew_applications.invite_password
+-- makes, and bounded the same way: it opens one account that has never had a
+-- password, it expires with reset_token_expires_at, and it is only treated as
+-- an invitation while it still hashes to reset_token_hash, so a link that a
+-- newer one has replaced is dead whether or not this column was cleared.
+--
+--   invite_link      the setup token itself, while it is live
+--   invite_sent_at   when somebody copied it to send, so the next person
+--   invite_sent_by   looking at the list does not send it a second time
+alter table crew_accounts add column if not exists invite_link    text not null default '';
+alter table crew_accounts add column if not exists invite_sent_at timestamptz;
+alter table crew_accounts add column if not exists invite_sent_by text not null default '';
+
 -- The link lookup runs on an UNAUTHENTICATED route, once per press of a reset
 -- link, so it is the one read here that must not become a scan. Partial on the
 -- non-empty hashes: every account that has not asked holds '' in this column,
@@ -2460,5 +2479,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 23)
+insert into crew_schema_info (id, version) values (1, 24)
 on conflict (id) do update set version = excluded.version, updated_at = now();
