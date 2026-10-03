@@ -290,17 +290,53 @@ const SETUP_TTL_DAYS = (() => {
 
 const SETUP = 'setup';
 
-function setupPatch({ hash }, now = new Date()) {
-    return {
+/**
+ * Issue a setup link. With `keep` (a v24 project), the token is also kept
+ * readable as an INVITATION so staff can send it later, and any record of the
+ * previous one having been sent is cleared — it is a different link now.
+ */
+function setupPatch({ hash, token = '', keep = false }, now = new Date()) {
+    const out = {
         resetTokenHash: String(hash || ''),
         resetTokenExpiresAt: hash ? new Date(now.getTime() + SETUP_TTL_DAYS * 24 * 60 * MINUTE_MS) : null,
         resetRequestedAt: null,
         resetNeedsStaff: false,
         resetReason: hash ? SETUP : '',
     };
+    if (keep) Object.assign(out, { inviteLink: hash ? String(token || '') : '', inviteSentAt: null, inviteSentBy: '' });
+    return out;
 }
 
 const isSetup = (account) => !!account && account.resetReason === SETUP;
+
+/**
+ * The only correct way to ask "is there an invitation on this account?".
+ *
+ * The kept token is an invitation only while it is still THE link: it must
+ * hash to the stored hash, be a setup link, and be in date. A link replaced by
+ * a pilot's own reset request, used, or aged out is not one — whether or not
+ * anything got round to clearing the column — so a stale copy can never be
+ * shown to staff as something worth sending.
+ *
+ * @returns {{state: 'none'|'live'|'expired'|'claimed', token?: string,
+ *            expiresAt?: Date, sentAt?: Date|null, sentBy?: string}}
+ */
+function setupInvite(account, now = new Date()) {
+    if (!account) return { state: 'none' };
+    if (account.lastLoginAt) return { state: 'claimed' };
+    const token = String(account.inviteLink || '');
+    if (!token || !isSetup(account) || hashToken(token) !== String(account.resetTokenHash || '').toLowerCase()) {
+        return { state: 'none' };
+    }
+    const sent = { sentAt: asDate(account.inviteSentAt), sentBy: account.inviteSentBy || '' };
+    if (!isLive(account, now)) return { state: 'expired', expiresAt: asDate(account.resetTokenExpiresAt), ...sent };
+    return { state: 'live', token, expiresAt: asDate(account.resetTokenExpiresAt), ...sent };
+}
+
+/** Somebody copied it to send — or, with `sent: false`, did not after all. */
+const sentPatch = ({ sent = true, by = '' } = {}, now = new Date()) => (sent
+    ? { inviteSentAt: now, inviteSentBy: String(by || '').slice(0, 80) }
+    : { inviteSentAt: null, inviteSentBy: '' });
 
 /**
  * The message a staff member pastes to a pilot whose login has just been set
@@ -375,6 +411,8 @@ module.exports = {
     SETUP_TTL_DAYS,
     setupPatch,
     isSetup,
+    setupInvite,
+    sentPatch,
     buildSetupMessage,
     _reset,
 };

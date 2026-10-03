@@ -446,6 +446,10 @@ async function setPasswordFromReset(store, account, newPassword) {
         mustChangePassword: false,
         ...crewPasswordReset.clearPatch(),
     });
+    // A used setup link is dead the moment the hash above changes, and
+    // setupInvite already says so. Clearing the readable copy is tidiness, on
+    // its own write because a pre-v24 project has no column for it.
+    if (account.inviteLink) await store.updateAccount(account._id, { inviteLink: '' }).catch(() => null);
     return { ok: true, username: account.username };
 }
 

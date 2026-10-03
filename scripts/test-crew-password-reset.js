@@ -451,6 +451,25 @@ const LIVE = () => ({
             link: 'https://inflight.info/crew/hva?reset=' + token, expiresAt: p.resetTokenExpiresAt });
         ok('the message carries the link and username, and no password',
             msg.includes(token) && msg.includes('sky') && !/temporary password/i.test(msg), msg);
+        // v24. Kept as an invitation.
+        const kept = R.setupPatch({ hash, token, keep: true }, now);
+        const inv = R.setupInvite({ ...kept }, now);
+        ok('a kept setup link is a live invitation carrying the token', inv.state === 'live' && inv.token === token && !inv.sentAt, inv);
+        ok('…not kept, there is nothing to show', R.setupInvite({ ...p }, now).state === 'none');
+        const sentAcct = { ...kept, ...R.sentPatch({ by: 'Elijah' }, now) };
+        const sentInv = R.setupInvite(sentAcct, now);
+        ok('copying it records who and when', sentInv.sentBy === 'Elijah' && +sentInv.sentAt === +now, sentInv);
+        ok('…and that can be undone', !R.setupInvite({ ...sentAcct, ...R.sentPatch({ sent: false }) }, now).sentAt);
+        const again = R.mintToken();
+        ok('a fresh link forgets the old one was sent', !R.setupInvite({ ...sentAcct, ...R.setupPatch({ hash: again.hash, token: again.token, keep: true }, now) }, now).sentAt);
+        ok('a reset request kills the invitation even if the copy is still there',
+            R.setupInvite({ ...kept, ...R.requestPatch({ hash: R.mintToken().hash }, now) }, now).state === 'none');
+        ok('a used link is not an invitation', R.setupInvite({ ...kept, ...R.clearPatch() }, now).state === 'none');
+        ok('a pilot who signed in has claimed it', R.setupInvite({ ...kept, lastLoginAt: now }, now).state === 'claimed');
+        ok('an aged-out one is expired, with no token to send',
+            (() => { const x = R.setupInvite(kept, new Date(now.getTime() + (R.SETUP_TTL_DAYS + 1) * 24 * 60 * MINUTE)); return x.state === 'expired' && !x.token; })());
+        ok('a tampered copy that does not hash to the link is ignored', R.setupInvite({ ...kept, inviteLink: R.mintToken().token }, now).state === 'none');
+
         const fallback = R.buildSetupMessage({ name: 'SKY', username: 'sky', password: 'Temp2345pass', signInUrl: 'https://x' });
         ok('…or, on a project too old for links, the temporary password', fallback.includes('Temp2345pass') && fallback.includes('https://x'), fallback);
     }

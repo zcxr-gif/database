@@ -244,5 +244,25 @@ console.log('\n a roster from a Discord bot');
         [dates.create.map((r) => r.values.joined), dates.errors.length], [['2025-12-31', '2026-08-02'], 2]);
 }
 
+console.log('\n several roster sheets at once');
+{
+    // Two files from two systems — or two tabs of one workbook — with
+    // different headings, one pilot in both, and a tab that is not a roster.
+    const crewRosterCsv = require(path.join('..', 'crewRosterCsv.js'));
+    const sheets = [
+        { name: 'Discord bot', csv: 'pilot,if username,callsign,rank,hours,role,joined\nSKY,SKY,808AG,First Officer,51.4,pilot,2026-08-23\nRT Carter,RTCarter1,004AG,First Officer,83.9,pilot,2026-08-19\n' },
+        { name: 'Old sheet', csv: 'Hawaiian Virtual roster\n\nPilot Name,Pilot ID,Flight Time,Status\nIsaac Crabtree,403AG,19:30,active\nSKY,808AG,51:24,active\n' },
+        { name: 'Notes', csv: 'Remember to post the event\n' },
+    ];
+    const { prepare } = crewRosterCsv.prepareFor({ ranks: [] });
+    const p = crewCsv.planImport(crewCsv.ROSTER_SPEC, sheets, [], { prepare });
+    T('every pilot once, across both sheets', p.create.map((r) => r.values.name).sort(), ['Isaac Crabtree', 'RT Carter', 'SKY']);
+    T('each sheet read under its own headings', p.sheets.map((s) => s.rows), [2, 2, 0]);
+    T('a title above the headings is skipped', p.sheets[1].headerRow, 3);
+    T('the pilot in both sheets is combined, later values winning', p.create.find((r) => r.values.name === 'SKY').values,
+        { name: 'SKY', ifcName: 'SKY', callsign: '808AG', hours: 51.4, role: '', joined: '2026-08-23', status: 'active' });
+    T('a tab that is not a roster is skipped, not refused', [!!p.sheets[2].skipped, p.errors.length], [true, 0]);
+}
+
 console.log(failures ? `\n${failures} check(s) failed\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

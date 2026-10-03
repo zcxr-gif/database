@@ -49,6 +49,16 @@ console.log('\n half-way');
     T('sharing waits for the essentials', state(g, 'launch'), 'todo');
 }
 
+console.log('\n invitations made, not sent');
+{
+    const g = guide.evaluate({
+        va: {}, store: { connected: true, ok: true, provisioned: true },
+        counts: { members: 17, active: 17, routes: 1, withoutLogin: 0, invitesUnsent: 5 },
+    });
+    const s = g.steps.find((x) => x.id === 'logins');
+    T('logins need a hand until they are sent', [s.state, /5 invitations/.test(s.summary)], ['attention', true]);
+}
+
 console.log('\n done');
 {
     const g = guide.evaluate({

@@ -159,9 +159,11 @@ function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0 } = {}
     if (c && c.members) {
         steps.push({
             id: 'logins', group: 'people', title: 'Pilot logins', required: true,
-            state: c.withoutLogin ? 'attention' : 'done',
+            state: c.withoutLogin || c.invitesUnsent ? 'attention' : 'done',
             summary: c.withoutLogin
                 ? `${plural(c.withoutLogin, 'pilot')} can’t sign in yet. Set them up together and send each one a link to choose their password.`
+                : c.invitesUnsent
+                ? `${plural(c.invitesUnsent, 'invitation')} made and not sent yet — copy each one into a Discord DM.`
                 : (c.neverSignedIn
                     ? `Everyone has a login; ${plural(c.neverSignedIn, 'pilot hasn’t', 'pilots haven’t')} signed in yet.`
                     : 'Everyone on the roster can sign in.'),

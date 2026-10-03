@@ -6683,7 +6683,7 @@ function csvInput(body) {
 // The dry run is not an optimisation, it is the point — the dashboard shows a
 // VA what an upload would do before it touches a live roster, and the commit
 // replays that same plan rather than re-deciding.
-async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store, prepare, extra }) {
+async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store, prepare, extra, afterCommit }) {
     const input = csvInput(req.body);
     const empty = Array.isArray(input) ? !input.some((s) => s.csv.trim()) : !input.trim();
     if (empty) return res.status(400).json({ error: 'Attach a CSV file first.' });
@@ -6744,8 +6744,9 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
 
     let created = 0; let updated = 0;
     const failures = [];
+    const createdIds = [];
     await eachLimited(plan.create, 6, async (row) => {
-        try { await create(row.values); created++; } catch (err) {
+        try { const doc = await create(row.values); created++; if (doc && doc._id) createdIds.push(String(doc._id)); } catch (err) {
             failures.push({ line: row.line, sheet: row.sheet, message: err?.message || 'Could not add this row.' });
         }
     });
@@ -6755,7 +6756,17 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
         }
     });
     if (onDone) { try { onDone({ ...summary, created, updated }); } catch { /* never fail an import over a notice */ } }
-    res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures, skipped: skipping ? plan.errors.length : 0 }));
+    // Whatever the caller does with what was just written — for a roster, the
+    // invitations for the pilots it added. Its failure is reported, never the
+    // import's: the rows are in either way.
+    let more = {};
+    if (afterCommit) {
+        try { more = (await afterCommit({ createdIds })) || {}; } catch (err) {
+            console.error(`${kind} import follow-up error`, err?.message || err);
+            more = { followUpError: err?.message || 'The import worked, but what was meant to follow it did not.' };
+        }
+    }
+    res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures, skipped: skipping ? plan.errors.length : 0, ...more }));
 }
 
 app.get('/api/crew/:slug/roster.csv', async (req, res) => {
@@ -6808,6 +6819,25 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
                 const merged = cleanMember({ ...before, ...values });
                 return store.updateMember(id, { ...merged, callsign: shape(merged.callsign), ...crewRosterCsv.importExtras(values, ladder, before) });
             },
+            // v24. `createInvites` on the commit: every pilot this file added
+            // gets a login and an invitation, waiting in the Logins tab to be
+            // sent. Only the ones it ADDED — a pilot it merely updated may
+            // well have signed in yesterday.
+            afterCommit: req.body?.createInvites === true ? async ({ createdIds }) => {
+                if (!createdIds.length) return {};
+                const out = await issueSetupInvites({ va, store, ids: createdIds, by: gate.p?.name, slug: req.params.slug });
+                const made = out.results.filter((r) => r.message);
+                return {
+                    invites: {
+                        created: made.length, kept: out.kept, mode: out.mode, ttlDays: out.ttlDays,
+                        failed: out.results.filter((r) => r.status === 'failed').length,
+                        // Not kept means the reply is the only copy, so it
+                        // carries them; kept means the Logins tab has them.
+                        results: out.kept ? undefined : out.results,
+                        signInUrl: out.signInUrl,
+                    },
+                };
+            } : null,
         });
     } catch (err) { crewFail(res, err, { log: 'roster import error', message: 'Could not import the roster.' }); }
 });
@@ -14894,6 +14924,11 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                         const a = byMember.get(String(m._id));
                         return a && !a.lastLoginAt && !a.portalAccountId;
                     }).length,
+                    // v24. Invitations made and not yet copied to anybody.
+                    invitesUnsent: active.filter((m) => {
+                        const inv = crewPasswordReset.setupInvite(byMember.get(String(m._id)));
+                        return inv.state === 'live' && !inv.sentAt;
+                    }).length,
                 };
             }
         } catch (err) {
@@ -15961,7 +15996,7 @@ app.post('/api/crew/:slug/accounts', async (req, res) => {
 
 // Staff: suspend or restore a login. Deactivating is how you take someone's
 // access away without deleting the account and its history.
-// ---- Logins for a whole roster at once (v22) ----
+// ---- Logins for a whole roster at once (v22), kept as invitations (v24) ----
 //
 // The roster import brings pilots in; this lets them sign in. Without it, a VA
 // that imported forty pilots had forty roster rows and no way for any of them
@@ -15969,16 +16004,20 @@ app.post('/api/crew/:slug/accounts', async (req, res) => {
 //
 // Each pilot gets a login in the VA's own store and a SETUP LINK — a single-use
 // link to choose their own password (see crewPasswordReset.setupPatch). No
-// password exists anywhere until the pilot picks one, so the list a staff
-// member is handed contains nothing that opens an account once it has been
-// used. A project too old for links falls back to the temporary passwords the
-// crew center has always issued, and the reply says which it did.
+// password exists anywhere until the pilot picks one.
+//
+// From v24 the link is also KEPT as an invitation, readable by staff until it
+// is used, replaced or expires, with a record of who copied it to send and
+// when. That is what lets a list of forty be worked through over a week by two
+// people without anybody sending the same pilot twice, or nobody sending one
+// at all. A project too old for that gets the v22 behaviour — the links are in
+// the reply and nowhere else — and one too old for links gets temporary
+// passwords. The reply says which (`mode`, `kept`).
 //
 // Never touched: a staff member's own pilot side (it has no password by
 // design — see provisionStaffAccount), and a login somebody has already signed
-// in with. Re-running it for a pilot who has a login but never used it mints a
-// fresh link, which kills the old one: that is the "they lost the message"
-// button.
+// in with. Re-issuing for a pilot who never used theirs mints a fresh link,
+// which kills the old one: that is the "they lost the message" button.
 
 const SETUP_BATCH_MAX = 500;
 
@@ -15998,25 +16037,114 @@ async function rosterWithLogins(store) {
     return { members: members || [], byMember };
 }
 
-// Can this project hold a setup link? Asked once per batch, by the cheapest
-// read that touches the columns: a lookup for a hash nobody has.
-async function setupLinksSupported(store) {
-    try { await store.getAccountByResetToken('0'.repeat(64)); return true; } catch (err) {
-        if (err instanceof crewStore.CrewStoreError && err.code === 'store_resets_missing') return false;
-        throw err;
+// What this project can do with a setup link: mint one at all (v19 columns),
+// and keep it as an invitation (v24). Asked once per request.
+async function setupSupport(store) {
+    let links = true;
+    try { await store.getAccountByResetToken('0'.repeat(64)); } catch (err) {
+        if (err instanceof crewStore.CrewStoreError && err.code === 'store_resets_missing') links = false;
+        else throw err;
     }
+    let keep = false;
+    if (links) { try { keep = !!(await store.health()).invites; } catch { keep = false; } }
+    return { links, keep };
 }
 
-// Staff: every pilot on the roster, and where their login stands.
+const crewSignInUrl = (va, slug) => `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || slug)}`;
+
+// One invitation as staff see it. The link and the message only while it is
+// live — an expired one is shown as expired, with nothing in it to send.
+function inviteView(va, member, account, signInUrl) {
+    const inv = crewPasswordReset.setupInvite(account);
+    if (inv.state !== 'live' && inv.state !== 'expired') return null;
+    const out = { accountId: account._id, state: inv.state, expiresAt: inv.expiresAt || null, sentAt: inv.sentAt || null, sentBy: inv.sentBy || '' };
+    if (inv.state === 'live') {
+        out.link = crewPasswordReset.resetUrl(signInUrl, inv.token);
+        out.message = crewPasswordReset.buildSetupMessage({
+            vaName: va.name, name: member.name, username: account.username, callsign: member.callsign,
+            link: out.link, expiresAt: inv.expiresAt,
+        });
+    }
+    return out;
+}
+
+/**
+ * Logins and setup links for these roster pilots. Shared by the Logins panel
+ * and by a roster import that asks for invitations for the pilots it added.
+ */
+async function issueSetupInvites({ va, store, ids, by, slug }) {
+    const { members, byMember } = await rosterWithLogins(store);
+    const byId = new Map(members.map((m) => [String(m._id), m]));
+    const support = await setupSupport(store);
+    const signInUrl = crewSignInUrl(va, slug);
+    const SKIP = {
+        staff: 'a staff member — they sign in with their staff account',
+        active: 'already signed in with their own password',
+        suspended: 'their login is suspended — restore it first',
+    };
+
+    const results = [];
+    await eachLimited(ids, 4, async (id) => {
+        const m = byId.get(String(id));
+        if (!m) { results.push({ memberId: id, status: 'skipped', reason: 'not on the roster' }); return; }
+        const base = { memberId: m._id, name: m.name, callsign: m.callsign, ifcName: m.ifcName || '' };
+        try {
+            let account = byMember.get(String(id));
+            let password = null;
+            let created = false;
+            if (!account) {
+                const r = await crewAccounts.provisionPilotAccount(store, {
+                    displayName: m.name, memberId: m._id, createdByName: by || 'Crew Center', vaName: va.name || '',
+                });
+                ({ account, created, password } = r);
+            }
+            const state = rosterLoginState(account);
+            if (SKIP[state]) { results.push({ ...base, accountId: account._id, username: account.username, status: 'skipped', reason: SKIP[state] }); return; }
+
+            const out = { ...base, accountId: account._id, username: account.username, status: created ? 'created' : 'reissued' };
+            if (support.links) {
+                // The password generated while provisioning is dropped here,
+                // never shown: with a link nobody needs it, and a password
+                // nobody has is as good as none.
+                const { token, hash } = crewPasswordReset.mintToken();
+                const patch = crewPasswordReset.setupPatch({ hash, token, keep: support.keep });
+                await store.updateAccount(account._id, patch);
+                out.link = crewPasswordReset.resetUrl(signInUrl, token);
+                out.expiresAt = patch.resetTokenExpiresAt;
+            } else {
+                if (!password) password = (await crewAccounts.resetPassword(store, account._id))?.password || null;
+                out.password = password;
+            }
+            out.message = crewPasswordReset.buildSetupMessage({
+                vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
+                link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
+            });
+            results.push(out);
+        } catch (err) {
+            console.error('crew login setup error', err?.message || err);
+            results.push({ ...base, status: 'failed', reason: err?.message || 'Could not set up this login.' });
+        }
+    });
+    // Back in the order asked for, so the list reads like the roster it came from.
+    const order = new Map(ids.map((id, i) => [String(id), i]));
+    results.sort((a, b) => (order.get(String(a.memberId)) ?? 0) - (order.get(String(b.memberId)) ?? 0));
+    return { mode: support.links ? 'link' : 'password', kept: support.links && support.keep, ttlDays: crewPasswordReset.SETUP_TTL_DAYS, signInUrl, results };
+}
+
+// Staff: every pilot on the roster, where their login stands, and — on a v24
+// project — the invitation waiting to be sent, with who sent it if anyone did.
 app.get('/api/crew/:slug/accounts/setup', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
-        const { members, byMember } = await rosterWithLogins(store);
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const [{ members, byMember }, support] = await Promise.all([rosterWithLogins(store), setupSupport(store)]);
+        const signInUrl = crewSignInUrl(va, req.params.slug);
         res.set('Cache-Control', 'no-store');
         res.json({
             ttlDays: crewPasswordReset.SETUP_TTL_DAYS,
+            mode: support.links ? 'link' : 'password',
+            keep: support.links && support.keep,
             pilots: members.map((m) => {
                 const a = byMember.get(String(m._id));
                 const state = rosterLoginState(a);
@@ -16024,6 +16152,7 @@ app.get('/api/crew/:slug/accounts/setup', async (req, res) => {
                     memberId: m._id, name: m.name, callsign: m.callsign, ifcName: m.ifcName || '',
                     status: m.status, state, username: a ? a.username : '',
                     linkExpiresAt: state === 'sent' ? a.resetTokenExpiresAt : null,
+                    invite: a && support.keep ? inviteView(va, m, a, signInUrl) : null,
                 };
             }),
         });
@@ -16031,10 +16160,6 @@ app.get('/api/crew/:slug/accounts/setup', async (req, res) => {
 });
 
 // Staff: set up logins for these pilots  { memberIds: [...] }.
-//
-// The reply is the only place the links ever exist in readable form, exactly
-// as with a generated password: the dashboard shows them, offers them as a
-// file, and they are gone when it closes. Issuing again is always possible.
 app.post('/api/crew/:slug/accounts/setup', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -16043,67 +16168,51 @@ app.post('/api/crew/:slug/accounts/setup', async (req, res) => {
             .map((v) => String(v || '').trim()).filter(Boolean))];
         if (!ids.length) return res.status(400).json({ error: 'Pick at least one pilot.' });
         if (ids.length > SETUP_BATCH_MAX) return res.status(400).json({ error: `At most ${SETUP_BATCH_MAX} pilots at a time.` });
-
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const { members, byMember } = await rosterWithLogins(store);
-        const byId = new Map(members.map((m) => [String(m._id), m]));
-        const links = await setupLinksSupported(store);
-        const signInUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`;
-        const SKIP = {
-            staff: 'a staff member — they sign in with their staff account',
-            active: 'already signed in with their own password',
-            suspended: 'their login is suspended — restore it first',
-        };
-
-        const results = [];
-        await eachLimited(ids, 4, async (id) => {
-            const m = byId.get(id);
-            if (!m) { results.push({ memberId: id, status: 'skipped', reason: 'not on the roster' }); return; }
-            const base = { memberId: m._id, name: m.name, callsign: m.callsign, ifcName: m.ifcName || '' };
-            try {
-                let account = byMember.get(id);
-                let password = null;
-                let created = false;
-                if (!account) {
-                    const r = await crewAccounts.provisionPilotAccount(store, {
-                        displayName: m.name, memberId: m._id,
-                        createdByName: gate.p?.name || 'Crew Center', vaName: va.name || '',
-                    });
-                    ({ account, created, password } = r);
-                }
-                const state = rosterLoginState(account);
-                if (SKIP[state]) { results.push({ ...base, username: account.username, status: 'skipped', reason: SKIP[state] }); return; }
-
-                const out = { ...base, username: account.username, status: created ? 'created' : 'reissued' };
-                if (links) {
-                    // The generated password from provisioning is dropped here,
-                    // never shown: with a link in hand nobody needs it, and a
-                    // password nobody has is as good as none.
-                    const { token, hash } = crewPasswordReset.mintToken();
-                    const patch = crewPasswordReset.setupPatch({ hash });
-                    await store.updateAccount(account._id, patch);
-                    out.link = crewPasswordReset.resetUrl(signInUrl, token);
-                    out.expiresAt = patch.resetTokenExpiresAt;
-                } else {
-                    if (!password) password = (await crewAccounts.resetPassword(store, account._id))?.password || null;
-                    out.password = password;
-                }
-                out.message = crewPasswordReset.buildSetupMessage({
-                    vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
-                    link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
-                });
-                results.push(out);
-            } catch (err) {
-                console.error('crew login setup error', err?.message || err);
-                results.push({ ...base, status: 'failed', reason: err?.message || 'Could not set up this login.' });
-            }
-        });
-        // Back in roster order, so the list reads like the roster it came from.
-        const order = new Map(ids.map((id, i) => [id, i]));
-        results.sort((a, b) => (order.get(String(a.memberId)) ?? 0) - (order.get(String(b.memberId)) ?? 0));
+        const out = await issueSetupInvites({ va, store, ids, by: gate.p?.name, slug: req.params.slug });
         res.set('Cache-Control', 'no-store');
-        res.json({ mode: links ? 'link' : 'password', ttlDays: crewPasswordReset.SETUP_TTL_DAYS, signInUrl, results });
+        res.json(out);
     } catch (err) { crewFail(res, err, { log: 'crew login setup error', message: 'Could not set up the logins.' }); }
+});
+
+// Staff: these invitations have been copied to send
+//   { accountIds: [...], sent: true }  — or, with sent: false, were not after all.
+// Who and when go on each row, so the next person working through the list sees
+// "copied by Elijah, 2h ago" rather than sending the same pilot a second link.
+// One request for "copy all", however long the list.
+//
+// Refused on a project without the columns rather than confirmed and lost.
+app.post('/api/crew/:slug/accounts/invites/sent', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const ids = [...new Set((Array.isArray(req.body?.accountIds) ? req.body.accountIds : [])
+            .map((v) => String(v || '').trim()).filter(Boolean))].slice(0, SETUP_BATCH_MAX);
+        if (!ids.length) return res.status(400).json({ error: 'Which invitations?' });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const support = await setupSupport(store);
+        if (!support.keep) {
+            return res.status(409).json({
+                error: 'Keeping track of sent invitations needs a newer database. Settings → Data store → Update my database.',
+                code: 'store_schema_outdated',
+            });
+        }
+        const sent = req.body?.sent !== false;
+        const by = gate.p?.name || 'Staff';
+        const signInUrl = crewSignInUrl(va, req.params.slug);
+        const invites = {};
+        await eachLimited(ids, 6, async (id) => {
+            const account = await store.getAccount(id).catch(() => null);
+            const inv = crewPasswordReset.setupInvite(account);
+            // Used or replaced since the list was drawn: nothing to mark, and
+            // the list redraws to say so.
+            if (!account || (inv.state !== 'live' && inv.state !== 'expired')) { invites[id] = null; return; }
+            const updated = await store.updateAccount(account._id, crewPasswordReset.sentPatch({ sent, by }));
+            const member = account.memberId ? await store.getMember(account.memberId).catch(() => null) : null;
+            invites[id] = inviteView(va, member || { name: account.displayName, callsign: '' }, updated || account, signInUrl);
+        });
+        res.json({ invites });
+    } catch (err) { crewFail(res, err, { log: 'crew invite sent error', message: 'Could not update those invitations.' }); }
 });
 
 app.patch('/api/crew/:slug/accounts/:id', async (req, res) => {
