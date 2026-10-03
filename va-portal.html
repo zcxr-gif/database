@@ -1794,9 +1794,9 @@
             list.innerHTML = rows.map(p => `
                 <div class="flex items-center justify-between gap-2 px-3 py-2">
                     <span class="text-sm mono truncate">${esc(p.username)}</span>
-                    <button type="button" data-pid="${esc(p.id)}" class="pf-pilot-del text-zinc-400 hover:text-red-500 shrink-0 px-1" title="${esc(t('fe.roster.remove'))}"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    <button type="button" data-pid="${esc(p.id)}" data-name="${esc(p.username)}" class="pf-pilot-del text-zinc-400 hover:text-red-500 shrink-0 px-1" title="${esc(t('fe.roster.remove'))}"><i data-lucide="x" class="w-4 h-4"></i></button>
                 </div>`).join('');
-            list.querySelectorAll('.pf-pilot-del').forEach(b => b.addEventListener('click', () => removePfPilot(b.getAttribute('data-pid'))));
+            list.querySelectorAll('.pf-pilot-del').forEach(b => b.addEventListener('click', () => removePfPilot(b.getAttribute('data-pid'), b.getAttribute('data-name'))));
             drawIcons();
         }
         async function loadPfPilots() {
@@ -1817,12 +1817,17 @@
                     body: JSON.stringify({ usernames }),
                 });
                 ta.value = ''; $('pfPilotSearch').value = '';
-                flash('pfPilotMsg', t('fe.roster.added', { added: data.added, skipped: data.skipped }), true);
+                const synced = data.crewCenter && data.crewCenter.created
+                    ? ' ' + t('fe.roster.synced', { n: data.crewCenter.created }) : '';
+                flash('pfPilotMsg', t('fe.roster.added', { added: data.added, skipped: data.skipped }) + synced, true);
                 loadPfPilots();
             } catch (err) { flash('pfPilotMsg', err.message, false); }
             finally { $('pfPilotAddBtn').disabled = false; }
         }
-        async function removePfPilot(pilotId) {
+        async function removePfPilot(pilotId, name) {
+            // The crew center follows this list, and removing a pilot there
+            // takes their flights and login with them — so this asks first.
+            if (!confirm(t('fe.roster.confirmRemove', { name: name || '' }))) return;
             try {
                 await api('/pilots/' + encodeURIComponent(pilotId), { method: 'DELETE' });
                 loadPfPilots();

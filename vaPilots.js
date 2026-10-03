@@ -275,13 +275,14 @@ const addPilots = async (VaPilot, vaAdId, rawUsernames, addedBy = '') => {
 };
 
 // Remove one roster entry by its id, scoped to the VA so one VA can't delete
-// another's pilot. Returns { removed, total }.
+// another's pilot. Returns { removed, total, username } — the username so the
+// caller can carry the removal over to the crew center (crewRosterSync.js).
 const removePilot = async (VaPilot, vaAdId, pilotId) => {
     if (!mongoose.Types.ObjectId.isValid(String(pilotId || ''))) {
-        return { removed: 0, total: await countPilots(VaPilot, vaAdId) };
+        return { removed: 0, total: await countPilots(VaPilot, vaAdId), username: '' };
     }
-    const r = await VaPilot.deleteOne({ _id: pilotId, vaAdId });
-    return { removed: r.deletedCount || 0, total: await countPilots(VaPilot, vaAdId) };
+    const doc = await VaPilot.findOneAndDelete({ _id: pilotId, vaAdId }).select('username').lean();
+    return { removed: doc ? 1 : 0, total: await countPilots(VaPilot, vaAdId), username: doc ? doc.username : '' };
 };
 
 // Wipe a VA's whole roster. Returns { removed }.

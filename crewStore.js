@@ -355,6 +355,21 @@ let models = null;
 
 function configure(m) { models = m || null; }
 
+// Told about every roster row created or removed, whichever handler did it, so
+// the VA portal's pilot list can follow the crew center (crewRosterSync.js).
+// Called as listener('added' | 'removed', vaAdId, member), never awaited: a
+// slow or failing listener must not hold up or fail the roster write itself.
+let rosterListener = null;
+
+function onRosterChange(fn) { rosterListener = typeof fn === 'function' ? fn : null; }
+
+function emitRoster(event, vaAdId, member) {
+    if (!rosterListener || !vaAdId || !member) return;
+    Promise.resolve()
+        .then(() => rosterListener(event, vaAdId, member))
+        .catch((err) => console.warn(`crew roster listener (${event}) failed:`, err && err.message));
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 //
@@ -1533,6 +1548,9 @@ class SupabaseStore {
     constructor(va) {
         this.kind = 'supabase';
         this.owned = true;              // the VA owns this data
+        // Only for roster-change events; absent on a store built to test a
+        // connection, which then emits nothing.
+        this.vaAdId = va._id || null;
         this.slug = String(va.slug || '').toLowerCase();
         this.db = new Postgrest(va.supabaseUrl, va.supabaseServiceKey);
     }
@@ -1580,13 +1598,20 @@ class SupabaseStore {
     getMember(id) { return this.one('crew_members', this.ident(id), memberFromRow); }
     async createMember(data) {
         const [row] = await this.db.insert('crew_members', { va_slug: this.slug, ...memberToRow(data) });
-        return memberFromRow(row);
+        const member = memberFromRow(row);
+        emitRoster('added', this.vaAdId, member);
+        return member;
     }
     async updateMember(id, patch) {
         const [row] = await this.db.update('crew_members', this.ident(id), memberToRow(patch));
         return row ? memberFromRow(row) : null;
     }
-    async deleteMember(id) { await this.db.remove('crew_members', this.ident(id)); return true; }
+    async deleteMember(id) {
+        const before = rosterListener ? await this.getMember(id).catch(() => null) : null;
+        await this.db.remove('crew_members', this.ident(id));
+        emitRoster('removed', this.vaAdId, before);
+        return true;
+    }
 
     /* ===================================================================
      * EVERYTHING THIS PILOT IS, GONE.
@@ -1629,6 +1654,8 @@ class SupabaseStore {
         const memberId = String(id || '');
         if (!memberId) return { ok: false, removed: {} };
         const byMember = { ...this.scope, member_id: `eq.${memberId}` };
+        // Read before anything goes, so the roster-change event can say who.
+        const before = rosterListener ? await this.getMember(memberId).catch(() => null) : null;
 
         // The order is the point — see the note above. `crew_accounts` sits
         // second to last, immediately before the roster row: it is the one
@@ -1683,6 +1710,7 @@ class SupabaseStore {
 
         await this.db.remove('crew_members', this.ident(memberId));
         removed.crew_members = 1;
+        emitRoster('removed', this.vaAdId, before);
         return { ok: true, removed, failed };
     }
 
@@ -3245,7 +3273,9 @@ class LegacyStore {
     }
     getMember(id) { return models.CrewMember.findOne({ ...this.q, _id: id }).lean(); }
     async createMember(data) {
-        return this.lean(await models.CrewMember.create({ ...this.q, ...memberDefaults(data) }));
+        const member = this.lean(await models.CrewMember.create({ ...this.q, ...memberDefaults(data) }));
+        emitRoster('added', this.vaAdId, member);
+        return member;
     }
     async updateMember(id, patch) {
         const m = await models.CrewMember.findOne({ ...this.q, _id: id });
@@ -3254,7 +3284,12 @@ class LegacyStore {
         await m.save();
         return this.lean(m);
     }
-    async deleteMember(id) { await models.CrewMember.deleteOne({ ...this.q, _id: id }); return true; }
+    async deleteMember(id) {
+        const before = rosterListener ? await this.getMember(id) : null;
+        await models.CrewMember.deleteOne({ ...this.q, _id: id });
+        emitRoster('removed', this.vaAdId, before);
+        return true;
+    }
     /**
      * Everything this pilot is, gone — see purgeMember on the Supabase store
      * for what the verb means and why it exists.
@@ -3267,10 +3302,12 @@ class LegacyStore {
      */
     async purgeMember(id) {
         const removed = {};
+        const before = rosterListener ? await this.getMember(id) : null;
         const gone = await models.CrewPirep.deleteMany({ ...this.q, memberId: id });
         removed.crew_pireps = gone.deletedCount || 0;
         await models.CrewMember.deleteOne({ ...this.q, _id: id });
         removed.crew_members = 1;
+        emitRoster('removed', this.vaAdId, before);
         return { ok: true, removed, failed: [] };
     }
     async addMemberHours(id, deltaHours) {
@@ -3839,6 +3876,7 @@ async function forVaOrNull(va) {
 
 module.exports = {
     configure,
+    onRosterChange,
     forVa,
     forVaOrNull,
     forgetLegacyData,
