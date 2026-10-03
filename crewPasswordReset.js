@@ -263,6 +263,77 @@ function buildIssuedMessage({
 }
 
 // ---------------------------------------------------------------------------
+// Setup links. v22.
+//
+// A pilot who arrives on an IMPORTED roster has a login nobody has used, and
+// the old way to hand it over was a temporary password per pilot: twenty
+// passwords on a staff member's screen, pasted one at a time into twenty
+// Discord DMs, each one readable by anybody who sees the channel or the
+// screenshot. A setup link is the same machinery as a reset link — a hashed,
+// single-use token on the account — pointed at a pilot who has never had a
+// password rather than one who lost theirs. Nobody but the pilot ever knows
+// the password, because the pilot is the one who picks it.
+//
+// It lives longer than a reset link (days, not an hour) for the reason an
+// invitation does: it is handed over by a person, some time later, on
+// whatever channel reaches the pilot. It is still single-use, still replaced
+// by a newer one, and still dies the moment the password changes any other
+// way. `resetReason: 'setup'` is what tells the landing page to say "choose
+// your password" rather than "reset", and it never lands in the staff queue
+// because `resetNeedsStaff` stays false.
+// ---------------------------------------------------------------------------
+
+const SETUP_TTL_DAYS = (() => {
+    const n = parseInt(process.env.CREW_SETUP_TTL_DAYS, 10);
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 60) : 14;
+})();
+
+const SETUP = 'setup';
+
+function setupPatch({ hash }, now = new Date()) {
+    return {
+        resetTokenHash: String(hash || ''),
+        resetTokenExpiresAt: hash ? new Date(now.getTime() + SETUP_TTL_DAYS * 24 * 60 * MINUTE_MS) : null,
+        resetRequestedAt: null,
+        resetNeedsStaff: false,
+        resetReason: hash ? SETUP : '',
+    };
+}
+
+const isSetup = (account) => !!account && account.resetReason === SETUP;
+
+/**
+ * The message a staff member pastes to a pilot whose login has just been set
+ * up. Plain text, like buildIssuedMessage, for the same reason. No password in
+ * it, which is the point: this one is safe to send in a channel somebody else
+ * can read, as long as the pilot uses it before anybody else does.
+ */
+function buildSetupMessage({
+    vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
+    password = '', signInUrl = '',
+} = {}) {
+    const who = String(name || '').trim();
+    const va = String(vaName || '').trim() || 'the crew';
+    const until = asDate(expiresAt);
+    const lines = [];
+    lines.push(who ? `${who} — your ${va} crew center login is ready.` : `Your ${va} crew center login is ready.`);
+    lines.push('');
+    if (username) lines.push(`  Username: ${username}`);
+    if (callsign) lines.push(`  Callsign: ${callsign}`);
+    if (link) {
+        lines.push('', 'Open this link to choose your password:', `  ${link}`);
+        lines.push('', `It works once${until ? `, until ${until.toISOString().slice(0, 10)}` : ''}. Your hours and rank have already been carried over.`);
+    } else {
+        // A project too old for links: the fallback is the temporary password
+        // every crew center has always handed out, with the same promise.
+        if (password) lines.splice(lines.length - (callsign ? 1 : 0), 0, `  Temporary password: ${password}`);
+        if (signInUrl) lines.push('', `Sign in: ${signInUrl}`);
+        lines.push('', 'You\'ll be asked to choose your own password the first time you sign in. Your hours and rank have already been carried over.');
+    }
+    return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Shapes handed out
 // ---------------------------------------------------------------------------
 
@@ -301,5 +372,9 @@ module.exports = {
     resetUrl,
     buildIssuedMessage,
     staffRequest,
+    SETUP_TTL_DAYS,
+    setupPatch,
+    isSetup,
+    buildSetupMessage,
     _reset,
 };

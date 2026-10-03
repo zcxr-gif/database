@@ -462,6 +462,14 @@ const memberToRow = (m) => {
     pick(m, out, 'checksPassed', 'checks_passed', (v) => (Array.isArray(v)
         ? [...new Set(v.map((c) => str(c, 40)).filter(Boolean))].slice(0, 40) : []));
     pick(m, out, 'retentionWarnedAt', 'retention_warned_at', (v) => (v ? new Date(v).toISOString() : null));
+    // v22. Writable only so a roster brought from elsewhere keeps the dates
+    // its pilots actually joined (see `joined` in crewCsv.js). Nothing else
+    // sets it, and an unreadable date is left out rather than written as now.
+    pick(m, out, 'createdAt', 'created_at', (v) => {
+        const d = v ? new Date(v) : null;
+        return d && !Number.isNaN(d.getTime()) ? d.toISOString() : undefined;
+    });
+    for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
     return out;
 };
 

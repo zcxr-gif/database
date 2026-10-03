@@ -103,6 +103,8 @@ const crewPasswordReset = require('./crewPasswordReset');
 // Roster and route network in and out as CSV — the same columns both ways, so a
 // VA can take their data to a spreadsheet and bring it back. See crewCsv.js.
 const crewCsv = require('./crewCsv');
+// What the rank, role and joined columns of a roster from elsewhere mean here.
+const crewRosterCsv = require('./crewRosterCsv');
 const routeLibrary = require('./routeLibrary');
 
 // The VA's rank ladder. Rank is DERIVED from hours rather than stored, and it
@@ -6679,7 +6681,7 @@ function csvInput(body) {
 // The dry run is not an optimisation, it is the point — the dashboard shows a
 // VA what an upload would do before it touches a live roster, and the commit
 // replays that same plan rather than re-deciding.
-async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store, prepare }) {
+async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store, prepare, extra }) {
     const input = csvInput(req.body);
     const empty = Array.isArray(input) ? !input.some((s) => s.csv.trim()) : !input.trim();
     if (empty) return res.status(400).json({ error: 'Attach a CSV file first.' });
@@ -6714,6 +6716,9 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
             create: plan.create.slice(0, 5).map((r) => r.values),
             update: plan.update.slice(0, 5).map((r) => ({ id: r.id, before: r.before, values: r.values })),
         },
+        // Whatever the caller learned while preparing rows that is worth
+        // saying once for the whole file rather than once per row.
+        ...(extra ? extra() : {}),
     };
 
     if (req.body?.dryRun !== false) return res.json({ dryRun: true, ...summary });
@@ -6755,15 +6760,19 @@ app.get('/api/crew/:slug/roster.csv', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
-        const members = await store.listMembers();
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const [members, accounts] = await Promise.all([
+            store.listMembers(),
+            // A store with no logins (legacy) exports an empty column.
+            store.listAccounts().catch(() => []),
+        ]);
+        const loginOf = new Map((accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a.username]));
+        const ladder = crewRanks.normalizeLadder(va.ranks);
         // Exported from the stored row, not from publicMember: the point of an
         // export is to hand back everything, including the Infinite Flight link
         // that the roster screen never shows.
-        sendCsv(req, res, req.params.slug, 'roster', crewCsv.ROSTER_SPEC, (members || []).map((m) => ({
-            id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
-            aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
-        })));
+        sendCsv(req, res, req.params.slug, 'roster', crewCsv.ROSTER_SPEC,
+            (members || []).map((m) => crewRosterCsv.csvRow(m, ladder, loginOf)));
     } catch (err) { crewFail(res, err, { log: 'roster export error', message: 'Could not export the roster.' }); }
 });
 
@@ -6779,24 +6788,23 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
         // this "AEROMEXICO001" in the file and "AEROMEXICO 001MX" on the roster
         // look like two pilots and the import mints a duplicate of somebody who
         // is already there. Normalised, they match, and the row updates the
-        // pilot it is actually about.
+        // pilot it is actually about. prepareFor does the file's side.
         const shape = (cs) => normalizeStaffCallsign(va, cs);
+        const { prepare, extra, ladder } = crewRosterCsv.prepareFor(va, shape);
         await runCsvImport({
             req, res, store, kind: 'roster', spec: crewCsv.ROSTER_SPEC,
-            existing: (members || []).map((m) => ({
-                id: m._id, name: m.name, callsign: shape(m.callsign), hours: m.hours, role: m.role,
-                aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
-            })),
-            // The file's callsigns get the same shape before matching, so the
-            // comparison is like with like.
-            prepare: (values) => (values.callsign ? { ...values, callsign: shape(values.callsign) } : values),
-            create: (values) => store.createMember({ ...cleanMember(values), callsign: shape(values.callsign) }),
+            existing: (members || []).map((m) => ({ ...crewRosterCsv.csvRow(m, ladder, null), callsign: shape(m.callsign) })),
+            prepare,
+            extra,
+            create: (values) => store.createMember({
+                ...cleanMember(values), callsign: shape(values.callsign), ...crewRosterCsv.importExtras(values, ladder, null),
+            }),
             // Merge over what is already there before cleaning, exactly as the
             // roster editor's PATCH does — a file with six columns must not
             // blank the three it never mentioned.
             update: (id, values, before) => {
                 const merged = cleanMember({ ...before, ...values });
-                return store.updateMember(id, { ...merged, callsign: shape(merged.callsign) });
+                return store.updateMember(id, { ...merged, callsign: shape(merged.callsign), ...crewRosterCsv.importExtras(values, ladder, before) });
             },
         });
     } catch (err) { crewFail(res, err, { log: 'roster import error', message: 'Could not import the roster.' }); }
@@ -15873,6 +15881,151 @@ app.post('/api/crew/:slug/accounts', async (req, res) => {
 
 // Staff: suspend or restore a login. Deactivating is how you take someone's
 // access away without deleting the account and its history.
+// ---- Logins for a whole roster at once (v22) ----
+//
+// The roster import brings pilots in; this lets them sign in. Without it, a VA
+// that imported forty pilots had forty roster rows and no way for any of them
+// to reach the crew center short of re-applying through the join form.
+//
+// Each pilot gets a login in the VA's own store and a SETUP LINK — a single-use
+// link to choose their own password (see crewPasswordReset.setupPatch). No
+// password exists anywhere until the pilot picks one, so the list a staff
+// member is handed contains nothing that opens an account once it has been
+// used. A project too old for links falls back to the temporary passwords the
+// crew center has always issued, and the reply says which it did.
+//
+// Never touched: a staff member's own pilot side (it has no password by
+// design — see provisionStaffAccount), and a login somebody has already signed
+// in with. Re-running it for a pilot who has a login but never used it mints a
+// fresh link, which kills the old one: that is the "they lost the message"
+// button.
+
+const SETUP_BATCH_MAX = 500;
+
+function rosterLoginState(account) {
+    if (!account) return 'none';
+    if (account.portalAccountId) return 'staff';
+    if (account.lastLoginAt) return 'active';
+    if (account.active === false) return 'suspended';
+    if (crewPasswordReset.isSetup(account) && crewPasswordReset.isLive(account)) return 'sent';
+    return 'pending';
+}
+
+async function rosterWithLogins(store) {
+    const [members, accounts] = await Promise.all([store.listMembers(), store.listAccounts()]);
+    const byMember = new Map();
+    for (const a of accounts || []) if (a.memberId) byMember.set(String(a.memberId), a);
+    return { members: members || [], byMember };
+}
+
+// Can this project hold a setup link? Asked once per batch, by the cheapest
+// read that touches the columns: a lookup for a hash nobody has.
+async function setupLinksSupported(store) {
+    try { await store.getAccountByResetToken('0'.repeat(64)); return true; } catch (err) {
+        if (err instanceof crewStore.CrewStoreError && err.code === 'store_resets_missing') return false;
+        throw err;
+    }
+}
+
+// Staff: every pilot on the roster, and where their login stands.
+app.get('/api/crew/:slug/accounts/setup', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const { members, byMember } = await rosterWithLogins(store);
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ttlDays: crewPasswordReset.SETUP_TTL_DAYS,
+            pilots: members.map((m) => {
+                const a = byMember.get(String(m._id));
+                const state = rosterLoginState(a);
+                return {
+                    memberId: m._id, name: m.name, callsign: m.callsign, ifcName: m.ifcName || '',
+                    status: m.status, state, username: a ? a.username : '',
+                    linkExpiresAt: state === 'sent' ? a.resetTokenExpiresAt : null,
+                };
+            }),
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew login setup list error', message: 'Could not load the roster’s logins.' }); }
+});
+
+// Staff: set up logins for these pilots  { memberIds: [...] }.
+//
+// The reply is the only place the links ever exist in readable form, exactly
+// as with a generated password: the dashboard shows them, offers them as a
+// file, and they are gone when it closes. Issuing again is always possible.
+app.post('/api/crew/:slug/accounts/setup', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const ids = [...new Set((Array.isArray(req.body?.memberIds) ? req.body.memberIds : [])
+            .map((v) => String(v || '').trim()).filter(Boolean))];
+        if (!ids.length) return res.status(400).json({ error: 'Pick at least one pilot.' });
+        if (ids.length > SETUP_BATCH_MAX) return res.status(400).json({ error: `At most ${SETUP_BATCH_MAX} pilots at a time.` });
+
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const { members, byMember } = await rosterWithLogins(store);
+        const byId = new Map(members.map((m) => [String(m._id), m]));
+        const links = await setupLinksSupported(store);
+        const signInUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`;
+        const SKIP = {
+            staff: 'a staff member — they sign in with their staff account',
+            active: 'already signed in with their own password',
+            suspended: 'their login is suspended — restore it first',
+        };
+
+        const results = [];
+        await eachLimited(ids, 4, async (id) => {
+            const m = byId.get(id);
+            if (!m) { results.push({ memberId: id, status: 'skipped', reason: 'not on the roster' }); return; }
+            const base = { memberId: m._id, name: m.name, callsign: m.callsign, ifcName: m.ifcName || '' };
+            try {
+                let account = byMember.get(id);
+                let password = null;
+                let created = false;
+                if (!account) {
+                    const r = await crewAccounts.provisionPilotAccount(store, {
+                        displayName: m.name, memberId: m._id,
+                        createdByName: gate.p?.name || 'Crew Center', vaName: va.name || '',
+                    });
+                    ({ account, created, password } = r);
+                }
+                const state = rosterLoginState(account);
+                if (SKIP[state]) { results.push({ ...base, username: account.username, status: 'skipped', reason: SKIP[state] }); return; }
+
+                const out = { ...base, username: account.username, status: created ? 'created' : 'reissued' };
+                if (links) {
+                    // The generated password from provisioning is dropped here,
+                    // never shown: with a link in hand nobody needs it, and a
+                    // password nobody has is as good as none.
+                    const { token, hash } = crewPasswordReset.mintToken();
+                    const patch = crewPasswordReset.setupPatch({ hash });
+                    await store.updateAccount(account._id, patch);
+                    out.link = crewPasswordReset.resetUrl(signInUrl, token);
+                    out.expiresAt = patch.resetTokenExpiresAt;
+                } else {
+                    if (!password) password = (await crewAccounts.resetPassword(store, account._id))?.password || null;
+                    out.password = password;
+                }
+                out.message = crewPasswordReset.buildSetupMessage({
+                    vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
+                    link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
+                });
+                results.push(out);
+            } catch (err) {
+                console.error('crew login setup error', err?.message || err);
+                results.push({ ...base, status: 'failed', reason: err?.message || 'Could not set up this login.' });
+            }
+        });
+        // Back in roster order, so the list reads like the roster it came from.
+        const order = new Map(ids.map((id, i) => [id, i]));
+        results.sort((a, b) => (order.get(String(a.memberId)) ?? 0) - (order.get(String(b.memberId)) ?? 0));
+        res.set('Cache-Control', 'no-store');
+        res.json({ mode: links ? 'link' : 'password', ttlDays: crewPasswordReset.SETUP_TTL_DAYS, signInUrl, results });
+    } catch (err) { crewFail(res, err, { log: 'crew login setup error', message: 'Could not set up the logins.' }); }
+});
+
 app.patch('/api/crew/:slug/accounts/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -16177,7 +16330,13 @@ app.get('/api/crew/:slug/password-reset/:token', async (req, res) => {
                 code: 'reset_link_dead',
             });
         }
-        res.json({ ok: true, name: account.displayName || account.username || '' });
+        // A setup link (crewPasswordReset.setupPatch) is a first password, not
+        // a replacement, and the pilot has never seen their username — so the
+        // page is told which it is and shown the username to sign in with.
+        res.json({
+            ok: true, name: account.displayName || account.username || '',
+            ...(crewPasswordReset.isSetup(account) ? { setup: true, username: account.username || '' } : {}),
+        });
     } catch (err) {
         if (resetsUnavailable(res, err)) return;
         crewFail(res, err, { log: 'crew reset check error', message: 'Could not check that link.' });
