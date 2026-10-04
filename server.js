@@ -255,6 +255,11 @@ const sharp = require('sharp'); // Image processing library
 const fs = require('fs');
 const os = require('os');
 
+// The start script also caps the V8 heap (--max-old-space-size, NODE_HEAP_MB,
+// default 256). Uncapped, V8 sizes its heap from the host's memory, not the
+// container's, so it lets garbage pile up long past the point where the
+// container kills the process. Capped, it collects before that instead.
+//
 // MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
 sharp.cache(false);
 sharp.concurrency(1);
@@ -308,13 +313,16 @@ app.use((req, res, next) => {
 // Body size limits.
 //
 // Only trail uploads are genuinely large, so only /api/trails gets the big
-// ceiling. It used to be 100 MB on EVERY route, which let any unauthenticated
+// ceiling — 10 MB. A trail is ~90 bytes a point as JSON and the recorder keeps
+// every point, so even a full day of 15-second sampling is about half a
+// megabyte. This route takes unauthenticated POSTs, and at the old 100 MB one
+// request parsed to more memory than this container has. It used to be 100 MB on EVERY route, which let any unauthenticated
 // POST make the process buffer 100 MB and then JSON.parse it — several hundred
 // MB of heap and seconds of pinned CPU per request, and a handful at once is
 // past the container's cap. Everything else here is small JSON (the largest,
 // a VA site, is capped at 2 MB by vaSites.js); files arrive through multer.
 // Mounted first: express.json skips a body that has already been parsed.
-app.use('/api/trails', express.json({ limit: '100mb' }));
+app.use('/api/trails', express.json({ limit: '10mb' }));
 // A whole workbook — every tab of a VA's route spreadsheet, as CSV — is the
 // body of a roster or routes import, and a big network outgrows 5mb.
 app.use(/^\/api\/crew\/[^/]+\/(roster|routes)\/import$/, express.json({ limit: '25mb' }));
