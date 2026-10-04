@@ -1698,6 +1698,28 @@ create index if not exists crew_quiz_attempts_member_idx
 create unique index if not exists crew_quiz_attempts_token_idx
     on crew_quiz_attempts (token) where token <> '';
 
+-- v25. ENTRANCE TESTS — a quiz sat by somebody who is not crew yet.
+--
+-- Staff send an applicant (or anybody they met on the IFC) a test before they
+-- are accepted, and the taker has no login to sit it under. Such a row has no
+-- member_id — that is what makes it an entrance test — and names who it was
+-- sent to instead:
+--
+--   application_id   the application it belongs to, when there is one, so the
+--                    result sits on the card staff accept or decline from
+--   ifc_name         their Infinite Flight Community name, so a test sent to
+--                    somebody who never applied still says who it was for
+--
+-- The token is the taker's only key, so a candidate row is opened by holding it
+-- (a pilot's row still also needs the pilot signed in — see the backend). Both
+-- columns are additive with defaults; an older project degrades to tests that
+-- are not tied to an application rather than to no tests at all.
+alter table crew_quiz_attempts add column if not exists application_id uuid
+    references crew_applications (id) on delete set null;
+alter table crew_quiz_attempts add column if not exists ifc_name text not null default '';
+create index if not exists crew_quiz_attempts_application_idx
+    on crew_quiz_attempts (va_slug, application_id) where application_id is not null;
+
 -- ----------------------------------------------------------------------------
 -- Buying something.
 --
@@ -2479,5 +2501,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 24)
+insert into crew_schema_info (id, version) values (1, 25)
 on conflict (id) do update set version = excluded.version, updated_at = now();

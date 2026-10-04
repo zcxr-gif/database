@@ -32,7 +32,8 @@
     "test:design": "node scripts/test-crew-design.js",
     "test:external": "node scripts/test-crew-external.js",
     "test:if-beta": "node scripts/test-if-beta.js",
-    "test:invite-banner": "node scripts/test-crew-invite-banner.js"
+    "test:invite-banner": "node scripts/test-crew-invite-banner.js",
+    "test:entrance": "node scripts/test-crew-entrance-tests.js"
   },
   "keywords": [],
   "author": "Antony",

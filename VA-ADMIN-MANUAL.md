@@ -343,6 +343,22 @@ asks.
   draw from their name and logo) and ends with a small *Welcome aboard* strip
   in their colours, drawn at `/api/crew/<slug>/invite-banner.png`. There is a
   *Plain text* copy beside it for Discord, where markdown images do not draw.
+- **No login on the screen after signing up.** A free-join VA still accepts
+  somebody the moment they sign up (roster row, callsign), but no password is
+  minted, shown or emailed. They land in Roster → **Logins** as "no login yet",
+  and staff send the sign-in from there — after an entrance test, if the VA
+  runs one. Their status link says the sign-in is on its way.
+- **Entrance tests.** Any quiz (Recruitment → Quizzes) can be sent as an
+  entrance test — from an application card, or to somebody who never applied
+  (Applications → *All tests & send to someone new*). The taker needs **no
+  account**: the link is the key (`/crew/<slug>/test?t=…`), and it only ever
+  opens a test sent to somebody who is not crew yet. The quiz sets the pass
+  mark, the **wait before a retake** (new quizzes default to 24 h) and the
+  **study resources** shown to anybody who does not pass. Staff copy a
+  ready-made welcome message (banner on top, strip at the bottom) to paste on
+  the IFC; passing is reported to staff, who then **accept** the application
+  (or *Add & invite* somebody who never applied) to send the crew center
+  invitation. Needs database v25 — the dashboard's *Update my database* button.
 - **Infinite Flight Live is locked in beta** for every crew center. The tile and
   setup step stay, marked Beta. To open it for testers set
   `IF_LIVE_BETA_SLUGS=slug1,slug2` on the backend, or `*` for everyone. Nothing a
