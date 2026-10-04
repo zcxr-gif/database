@@ -3660,7 +3660,8 @@ client.on('interactionCreate', async (interaction) => {
                                     `and to give your own staff access.\n` +
                                     `• Username: \`${username}\`\n` +
                                     `• Temporary password: \`${password}\`\n` +
-                                    `Please change your password after your first login.`;
+                                    `Please change your password after your first login — and pick your own callsign ` +
+                                    `under **Account → Your callsign** (the low numbers are yours to take).`;
                             } else {
                                 portalLine = `\n\n🔐 Your VA Partnership Portal is at ${VA_PORTAL_URL} ` +
                                     `(sign in with your existing portal credentials).`;
@@ -4575,7 +4576,8 @@ client.on('interactionCreate', async (interaction) => {
                                         `Log in at ${VA_PORTAL_URL} to submit documents, requests and reports for your VA.\n` +
                                         `• Username: \`${username}\`\n` +
                                         `• Temporary password: \`${password}\`\n` +
-                                        `Please change your password after your first login.`
+                                        `Please change your password after your first login, and set the callsign you fly as ` +
+                                        `under **Account → Your callsign**.`
                                     ).then(() => true).catch(() => false);
                                     portalLine = dmOk
                                         ? `\n🔐 Portal account \`@${username}\` ${reactivated ? 'reactivated' : 'created'} — credentials DM'd to them.`

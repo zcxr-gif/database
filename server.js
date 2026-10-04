@@ -67,7 +67,8 @@ const pilotModeration = require('./pilotModeration');
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
 const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial,
-    capabilitySummary, provisionStaffFromMember, CREW_CAPABILITIES } = require('./crewAuth');
+    capabilitySummary, provisionStaffFromMember, CREW_CAPABILITIES,
+    setUpStaffPilotSide, PilotSideError, ownMemberId } = require('./crewAuth');
 // Openings and staff applications — see the head of that file for why hiring is
 // gated on team.manage rather than on a capability of its own.
 const crewStaffApps = require('./crewStaffApps');
@@ -224,6 +225,11 @@ const crewSecrets = require('./crewSecrets');
 // rather than a deploy.
 const ifLive = require('./ifLive');
 const ifOAuth = require('./ifOAuth');
+// …and all of it behind a beta lock until it is opened on purpose. ifBeta.js.
+const ifBeta = require('./ifBeta');
+
+// The pictures that open and close a welcome message pasted on the IFC.
+const crewInviteBanner = require('./crewInviteBanner');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -1789,6 +1795,10 @@ async function postCrewNotice(url, { title, description, color, fields, image })
 // that wants applicant emails plugs in their own provider (below); otherwise no
 // email is ever sent and applicants rely on the status page.
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
+// Where THIS backend is reachable from the open internet — for pictures we draw
+// and somebody else's page hotlinks (the IFC welcome banners). Same variable
+// and fallback vaSites.js uses for a hosted site's crew endpoints.
+const BACKEND_PUBLIC_ORIGIN = String(process.env.PUBLIC_BACKEND_ORIGIN || 'https://site--indgo-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
 const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
 const CREW_EMAIL_LABELS = { resend: 'Resend', sendgrid: 'SendGrid', postmark: 'Postmark', mailgun: 'Mailgun' };
 const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -3862,7 +3872,82 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
+/* CALLSIGNS FROM THE VA PORTAL.
+ *
+ * The portal is where an owner adds their staff, and where an owner signs in
+ * first — so it is where "and what do you fly as?" belongs too. A callsign is a
+ * roster identity, which lives in the VA's own crew store, so these reach into
+ * that store through exactly the function the crew center's own "my callsign"
+ * box uses (crewAuth.setUpStaffPilotSide) — one answer to who somebody is,
+ * whichever door they asked at. vaPortal.js holds the routes and the auth.
+ *
+ * Every refusal comes back as { ok: false, code, error }, never a throw: the
+ * portal decides whether a missing database is a reason to stop (a callsign
+ * typed into a form that then cannot be kept) or a footnote (a team list that
+ * cannot show callsigns yet).
+ */
+const portalCallsigns = (() => {
+    const loadVa = (vaAdId) => VirtualAirlineAd.findById(vaAdId).select(crewStore.SELECT).lean();
+    const refusal = (err) => {
+        if (err instanceof PilotSideError) return { ok: false, code: err.code, error: err.message };
+        if (err instanceof crewStore.CrewStoreError) {
+            return {
+                ok: false, code: err.code || 'store_unavailable',
+                error: err.code === 'store_not_connected'
+                    ? 'Callsigns live in your crew center’s database, and it is not connected yet. Connect it from the crew center (Settings → Data store), then come back.'
+                    : err.message,
+            };
+        }
+        console.error('portal callsign error:', err?.message || err);
+        return { ok: false, code: 'callsign_failed', error: 'Could not reach your crew center to save that callsign.' };
+    };
+    const withStore = async (vaAdId, fn) => {
+        try {
+            const va = await loadVa(vaAdId);
+            if (!va) return { ok: false, code: 'va_not_found', error: 'That VA does not exist.' };
+            return await fn(va, await crewStore.forVa(va));
+        } catch (err) { return refusal(err); }
+    };
+    return {
+        /** What the shape looks like, and whether there is anywhere to keep one. */
+        info: (vaAdId, account) => withStore(vaAdId, async (va, store) => {
+            const fmt = crewCallsign.primaryFormat(va);
+            let callsign = '';
+            if (account) {
+                const own = await ownMemberId(store, account).catch(() => null);
+                const m = own ? await store.getMember(own).catch(() => null) : null;
+                callsign = (m && m.callsign) || '';
+            }
+            return { ok: true, available: true, callsign, sample: fmt ? crewCallsign.sample(fmt) : '' };
+        }),
+        /** Is it free? `account` may be null — a teammate not created yet. */
+        check: ({ vaAdId, account = null, callsign }) => withStore(vaAdId, async (va, store) => {
+            const own = account ? await ownMemberId(store, account).catch(() => null) : null;
+            return vetStaffCallsign(va, store, callsign, { exceptMemberId: own });
+        }),
+        /** Give this account its callsign, setting up its pilot side if needed. */
+        set: ({ vaAdId, account, callsign }) => withStore(vaAdId, async (va, store) => {
+            const out = await setUpStaffPilotSide({ va, acct: account, store, callsign });
+            return { ok: true, callsign: (out.member && out.member.callsign) || '', created: out.created };
+        }),
+        /** { accountId: callsign } for a team list. Best-effort: {} when unreachable. */
+        forAccounts: async (vaAdId, accounts) => {
+            const r = await withStore(vaAdId, async (va, store) => {
+                const members = await store.listMembers({ limit: 5000 });
+                const byId = new Map(members.map((m) => [String(m._id), m.callsign || '']));
+                const map = {};
+                await Promise.all((accounts || []).map(async (a) => {
+                    const own = await ownMemberId(store, a).catch(() => null);
+                    if (own && byId.get(String(own))) map[String(a._id)] = byId.get(String(own));
+                }));
+                return { ok: true, map };
+            });
+            return r.ok ? r.map : {};
+        },
+    };
+})();
+
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body), portalCallsigns });
 
 // The VA website editor's API (/api/va-portal/site/*) and Inflight's moderation
 // switch. Gated on the same portal session as everything else in the portal —
@@ -3895,7 +3980,7 @@ pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 // postAnnouncement is handed over rather than imported: crewAuth cannot require
 // this file back. See announceToBoard there.
-registerCrewAuthRoutes(app, { postAnnouncement });
+registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they
@@ -3993,7 +4078,10 @@ app.get('/api/crew/setup-sql', (req, res) => {
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = crewStore.SELECT;
+    // bannerUrl/logoUrl/tagline ride along for the IFC welcome message's
+    // pictures (inviteArt) — three short strings, and it saves a second read on
+    // every acceptance.
+    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
@@ -4174,6 +4262,23 @@ function normalizeStaffCallsign(va, raw) {
         if (fmt) return crewCallsign.build(fmt, parts.n).slice(0, 40);
     }
     return typed.toUpperCase().slice(0, 40);
+}
+
+/**
+ * May a member of staff take this callsign for THEMSELVES?
+ *
+ * Staff rules — the shape normalizeStaffCallsign gives, reserved numbers
+ * allowed — and the same holder check the roster runs, applications included.
+ * The owner who founded the airline flies as 001; nobody else gets 001 twice.
+ * Used by the crew center's "my callsign" box and by the VA portal when an
+ * owner gives a new teammate theirs (crewAuth.setUpStaffPilotSide).
+ */
+async function vetStaffCallsign(va, store, raw, { exceptMemberId = null } = {}) {
+    const callsign = normalizeStaffCallsign(va, raw);
+    if (!callsign) return { ok: true, callsign: '' };
+    const holder = await callsignHolder(va, store, callsign, { exceptMemberId });
+    if (holder) return { ok: false, code: 'callsign_taken', callsign, error: callsignTakenMessage(holder, callsign) };
+    return { ok: true, callsign };
 }
 
 // `ranks` is the VA's ladder. Passing it resolves the pilot's rank here rather
@@ -4359,7 +4464,25 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         if (holder) return res.status(409).json({ error: callsignTakenMessage(holder, values.callsign), code: 'callsign_taken' });
         const m = await store.createMember(values);
         vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
-        res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs) });
+        /* ADDED BY INVITE. Staff who already know who they want — somebody
+           they recruited on the IFC, a pilot coming over from another airline
+           — should not have to send them through the join form to be
+           accepted. Ticking "invite" makes their login and a single-use setup
+           link in the same step, and hands back the message to paste to them:
+           the same invitation the Logins tab keeps, so it is still there to
+           copy tomorrow if it is not sent today. A login that could not be
+           made does not undo the roster row — they are on the roster either
+           way, and the Logins tab can try again. */
+        let invite = null;
+        if (req.body && req.body.invite) {
+            try {
+                invite = await issueSetupInvites({ va, store, ids: [m._id], by: gate.p?.name, slug: req.params.slug });
+            } catch (err) {
+                console.error('roster add invite error:', err?.message || err);
+                invite = { error: 'They are on the roster, but their login could not be made. Try again from Logins.' };
+            }
+        }
+        res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs), ...(invite ? { invite } : {}) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
 // Edit a member.
@@ -8399,6 +8522,12 @@ const ifInvalidate = (vaId) => {
     for (const key of IF_CACHE.keys()) if (key.startsWith(prefix)) IF_CACHE.delete(key);
 };
 
+// --- The beta lock ----------------------------------------------------------
+//
+// Live is shut for every crew center until IF_LIVE_BETA_SLUGS opens it. One
+// gate in front of every route below — see ifBeta.js for what it answers.
+app.use('/api/crew/:slug/if', ifBeta.middleware());
+
 // --- The connection ---------------------------------------------------------
 
 /**
@@ -9594,6 +9723,9 @@ app.post('/api/crew/:slug/if/pull', async (req, res) => {
  * ------------------------------------------------------------------------ */
 async function syncScheduleToIf(va, action, schedule, store) {
     if (!va || !schedule) return;
+    // Locked in beta: a VA that switched the sync on before the lock keeps the
+    // setting, and nothing is written to its real rota until Live opens.
+    if (ifBeta.isLocked(va.slug)) return;
     try {
         const ad = await ifConnection(va._id);
         if (!ad || !ad.ifConnectedAt || !ad.ifSyncSchedules) return;
@@ -13267,8 +13399,56 @@ app.post('/api/crew/:slug/callsign-check', async (req, res) => {
 // Everything a rendering of an invitation needs to know. One builder, used by
 // the acceptance response, the applicant's status page and the staff clipboard,
 // so the three cannot drift into saying different things about the same login.
+/**
+ * The two pictures that frame a welcome pasted on the IFC (crewInvite.forIfc).
+ *
+ * Top: the airline's own directory banner when it has one, and otherwise a
+ * header we draw from its name and logo — a message should open with something
+ * that is THEIRS. Bottom: the small "Welcome aboard" strip, always ours to draw.
+ * Both are absolute, because the reader's browser fetches them from a forum
+ * post, and the drawn ones carry a version so a new logo or name is not hidden
+ * behind the forum's image cache.
+ */
+function inviteArt(va, slug) {
+    const s = String((va && va.slug) || slug || '').toLowerCase();
+    if (!s) return { bannerUrl: '', footerUrl: '' };
+    const v = crypto.createHash('sha1')
+        .update(JSON.stringify([va && va.name, va && va.logoUrl, va && va.crewAccent, va && va.tagline]))
+        .digest('hex').slice(0, 10);
+    const drawn = (kind) => `${BACKEND_PUBLIC_ORIGIN}/api/crew/${encodeURIComponent(s)}/invite-banner.png?kind=${kind}&v=${v}`;
+    const own = va && /^https:\/\//i.test(String(va.bannerUrl || '')) ? String(va.bannerUrl) : '';
+    return { bannerUrl: own || drawn('header'), footerUrl: drawn('footer') };
+}
+
+/**
+ * Public: the welcome message's pictures, as PNGs (crewInviteBanner.js).
+ * Hotlinked from IFC posts, so it is cached hard and a VA that cannot be found
+ * still gets a 404 rather than somebody else's airline.
+ */
+app.get('/api/crew/:slug/invite-banner.png', async (req, res) => {
+    try {
+        const slug = String(req.params.slug || '').trim().toLowerCase();
+        const va = await VirtualAirlineAd.findOne({ slug, status: 'approved' })
+            .select('name slug logoUrl crewAccent tagline').lean();
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const kind = req.query.kind === 'header' ? 'header' : 'footer';
+        const png = await crewInviteBanner.cached({
+            kind, name: va.name || '', logoUrl: va.logoUrl || '', accent: va.crewAccent || '',
+            url: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || slug)}`, tagline: va.tagline || '',
+        });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+        res.set('Access-Control-Allow-Origin', '*');
+        res.send(png);
+    } catch (err) {
+        console.error('invite banner error:', err?.message || err);
+        res.status(500).json({ error: 'Could not draw that banner.' });
+    }
+});
+
 function inviteContext(va, appDoc, slug) {
     return {
+        ...inviteArt(va, slug),
         vaName: (va && va.name) || '',
         ifcName: (appDoc && appDoc.ifcName) || '',
         callsign: applicationCallsign(appDoc, va),
@@ -14900,6 +15080,9 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
 
         const storeState = { connected: crewStore.isConnected(va) };
         let counts = null;
+        // The reader's own callsign, for the "fly as yourself" step. Only one
+        // of the VA's own staff logins has one to choose.
+        const you = gate.p && gate.p.kind === 'va' ? { applies: true, callsign: '' } : null;
         try {
             const store = await crewStore.forVaOrNull(va);
             const health = store ? await store.health() : null;
@@ -14914,6 +15097,16 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                     store.listAccounts().catch(() => []),
                 ]);
                 const byMember = new Map((accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a]));
+                if (you) {
+                    const own = (accounts || []).find((a) => String(a.portalAccountId || '') === String(gate.p.sub));
+                    let ownId = own && own.memberId;
+                    if (!ownId) {
+                        const acct = await VaPortalAccount.findById(gate.p.sub).select('crewMemberId').lean().catch(() => null);
+                        ownId = acct && acct.crewMemberId;
+                    }
+                    const m = ownId ? (members || []).find((x) => String(x._id) === String(ownId)) : null;
+                    you.callsign = (m && m.callsign) || '';
+                }
                 const active = (members || []).filter((m) => m.status !== 'inactive');
                 counts = {
                     members: (members || []).length,
@@ -14942,7 +15135,8 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                 crewWebhooks: (hooks && hooks.crewWebhooks) || {},
                 hasLegacyWebhook: !!(hooks && hooks.crewWebhookUrl),
             },
-            store: storeState, counts, staffAccounts,
+            store: storeState, counts, staffAccounts, you,
+            ifLocked: ifBeta.isLocked(va.slug || req.params.slug),
         });
         res.set('Cache-Control', 'no-store');
         res.json({
@@ -16060,10 +16254,14 @@ function inviteView(va, member, account, signInUrl) {
     const out = { accountId: account._id, state: inv.state, expiresAt: inv.expiresAt || null, sentAt: inv.sentAt || null, sentBy: inv.sentBy || '' };
     if (inv.state === 'live') {
         out.link = crewPasswordReset.resetUrl(signInUrl, inv.token);
-        out.message = crewPasswordReset.buildSetupMessage({
+        const words = {
             vaName: va.name, name: member.name, username: account.username, callsign: member.callsign,
-            link: out.link, expiresAt: inv.expiresAt,
-        });
+            link: out.link, expiresAt: inv.expiresAt, discordInvite: va.crewDiscordInvite || '',
+        };
+        // Framed for the IFC, where most of these are pasted; the plain one
+        // for Discord, where a markdown image is just text.
+        out.message = crewPasswordReset.buildSetupMessage({ ...words, ...inviteArt(va), format: 'ifc' });
+        out.plainMessage = crewPasswordReset.buildSetupMessage(words);
     }
     return out;
 }
@@ -16115,10 +16313,13 @@ async function issueSetupInvites({ va, store, ids, by, slug }) {
                 if (!password) password = (await crewAccounts.resetPassword(store, account._id))?.password || null;
                 out.password = password;
             }
-            out.message = crewPasswordReset.buildSetupMessage({
+            const words = {
                 vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
                 link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
-            });
+                discordInvite: va.crewDiscordInvite || '',
+            };
+            out.message = crewPasswordReset.buildSetupMessage({ ...words, ...inviteArt(va, slug), format: 'ifc' });
+            out.plainMessage = crewPasswordReset.buildSetupMessage(words);
             results.push(out);
         } catch (err) {
             console.error('crew login setup error', err?.message || err);

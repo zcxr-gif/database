@@ -88,7 +88,7 @@ function storeStep(store) {
  * @param {number} [input.staffAccounts]  central staff logins for this VA
  * @returns {{groups, steps, progress: {required, requiredDone, total, done}, next}}
  */
-function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0 } = {}) {
+function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0, ifLocked = false, you = null } = {}) {
     const steps = [];
     const db = storeStep(store);
     steps.push(db.step);
@@ -192,6 +192,19 @@ function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0 } = {}
             : 'Give your admins their own logins, each with only the permissions they need.',
     });
 
+    // The person reading this flies too. Only for one of the VA's own staff
+    // logins — Inflight oversight has no callsign at anybody's airline — and
+    // never required: an owner who does not fly has not left anything undone.
+    if (you && you.applies) {
+        steps.push(needsDb({
+            id: 'you', group: 'people', title: 'Your own callsign', required: false,
+            state: has(you.callsign) ? 'done' : 'todo',
+            summary: has(you.callsign)
+                ? `You fly as ${you.callsign}.`
+                : 'Staff fly too. Pick the callsign you fly as — the reserved low numbers are yours to take.',
+        }));
+    }
+
     // --- Connections -------------------------------------------------------
     const hooks = va.crewWebhooks || {};
     const hookCount = Object.values(hooks).filter((v) => typeof v === 'string' && v.trim()).length
@@ -210,7 +223,14 @@ function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0 } = {}
             ? 'Sending from your own provider.'
             : 'Optional. Lets pilots reset their own password and get decisions by email.',
     });
-    steps.push({
+    // Locked in beta (ifBeta.js): shown, so nobody wonders where it went, and
+    // `blocked` so it neither opens nor counts as the next thing to do.
+    if (ifLocked) steps.push({
+        id: 'infinite-flight', group: 'connections', title: 'Infinite Flight Live', required: false,
+        state: 'blocked', beta: true,
+        summary: 'In beta and locked for every crew center for now. It opens here when it is ready.',
+    });
+    else steps.push({
         id: 'infinite-flight', group: 'connections', title: 'Infinite Flight', required: false,
         state: has(va.ifOrganizationId) ? 'done' : 'todo',
         summary: has(va.ifOrganizationId)

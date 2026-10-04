@@ -317,6 +317,37 @@ tab. Use this when a VA's founder leaves rather than editing the database.
 - **Deleting** is permanent and does not free the VA's submissions or warnings;
   prefer Disable unless the account was created in error.
 
+### 7.6 Callsigns, the pilot view and adding pilots by invite
+
+What a VA's owner and staff can now do for themselves — worth knowing when one
+asks.
+
+- **Their own callsign.** Portal → **Account** → *Your callsign*, or the crew
+  center's *My flying* card. A bare number takes the VA's callsign shape
+  (`1` → `BAW 001VA`). Staff may take a reserved low number; nobody may take one
+  another pilot already flies. It is written to their own pilot record in the
+  VA's database (made for them if they have none), so a VA that has not
+  connected its database is told to do that first.
+- **A teammate's callsign.** Portal → **Team** → the *Callsign* box when adding
+  them, or the radio icon on their row. A taken number stops the form before
+  the account exists. If the VA has no database yet the teammate is still
+  added, and the owner is told the callsign has to wait.
+- **Pilot view ⇄ Admin view.** Owner and staff get a button in the crew center
+  header to move between the dashboard and the pilot home on the same session.
+  The last one they switched to is where sign-in lands them next time, on that
+  device.
+- **Adding a pilot by invite.** Roster → **Add** → tick *Invite them* (on by
+  default). It makes the roster row, their login and a single-use setup link,
+  and opens the welcome message to copy — no email needed.
+- **The IFC welcome message** opens with the VA's directory banner (or one we
+  draw from their name and logo) and ends with a small *Welcome aboard* strip
+  in their colours, drawn at `/api/crew/<slug>/invite-banner.png`. There is a
+  *Plain text* copy beside it for Discord, where markdown images do not draw.
+- **Infinite Flight Live is locked in beta** for every crew center. The tile and
+  setup step stay, marked Beta. To open it for testers set
+  `IF_LIVE_BETA_SLUGS=slug1,slug2` on the backend, or `*` for everyone. Nothing a
+  VA connected before the lock is lost.
+
 ---
 
 ## 8. Day-to-Day Workflows (the tool: `/va-ads`)
