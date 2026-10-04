@@ -258,6 +258,11 @@ const os = require('os');
 // MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
 sharp.cache(false);
 sharp.concurrency(1);
+// The rest of sharp's footprint is glibc keeping a malloc arena per thread and
+// never handing freed pages back: RSS sits hundreds of MB above heap+external
+// with nothing in flight. package.json's start script sets MALLOC_ARENA_MAX=2
+// for that — it has to be in the environment before the process starts, so it
+// cannot be set from here.
 
 // STABILITY: Keep the backend alive when the bot (or anything else) misbehaves.
 // Without these, a single rejected promise inside discord.js takes down the API.
@@ -23376,16 +23381,24 @@ setInterval(() => {
  * The watchdog. The 5-minute line above cannot see a kill that builds in under
  * a minute — which is what the logs show: an ordinary line, then "Killed" 40
  * seconds later. So RSS is checked every 5 seconds (process.memoryUsage.rss()
- * is a single syscall), and once it is high, or jumps sharply, each tick logs
- * the breakdown AND every request in flight, oldest first. The last of these
- * lines before a "Killed" names what was running when memory ran out.
+ * is a single syscall), and once it is high, or jumps sharply, it logs the
+ * breakdown AND every request in flight, oldest first. While high it repeats
+ * on every 25MB of growth and every tick in the shed zone, so the last of these
+ * lines before a "Killed" still names what was running when memory ran out.
  */
 const WATCHDOG_MS = 5000;
 const WATCHDOG_ALERT_RATIO = 0.70;
 const WATCHDOG_JUMP_MB = 100;         // growth within one tick worth reporting
 const SHED_MIN_GAP_MS = 30 * 1000;
+// Sitting above the alert ratio is reported once, then again only if it keeps
+// climbing or every few minutes. Repeating an unchanged line every 5 seconds
+// buried the logs without saying anything the first line had not.
+const WATCHDOG_REPEAT_MS = 5 * 60 * 1000;
+const WATCHDOG_REPEAT_GROWTH_MB = 25;
 let watchdogLastRssMb = 0;
 let lastShedAt = 0;
+let watchdogLastWarnAt = 0;
+let watchdogLastWarnRssMb = 0;
 
 const inflightLine = () => {
     const now = Date.now();
@@ -23403,7 +23416,17 @@ setInterval(() => {
     const jumped = watchdogLastRssMb && rssMb - watchdogLastRssMb >= WATCHDOG_JUMP_MB;
     const high = MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * WATCHDOG_ALERT_RATIO;
     watchdogLastRssMb = rssMb;
-    if (!high && !jumped) return;
+    if (!high && !jumped) {
+        watchdogLastWarnAt = 0;
+        return;
+    }
+    const shedDue = MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO;
+    const repeatDue = !watchdogLastWarnAt
+        || Date.now() - watchdogLastWarnAt >= WATCHDOG_REPEAT_MS
+        || rssMb - watchdogLastWarnRssMb >= WATCHDOG_REPEAT_GROWTH_MB;
+    if (!jumped && !shedDue && !repeatDue) return;
+    watchdogLastWarnAt = Date.now();
+    watchdogLastWarnRssMb = rssMb;
 
     const m = process.memoryUsage();
     const pct = MEMORY_LIMIT_MB ? ` (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}% of ${MEMORY_LIMIT_MB}MB)` : '';
@@ -23412,7 +23435,7 @@ setInterval(() => {
         + ` external=${mb(m.external)}MB arrayBuffers=${mb(m.arrayBuffers)}MB${imageCacheLine()}`
         + ` — ${inflightLine()}`,
     );
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO && Date.now() - lastShedAt >= SHED_MIN_GAP_MS) {
+    if (shedDue && Date.now() - lastShedAt >= SHED_MIN_GAP_MS) {
         lastShedAt = Date.now();
         shedImageCaches(rssMb);
     }
