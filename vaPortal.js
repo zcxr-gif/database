@@ -1004,7 +1004,19 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview, applyEmbedAppearance }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview, applyEmbedAppearance, portalCallsigns = null }) {
+    // Callsigns live in the VA's own crew store, which server.js knows how to
+    // reach and this file does not (see portalCallsigns there). Absent — the
+    // test harness, or a deployment without the crew center — every callsign
+    // answer is a polite "not here", never a crash.
+    const callsigns = portalCallsigns || {
+        info: async () => ({ ok: false, code: 'unavailable', error: 'Callsigns are not available here.' }),
+        check: async () => ({ ok: false, code: 'unavailable', error: 'Callsigns are not available here.' }),
+        set: async () => ({ ok: false, code: 'unavailable', error: 'Callsigns are not available here.' }),
+        forAccounts: async () => ({}),
+    };
+    const typedCallsign = (v) => String(v == null ? '' : v).trim().slice(0, 40);
+
     // Webhook URLs are secrets, so the profile API never echoes one back in full.
     // Surface just enough for the owner to recognise what's saved: the trailing
     // chars of the webhook id. Defensive against malformed stored values.
@@ -1996,7 +2008,42 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     // =====================================================================
     app.get('/api/va-portal/team', requirePortal, async (req, res) => {
         const team = await VaPortalAccount.find({ vaAdId: req.portal.vaAdId }).sort({ createdAt: 1 });
-        res.json({ team: team.map(publicAccount) });
+        // What each of them flies as, read from the crew center. Best-effort:
+        // a VA that has not connected its database still gets its team list.
+        const flying = await callsigns.forAccounts(req.portal.vaAdId, team).catch(() => ({}));
+        res.json({ team: team.map((a) => ({ ...publicAccount(a), callsign: flying[String(a._id)] || '' })) });
+    });
+
+    /* =====================================================================
+     * MY CALLSIGN
+     *
+     * The owner — and every teammate — picks what they fly as, here where
+     * they first sign in, rather than having to find it on a roster. Written
+     * to their own pilot record in the crew center (made for them if they have
+     * not got one), under staff rules: a reserved low number is theirs to take,
+     * a number somebody already flies is not. `check` only asks.
+     * =================================================================== */
+    app.get('/api/va-portal/me/callsign', requirePortal, async (req, res) => {
+        const r = await callsigns.info(req.portal.vaAdId, req.portal);
+        res.set('Cache-Control', 'no-store');
+        res.json(r.ok ? r : { ok: false, available: false, code: r.code, error: r.error, callsign: '', sample: '' });
+    });
+
+    app.post('/api/va-portal/me/callsign', requirePortal, async (req, res) => {
+        const callsign = typedCallsign(req.body && req.body.callsign);
+        if (!callsign) return res.status(400).json({ error: 'Type the callsign you fly as.', code: 'callsign_required' });
+        if (req.body && req.body.check) {
+            const v = await callsigns.check({ vaAdId: req.portal.vaAdId, account: req.portal, callsign });
+            return res.json(v);
+        }
+        const r = await callsigns.set({ vaAdId: req.portal.vaAdId, account: req.portal, callsign });
+        if (!r.ok) return res.status(r.code === 'callsign_taken' ? 409 : 400).json(r);
+        logActivity({
+            vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+            actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+            action: 'team.callsign', detail: `Now flying as ${r.callsign}`,
+        });
+        res.json(r);
     });
 
     app.post('/api/va-portal/team', requirePortalOwner, async (req, res) => {
@@ -2017,6 +2064,17 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (await VaPortalAccount.exists({ username: uname })) {
                 return res.status(409).json({ error: 'That username is already taken.' });
             }
+            /* THEIR CALLSIGN, if the owner gave one. Asked BEFORE the account
+               exists, so a number somebody already flies stops the form while
+               it can still be changed, instead of leaving a teammate made and
+               a callsign silently dropped. A database that cannot be reached
+               is different: the teammate still gets their login, and the reply
+               says the callsign has to wait. */
+            const callsign = typedCallsign(req.body.callsign);
+            if (callsign) {
+                const v = await callsigns.check({ vaAdId: req.portal.vaAdId, account: null, callsign });
+                if (!v.ok && v.code === 'callsign_taken') return res.status(409).json(v);
+            }
             const passwordHash = await bcrypt.hash(password, 12);
             const account = await VaPortalAccount.create({
                 username: uname,
@@ -2029,12 +2087,17 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 createdByName: req.portal.displayName || req.portal.username,
                 active: true,
             });
+            let flying = null;
+            if (callsign) flying = await callsigns.set({ vaAdId: req.portal.vaAdId, account, callsign });
             logActivity({
                 vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
                 actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
-                action: 'team.create', detail: `Added @${uname}`,
+                action: 'team.create', detail: `Added @${uname}${flying && flying.ok ? ` as ${flying.callsign}` : ''}`,
             });
-            res.status(201).json({ account: publicAccount(account) });
+            res.status(201).json({
+                account: { ...publicAccount(account), callsign: (flying && flying.ok && flying.callsign) || '' },
+                ...(flying && !flying.ok ? { callsignWarning: flying.error } : {}),
+            });
         } catch (err) {
             console.error('VA portal team create error:', err);
             res.status(500).json({ error: 'Could not create the account.' });
@@ -2089,13 +2152,22 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 account.passwordHash = await bcrypt.hash(password, 12);
                 account.mustChangePassword = false;
             }
+            // A teammate's callsign, set by the owner. First, and on its own:
+            // a number that is taken refuses the request before anything else
+            // about the account has been changed.
+            let flying = null;
+            const callsign = typedCallsign(req.body && req.body.callsign);
+            if (callsign) {
+                flying = await callsigns.set({ vaAdId: req.portal.vaAdId, account, callsign });
+                if (!flying.ok) return res.status(flying.code === 'callsign_taken' ? 409 : 400).json(flying);
+            }
             await account.save();
             logActivity({
                 vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
                 actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
-                action: 'team.update', detail: `Updated @${account.username}`,
+                action: 'team.update', detail: `Updated @${account.username}${flying ? ` — flies as ${flying.callsign}` : ''}`,
             });
-            res.json({ account: publicAccount(account) });
+            res.json({ account: { ...publicAccount(account), ...(flying ? { callsign: flying.callsign } : {}) } });
         } catch (err) {
             console.error('VA portal team update error:', err);
             res.status(500).json({ error: 'Could not update the account.' });
@@ -2274,13 +2346,23 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 mustChangePassword: generated,
                 active: true,
             });
+            // The owner's callsign, when we are setting the account up for them
+            // and already know it. Best-effort: a VA whose crew center has no
+            // database yet still gets its account, and the owner picks it in
+            // the portal later.
+            const callsign = typedCallsign(req.body && req.body.callsign);
+            const flying = callsign ? await callsigns.set({ vaAdId: ad._id, account, callsign }) : null;
             logActivity({
                 vaAdId: ad._id, vaName: ad.name,
                 actorName: req.staff.displayName || req.staff.username, actorRole: 'inflight-staff',
-                action: 'account.create', detail: `Created ${wantRole} @${uname}`,
+                action: 'account.create', detail: `Created ${wantRole} @${uname}${flying && flying.ok ? ` flying as ${flying.callsign}` : ''}`,
             });
             // Return the plaintext password ONLY when we generated it.
-            res.status(201).json({ account: publicAccount(account), password: generated ? plainPassword : null });
+            res.status(201).json({
+                account: { ...publicAccount(account), callsign: (flying && flying.ok && flying.callsign) || '' },
+                password: generated ? plainPassword : null,
+                ...(flying && !flying.ok ? { callsignWarning: flying.error } : {}),
+            });
         } catch (err) {
             console.error('VA portal admin create account error:', err);
             res.status(500).json({ error: 'Could not create the account.' });

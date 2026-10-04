@@ -85,5 +85,16 @@ console.log('\n a database that will not answer');
     T('and does not trust counts it could not have read', state(g, 'roster'), 'blocked');
 }
 
+console.log('\n the reader\'s own callsign');
+{
+    const base = { va: { callsign: 'BAW ###' }, store: { connected: true, ok: true, provisioned: true }, counts: { members: 1, active: 1, routes: 0 } };
+    T('only shown to one of the VA\'s own staff logins', state(guide.evaluate(base), 'you'), undefined);
+    T('to do until they have one', state(guide.evaluate({ ...base, you: { applies: true, callsign: '' } }), 'you'), 'todo');
+    const done = guide.evaluate({ ...base, you: { applies: true, callsign: 'BAW 001' } });
+    T('done once they fly as something, and it says what', [state(done, 'you'), /BAW 001/.test(done.steps.find((x) => x.id === 'you').summary)], ['done', true]);
+    T('never required', done.steps.find((x) => x.id === 'you').required, false);
+    T('waits for the database like the rest of the roster', state(guide.evaluate({ va: {}, store: {}, you: { applies: true } }), 'you'), 'blocked');
+}
+
 console.log(failures ? `\n${failures} check(s) failed\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

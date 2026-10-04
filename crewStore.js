@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 24;
+const EXPECTED_SCHEMA_VERSION = 25;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -202,6 +202,13 @@ const CODESHARE_LINK_SCHEMA_VERSION = 23;
 // them, and "mark as sent" is refused rather than confirmed and not stored.
 const INVITES_SCHEMA_VERSION = 24;
 
+// The version that ties a quiz attempt to somebody who is not on the roster yet
+// (crew_quiz_attempts.application_id, ifc_name): the entrance test. Not a gate:
+// a v24 project can still SEND a test — the row simply has no member, which is
+// what makes it an entrance test — it just cannot remember which application it
+// belongs to. So both columns sit in LATE_COLUMNS.
+const ENTRANCE_SCHEMA_VERSION = 25;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -273,6 +280,9 @@ const LATE_COLUMNS = {
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
     ]),
+    // v25. A test written without them is still a test, sat and marked; what
+    // waits for the upgrade is the line back to the application it was for.
+    crew_quiz_attempts: new Set(['application_id', 'ifc_name']),
 };
 
 // What each dropped column costs, in words a VA reads rather than column names.
@@ -310,6 +320,8 @@ const DRIFT_LABELS = {
     'crew_applications.invite_claimed_at': 'saved pilot invitations',
     'crew_applications.invite_revoked_at': 'saved pilot invitations',
     'crew_applications.invite_account_id': 'saved pilot invitations',
+    'crew_quiz_attempts.application_id': 'entrance tests tied to an application',
+    'crew_quiz_attempts.ifc_name': 'the IFC name an entrance test was sent to',
     // v20. Not a column — the only entry here that is not. `kind` is an inline
     // CHECK constraint, and a project provisioned before the value being
     // written was added refuses it; createAnnouncement posts the notice as a
@@ -1280,6 +1292,9 @@ const quizAttemptFromRow = (r) => r && {
     quizTitle: r.quiz_title || '',
     token: r.token || '',
     memberId: r.member_id || null,
+    // v25. Set on an entrance test — somebody not on the roster yet.
+    applicationId: r.application_id || null,
+    ifcName: r.ifc_name || '',
     pilotName: r.pilot_name || '',
     callsign: r.callsign || '',
     status: r.status || 'issued',
@@ -1304,6 +1319,8 @@ const quizAttemptToRow = (a) => {
     pick(a, out, 'quizTitle', 'quiz_title', (v) => str(v, 120));
     pick(a, out, 'token', 'token', (v) => str(v, 64));
     pick(a, out, 'memberId', 'member_id', (v) => v || null);
+    pick(a, out, 'applicationId', 'application_id', (v) => (str(v, 64) || null));
+    pick(a, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
     pick(a, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
     pick(a, out, 'callsign', 'callsign', (v) => str(v, 40));
     pick(a, out, 'status', 'status', (v) => (QUIZ_ATTEMPT_STATUSES.includes(v) ? v : 'issued'));
@@ -2684,10 +2701,13 @@ class SupabaseStore {
      * see, and the filter is applied in the query so the rest of the airline's
      * results never leave Postgres.
      */
-    listQuizAttempts({ memberId = '', quizId = '', status = '', limit = 300 } = {}) {
+    listQuizAttempts({ memberId = '', quizId = '', status = '', applicationId = '', candidates = false, limit = 300 } = {}) {
         return this.quizzes(async () => {
             const q = { ...this.scope, order: 'created_at.desc', limit };
             if (memberId) q.member_id = `eq.${memberId}`;
+            // Entrance tests: the rows with nobody on the roster behind them.
+            else if (candidates) q.member_id = 'is.null';
+            if (applicationId) q.application_id = `eq.${applicationId}`;
             if (quizId) q.quiz_id = `eq.${quizId}`;
             if (status) q.status = `eq.${status}`;
             const rows = await this.db.select('crew_quiz_attempts', q);
@@ -3060,6 +3080,7 @@ class SupabaseStore {
                 codeshareLinks: version >= CODESHARE_LINK_SCHEMA_VERSION,
                 // v24. Whether setup links can be kept as invitations.
                 invites: version >= INVITES_SCHEMA_VERSION,
+                entrance: version >= ENTRANCE_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -3868,5 +3889,6 @@ module.exports = {
     STAFF_APPS_SCHEMA_VERSION,
     CODESHARE_LINK_SCHEMA_VERSION,
     INVITES_SCHEMA_VERSION,
+    ENTRANCE_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

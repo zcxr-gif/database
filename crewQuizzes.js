@@ -144,6 +144,12 @@ function sanitizeQuizzes(arr) {
             // somebody a link.
             open: !!(qz && qz.open),
             active: !(qz && qz.active === false),
+            // ENTRANCE TESTS (v25). How long somebody who did not pass waits
+            // before another go, and what they are pointed at to prepare. 0 is
+            // "straight away", which is what every quiz did before these
+            // existed — so a quiz saved before them keeps behaving as it did.
+            retakeHours: int(qz && qz.retakeHours, 0, 720, 0),
+            study: clean(qz && qz.study, 2000),
             questions,
         };
     });
@@ -168,6 +174,10 @@ function publicQuiz(q, { withAnswers = false } = {}) {
         maxAttempts: q.maxAttempts,
         open: q.open,
         active: q.active,
+        retakeHours: Number(q.retakeHours) || 0,
+        // Study material is for somebody who did not pass; a taker is handed it
+        // with their result (see `retryAfter` and the test routes), not before.
+        ...(withAnswers ? { study: q.study || '' } : {}),
         ready: isReady(q),
         questionCount: (q.questions || []).length,
         questions: (q.questions || []).map((qq) => (withAnswers
@@ -316,6 +326,31 @@ function myAttemptView(a) {
     return v;
 }
 
+/**
+ * When a failed paper may be sat again, or null when it may be now.
+ *
+ * Read off the paper's own last hand-in and the quiz's `retakeHours`, so
+ * changing the wait applies to everybody still waiting — a VA that shortens it
+ * from a week to a day has not left anybody stranded on the old rule.
+ */
+function retryAfter(quiz, attempt, now = Date.now()) {
+    if (!quiz || !attempt || attempt.status !== 'failed') return null;
+    const hours = Number(quiz.retakeHours) || 0;
+    const at = attempt.submittedAt ? new Date(attempt.submittedAt).getTime() : NaN;
+    if (!hours || !Number.isFinite(at)) return null;
+    const open = at + hours * 3600 * 1000;
+    return open > now ? new Date(open) : null;
+}
+
+/** "in 23 hours" / "in 3 days", for a sentence. */
+function waitText(until, now = Date.now()) {
+    const ms = new Date(until).getTime() - now;
+    const h = Math.max(1, Math.ceil(ms / 3600000));
+    if (h < 48) return `in ${h} hour${h === 1 ? '' : 's'}`;
+    const d = Math.ceil(h / 24);
+    return `in ${d} days`;
+}
+
 /** Why this pilot cannot sit this attempt now, or '' if they can. */
 function takeFailure(quiz, attempt) {
     if (!attempt) return 'That quiz link is not valid. Ask your staff for a new one.';
@@ -327,7 +362,63 @@ function takeFailure(quiz, attempt) {
     if (max > 0 && (Number(attempt.attemptsUsed) || 0) >= max) {
         return `You have used all ${max} attempt${max === 1 ? '' : 's'} at this one. Your staff can give you another go.`;
     }
+    const wait = retryAfter(quiz, attempt);
+    if (wait) return `You can take it again ${waitText(wait)}.${quiz.study ? ' Use the time to go over the study material.' : ''}`;
     return '';
+}
+
+/* ===========================================================================
+ * ENTRANCE TESTS (v25)
+ *
+ * A quiz sent to somebody who is NOT crew yet — an applicant, or a pilot staff
+ * met on the IFC — before they are given a crew centre login. The taker has no
+ * account, so the link alone opens it; that is the one difference from a
+ * pilot's quiz, and it is why a link only ever opens a row with no pilot behind
+ * it (see the test routes in server.js). Passing does not let anybody in:
+ * staff read the result and send the invitation themselves.
+ * ======================================================================== */
+
+/** An entrance test as STAFF see it. */
+function candidateView(a) {
+    const v = attemptView(a);
+    v.applicationId = a.applicationId || null;
+    v.ifcName = a.ifcName || '';
+    return v;
+}
+
+/**
+ * The message a staff member pastes to the person they are testing — the same
+ * shape as the welcome a VA writes by hand ("Welcome to …! Before you take to
+ * the virtual skies, please complete our Entrance Test…"), filled in from the
+ * quiz so the pass mark and the retake rule it states are the ones enforced.
+ *
+ * Plain text; crewInvite.forIfc frames it with the airline's banners for the
+ * IFC, exactly like an acceptance.
+ */
+function buildTestMessage({ vaName = '', name = '', quiz = {}, link = '', note = '' } = {}) {
+    const va = String(vaName || '').trim() || 'the crew';
+    const who = String(name || '').trim();
+    const mark = Number(quiz.passMark) || 80;
+    const wait = Number(quiz.retakeHours) || 0;
+    const max = Number(quiz.maxAttempts) || 0;
+    const lines = [];
+    lines.push(who ? `Welcome to ${va}, ${who}!` : `Welcome to ${va}!`);
+    lines.push('', String(quiz.blurb || '').trim() || 'We are thrilled to have you join our flight deck.');
+    if (note) lines.push('', String(note).trim());
+    lines.push('', `Before you take to the virtual skies, please complete our ${String(quiz.title || 'Entrance Test').trim()}.`);
+    lines.push('', 'Important details:');
+    lines.push(`  - Passing grade: ${mark}% or higher`);
+    lines.push(`  - Questions: ${(quiz.questions || []).length || quiz.questionCount || 0}`);
+    const below = [];
+    if (quiz.study) below.push('we will give you study resources to help you prepare');
+    if (wait) below.push(`you can retake the test in ${wait % 24 === 0 ? `${wait / 24} day${wait === 24 ? '' : 's'} (${wait} hours)` : `${wait} hour${wait === 1 ? '' : 's'}`}`);
+    else below.push('you can retake it straight away');
+    lines.push(`  - If you score below ${mark}%: don't worry — ${below.join(', and ')}.${max ? ` (${max} attempt${max === 1 ? '' : 's'} in all.)` : ''}`);
+    lines.push('  - No account needed — just open the link.');
+    lines.push('', 'Pass, and we\'ll send you your crew center invitation.');
+    lines.push('', 'Clear skies, and happy flying!');
+    if (link) lines.push('', 'Here is your link:', link);
+    return lines.join('\n');
 }
 
 /**
@@ -392,4 +483,5 @@ module.exports = {
     isReady, publicQuiz, grade,
     sanitizeGate, sanitizeBanners, sanitizeReminders,
     attemptView, myAttemptView, takeFailure, gateState, attemptToken,
+    retryAfter, waitText, candidateView, buildTestMessage,
 };

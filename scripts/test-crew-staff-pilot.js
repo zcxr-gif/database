@@ -71,6 +71,11 @@ const store = {
         return a || null;
     },
     getMember: async (id) => MEMBERS.find((m) => String(m._id) === String(id)) || null,
+    updateMember: async (id, patch) => {
+        const m = MEMBERS.find((x) => String(x._id) === String(id));
+        if (m) Object.assign(m, patch);
+        return m || null;
+    },
     listMembers: async () => MEMBERS.slice(),
     getAccountByMember: async (mid) => ACCOUNTS.find((a) => String(a.memberId || '') === String(mid)) || null,
     createMember: async (data) => {
@@ -361,6 +366,46 @@ const server = app.listen(0, async () => {
             /* Nothing to record an answer on, so nobody is shown a prompt with
                no button behind it. */
             check('Inflight oversight is never asked', oversight.terms.applies === false && oversight.terms.accepted === true, oversight.terms);
+        }
+
+        /* ---- choosing their own callsign ------------------------------------ */
+        {
+            // A fresh owner with no pilot side, and a roster where 101 is Rae's.
+            freshStore();
+            PORTAL.crewMemberId = null;
+
+            const pilot = await post('/api/crew/ba/me/callsign', { callsign: 'BAW 7' }, auth(pilotSession));
+            check('a pilot cannot choose their own callsign', pilot.status === 403);
+
+            const taken = await post('/api/crew/ba/me/callsign', { callsign: 'BAW101', check: true }, auth(staffSession));
+            const t = await taken.json();
+            check('checking a number somebody flies says it is taken', t.ok === false && t.code === 'callsign_taken', t);
+
+            const clash = await post('/api/crew/ba/me/pilot-side', { callsign: 'BAW101' }, auth(staffSession));
+            check('setting up with a taken callsign is refused…', clash.status === 409);
+            check('…and leaves nothing half-made behind',
+                MEMBERS.length === 1 && !ACCOUNTS.some((a) => a.portalAccountId === PORTAL._id), { MEMBERS, ACCOUNTS });
+
+            const setUp = await post('/api/crew/ba/me/pilot-side', { callsign: 'BAW001' }, auth(staffSession));
+            const b = await setUp.json();
+            check('an owner can set up with their own callsign', setUp.status === 201 && b.pilot && b.pilot.callsign === 'BAW001', b);
+            check('the roster row carries it', MEMBERS.some((m) => m.name === 'Chris' && m.callsign === 'BAW001'), MEMBERS);
+
+            const again = await post('/api/crew/ba/me/callsign', { callsign: 'BAW001', check: true }, auth(staffSession));
+            const a = await again.json();
+            check('their own callsign is not a clash with themselves', a.ok === true, a);
+
+            const change = await post('/api/crew/ba/me/callsign', { callsign: 'BAW002' }, auth(staffSession));
+            const c = await change.json();
+            check('they can change it later', change.status === 200 && c.pilot && c.pilot.callsign === 'BAW002', c);
+            check('…on the same row, not a second one', MEMBERS.filter((m) => m.name === 'Chris').length === 1, MEMBERS);
+
+            const blank = await post('/api/crew/ba/me/pilot-side', { callsign: '' }, auth(staffSession));
+            const d = await blank.json();
+            check('an empty box never takes a callsign away', d.pilot && d.pilot.callsign === 'BAW002', d);
+
+            const empty = await post('/api/crew/ba/me/callsign', { callsign: '  ' }, auth(staffSession));
+            check('saving nothing is refused rather than read as a clear', empty.status === 400);
         }
 
         done();

@@ -50,6 +50,8 @@ const crewSchedules = require('./crewSchedules');
 // something different when the page draws it.
 const crewHero = require('./crewHero');
 const crewRetention = require('./crewRetention');
+// Only to say whether Infinite Flight Live is open for this crew center.
+const ifBeta = require('./ifBeta');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 
@@ -1242,8 +1244,173 @@ function crewSession(va, identity, username, slugFallback) {
  */
 let announceToBoard = () => {};
 
-function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
+/* =========================================================================
+ * A STAFF MEMBER'S OWN PILOT SIDE — and their callsign on it
+ *
+ * One function behind three doors: the crew center's "Set up my pilot account"
+ * card, the crew center's "My callsign" box, and the VA portal, where an owner
+ * adding a teammate can give them a callsign on the spot (see vaPortal.js).
+ * Three copies of "find their row, make one if there is none, bind the login"
+ * would be three slightly different answers to who somebody is.
+ * ======================================================================= */
+
+/** A refusal with a status and a code the screen can act on. */
+class PilotSideError extends Error {
+    constructor(status, code, message) {
+        super(message);
+        this.status = status;
+        this.code = code;
+    }
+}
+
+/*
+ * Is this callsign one a member of staff may take?
+ *
+ * Handed over at registration, like the noticeboard writer: the callsign rules
+ * that matter — the VA's mask, its registered airlines, who already holds a
+ * number, including applications still under review — live in server.js next
+ * to the roster that enforces them, and requiring server.js from here would be
+ * a cycle. This default is what the test harness gets: the roster half of the
+ * holder check and nothing else.
+ *
+ * Answers { ok, callsign } or { ok: false, code, error, callsign }.
+ */
+let vetCallsign = async (va, store, raw, { exceptMemberId = null } = {}) => {
+    const callsign = clampStr(raw, 40).toUpperCase();
+    if (!callsign) return { ok: true, callsign: '' };
+    const members = await store.listMembers({ limit: 5000 });
+    const held = crewCallsign.heldBy(members, callsign, { exceptId: exceptMemberId });
+    return held
+        ? { ok: false, code: 'callsign_taken', callsign, error: `${callsign} is already flown by ${held.name || 'another pilot'}. Pick a different number.` }
+        : { ok: true, callsign };
+};
+
+/** The roster row this central account already flies as, or null. */
+async function ownMemberId(store, acct) {
+    const row = await boundPilotRow(store, String(acct._id));
+    return (row && row.memberId) || acct.crewMemberId || null;
+}
+
+/**
+ * Set up — or bring up to date — a staff member's own pilot side.
+ *
+ * @param {Object} o
+ * @param {Object} o.va        the VA (lean, with crewStore.SELECT)
+ * @param {Object} o.acct      their VaPortalAccount (lean: _id username displayName crewMemberId)
+ * @param {Object} o.store     the VA's crew store
+ * @param {string} [o.memberId]  a roster row they say is them
+ * @param {string} [o.callsign]  what they fly as; undefined leaves it alone,
+ *                               and so does '' — an empty box on a set-up card
+ *                               is "not now", never "take my callsign away"
+ * @returns {{created: boolean, account: Object, member: Object|null}}
+ * @throws {PilotSideError}
+ */
+async function setUpStaffPilotSide({ va, acct, store, memberId = '', callsign } = {}) {
+    if (typeof store.getAccountByPortal !== 'function') {
+        throw new PilotSideError(409, 'unsupported_store', 'This crew center’s data store cannot hold a staff pilot account yet.');
+    }
+    const VaPortalAccount = mongoose.model('VaPortalAccount');
+    const name = String(acct.displayName || acct.username || 'Staff').trim();
+
+    /* THE ROSTER ROW.
+       In order of preference: one they asked for, the one they have already
+       claimed, or a new one in their own name. The third is the point of the
+       whole thing — a staff member should not have to pick somebody else's
+       row off the roster to be a pilot — and it is why this creates rather
+       than only links. */
+    let member = null;
+    const wanted = String(memberId || '').trim();
+    if (wanted) {
+        member = await store.getMember(wanted);
+        if (!member) throw new PilotSideError(404, 'member_not_found', 'That pilot isn’t on this roster.');
+        /* NOT SOMEBODY ELSE'S. The request may name any roster row, so this is
+           the check that stops a staff member binding their pilot side to a
+           pilot who signs in as themselves — two identities on one record,
+           each able to cancel the other's flying, and the pilot's own login no
+           longer findable by their roster row. The same rule POST /me/pilot
+           applies; this is the other door into it.
+           Their own binding passes, because re-running this with the row they
+           already hold has to be a no-op and not a refusal. */
+        if (typeof store.getAccountByMember === 'function') {
+            const owner = await store.getAccountByMember(member._id).catch(() => null);
+            if (owner && String(owner.portalAccountId || '') !== String(acct._id)) {
+                throw new PilotSideError(409, 'pilot_has_login', 'That pilot already has their own crew center login.');
+            }
+        }
+    } else {
+        const own = await ownMemberId(store, acct);
+        if (own) member = await store.getMember(own);
+    }
+    /* Already on the roster under their own name? Take that row rather than
+       adding a second of them — see findUnclaimedNamesake for why a duplicate
+       is worse than it looks. */
+    if (!member) member = await crewAccounts.findUnclaimedNamesake(store, name, String(acct._id));
+
+    /* THE CALLSIGN. Vetted before anything is written, so a number that is
+       taken refuses the whole request instead of leaving a half-made pilot
+       behind. Their own row is excluded from the holder check — re-saving the
+       callsign you already fly as is not a clash with yourself. */
+    let chosen = '';
+    if (typeof callsign === 'string' && callsign.trim()) {
+        const v = await vetCallsign(va, store, callsign, { exceptMemberId: member ? member._id : null });
+        if (!v.ok) throw new PilotSideError(409, v.code || 'callsign_taken', v.error || 'That callsign is taken.');
+        chosen = v.callsign;
+    }
+
+    if (!member) {
+        member = await store.createMember({
+            name,
+            // Theirs if they chose one; otherwise left for them or for staff to
+            // fill in — guessing one risks handing out a number another pilot
+            // already flies.
+            callsign: chosen,
+            hours: 0,
+            status: 'active',
+        });
+    } else if (chosen && chosen !== member.callsign) {
+        member = (await store.updateMember(member._id, { callsign: chosen })) || { ...member, callsign: chosen };
+    }
+
+    const r = await crewAccounts.provisionStaffAccount(store, {
+        portalAccountId: String(acct._id),
+        displayName: name,
+        username: acct.username || '',
+        memberId: member ? member._id : null,
+        vaName: va.name || '',
+    });
+
+    // Keep the central account's own pointer in step, so the roster link staff
+    // already had (POST /me/pilot) and this agree about who they are rather
+    // than each holding half an answer.
+    if (member && String(acct.crewMemberId || '') !== String(member._id)) {
+        await VaPortalAccount.findByIdAndUpdate(acct._id, { crewMemberId: String(member._id) }).catch(() => {});
+    }
+    return { created: r.created, account: r.account, member };
+}
+
+/** What the set-up and callsign routes answer with. */
+function pilotSideReply({ created, account, member }) {
+    return {
+        created,
+        account: crewAccounts.publicAccount(account),
+        pilot: member
+            ? { memberId: member._id, name: member.name, callsign: member.callsign || '', hours: Number(member.hours) || 0 }
+            : null,
+        discord: {
+            available: crewDiscord.configured(),
+            linked: !!(account && account.discordId),
+            name: (account && account.discordUsername) || '',
+            avatar: crewDiscord.avatarUrl({
+                id: (account && account.discordId) || '',
+                avatar: (account && account.discordAvatar) || '',
+            }),
+        },
+    };
+}
+
+function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}) {
     if (typeof postAnnouncement === 'function') announceToBoard = postAnnouncement;
+    if (typeof vetStaffCallsign === 'function') vetCallsign = vetStaffCallsign;
     // --- Sign in ---
     app.post('/api/crew/:slug/login', async (req, res) => {
         try {
@@ -2396,97 +2563,16 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                 return res.status(403).json({ error: 'That account does not belong to this crew center.' });
             }
             const store = await crewStore.forVa(va);
-            if (typeof store.getAccountByPortal !== 'function') {
-                return res.status(409).json({
-                    error: 'This crew center’s data store cannot hold a staff pilot account yet.',
-                    code: 'unsupported_store',
-                });
-            }
-
-            const name = String(acct.displayName || acct.username || 'Staff').trim();
-
-            /* THE ROSTER ROW.
-               In order of preference: one they asked for, the one they have
-               already claimed, or a new one in their own name. The third is the
-               point of the whole route — a staff member should not have to pick
-               somebody else's row off the roster to be a pilot — and it is why
-               this creates rather than only links. */
-            let member = null;
-            const wanted = String((req.body && req.body.memberId) || '').trim();
-            if (wanted) {
-                member = await store.getMember(wanted);
-                if (!member) return res.status(404).json({ error: 'That pilot isn’t on this roster.' });
-                /* NOT SOMEBODY ELSE'S. The request may name any roster row, so
-                   this is the check that stops a staff member binding their
-                   pilot side to a pilot who signs in as themselves — two
-                   identities on one record, each able to cancel the other's
-                   flying, and the pilot's own login no longer findable by their
-                   roster row. The same rule POST /me/pilot applies; this is the
-                   other door into it.
-                   Their own binding passes, because re-running this route with
-                   the row they already hold has to be a no-op and not a refusal. */
-                if (typeof store.getAccountByMember === 'function') {
-                    const owner = await store.getAccountByMember(member._id).catch(() => null);
-                    if (owner && String(owner.portalAccountId || '') !== String(acct._id)) {
-                        return res.status(409).json({
-                            error: 'That pilot already has their own crew center login.',
-                            code: 'pilot_has_login',
-                        });
-                    }
-                }
-            } else if (acct.crewMemberId) {
-                member = await store.getMember(acct.crewMemberId);
-            }
-            /* Already on the roster under their own name? Take that row rather
-               than adding a second of them — see findUnclaimedNamesake for why
-               a duplicate is worse than it looks. */
-            if (!member) {
-                member = await crewAccounts.findUnclaimedNamesake(store, name, String(acct._id));
-            }
-            if (!member) {
-                member = await store.createMember({
-                    name,
-                    // Left for them to fill in on the roster: a callsign is the
-                    // VA's to issue in their own numbering, and guessing one
-                    // risks handing out a number another pilot already flies.
-                    callsign: '',
-                    hours: 0,
-                    status: 'active',
-                });
-            }
-
-            const r = await crewAccounts.provisionStaffAccount(store, {
-                portalAccountId: String(acct._id),
-                displayName: name,
-                username: acct.username || '',
-                memberId: member ? member._id : null,
-                vaName: va.name || '',
+            const body = req.body || {};
+            const out = await setUpStaffPilotSide({
+                va, acct, store,
+                memberId: body.memberId,
+                // Absent means "leave it as it is"; a callsign typed on the
+                // set-up card is theirs from the first moment.
+                callsign: typeof body.callsign === 'string' ? body.callsign : undefined,
             });
-
-            // Keep the central account's own pointer in step, so the roster
-            // link staff already had (POST /me/pilot) and this agree about who
-            // they are rather than each holding half an answer.
-            if (member && String(acct.crewMemberId || '') !== String(member._id)) {
-                await VaPortalAccount.findByIdAndUpdate(acct._id, { crewMemberId: String(member._id) }).catch(() => {});
-            }
-
             res.set('Cache-Control', 'no-store');
-            res.status(r.created ? 201 : 200).json({
-                created: r.created,
-                account: crewAccounts.publicAccount(r.account),
-                pilot: member
-                    ? { memberId: member._id, name: member.name, callsign: member.callsign || '', hours: Number(member.hours) || 0 }
-                    : null,
-                discord: {
-                    available: crewDiscord.configured(),
-                    linked: !!(r.account && r.account.discordId),
-                    name: (r.account && r.account.discordUsername) || '',
-                    avatar: crewDiscord.avatarUrl({
-                        id: (r.account && r.account.discordId) || '',
-                        avatar: (r.account && r.account.discordAvatar) || '',
-                    }),
-                },
-            });
+            res.status(out.created ? 201 : 200).json(pilotSideReply(out));
         } catch (err) {
             /* A project that has not run the v17 SQL has no portal_account_id
                column, so the lookup that finds an existing row fails before
@@ -2495,7 +2581,62 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
                project at all, or one that has gone read-only, each get their
                own sentence for the same reason. This is staff reading it, and
                staff are the people who can act on every one of them. */
+            if (err instanceof PilotSideError) return res.status(err.status).json({ error: err.message, code: err.code });
             storeFail(res, err, 'Crew pilot-side error', 'Could not set up your pilot account.');
+        }
+    });
+
+    /* =====================================================================
+     * MY CALLSIGN
+     *
+     * A VA's owner and staff choose their own callsign — the founder flies as
+     * 001, and nobody should have to edit the roster to say so. `check: true`
+     * only answers whether it is free, so the box can say "taken" while they
+     * type; anything else saves it, setting up their pilot side first when
+     * they have not got one (a callsign is a roster identity, and it needs a
+     * roster row to live on).
+     *
+     * Staff rules, not the join form's: a reserved low number is theirs to
+     * take, because being staff is what being selected for one means. Never
+     * somebody else's — the same holder check the roster runs.
+     * =================================================================== */
+    app.post('/api/crew/:slug/me/callsign', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+        if (p.kind !== 'va') {
+            return res.status(403).json({
+                error: p.kind === 'crew'
+                    ? 'Your callsign is issued by your staff — ask them to change it.'
+                    : 'An Inflight staff login has no callsign at a VA.',
+                code: 'not_staff',
+            });
+        }
+        if (p.slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const acct = await VaPortalAccount.findById(p.sub)
+                .select('username displayName active vaAdId crewMemberId').lean();
+            if (!acct || acct.active === false || String(acct.vaAdId) !== String(va._id)) {
+                return res.status(403).json({ error: 'That account does not belong to this crew center.' });
+            }
+            const store = await crewStore.forVa(va);
+            const raw = String((req.body && req.body.callsign) || '').trim();
+            if (!raw) return res.status(400).json({ error: 'Type the callsign you fly as.', code: 'callsign_required' });
+            if (req.body && req.body.check) {
+                const own = await ownMemberId(store, acct);
+                const v = await vetCallsign(va, store, raw, { exceptMemberId: own });
+                res.set('Cache-Control', 'no-store');
+                return res.json(v.ok ? { ok: true, callsign: v.callsign } : { ok: false, code: v.code, error: v.error, callsign: v.callsign || '' });
+            }
+            const out = await setUpStaffPilotSide({ va, acct, store, callsign: raw });
+            res.set('Cache-Control', 'no-store');
+            res.status(out.created ? 201 : 200).json(pilotSideReply(out));
+        } catch (err) {
+            if (err instanceof PilotSideError) return res.status(err.status).json({ error: err.message, code: err.code });
+            storeFail(res, err, 'Crew own-callsign error', 'Could not save your callsign.');
         }
     });
 
@@ -2689,6 +2830,10 @@ function registerCrewAuthRoutes(app, { postAnnouncement } = {}) {
             // a deployment could yet turn the feature off.
             siteHosting: true,
             siteUrl: vaSites.siteUrlFor((va && va.slug) || slug || p.slug || ''),
+            // Infinite Flight Live is a beta behind a lock (ifBeta.js). Said
+            // here so the dashboard can draw the tile locked from the first
+            // answer instead of finding out from a 423 when somebody opens it.
+            ifLive: ifBeta.state((va && va.slug) || slug || p.slug || ''),
         });
     });
 }
@@ -2700,4 +2845,6 @@ module.exports = {
     CREW_OWNER_GRADE_CAPS, CREW_DEFAULT_STAFF_CAPS, teamSaveFailure,
     capabilitySummary, provisionStaffFromMember, standDownStaff, sanitizeAssignments,
     parseSocialPost, sanitizeSocial, publicSocial, MAX_SOCIAL_POSTS,
+    setUpStaffPilotSide, PilotSideError, ownMemberId,
+    vetStaffCallsign: (...args) => vetCallsign(...args),
 };

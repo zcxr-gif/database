@@ -251,4 +251,43 @@ ok('a link is a secret worth guessing at', () => {
     assert.notStrictEqual(a, b);
 });
 
+console.log('\nEntrance tests — the wait, the study material, the message (v25)');
+
+ok('a quiz saved before entrance tests keeps letting people retake at once', () => {
+    const [q] = Q.sanitizeQuizzes([QUIZ]);
+    assert.strictEqual(q.retakeHours, 0);
+    assert.strictEqual(Q.retryAfter(q, { status: 'failed', submittedAt: new Date() }), null);
+});
+
+ok('a failed paper waits out the retake, then opens again', () => {
+    const [q] = Q.sanitizeQuizzes([{ ...QUIZ, retakeHours: 24, maxAttempts: 0 }]);
+    const recent = { status: 'failed', submittedAt: new Date(Date.now() - 3600e3), attemptsUsed: 1, maxAttempts: 0 };
+    assert.ok(Q.retryAfter(q, recent) instanceof Date);
+    assert.ok(/in 23 hours/.test(Q.takeFailure(q, recent)));
+    const old = { ...recent, submittedAt: new Date(Date.now() - 25 * 3600e3) };
+    assert.strictEqual(Q.takeFailure(q, old), '');
+});
+
+ok('the wait is bounded, and nonsense is no wait', () => {
+    assert.strictEqual(Q.sanitizeQuizzes([{ ...QUIZ, retakeHours: 99999 }])[0].retakeHours, 720);
+    assert.strictEqual(Q.sanitizeQuizzes([{ ...QUIZ, retakeHours: 'soon' }])[0].retakeHours, 0);
+});
+
+ok('study material reaches the builder, never the paper a taker is handed', () => {
+    const [q] = Q.sanitizeQuizzes([{ ...QUIZ, study: 'Read the SOP' }]);
+    assert.strictEqual(Q.publicQuiz(q, { withAnswers: true }).study, 'Read the SOP');
+    assert.strictEqual(Q.publicQuiz(q).study, undefined);
+});
+
+ok('the test message states the rules the server enforces', () => {
+    const [q] = Q.sanitizeQuizzes([{ ...QUIZ, title: 'Entrance Test', passMark: 80, retakeHours: 24, study: 'x' }]);
+    const m = Q.buildTestMessage({ vaName: 'Aeroméxico Virtual', name: 'Rae', quiz: q, link: 'https://inflight.info/crew/am/test?t=abc' });
+    assert.ok(m.startsWith('Welcome to Aeroméxico Virtual, Rae!'));
+    assert.ok(/Passing grade: 80% or higher/.test(m));
+    assert.ok(/study resources/.test(m) && /1 day \(24 hours\)/.test(m));
+    assert.ok(m.trim().endsWith('https://inflight.info/crew/am/test?t=abc'));
+    const noStudy = Q.buildTestMessage({ vaName: 'X', quiz: { ...q, study: '', retakeHours: 0 } });
+    assert.ok(!/study resources/.test(noStudy) && /straight away/.test(noStudy));
+});
+
 console.log(`\n${passed} checks passed.\n`);

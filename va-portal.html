@@ -770,16 +770,21 @@
                      640px is ~115px a field, which is narrower than the word
                      "Password" — adding the role select made a four-column row
                      that already only just fitted into one that did not. -->
-                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                <!-- Three across from a desktop, two rows: who they are, then
+                     what they fly as and what they do. The callsign is optional
+                     and is written to their pilot record in the crew centre. -->
+                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                     <input id="tmName" type="text" placeholder="Display name" data-i18n-ph="team.namePh" class="field sm:col-span-1">
                     <input id="tmUser" type="text" placeholder="Username" data-i18n-ph="team.userPh" required class="field sm:col-span-1">
                     <input id="tmPass" type="text" placeholder="Password (min 8)" data-i18n-ph="team.passPh" required class="field sm:col-span-1">
+                    <input id="tmCallsign" type="text" placeholder="Callsign (optional)" data-i18n-ph="team.callsignPh" autocomplete="off" maxlength="40" class="field sm:col-span-1 uppercase placeholder:normal-case">
                     <select id="tmRole" class="field sm:col-span-1">
                         <option value="staff" data-i18n="team.roleStaff">Staff — portal access</option>
                         <option value="pilot" data-i18n="team.rolePilot">Pilot — crew centre only</option>
                     </select>
                     <button type="submit" class="btn sm:col-span-2 lg:col-span-1" data-i18n="team.addBtn">Add member</button>
                 </form>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2" data-i18n="team.callsignHint">Type a number and it takes your VA's callsign shape — 7 becomes your airline's 007. Staff may take a reserved low number.</p>
                 <p id="teamMsg" class="hidden text-sm font-medium mt-3"></p>
             </div>
             <!-- FIND THE PERSON FIRST. This list is every account on the VA —
@@ -843,6 +848,18 @@
             <div class="mb-3">
                 <h2 class="text-base font-bold tracking-tight" data-i18n="acct.heading">Account</h2>
                 <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="acct.sub">Manage your sign-in.</p>
+            </div>
+            <!-- What this person flies as. Written to their own pilot record
+                 in the crew centre (made for them if they have none), so the
+                 owner who founded the airline can be 001 from the first day. -->
+            <div id="csCard" class="surface rounded-2xl p-5 sm:p-6 max-w-md mb-4">
+                <p class="text-sm font-semibold mb-1 flex items-center gap-2"><i data-lucide="radio" class="w-4 h-4"></i> <span data-i18n="acct.callsign">Your callsign</span></p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3" data-i18n="acct.callsignSub">What you fly as in the crew centre. Type a number and it takes your VA's callsign shape.</p>
+                <form id="csForm" class="flex gap-2">
+                    <input id="csInput" type="text" autocomplete="off" maxlength="40" placeholder="e.g. 001" class="field flex-1 uppercase placeholder:normal-case">
+                    <button id="csSave" type="submit" class="btn" data-i18n="acct.callsignSave">Save</button>
+                </form>
+                <p id="csMsg" class="hidden text-sm font-medium mt-2"></p>
             </div>
             <div class="surface rounded-2xl p-5 sm:p-6 max-w-md">
                 <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4"></i> <span data-i18n="acct.changePw">Change password</span></p>
@@ -1120,6 +1137,7 @@
             loadEmbeds();
             loadCompliance();     // Terms banner + warnings + standing
             if (me.role === 'owner') loadTeam();
+            loadCallsign();
             setThemeIcons();
             drawIcons();
         }
@@ -2494,10 +2512,11 @@
             return `<div class="surface rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div class="min-w-0">
                     <p class="font-semibold text-sm truncate">${esc(m.displayName)}</p>
-                    <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
+                    <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.callsign ? `· <span class="font-mono font-semibold text-zinc-600 dark:text-zinc-300">${esc(m.callsign)}</span>` : ''} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
                 </div>
                 <div class="flex items-center flex-wrap gap-1.5 sm:shrink-0">
                     ${rolePicker}
+                    ${isOwner ? '' : `<button onclick="setMemberCallsign('${m.id}')" title="${esc(t('team.callsignTitle'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="radio" class="w-4 h-4"></i></button>`}
                     ${isOwner ? '' : `
                     ${canOwn ? `<button onclick="makeOwner('${m.id}')" title="${esc(t('team.makeOwnerTitle'))}" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">${esc(t('team.makeOwner'))}</button>` : ''}
                     <button onclick="resetMember('${m.id}')" title="${esc(t('team.reset'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
@@ -2551,17 +2570,93 @@
             e.preventDefault();
             hide('teamMsg');
             try {
-                await api('/team', {
+                const d = await api('/team', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         displayName: $('tmName').value, username: $('tmUser').value,
                         password: $('tmPass').value, role: $('tmRole').value,
+                        callsign: $('tmCallsign').value,
                     }),
                 });
                 $('teamForm').reset();
-                flash('teamMsg', t('team.added'), true);
+                // Added either way; a callsign that could not be kept yet is
+                // said rather than dropped, so the owner knows to come back.
+                if (d && d.callsignWarning) flash('teamMsg', t('team.addedNoCallsign', { why: d.callsignWarning }), false);
+                else flash('teamMsg', d && d.account && d.account.callsign
+                    ? t('team.addedAs', { callsign: d.account.callsign }) : t('team.added'), true);
                 loadTeam();
             } catch (err) { flash('teamMsg', err.message, false); }
+        });
+
+        /** Give a teammate the callsign they fly as. */
+        async function setMemberCallsign(id) {
+            const m = TEAM.find(x => x.id === id);
+            if (!m) return;
+            const callsign = prompt(t('team.callsignPrompt', { name: m.displayName || m.username }), m.callsign || '');
+            if (callsign == null || !callsign.trim()) return;
+            try {
+                const d = await api('/team/' + id, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ callsign: callsign.trim() }),
+                });
+                toast(t('team.callsignSet', { name: m.displayName || m.username, callsign: (d.account && d.account.callsign) || callsign.trim().toUpperCase() }));
+                loadTeam();
+            } catch (err) { alert(err.message); }
+        }
+
+        // ---------- My callsign ----------
+        // Read from the crew centre, where it lives. A VA with no crew centre
+        // database yet gets the card with the reason in it, not a dead form.
+        let csTimer = null, csLast = '';
+        async function loadCallsign() {
+            try {
+                const d = await api('/me/callsign');
+                if (!d.ok && !d.available) {
+                    $('csInput').disabled = true; $('csSave').disabled = true;
+                    flash('csMsg', d.error || t('acct.callsignUnavailable'), false);
+                    return;
+                }
+                $('csInput').disabled = false; $('csSave').disabled = false;
+                $('csInput').value = d.callsign || '';
+                csLast = d.callsign || '';
+                if (d.sample) $('csInput').placeholder = t('acct.callsignPh', { sample: d.sample });
+                if (!d.callsign) flash('csMsg', t('acct.callsignNone'), true);
+                else hide('csMsg');
+            } catch (err) { flash('csMsg', err.message, false); }
+        }
+        // "Taken" while they type, not after they press Save.
+        $('csInput').addEventListener('input', () => {
+            clearTimeout(csTimer);
+            const v = $('csInput').value.trim();
+            if (!v || v.toUpperCase() === csLast.toUpperCase()) { hide('csMsg'); return; }
+            csTimer = setTimeout(async () => {
+                try {
+                    const d = await api('/me/callsign', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ callsign: v, check: true }),
+                    });
+                    if ($('csInput').value.trim() !== v) return;
+                    if (d.ok) flash('csMsg', t('acct.callsignFree', { callsign: d.callsign }), true);
+                    else flash('csMsg', d.error || t('acct.callsignTaken'), false);
+                } catch { /* the save will say */ }
+            }, 400);
+        });
+        $('csForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const v = $('csInput').value.trim();
+            if (!v) { flash('csMsg', t('acct.callsignEmpty'), false); return; }
+            $('csSave').disabled = true;
+            try {
+                const d = await api('/me/callsign', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ callsign: v }),
+                });
+                csLast = d.callsign || v;
+                $('csInput').value = csLast;
+                flash('csMsg', t('acct.callsignSaved', { callsign: csLast }), true);
+                if (me && me.role === 'owner') loadTeam();
+            } catch (err) { flash('csMsg', err.message, false); }
+            finally { $('csSave').disabled = false; }
         });
 
         async function toggleMember(id, active) {

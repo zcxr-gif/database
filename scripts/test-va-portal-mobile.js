@@ -171,11 +171,11 @@ const rowMetrics = (page) => page.evaluate(() => [...document.querySelectorAll('
             rows.map((r) => r.controls.map((c) => c.right)));
         check(`${width}px: the controls sit below the name rather than beside it`,
             rows.every((r) => r.stacked), rows.map((r) => [r.who, r.stacked]));
-        // The row that carries the most: role picker, Make owner, and three
-        // icon buttons. If anything fits, it has to.
+        // The row that carries the most: role picker, callsign, Make owner,
+        // and three icon buttons. If anything fits, it has to.
         const robin = rows.find((r) => r.who === 'Robin Vale');
-        check(`${width}px: the active staff row carries all five of its controls`,
-            robin && robin.controls.length === 5, robin && robin.controls.length);
+        check(`${width}px: the active staff row carries all six of its controls`,
+            robin && robin.controls.length === 6, robin && robin.controls.length);
 
         // Ninth of ten tabs. If the strip does not scroll, Team is unreachable
         // on a phone no matter how well its contents are laid out.

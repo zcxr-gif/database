@@ -138,6 +138,41 @@ function buildInviteMessage({
     vaName = '', ifcName = '', callsign = '',
     username = '', password = '', signInUrl = '',
     discordInvite = '', staffMessage = '',
+    bannerUrl = '', footerUrl = '', format = 'plain',
+} = {}) {
+    const body = plainInviteMessage({ vaName, ifcName, callsign, username, password, signInUrl, discordInvite, staffMessage });
+    return format === 'ifc' ? forIfc(body, { vaName, bannerUrl, footerUrl }) : body;
+}
+
+/**
+ * The same words, framed for the IFC: the airline's banner on top and a small
+ * sign-off strip underneath (crewInviteBanner.js draws the strip, and the top
+ * one too for a VA that has never uploaded a banner).
+ *
+ * The IFC is Discourse, which renders markdown images — `![alt|WxH](url)` is
+ * Discourse's own way of sizing one, and anywhere that does not know it just
+ * shows the alt text. Images go on lines of their own with blank lines around
+ * them, which is what Discourse needs to draw them as pictures rather than
+ * inline glyphs. Nothing here is the credential: the body in between is
+ * exactly the plain message, so a copy of either says the same thing.
+ */
+function forIfc(body, { vaName = '', bannerUrl = '', footerUrl = '' } = {}) {
+    const va = String(vaName || '').trim() || 'the crew';
+    const safe = (u) => (/^https:\/\/[^\s()<>]+$/i.test(String(u || '')) ? String(u) : '');
+    const alt = (t) => String(t).replace(/[[\]|]/g, ' ').replace(/\s+/g, ' ').trim();
+    const top = safe(bannerUrl);
+    const end = safe(footerUrl);
+    const out = [];
+    if (top) out.push(`![${alt(va)}](${top})`, '');
+    out.push(String(body || '').trim());
+    if (end) out.push('', `![${alt(`Welcome aboard — ${va}`)}|600x100](${end})`);
+    return out.join('\n');
+}
+
+function plainInviteMessage({
+    vaName = '', ifcName = '', callsign = '',
+    username = '', password = '', signInUrl = '',
+    discordInvite = '', staffMessage = '',
 } = {}) {
     const who = String(ifcName || '').trim();
     const va = String(vaName || '').trim() || 'the crew';
@@ -187,7 +222,11 @@ function staffInvite(app, ctx = {}, now = new Date()) {
         username,
         password,
         // Prebuilt so the dashboard's copy button cannot drift from the email.
-        message: live ? buildInviteMessage({ ...ctx, username, password }) : '',
+        // `message` is the one staff paste on the IFC — framed with the
+        // airline's banner and sign-off strip when the context carries them;
+        // `plainMessage` is the same words with no pictures, for Discord.
+        message: live ? buildInviteMessage({ ...ctx, username, password, format: 'ifc' }) : '',
+        plainMessage: live ? buildInviteMessage({ ...ctx, username, password }) : '',
         signInUrl: ctx.signInUrl || '',
         issuedAt: asDate(app && app.inviteIssuedAt),
         claimedAt: asDate(app && app.inviteClaimedAt),
@@ -228,6 +267,7 @@ module.exports = {
     revokePatch,
     expirePatch,
     buildInviteMessage,
+    forIfc,
     staffInvite,
     applicantCredentials,
     TTL_DAYS,

@@ -346,6 +346,20 @@ const sentPatch = ({ sent = true, by = '' } = {}, now = new Date()) => (sent
  */
 function buildSetupMessage({
     vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
+    password = '', signInUrl = '', bannerUrl = '', footerUrl = '', format = 'plain',
+    discordInvite = '',
+} = {}) {
+    let body = plainSetupMessage({ vaName, name, username, callsign, link, expiresAt, password, signInUrl });
+    // The crew's Discord, when the VA hands one to new pilots — the same line
+    // an accepted applicant's welcome ends with (crewInvite.buildInviteMessage).
+    if (/^https:\/\/\S+$/i.test(String(discordInvite || ''))) body += `\n\nJoin the crew on Discord: ${discordInvite}`;
+    // Framed for the IFC exactly as an accepted applicant's welcome is — see
+    // crewInvite.forIfc. Required lazily: crewInvite does not need this file.
+    return format === 'ifc' ? require('./crewInvite').forIfc(body, { vaName, bannerUrl, footerUrl }) : body;
+}
+
+function plainSetupMessage({
+    vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
     password = '', signInUrl = '',
 } = {}) {
     const who = String(name || '').trim();

@@ -67,7 +67,8 @@ const pilotModeration = require('./pilotModeration');
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
 const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial,
-    capabilitySummary, provisionStaffFromMember, CREW_CAPABILITIES } = require('./crewAuth');
+    capabilitySummary, provisionStaffFromMember, CREW_CAPABILITIES,
+    setUpStaffPilotSide, PilotSideError, ownMemberId } = require('./crewAuth');
 // Openings and staff applications — see the head of that file for why hiring is
 // gated on team.manage rather than on a capability of its own.
 const crewStaffApps = require('./crewStaffApps');
@@ -224,6 +225,11 @@ const crewSecrets = require('./crewSecrets');
 // rather than a deploy.
 const ifLive = require('./ifLive');
 const ifOAuth = require('./ifOAuth');
+// …and all of it behind a beta lock until it is opened on purpose. ifBeta.js.
+const ifBeta = require('./ifBeta');
+
+// The pictures that open and close a welcome message pasted on the IFC.
+const crewInviteBanner = require('./crewInviteBanner');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -679,6 +685,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         type: [{
             _id: false, id: String, title: String, blurb: String, banner: String,
             passMark: Number, maxAttempts: Number, open: Boolean, active: Boolean,
+            // Entrance tests (v25): the wait before another go, and what to read
+            // meanwhile. Declared, or mongoose drops them on save.
+            retakeHours: Number, study: String,
             questions: [{ _id: false, id: String, text: String, options: [String], correct: Number }],
         }],
         default: [],
@@ -1789,6 +1798,10 @@ async function postCrewNotice(url, { title, description, color, fields, image })
 // that wants applicant emails plugs in their own provider (below); otherwise no
 // email is ever sent and applicants rely on the status page.
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
+// Where THIS backend is reachable from the open internet — for pictures we draw
+// and somebody else's page hotlinks (the IFC welcome banners). Same variable
+// and fallback vaSites.js uses for a hosted site's crew endpoints.
+const BACKEND_PUBLIC_ORIGIN = String(process.env.PUBLIC_BACKEND_ORIGIN || 'https://site--indgo-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
 const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
 const CREW_EMAIL_LABELS = { resend: 'Resend', sendgrid: 'SendGrid', postmark: 'Postmark', mailgun: 'Mailgun' };
 const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -3862,7 +3875,82 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
+/* CALLSIGNS FROM THE VA PORTAL.
+ *
+ * The portal is where an owner adds their staff, and where an owner signs in
+ * first — so it is where "and what do you fly as?" belongs too. A callsign is a
+ * roster identity, which lives in the VA's own crew store, so these reach into
+ * that store through exactly the function the crew center's own "my callsign"
+ * box uses (crewAuth.setUpStaffPilotSide) — one answer to who somebody is,
+ * whichever door they asked at. vaPortal.js holds the routes and the auth.
+ *
+ * Every refusal comes back as { ok: false, code, error }, never a throw: the
+ * portal decides whether a missing database is a reason to stop (a callsign
+ * typed into a form that then cannot be kept) or a footnote (a team list that
+ * cannot show callsigns yet).
+ */
+const portalCallsigns = (() => {
+    const loadVa = (vaAdId) => VirtualAirlineAd.findById(vaAdId).select(crewStore.SELECT).lean();
+    const refusal = (err) => {
+        if (err instanceof PilotSideError) return { ok: false, code: err.code, error: err.message };
+        if (err instanceof crewStore.CrewStoreError) {
+            return {
+                ok: false, code: err.code || 'store_unavailable',
+                error: err.code === 'store_not_connected'
+                    ? 'Callsigns live in your crew center’s database, and it is not connected yet. Connect it from the crew center (Settings → Data store), then come back.'
+                    : err.message,
+            };
+        }
+        console.error('portal callsign error:', err?.message || err);
+        return { ok: false, code: 'callsign_failed', error: 'Could not reach your crew center to save that callsign.' };
+    };
+    const withStore = async (vaAdId, fn) => {
+        try {
+            const va = await loadVa(vaAdId);
+            if (!va) return { ok: false, code: 'va_not_found', error: 'That VA does not exist.' };
+            return await fn(va, await crewStore.forVa(va));
+        } catch (err) { return refusal(err); }
+    };
+    return {
+        /** What the shape looks like, and whether there is anywhere to keep one. */
+        info: (vaAdId, account) => withStore(vaAdId, async (va, store) => {
+            const fmt = crewCallsign.primaryFormat(va);
+            let callsign = '';
+            if (account) {
+                const own = await ownMemberId(store, account).catch(() => null);
+                const m = own ? await store.getMember(own).catch(() => null) : null;
+                callsign = (m && m.callsign) || '';
+            }
+            return { ok: true, available: true, callsign, sample: fmt ? crewCallsign.sample(fmt) : '' };
+        }),
+        /** Is it free? `account` may be null — a teammate not created yet. */
+        check: ({ vaAdId, account = null, callsign }) => withStore(vaAdId, async (va, store) => {
+            const own = account ? await ownMemberId(store, account).catch(() => null) : null;
+            return vetStaffCallsign(va, store, callsign, { exceptMemberId: own });
+        }),
+        /** Give this account its callsign, setting up its pilot side if needed. */
+        set: ({ vaAdId, account, callsign }) => withStore(vaAdId, async (va, store) => {
+            const out = await setUpStaffPilotSide({ va, acct: account, store, callsign });
+            return { ok: true, callsign: (out.member && out.member.callsign) || '', created: out.created };
+        }),
+        /** { accountId: callsign } for a team list. Best-effort: {} when unreachable. */
+        forAccounts: async (vaAdId, accounts) => {
+            const r = await withStore(vaAdId, async (va, store) => {
+                const members = await store.listMembers({ limit: 5000 });
+                const byId = new Map(members.map((m) => [String(m._id), m.callsign || '']));
+                const map = {};
+                await Promise.all((accounts || []).map(async (a) => {
+                    const own = await ownMemberId(store, a).catch(() => null);
+                    if (own && byId.get(String(own))) map[String(a._id)] = byId.get(String(own));
+                }));
+                return { ok: true, map };
+            });
+            return r.ok ? r.map : {};
+        },
+    };
+})();
+
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body), portalCallsigns });
 
 // The VA website editor's API (/api/va-portal/site/*) and Inflight's moderation
 // switch. Gated on the same portal session as everything else in the portal —
@@ -3895,7 +3983,7 @@ pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 // postAnnouncement is handed over rather than imported: crewAuth cannot require
 // this file back. See announceToBoard there.
-registerCrewAuthRoutes(app, { postAnnouncement });
+registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they
@@ -3993,7 +4081,10 @@ app.get('/api/crew/setup-sql', (req, res) => {
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = crewStore.SELECT;
+    // bannerUrl/logoUrl/tagline ride along for the IFC welcome message's
+    // pictures (inviteArt) — three short strings, and it saves a second read on
+    // every acceptance.
+    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
@@ -4174,6 +4265,23 @@ function normalizeStaffCallsign(va, raw) {
         if (fmt) return crewCallsign.build(fmt, parts.n).slice(0, 40);
     }
     return typed.toUpperCase().slice(0, 40);
+}
+
+/**
+ * May a member of staff take this callsign for THEMSELVES?
+ *
+ * Staff rules — the shape normalizeStaffCallsign gives, reserved numbers
+ * allowed — and the same holder check the roster runs, applications included.
+ * The owner who founded the airline flies as 001; nobody else gets 001 twice.
+ * Used by the crew center's "my callsign" box and by the VA portal when an
+ * owner gives a new teammate theirs (crewAuth.setUpStaffPilotSide).
+ */
+async function vetStaffCallsign(va, store, raw, { exceptMemberId = null } = {}) {
+    const callsign = normalizeStaffCallsign(va, raw);
+    if (!callsign) return { ok: true, callsign: '' };
+    const holder = await callsignHolder(va, store, callsign, { exceptMemberId });
+    if (holder) return { ok: false, code: 'callsign_taken', callsign, error: callsignTakenMessage(holder, callsign) };
+    return { ok: true, callsign };
 }
 
 // `ranks` is the VA's ladder. Passing it resolves the pilot's rank here rather
@@ -4359,7 +4467,25 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         if (holder) return res.status(409).json({ error: callsignTakenMessage(holder, values.callsign), code: 'callsign_taken' });
         const m = await store.createMember(values);
         vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
-        res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs) });
+        /* ADDED BY INVITE. Staff who already know who they want — somebody
+           they recruited on the IFC, a pilot coming over from another airline
+           — should not have to send them through the join form to be
+           accepted. Ticking "invite" makes their login and a single-use setup
+           link in the same step, and hands back the message to paste to them:
+           the same invitation the Logins tab keeps, so it is still there to
+           copy tomorrow if it is not sent today. A login that could not be
+           made does not undo the roster row — they are on the roster either
+           way, and the Logins tab can try again. */
+        let invite = null;
+        if (req.body && req.body.invite) {
+            try {
+                invite = await issueSetupInvites({ va, store, ids: [m._id], by: gate.p?.name, slug: req.params.slug });
+            } catch (err) {
+                console.error('roster add invite error:', err?.message || err);
+                invite = { error: 'They are on the roster, but their login could not be made. Try again from Logins.' };
+            }
+        }
+        res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs), ...(invite ? { invite } : {}) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
 // Edit a member.
@@ -8399,6 +8525,12 @@ const ifInvalidate = (vaId) => {
     for (const key of IF_CACHE.keys()) if (key.startsWith(prefix)) IF_CACHE.delete(key);
 };
 
+// --- The beta lock ----------------------------------------------------------
+//
+// Live is shut for every crew center until IF_LIVE_BETA_SLUGS opens it. One
+// gate in front of every route below — see ifBeta.js for what it answers.
+app.use('/api/crew/:slug/if', ifBeta.middleware());
+
 // --- The connection ---------------------------------------------------------
 
 /**
@@ -9594,6 +9726,9 @@ app.post('/api/crew/:slug/if/pull', async (req, res) => {
  * ------------------------------------------------------------------------ */
 async function syncScheduleToIf(va, action, schedule, store) {
     if (!va || !schedule) return;
+    // Locked in beta: a VA that switched the sync on before the lock keeps the
+    // setting, and nothing is written to its real rota until Live opens.
+    if (ifBeta.isLocked(va.slug)) return;
     try {
         const ad = await ifConnection(va._id);
         if (!ad || !ad.ifConnectedAt || !ad.ifSyncSchedules) return;
@@ -13116,45 +13251,29 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         });
         vaStats.recordEngagement(ad._id, 'application', 1, ad.name);
         // A free-join VA accepts on the spot, so this is the moment that pilot
-        // becomes crew — roster row and crew center login together. `credentials`
-        // carries the one-time password: emailed below when they gave an address,
-        // and returned in the response either way so the join page can show it
-        // once to someone who didn't.
-        let credentials = null;
+        // becomes crew — on the roster, with their callsign.
+        //
+        // NOT WITH A LOGIN. This used to mint one here and put the password on
+        // the join page (and in the welcome email) the second the form was
+        // sent, which took the one decision a VA still had — when somebody gets
+        // into the crew center — away from it. Sign-ins come from staff now:
+        // the pilot lands in Roster → Logins as "no login yet", where one press
+        // makes their login and a welcome message to send on the IFC. A VA that
+        // runs an entrance test sends that first, and the invite after a pass.
         if (status === 'accepted') {
-            const member = await store.createMember({
+            await store.createMember({
                 name: ifcName, callsign: cs,
                 hours: 0, role: '', aircraft: [], status: 'active',
                 ifUserId: ifUserId || '', ifcName,
             });
             vaStats.recordEngagement(ad._id, 'crewJoin', 1, ad.name);
-            // Best-effort, like the accept path: a pilot who is on the roster
-            // but could not be issued a login is fixable from the dashboard,
-            // and failing the join over it would be worse.
-            try {
-                const r = await crewAccounts.provisionPilotAccount(store, {
-                    displayName: ifcName, memberId: member ? member._id : null,
-                    email, createdByName: 'Join form', vaName: ad.name || '',
-                });
-                credentials = { username: r.username, password: r.password, created: r.created };
-                // Keep the invitation on the application row as well as in this
-                // response. The status link handed back below is the only
-                // channel that still reaches an applicant who gave no email and
-                // closed this page before writing the password down.
-                if (r.created && r.password) {
-                    await store.updateApplication(appDoc._id, crewInvite.issuePatch({
-                        username: r.username, password: r.password, accountId: r.account && r.account._id,
-                    })).catch((e) => console.error('join invite persist error:', e?.message || e));
-                }
-            } catch (err) {
-                console.error('join account provision error:', err?.message || err);
-            }
         }
         // Notify the VA's Discord (fire-and-forget). Free-mode joins and
         // pending applications both post so staff see activity in real time.
         if (ad.crewWebhookUrl) {
             postCrewNotice(ad.crewWebhookUrl, status === 'accepted' ? {
                 title: `🎉 New pilot joined — ${ifcName}`,
+                description: 'Send their crew center sign-in from Roster → Logins.',
                 color: CREW_COLORS.accepted,
                 fields: [
                     { name: 'Callsign', value: cs || '—', inline: true },
@@ -13183,8 +13302,8 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                 sendCrewEmail(emailCfg, { to: email, subject: `Welcome to ${ad.name || 'the crew'}!`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
                         bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`
-                            + crewCredentialsHtml({ ...(credentials || {}), signInUrl: centerUrl }),
-                        button: { label: credentials && credentials.password ? 'Sign in to the crew center' : 'Open the crew center', url: centerUrl } }) }).catch(() => {});
+                            + ` The ${escHtml(ad.name || 'VA')} team will send you your crew center sign-in — keep an eye on your IFC messages.`,
+                        button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
             } else {
                 sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
@@ -13195,10 +13314,10 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         res.json({
             status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade,
             emailed: !!email,
-            // Only ever populated on a free-mode join, and only the first time —
-            // this is the sole copy of that password, and the join page shows it
-            // once with a "write this down" warning.
-            account: credentials,
+            // Never a login: staff hand those out (see above). Kept in the shape
+            // so an older join page reads "no credentials" rather than breaking.
+            account: null,
+            signInFromStaff: status === 'accepted',
         });
     } catch (err) { crewFail(res, err, { log: 'apply error', message: 'Could not submit your application.' }); }
 });
@@ -13267,8 +13386,56 @@ app.post('/api/crew/:slug/callsign-check', async (req, res) => {
 // Everything a rendering of an invitation needs to know. One builder, used by
 // the acceptance response, the applicant's status page and the staff clipboard,
 // so the three cannot drift into saying different things about the same login.
+/**
+ * The two pictures that frame a welcome pasted on the IFC (crewInvite.forIfc).
+ *
+ * Top: the airline's own directory banner when it has one, and otherwise a
+ * header we draw from its name and logo — a message should open with something
+ * that is THEIRS. Bottom: the small "Welcome aboard" strip, always ours to draw.
+ * Both are absolute, because the reader's browser fetches them from a forum
+ * post, and the drawn ones carry a version so a new logo or name is not hidden
+ * behind the forum's image cache.
+ */
+function inviteArt(va, slug) {
+    const s = String((va && va.slug) || slug || '').toLowerCase();
+    if (!s) return { bannerUrl: '', footerUrl: '' };
+    const v = crypto.createHash('sha1')
+        .update(JSON.stringify([va && va.name, va && va.logoUrl, va && va.crewAccent, va && va.tagline]))
+        .digest('hex').slice(0, 10);
+    const drawn = (kind) => `${BACKEND_PUBLIC_ORIGIN}/api/crew/${encodeURIComponent(s)}/invite-banner.png?kind=${kind}&v=${v}`;
+    const own = va && /^https:\/\//i.test(String(va.bannerUrl || '')) ? String(va.bannerUrl) : '';
+    return { bannerUrl: own || drawn('header'), footerUrl: drawn('footer') };
+}
+
+/**
+ * Public: the welcome message's pictures, as PNGs (crewInviteBanner.js).
+ * Hotlinked from IFC posts, so it is cached hard and a VA that cannot be found
+ * still gets a 404 rather than somebody else's airline.
+ */
+app.get('/api/crew/:slug/invite-banner.png', async (req, res) => {
+    try {
+        const slug = String(req.params.slug || '').trim().toLowerCase();
+        const va = await VirtualAirlineAd.findOne({ slug, status: 'approved' })
+            .select('name slug logoUrl crewAccent tagline').lean();
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const kind = req.query.kind === 'header' ? 'header' : 'footer';
+        const png = await crewInviteBanner.cached({
+            kind, name: va.name || '', logoUrl: va.logoUrl || '', accent: va.crewAccent || '',
+            url: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || slug)}`, tagline: va.tagline || '',
+        });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+        res.set('Access-Control-Allow-Origin', '*');
+        res.send(png);
+    } catch (err) {
+        console.error('invite banner error:', err?.message || err);
+        res.status(500).json({ error: 'Could not draw that banner.' });
+    }
+});
+
 function inviteContext(va, appDoc, slug) {
     return {
+        ...inviteArt(va, slug),
         vaName: (va && va.name) || '',
         ifcName: (appDoc && appDoc.ifcName) || '',
         callsign: applicationCallsign(appDoc, va),
@@ -13317,11 +13484,33 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
             credentials: appDoc.status === 'accepted'
                 ? crewInvite.applicantCredentials(appDoc, inviteContext(va, appDoc, req.params.slug))
                 : null,
+            // Their entrance test, when staff have sent one — the link to sit it
+            // while it can be sat, and how it went once it has been.
+            test: await applicantTest(va, store, appDoc, req.params.slug),
             reviewedAt: appDoc.reviewedAt || null,
             submittedAt: appDoc.createdAt || null,
         });
     } catch (err) { crewFail(res, err, { log: 'application-status error', message: 'Could not load that application.' }); }
 });
+
+/** The applicant's own view of their latest entrance test, or null. */
+async function applicantTest(va, store, appDoc, slug) {
+    try {
+        const [a] = await store.listQuizAttempts({ candidates: true, applicationId: String(appDoc._id), limit: 1 });
+        if (!a || a.status === 'revoked') return null;
+        const ad = await crewQuizDoc(slug);
+        const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
+        const quiz = quizzes.find((q) => q.id === a.quizId) || null;
+        return {
+            title: a.quizTitle || (quiz && quiz.title) || 'Entrance test',
+            status: a.status,
+            percent: a.total ? Math.floor((Number(a.score) || 0) / a.total * 100) : 0,
+            passMark: a.passMark,
+            retryAt: crewQuizzes.retryAfter(quiz, a),
+            link: entranceLive(quiz, a) ? testLinkFor(va.slug || slug, a.token) : '',
+        };
+    } catch { return null; }
+}
 
 // An application on its way out to staff. The raw row carries the invitation's
 // stored password, and handing that straight to the browser would show one that
@@ -13354,11 +13543,36 @@ app.get('/api/crew/:slug/applications', async (req, res) => {
         const status = ['pending', 'accepted', 'declined'].includes(wanted) ? wanted : 'pending';
         const rows = await store.listApplications({ status });
         (rows || []).forEach((a) => sweepExpiredInvite(store, a));
+        // Each applicant's entrance test (v25), newest first, so the card staff
+        // accept from says how they did. Best-effort: a project that cannot
+        // record tests still lists its applications.
+        const tests = await applicationTests(va, store, req.params.slug);
         // Live passwords may be in here, so keep it out of every cache.
         res.set('Cache-Control', 'no-store');
-        res.json({ applications: (rows || []).map((a) => staffApplication(a, va, req.params.slug)) });
+        res.json({
+            applications: (rows || []).map((a) => ({
+                ...staffApplication(a, va, req.params.slug),
+                test: tests.get(String(a._id)) || null,
+            })),
+        });
     } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
+/** applicationId -> that applicant's latest entrance test, as staff see it. */
+async function applicationTests(va, store, slug) {
+    const out = new Map();
+    try {
+        const ad = await crewQuizDoc(slug);
+        const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
+        const rows = await store.listQuizAttempts({ candidates: true, limit: 500 });
+        for (const a of rows) {   // newest first, so the first one seen wins
+            if (a.applicationId && !out.has(String(a.applicationId))) {
+                out.set(String(a.applicationId), staffEntrance(va, quizzes, a, slug));
+            }
+        }
+    } catch { /* no tests on this project — the cards simply carry none */ }
+    return out;
+}
+
 // Staff: accept / decline an application. Accept creates the pilot.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
@@ -14411,7 +14625,9 @@ app.get('/api/crew/:slug/quiz-attempts', async (req, res) => {
                 // Staff need the link back — they are the ones who hand it over,
                 // and a link they cannot recover is a link they have to reissue.
                 link: a.status === 'issued' || a.status === 'started'
-                    ? quizLinkFor(va.slug || req.params.slug, a.token) : '',
+                    ? attemptLinkFor(va.slug || req.params.slug, a) : '',
+                // An entrance test (v25) — somebody not on the roster yet.
+                entrance: !a.memberId,
             })),
         }));
     } catch (err) { crewFail(res, err, { log: 'quiz attempts list error', message: 'Could not load the quiz results.' }); }
@@ -14447,8 +14663,15 @@ app.patch('/api/crew/:slug/quiz-attempts/:id', async (req, res) => {
                 attemptsUsed: 0, score: 0, total: 0, answers: [],
                 note, issuedBy: by, startedAt: null, submittedAt: null,
             });
-            const link = quizLinkFor(va.slug || req.params.slug, saved.token);
+            const link = attemptLinkFor(va.slug || req.params.slug, saved);
             const member = existing.memberId ? await store.getMember(existing.memberId).catch(() => null) : null;
+            // An entrance test goes back out by hand, so staff get the message
+            // to paste with the new link in it.
+            if (!existing.memberId) {
+                const ad = await crewQuizDoc(req.params.slug);
+                const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
+                return res.json(withDrift(store, { attempt: crewQuizzes.attemptView(saved), link, test: staffEntrance(va, quizzes, saved, req.params.slug) }));
+            }
             if (member) {
                 notifyPilot(va, member, {
                     kind: 'quiz',
@@ -14668,6 +14891,264 @@ app.post('/api/crew/:slug/quiz-attempts/self', async (req, res) => {
         res.set('Cache-Control', 'no-store');
         res.status(201).json(withDrift(store, { attempt: crewQuizzes.myAttemptView(saved) }));
     } catch (err) { crewFail(res, err, { log: 'quiz self-start error', message: 'Could not start that quiz.' }); }
+});
+
+/* ===========================================================================
+ * ENTRANCE TESTS (v25) — a quiz for somebody who is not crew yet.
+ *
+ * Staff send an applicant, or somebody they met on the IFC, a test BEFORE they
+ * are given a login. Pass, and staff send the crew center invitation; do not,
+ * and the test says when they may try again and what to read meanwhile.
+ *
+ * WHAT IS DIFFERENT FROM A PILOT'S QUIZ, AND WHY IT IS SAFE
+ *
+ * The taker has no account, so the link alone opens the paper. That is only
+ * ever true of a row with NO pilot behind it (member_id null): a pilot's quiz
+ * still refuses anybody who is not that pilot, signed in, because a pilot's
+ * result opens doors inside the crew center. An entrance test opens nothing —
+ * passing it is information for staff, who still decide — so the worst a
+ * forwarded link can do is let the wrong person sit somebody's test, which is
+ * exactly as much as a Google Form link allowed, minus the answer key.
+ *
+ * The answer key never leaves this process (crewQuizzes.publicQuiz).
+ * ======================================================================== */
+
+/** Where somebody opens the test they were sent. Public; no sign-in. */
+const testLinkFor = (slug, token) =>
+    `${SITE_ORIGIN}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}/test?t=${encodeURIComponent(token)}`;
+
+/** The link a staff screen hands back for an attempt, whichever kind it is. */
+const attemptLinkFor = (slug, a) => (a && a.memberId ? quizLinkFor(slug, a.token) : testLinkFor(slug, a && a.token));
+
+/** The message staff paste to them: IFC-framed with the airline's banners, and plain. */
+function entranceMessages(va, quiz, attempt, link) {
+    const plain = crewQuizzes.buildTestMessage({
+        vaName: va.name || '', name: attempt.ifcName || attempt.pilotName || '', quiz, link, note: attempt.note || '',
+    });
+    return { message: crewInvite.forIfc(plain, { vaName: va.name || '', ...inviteArt(va) }), plainMessage: plain };
+}
+
+/** Is this test still something the taker can act on? (sent, opened, or failed with a go left) */
+function entranceLive(quiz, a) {
+    if (!a || a.status === 'revoked' || a.status === 'passed') return false;
+    if (a.status === 'issued' || a.status === 'started') return true;
+    const max = Number(a.maxAttempts) || 0;
+    return !(max > 0 && (Number(a.attemptsUsed) || 0) >= max);
+}
+
+/** One test as staff see it — with the link and the message while it is live. */
+function staffEntrance(va, quizzes, a, slug) {
+    const quiz = quizzes.find((q) => q.id === a.quizId) || null;
+    const live = entranceLive(quiz, a);
+    const retry = crewQuizzes.retryAfter(quiz, a);
+    const out = { ...crewQuizzes.candidateView(a), retryAt: retry, live };
+    if (live && quiz) {
+        out.link = testLinkFor(va.slug || slug, a.token);
+        Object.assign(out, entranceMessages(va, quiz, a, out.link));
+    }
+    return out;
+}
+
+// Staff: send one.  { quizId, applicationId? | name, ifcName?, note? }
+app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to send entrance tests.',
+        });
+    }
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewQuizDoc(req.params.slug);
+        if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
+        const b = req.body || {};
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        const quiz = quizzes.find((q) => q.id === String(b.quizId || ''));
+        if (!quiz) return res.status(404).json({ error: 'That test no longer exists. Build one under Recruitment → Quizzes.' });
+        if (!crewQuizzes.isReady(quiz)) return res.status(409).json({ error: `“${quiz.title}” has no questions in it yet.` });
+
+        // WHO IT IS FOR: an application on file, or a name typed by staff.
+        let appDoc = null;
+        let name = String(b.name || '').trim().slice(0, 80);
+        let ifcName = String(b.ifcName || '').trim().replace(/^@/, '').slice(0, 60);
+        if (b.applicationId) {
+            appDoc = await store.getApplication(String(b.applicationId));
+            if (!appDoc) return res.status(404).json({ error: 'That application no longer exists.' });
+            if (appDoc.status === 'declined') return res.status(409).json({ error: 'That application was declined.' });
+            ifcName = appDoc.ifcName || ifcName;
+            name = name || appDoc.ifcName || '';
+        }
+        name = name || ifcName;
+        if (!name) return res.status(400).json({ error: 'Who is this test for? Type their name or IFC username.' });
+
+        // One live test per person per quiz — a second link while the first is
+        // still usable is two doors to the same room, and two rows in the queue.
+        const mine = await store.listQuizAttempts({ candidates: true, quizId: quiz.id, limit: 300 });
+        const same = (a) => (appDoc ? String(a.applicationId || '') === String(appDoc._id)
+            : (ifcName && String(a.ifcName || '').toLowerCase() === ifcName.toLowerCase())
+              || String(a.pilotName || '').toLowerCase() === name.toLowerCase());
+        const theirs = mine.filter(same);
+        if (theirs.some((a) => a.status === 'passed')) {
+            return res.status(409).json({ error: `${name} has already passed “${quiz.title}”.`, code: 'already_passed' });
+        }
+        const live = theirs.find((a) => entranceLive(quiz, a));
+        if (live) {
+            return res.status(409).json({
+                error: `${name} already has a link for “${quiz.title}”.`,
+                code: 'already_issued',
+                test: staffEntrance(va, quizzes, live, req.params.slug),
+            });
+        }
+
+        const saved = await store.createQuizAttempt({
+            quizId: quiz.id,
+            quizTitle: quiz.title,
+            token: crewQuizzes.attemptToken(),
+            memberId: null,
+            applicationId: appDoc ? appDoc._id : null,
+            ifcName,
+            pilotName: name,
+            callsign: appDoc ? applicationCallsign(appDoc, va) : '',
+            status: 'issued',
+            gate: false,
+            passMark: quiz.passMark,
+            maxAttempts: quiz.maxAttempts,
+            note: String(b.note || '').trim().slice(0, 500),
+            issuedBy: (gate.p && (gate.p.name || gate.p.uname)) || '',
+        });
+        const test = staffEntrance(va, quizzes, saved, req.params.slug);
+
+        // By email too, when the applicant gave one and the VA can send. The
+        // copy-for-IFC message is the main road; this is the second one.
+        let emailed = false;
+        if (appDoc && appDoc.email && test.link) {
+            try {
+                const emailCfg = await crewEmailConfigFor(va._id);
+                if (emailCfg) {
+                    emailed = true;
+                    sendCrewEmail(emailCfg, {
+                        to: appDoc.email, subject: `${quiz.title} — ${va.name || 'Crew Center'}`,
+                        html: crewEmailHtml({
+                            vaName: va.name, accent: va.crewAccent, heading: `Welcome to ${va.name || 'the crew'}!`,
+                            bodyHtml: escHtml(test.plainMessage.split('\nHere is your link:')[0]).replace(/\n/g, '<br>'),
+                            button: { label: 'Take the test', url: test.link },
+                        }),
+                    }).catch(() => {});
+                }
+            } catch { emailed = false; }
+        }
+
+        res.set('Cache-Control', 'no-store');
+        res.status(201).json(withDrift(store, { test, emailed }));
+    } catch (err) { crewFail(res, err, { log: 'entrance test issue error', message: 'Could not send that test.' }); }
+});
+
+// Staff: every entrance test, newest first, with what to do next.
+app.get('/api/crew/:slug/entrance-tests', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await crewQuizDoc(req.params.slug);
+        const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
+        const rows = await store.listQuizAttempts({ candidates: true, limit: 300 });
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            tests: rows.map((a) => staffEntrance(va, quizzes, a, req.params.slug)),
+            quizzes: quizzes.filter(crewQuizzes.isReady).map((q) => ({ id: q.id, title: q.title, passMark: q.passMark, retakeHours: q.retakeHours })),
+        }));
+    } catch (err) { crewFail(res, err, { log: 'entrance tests list error', message: 'Could not load the entrance tests.' }); }
+});
+
+/* ---- Sitting one: public, the link is the key ------------------------- */
+async function resolveEntrance(req, res) {
+    const { va, store } = await resolveCrewStore(req.params.slug);
+    const ad = await crewQuizDoc(req.params.slug);
+    if (!ad) { res.status(404).json({ error: 'Crew centre not found.' }); return null; }
+    const token = String(req.params.token || '');
+    const attempt = /^[a-f0-9]{32}$/.test(token) ? await store.getQuizAttemptByToken(token) : null;
+    // A PILOT's paper is never opened here, only signed in — see the head of
+    // this section. Same answer as a link that does not exist.
+    if (!attempt || attempt.memberId) {
+        res.status(404).json({ error: 'That test link is not valid. Ask the staff who sent it for a new one.' });
+        return null;
+    }
+    const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+    const quiz = quizzes.find((q) => q.id === attempt.quizId) || null;
+    return { va, store, ad, quiz, attempt };
+}
+
+/** What the taker's page is told about the airline and their paper. */
+function takerView(va, ad, quiz, attempt) {
+    const failed = attempt.status === 'failed';
+    return {
+        va: { name: va.name || '', logo: va.logoUrl || '', accent: va.crewAccent || '', slug: va.slug || '' },
+        banner: (quiz && quiz.banner) || crewQuizzes.sanitizeBanners(ad.crewBanners || {}).quiz || va.bannerUrl || '',
+        quiz: quiz ? crewQuizzes.publicQuiz(quiz) : null,
+        attempt: {
+            name: attempt.ifcName || attempt.pilotName || '',
+            status: attempt.status,
+            score: attempt.score, total: attempt.total,
+            percent: attempt.total ? Math.floor((Number(attempt.score) || 0) / attempt.total * 100) : 0,
+            passMark: attempt.passMark,
+            attemptsUsed: attempt.attemptsUsed, maxAttempts: attempt.maxAttempts,
+        },
+        refusal: crewQuizzes.takeFailure(quiz, attempt),
+        retryAt: crewQuizzes.retryAfter(quiz, attempt),
+        // Study material is for somebody who has not passed — handed over with
+        // the result, not with the questions.
+        study: failed && quiz ? (quiz.study || '') : '',
+    };
+}
+
+app.get('/api/crew/:slug/test/:token', async (req, res) => {
+    try {
+        const ctx = await resolveEntrance(req, res);
+        if (!ctx) return;
+        const { va, store, ad, quiz } = ctx;
+        let { attempt } = ctx;
+        if (attempt.status === 'issued' && !crewQuizzes.takeFailure(quiz, attempt)) {
+            attempt = (await store.updateQuizAttempt(attempt._id, { status: 'started', startedAt: new Date() }).catch(() => null)) || attempt;
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json(takerView(va, ad, quiz, attempt));
+    } catch (err) { crewFail(res, err, { log: 'entrance test read error', message: 'Could not open that test.' }); }
+});
+
+app.post('/api/crew/:slug/test/:token', async (req, res) => {
+    try {
+        const ctx = await resolveEntrance(req, res);
+        if (!ctx) return;
+        const { va, store, ad, quiz, attempt } = ctx;
+        const refusal = crewQuizzes.takeFailure(quiz, attempt);
+        if (refusal) return res.status(409).json({ error: refusal, ...takerView(va, ad, quiz, attempt) });
+
+        // Marked here, against the airline's own copy, at the bar the taker was
+        // told about when the test was sent.
+        const bar = Number(attempt.passMark) || quiz.passMark;
+        const result = crewQuizzes.grade({ ...quiz, passMark: bar }, (req.body || {}).answers);
+        const saved = await store.updateQuizAttempt(attempt._id, {
+            status: result.passed ? 'passed' : 'failed',
+            score: result.score,
+            total: result.total,
+            attemptsUsed: (Number(attempt.attemptsUsed) || 0) + 1,
+            answers: result.marks.map((m) => ({ id: m.id, chosen: m.chosen, right: m.right })),
+            submittedAt: new Date(),
+        });
+
+        // Staff hear it where applications land — with what to do next.
+        crewWebhookUrlFor(va._id, 'recruitment')
+            .then((url) => postCrewNotice(url, {
+                title: result.passed ? '✅ Entrance test passed' : '📝 Entrance test not passed',
+                description: `**${attempt.ifcName || attempt.pilotName || 'A candidate'}** scored **${result.score}/${result.total}** (${result.percent}%) on **${attempt.quizTitle}**.`
+                    + (result.passed ? '\nSend their crew center invitation from Roster → Applications.' : ''),
+                color: result.passed ? 0x16A34A : 0xD97706,
+            }))
+            .catch(() => {});
+
+        res.set('Cache-Control', 'no-store');
+        res.json({ ...takerView(va, ad, quiz, saved), passed: result.passed, score: result.score, total: result.total, percent: result.percent, passMark: bar });
+    } catch (err) { crewFail(res, err, { log: 'entrance test submit error', message: 'Could not mark that test.' }); }
 });
 
 // ---- Public statistics ----
@@ -14900,6 +15381,9 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
 
         const storeState = { connected: crewStore.isConnected(va) };
         let counts = null;
+        // The reader's own callsign, for the "fly as yourself" step. Only one
+        // of the VA's own staff logins has one to choose.
+        const you = gate.p && gate.p.kind === 'va' ? { applies: true, callsign: '' } : null;
         try {
             const store = await crewStore.forVaOrNull(va);
             const health = store ? await store.health() : null;
@@ -14914,6 +15398,16 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                     store.listAccounts().catch(() => []),
                 ]);
                 const byMember = new Map((accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a]));
+                if (you) {
+                    const own = (accounts || []).find((a) => String(a.portalAccountId || '') === String(gate.p.sub));
+                    let ownId = own && own.memberId;
+                    if (!ownId) {
+                        const acct = await VaPortalAccount.findById(gate.p.sub).select('crewMemberId').lean().catch(() => null);
+                        ownId = acct && acct.crewMemberId;
+                    }
+                    const m = ownId ? (members || []).find((x) => String(x._id) === String(ownId)) : null;
+                    you.callsign = (m && m.callsign) || '';
+                }
                 const active = (members || []).filter((m) => m.status !== 'inactive');
                 counts = {
                     members: (members || []).length,
@@ -14942,7 +15436,8 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                 crewWebhooks: (hooks && hooks.crewWebhooks) || {},
                 hasLegacyWebhook: !!(hooks && hooks.crewWebhookUrl),
             },
-            store: storeState, counts, staffAccounts,
+            store: storeState, counts, staffAccounts, you,
+            ifLocked: ifBeta.isLocked(va.slug || req.params.slug),
         });
         res.set('Cache-Control', 'no-store');
         res.json({
@@ -16060,10 +16555,14 @@ function inviteView(va, member, account, signInUrl) {
     const out = { accountId: account._id, state: inv.state, expiresAt: inv.expiresAt || null, sentAt: inv.sentAt || null, sentBy: inv.sentBy || '' };
     if (inv.state === 'live') {
         out.link = crewPasswordReset.resetUrl(signInUrl, inv.token);
-        out.message = crewPasswordReset.buildSetupMessage({
+        const words = {
             vaName: va.name, name: member.name, username: account.username, callsign: member.callsign,
-            link: out.link, expiresAt: inv.expiresAt,
-        });
+            link: out.link, expiresAt: inv.expiresAt, discordInvite: va.crewDiscordInvite || '',
+        };
+        // Framed for the IFC, where most of these are pasted; the plain one
+        // for Discord, where a markdown image is just text.
+        out.message = crewPasswordReset.buildSetupMessage({ ...words, ...inviteArt(va), format: 'ifc' });
+        out.plainMessage = crewPasswordReset.buildSetupMessage(words);
     }
     return out;
 }
@@ -16115,10 +16614,13 @@ async function issueSetupInvites({ va, store, ids, by, slug }) {
                 if (!password) password = (await crewAccounts.resetPassword(store, account._id))?.password || null;
                 out.password = password;
             }
-            out.message = crewPasswordReset.buildSetupMessage({
+            const words = {
                 vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
                 link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
-            });
+                discordInvite: va.crewDiscordInvite || '',
+            };
+            out.message = crewPasswordReset.buildSetupMessage({ ...words, ...inviteArt(va, slug), format: 'ifc' });
+            out.plainMessage = crewPasswordReset.buildSetupMessage(words);
             results.push(out);
         } catch (err) {
             console.error('crew login setup error', err?.message || err);
