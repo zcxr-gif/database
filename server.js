@@ -1206,6 +1206,12 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // (a one-time or role-specific invite). Validated as a real Discord invite
     // link — see isDiscordInviteUrl.
     crewDiscordInvite: { type: String, trim: true, default: '' },
+    // Whether accepting an application makes the pilot a crew center login.
+    // The default each accept card starts from — staff can still flip it on
+    // one card. On unless a VA turns it off: some airlines live in Discord and
+    // hand out logins later, and unticking it on every single card was the
+    // only way to say so.
+    crewAcceptCreatesLogin: { type: Boolean, default: true },
 
     // --- Bring-your-own email provider (applicant notifications) ---
     // When set, applicant emails go through the VA's OWN provider/account so
@@ -19329,7 +19335,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewBanners supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewAcceptCreatesLogin crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -19499,6 +19505,9 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 // meant to be shared) and read by the dashboard so the accept
                 // dialog can pre-fill it.
                 discordInvite: ad.crewDiscordInvite || '',
+                // Whether the accept card's "Create a crew center login" starts
+                // ticked. Absent on an old record means the old behaviour: yes.
+                createsLogin: ad.crewAcceptCreatesLogin !== false,
             },
             // Public Supabase connection (never the secret service key).
             supabase: {
