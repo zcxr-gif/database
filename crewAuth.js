@@ -111,7 +111,22 @@ function claimInvitation(store, accountId) {
         })
         .catch((err) => console.warn('crew login: could not clear invitation —', err?.message || err));
 }
+/* HOW LONG A CREW SIGN-IN LASTS.
+ *
+ * The sign-in card has a "Stay signed in" box. Ticked, the session outlives a
+ * month of not opening the crew center; left clear, it is a sitting's worth and
+ * the next visit asks again — which is what somebody on a shared or borrowed
+ * computer is choosing. A page too old to send the flag at all gets the week
+ * every session used to get, so nobody is signed out sooner by this change.
+ */
 const TOKEN_TTL = '7d';
+const TOKEN_TTL_REMEMBER = '30d';
+const TOKEN_TTL_SITTING = '12h';
+function ttlFor(remember) {
+    if (remember === true) return TOKEN_TTL_REMEMBER;
+    if (remember === false) return TOKEN_TTL_SITTING;
+    return TOKEN_TTL;
+}
 
 // Known layout presets + login looks (mirrors the crew center front-end).
 const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
@@ -1137,9 +1152,9 @@ function viewForRole(role) {
     return role === 'pilot' ? 'pilot' : 'owner';
 }
 
-function signCrewToken(payload) {
+function signCrewToken(payload, ttl) {
     // typ:'crew' namespaces these so they can't be swapped for a staff/portal cookie.
-    return jwt.sign({ ...payload, typ: 'crew' }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+    return jwt.sign({ ...payload, typ: 'crew' }, JWT_SECRET, { expiresIn: ttl || TOKEN_TTL });
 }
 
 function getBearer(req) {
@@ -1200,18 +1215,28 @@ function crewTermsState(acceptedVersion, applies) {
     };
 }
 
-function crewSession(va, identity, username, slugFallback) {
+// The "Stay signed in" box as the request sent it: true, false, or — from a
+// page that predates the box — undefined.
+function rememberFrom(body) {
+    const r = body && body.remember;
+    return typeof r === 'boolean' ? r : undefined;
+}
+
+function crewSession(va, identity, username, slugFallback, remember) {
     const view = viewForRole(identity.role);
     const token = signCrewToken({
         sub: identity.sub, kind: identity.kind, role: identity.role, view,
         slug: va.slug || String(slugFallback || '').toLowerCase(), vaId: String(va._id),
         name: identity.name, uname: username,
-    });
+    }, ttlFor(remember));
+    // When it runs out, so the page can send the reader to sign in at that
+    // moment instead of drawing a crew center whose every call is refused.
+    const exp = (jwt.decode(token) || {}).exp;
     const payload = { kind: identity.kind, role: identity.role, uname: username };
     const caps = effectiveCaps(va, payload);
     return {
         token, view, role: identity.role, oversight: identity.kind === 'inflight', name: identity.name,
-        username,
+        username, remember: remember !== false, expiresAt: exp ? exp * 1000 : null,
         // The password this account was issued was generated for them and
         // has been seen by whoever handed it over, so the crew center
         // asks for a new one before it lets them do anything else. Only
@@ -1501,7 +1526,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
             if (!identity) return res.status(401).json({ error: 'Invalid username or password.' });
 
             res.set('Cache-Control', 'no-store');
-            res.json(crewSession(va, identity, username, req.params.slug));
+            res.json(crewSession(va, identity, username, req.params.slug, rememberFrom(req.body)));
         } catch (err) {
             console.error('Crew login error:', err);
             res.status(500).json({ error: 'Sign-in failed.' });
@@ -2459,7 +2484,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                     mustChangePassword: !!acct.mustChangePassword,
                     termsVersion: account.termsVersion || '',
                     termsApplies: true,
-                }, acct.username, slug));
+                }, acct.username, slug, rememberFrom(req.body)));
             }
 
             res.set('Cache-Control', 'no-store');
@@ -2469,7 +2494,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                 mustChangePassword: !!account.mustChangePassword,
                 termsVersion: account.termsVersion || '',
                 termsApplies: true,
-            }, account.username, slug));
+            }, account.username, slug, rememberFrom(req.body)));
         } catch (err) {
             console.error('Crew Discord exchange error:', err && err.message ? err.message : err);
             res.status(500).json({ error: 'Sign-in failed.' });

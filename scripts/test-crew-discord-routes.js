@@ -260,6 +260,16 @@ const server = app.listen(0, async () => {
             check('…in the same shape a password sign-in produces',
                 'caps' in body && 'capabilities' in body && 'va' in body && 'canChangePassword' in body,
                 Object.keys(body));
+
+            /* "Stay signed in". Ticked: a month. Clear: one sitting. Not sent at
+               all (a page from before the box): the week it always was. */
+            const lifetime = (b) => { const p = jwt.decode(b.token) || {}; return (p.exp - p.iat) / 3600; };
+            check('…which says when it runs out', typeof body.expiresAt === 'number' && body.expiresAt > Date.now(), body.expiresAt);
+            check('…and lasts the old week when the page sends no choice', lifetime(body) === 7 * 24, lifetime(body));
+            const kept = await (await post('/api/crew/ba/auth/discord/exchange', { code: handoff, remember: true })).json();
+            check('"Stay signed in" buys thirty days', lifetime(kept) === 30 * 24 && kept.remember === true, lifetime(kept));
+            const sitting = await (await post('/api/crew/ba/auth/discord/exchange', { code: handoff, remember: false })).json();
+            check('leaving it clear buys twelve hours', lifetime(sitting) === 12 && sitting.remember === false, lifetime(sitting));
         }
 
         /* ---- the ninety seconds in between ------------------------------------ */
