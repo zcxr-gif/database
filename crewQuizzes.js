@@ -91,16 +91,21 @@ function cleanImageUrl(v) {
  */
 function sanitizeQuestion(q, i) {
     const text = clean(q && q.text, 300);
-    const options = (Array.isArray(q && q.options) ? q.options : [])
-        .map((o) => clean(o, 200)).filter(Boolean).slice(0, MAX_OPTIONS);
+    const raw = (Array.isArray(q && q.options) ? q.options : []).map((o) => clean(o, 200));
+    // `correct` indexes the options AS SENT, blanks included. Dropping a blank
+    // above the ticked one shifts everything under it, so the index is carried
+    // across the filter rather than reused — otherwise ['', 'b', 'c'] ticked
+    // on 'b' would quietly become "'c' is right".
+    const keep = raw.map((o, i) => (o ? i : -1)).filter((i) => i >= 0).slice(0, MAX_OPTIONS);
+    const options = keep.map((i) => raw[i]);
     if (!text || options.length < MIN_OPTIONS) return null;
     // NOT `int` with a fallback: that CLAMPS, so a question with nothing marked
     // (the builder sends -1 for "no option is ticked") would arrive as "the
     // first one is right" and quietly mark every taker against an answer the
-    // airline never chose. Out of range is dropped, which is the same treatment
-    // as a right answer pointing at an option that is not there.
-    const correct = Math.round(Number(q && q.correct));
-    if (!Number.isFinite(correct) || correct < 0 || correct >= options.length) return null;
+    // airline never chose. Out of range — or ticked on a blank — is dropped,
+    // which is the same treatment as a right answer pointing at nothing.
+    const correct = keep.indexOf(Math.round(Number(q && q.correct)));
+    if (correct < 0) return null;
     return {
         id: clean(q && q.id, 40) || `q${i + 1}`,
         text,

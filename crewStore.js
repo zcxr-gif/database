@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 25;
+const EXPECTED_SCHEMA_VERSION = 26;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -209,6 +209,12 @@ const INVITES_SCHEMA_VERSION = 24;
 // belongs to. So both columns sit in LATE_COLUMNS.
 const ENTRANCE_SCHEMA_VERSION = 25;
 
+// The version that lets a flight say it was flown as the Route of the Week or
+// of the Day (crew_pireps.featured). Not a gate: the bonus is paid off the leg
+// itself, so an older project loses only the label — the column is in
+// LATE_COLUMNS.
+const FEATURED_PIREP_SCHEMA_VERSION = 26;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -242,7 +248,7 @@ const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank', 'departure_gate', 'arrival_gate', 'partner_slug', 'source_route_id']),
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
-    crew_pireps: new Set(['event_id', 'schedule_id', 'edited_at', 'edited_by']),
+    crew_pireps: new Set(['event_id', 'schedule_id', 'edited_at', 'edited_by', 'featured']),
     // v18. Both are presentation: an item written without them is a perfectly
     // ordinary tile on an ungrouped shelf, which is what every item on every
     // shelf was until this shipped. Exactly the test in the note above.
@@ -294,6 +300,7 @@ const DRIFT_LABELS = {
     'crew_pireps.schedule_id': 'flights logged against a scheduled departure',
     'crew_pireps.edited_at': 'a record of hours edited by staff',
     'crew_pireps.edited_by': 'a record of hours edited by staff',
+    'crew_pireps.featured': 'flights filed as the Route of the Week or Day',
     'crew_shop_items.item_group': 'shelves in the shop',
     'crew_shop_items.tier': 'the shop’s showcase and flagship items',
     'crew_schedules.if_schedule_id': 'departures pushed to Infinite Flight',
@@ -648,6 +655,8 @@ const pirepFromRow = (r) => r && {
     // v8. The scheduled departure it was filed against, when it was flown off
     // the schedule. What lets a departure read as flown rather than only booked.
     scheduleId: r.schedule_id || null,
+    // v26. 'week' / 'day' when it was filed as a featured leg, '' otherwise.
+    featured: r.featured === 'week' || r.featured === 'day' ? r.featured : '',
     pilotName: r.pilot_name || '',
     callsign: r.callsign || '',
     flightNumber: r.flight_number || '',
@@ -688,6 +697,7 @@ const pirepToRow = (p) => {
     pick(p, out, 'routeId', 'route_id', (v) => v || null);
     pick(p, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
     pick(p, out, 'scheduleId', 'schedule_id', (v) => (str(v, 64) || null));
+    pick(p, out, 'featured', 'featured', (v) => (v === 'week' || v === 'day' ? v : ''));
     pick(p, out, 'pilotName', 'pilot_name', (v) => str(v, 60));
     pick(p, out, 'callsign', 'callsign', (v) => str(v, CALLSIGN_MAX));
     pick(p, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
@@ -3081,6 +3091,8 @@ class SupabaseStore {
                 // v24. Whether setup links can be kept as invitations.
                 invites: version >= INVITES_SCHEMA_VERSION,
                 entrance: version >= ENTRANCE_SCHEMA_VERSION,
+                // v26. Whether a flight can say it was filed as a featured leg.
+                featuredPireps: version >= FEATURED_PIREP_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -3890,5 +3902,6 @@ module.exports = {
     CODESHARE_LINK_SCHEMA_VERSION,
     INVITES_SCHEMA_VERSION,
     ENTRANCE_SCHEMA_VERSION,
+    FEATURED_PIREP_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

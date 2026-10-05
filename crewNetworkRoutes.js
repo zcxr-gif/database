@@ -56,6 +56,7 @@ module.exports = function registerCrewNetwork(app, deps) {
         mongoose, VirtualAirlineAd, crewStore, crewCsv, crewRanks,
         resolveCrewVa, resolveCrewStore, requireCap, crewFail, withDrift, crewViewer,
         cleanRoute, publicRoute, eachLimited, crewWebhookUrlFor, postCrewNotice, SITE_ORIGIN,
+        postCodeshareCard = null,
     } = deps;
 
     /* =======================================================================
@@ -466,15 +467,30 @@ module.exports = function registerCrewNetwork(app, deps) {
             doc.decidedAt = new Date();
             await doc.save();
             const sync = await syncBoth(doc.toObject());
-            tell(doc.fromVa, {
-                title: `✅ ${me.name} accepted your codeshare`,
-                description: [doc.reply ? `“${doc.reply}”` : '', 'Their flights are on your network now, marked as codeshares.'].filter(Boolean).join('\n\n'),
-                color: 0x16A34A,
-                fields: [
-                    { name: 'Your pilots now fly', value: String(sync.from.routes), inline: true },
-                    { name: 'Theirs now fly', value: String(sync.to.routes), inline: true },
-                ],
-            });
+            // News on BOTH sides, with both logos: a codeshare is a thing each
+            // airline's Discord wants to see, not a receipt for the one that asked.
+            const asker = { name: doc.fromName, logo: doc.fromLogo };
+            const accepter = { name: doc.toName || me.name, logo: doc.toLogo || (me.logoUrl || '') };
+            if (typeof postCodeshareCard === 'function') {
+                postCodeshareCard(doc.fromVa, {
+                    us: asker, them: accepter, weFly: sync.from.routes, theyFly: sync.to.routes,
+                    reply: doc.reply, link: crewLink(doc.toSlug),
+                }).catch(() => {});
+                postCodeshareCard(doc.toVa, {
+                    us: accepter, them: asker, weFly: sync.to.routes, theyFly: sync.from.routes,
+                    link: crewLink(doc.fromSlug),
+                }).catch(() => {});
+            } else {
+                tell(doc.fromVa, {
+                    title: `✅ ${me.name} accepted your codeshare`,
+                    description: [doc.reply ? `“${doc.reply}”` : '', 'Their flights are on your network now, marked as codeshares.'].filter(Boolean).join('\n\n'),
+                    color: 0x16A34A,
+                    fields: [
+                        { name: 'Your pilots now fly', value: String(sync.from.routes), inline: true },
+                        { name: 'Theirs now fly', value: String(sync.to.routes), inline: true },
+                    ],
+                });
+            }
             const fresh = await CrewCodeshare.findById(doc._id).lean();
             res.json({ agreement: crewCodeshare.view(fresh, me.slug), sync: sync[side] });
         } catch (err) { crewFail(res, err, { log: 'codeshare accept error', message: 'Could not accept the codeshare.' }); }

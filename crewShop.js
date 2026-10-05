@@ -299,7 +299,13 @@ function earnFor(pirep, rates) {
  * by them. A pilot who crosses a year of flying gets what the VA said a year is
  * worth, not that plus a percentage of it.
  */
-function payFor(pirep, rates, { clubName = '', clubPercent = 0, streakWeeks = 0, streakPercent = 0, milestone = null } = {}) {
+function payFor(pirep, rates, {
+    clubName = '', clubPercent = 0, streakWeeks = 0, streakPercent = 0, milestone = null,
+    // A featured leg's bonus: the whole flight paid again at this multiple
+    // (1.5 pays half as much again). The Route of the Week's random bonuses
+    // and staff-set ones arrive here; see crewFeatured.featuredSet.
+    featuredMultiplier = 1, featuredLabel = '',
+} = {}) {
     const lines = earnLines(pirep, rates);
     const base = Math.max(0, Math.round(lines.reduce((n, l) => n + l.amount, 0)));
     const club = Math.max(0, Math.round(Number(clubPercent) || 0));
@@ -325,6 +331,18 @@ function payFor(pirep, rates, { clubName = '', clubPercent = 0, streakWeeks = 0,
             rate: streak, units: 1, amount: streakShare,
         });
     }
+    // On everything the flight earned — rates, club and streak — and not on
+    // the milestone, which is a one-off for coming back rather than pay for
+    // this leg.
+    const mult = Math.min(3, Math.max(1, Number(featuredMultiplier) || 1));
+    const featuredExtra = mult > 1 ? Math.round(withBonus * (mult - 1)) : 0;
+    if (featuredExtra) {
+        extras.push({
+            key: 'featuredMultiplier',
+            label: `${featuredLabel || 'Featured route'} ${mult}× bonus`,
+            rate: mult, units: 1, amount: featuredExtra,
+        });
+    }
     const bonus = Math.max(0, Math.round(Number(milestone && milestone.bonus) || 0));
     if (bonus) {
         extras.push({
@@ -339,7 +357,8 @@ function payFor(pirep, rates, { clubName = '', clubPercent = 0, streakWeeks = 0,
         clubPercent: club,
         streakPercent: streak,
         milestone: bonus ? { weeks: milestone.weeks, bonus } : null,
-        total: Math.max(0, withBonus + bonus),
+        featuredMultiplier: featuredExtra ? mult : 1,
+        total: Math.max(0, withBonus + featuredExtra + bonus),
     };
 }
 

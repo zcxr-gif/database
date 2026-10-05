@@ -235,5 +235,84 @@ console.log('\n suggesting a leg');
     T('…and a leg with no distance is not guessed at', F.legMinutes({ distanceNm: 0 }), 0);
 }
 
+console.log('\n seven legs a week, with bonuses');
+{
+    const BIG = Array.from({ length: 14 }, (_, i) => route(`r${String(i).padStart(2, '0')}`, `K${String(100 + i)}`.slice(0, 4), `E${String(200 + i)}`.slice(0, 4),
+        i === 3 ? { kind: 'codeshare', partnerName: 'Borealis' } : {}));
+    const mon = new Date('2026-09-14T09:00:00Z');
+    const sun = new Date('2026-09-20T22:00:00Z');
+    const a = F.featuredSet(BIG, { period: 'week', now: mon, slug: 'ba' });
+    const b = F.featuredSet(BIG, { period: 'week', now: sun, slug: 'ba' });
+    T('the week holds seven legs', a.legs.length, 7);
+    T('…the same seven all week, with the same bonuses',
+        a.legs.map((l) => `${l.route.id}:${l.bonus}`), b.legs.map((l) => `${l.route.id}:${l.bonus}`));
+    T('…no leg twice', new Set(a.legs.map((l) => l.route.id)).size, 7);
+    T('…headed by the single pick older surfaces read',
+        a.legs[0].route.id, F.pickFeatured(BIG, { period: 'week', now: mon, slug: 'ba' }).route.id);
+    T('…and at least one leg pays a bonus', a.legs.some((l) => l.bonus > 1), true);
+    T('every bonus is one of the steps', a.legs.every((l) => l.bonus === 1 || F.BONUS_STEPS.includes(l.bonus)), true);
+    let withCodeshare = 0;
+    for (let w = 0; w < 30; w++) {
+        const s = F.featuredSet(BIG, { period: 'week', now: new Date(mon.getTime() + w * 7 * 86400000), slug: 'ba' });
+        if (s.legs.some((l) => l.route.kind === 'codeshare')) withCodeshare++;
+    }
+    T('codeshare legs are featured too', withCodeshare > 0, true);
+    T('a small network features what it has', F.featuredSet(NETWORK, { period: 'week', now: mon, slug: 'ba' }).legs.length, 6);
+
+    let clash = 0;
+    for (let d = 0; d < 14; d++) {
+        const when = new Date(mon.getTime() + d * 86400000);
+        const wk = F.featuredSet(BIG, { period: 'week', now: when, slug: 'ba' });
+        const dy = F.featuredSet(BIG, { period: 'day', now: when, slug: 'ba' });
+        if (wk.legs.some((l) => l.route.id === dy.legs[0].route.id)) clash++;
+    }
+    T('the day stays off all seven of the week’s legs', clash, 0);
+    T('the day is one leg', F.featuredSet(BIG, { period: 'day', now: mon, slug: 'ba' }).legs.length, 1);
+    T('bonus lookup', F.featuredBonusFor(a, a.legs[0].route.id) >= 1 && F.featuredBonusFor(a, 'nope') === 0, true);
+}
+
+console.log('\n staff plans');
+{
+    const now = new Date('2026-09-16T09:00:00Z');
+    const draft = F.cleanPlan({ period: 'week', legs: [{ routeId: 'a', bonus: 2 }, { routeId: 'c' }, { routeId: 'a' }] }, { now, id: 'p1' });
+    T('a plan defaults to this week, as a draft', [draft.plan.periodKey, draft.plan.status], ['2026-W38', 'draft']);
+    T('…without a leg twice', draft.plan.legs.map((l) => l.routeId), ['a', 'c']);
+    T('…keeping the bonus staff set', draft.plan.legs[0].bonus, 2);
+    T('a past week is refused', !!F.cleanPlan({ period: 'week', periodKey: '2026-W30', legs: [{ routeId: 'a' }] }, { now }).error, true);
+    T('…and so is an empty one', !!F.cleanPlan({ period: 'week', legs: [] }, { now }).error, true);
+    T('a day plan holds one leg', F.cleanPlan({ period: 'day', legs: [{ routeId: 'a' }, { routeId: 'b' }] }, { now }).plan.legs.length, 1);
+    T('a bonus is clamped', F.cleanBonus(9), 3);
+
+    const plans = F.upsertPlan([], draft.plan, now);
+    const drafted = F.featuredSet(NETWORK, { period: 'week', now, slug: 'ba', plans });
+    T('a draft is invisible to pilots', drafted.source === 'plan', false);
+    T('…but staff can preview it', F.featuredSet(NETWORK, { period: 'week', now, slug: 'ba', plans, includeDrafts: true }).source, 'plan');
+    const released = F.upsertPlan(plans, { ...draft.plan, status: 'released' }, now);
+    T('one plan per period', released.length, 1);
+    const live = F.featuredSet(NETWORK, { period: 'week', now, slug: 'ba', plans: released });
+    T('a released plan is the week', [live.source, live.legs.map((l) => `${l.route.id}:${l.bonus}`)], ['plan', ['a:2', 'c:1']]);
+    T('…and lapses with the week',
+        F.featuredSet(NETWORK, { period: 'week', now: new Date('2026-09-22T09:00:00Z'), slug: 'ba', plans: released }).source === 'plan', false);
+    T('a plan whose legs all left the network falls back to the rotation',
+        F.featuredSet(NETWORK, { period: 'week', now, slug: 'ba', plans: F.upsertPlan([], { ...draft.plan, status: 'released', legs: [{ routeId: 'gone', bonus: 1 }] }, now) }).source, 'auto');
+    T('the planner offers this week and the next eight', F.upcomingKeys('week', now, 9).length, 9);
+    T('a week key knows its Monday', F.periodStart('week', '2026-W38').toISOString().slice(0, 10), '2026-09-14');
+}
+
+console.log('\n what a bonus leg pays');
+{
+    const Shop = require(path.join('..', 'crewShop.js'));
+    const flight = { durationMin: 120, landings: 1, isFeatured: true };
+    const rates = { perHour: 100, featuredBonus: 50 };
+    const plain = Shop.payFor(flight, rates, {});
+    const doubled = Shop.payFor(flight, rates, { featuredMultiplier: 2, featuredLabel: 'Route of the Week' });
+    T('a 2× leg pays the whole flight twice', [plain.total, doubled.total], [250, 500]);
+    T('…and says so on its own line', doubled.lines.some((l) => l.key === 'featuredMultiplier' && l.label === 'Route of the Week 2× bonus'), true);
+    T('…on top of the club bonus too',
+        Shop.payFor(flight, rates, { clubPercent: 10, featuredMultiplier: 1.5 }).total, Math.round(275 * 1.5));
+    T('a silly multiplier is capped', Shop.payFor(flight, rates, { featuredMultiplier: 50 }).total, 750);
+    T('no multiplier, no line', plain.lines.some((l) => l.key === 'featuredMultiplier'), false);
+}
+
 console.log(failures ? `\n${failures} check(s) failed\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

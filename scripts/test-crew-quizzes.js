@@ -63,6 +63,18 @@ ok('a right answer that is not one of the options is dropped', () => {
     assert.strictEqual(q.questions.length, 0);
 });
 
+ok('a blank answer above the right one does not move the answer key', () => {
+    const [q] = Q.sanitizeQuizzes([{ title: 'x', questions: [
+        { text: 'blank first', options: ['', 'b', 'c'], correct: 1 },
+        { text: 'blank between', options: ['a', '', 'c'], correct: 2 },
+        { text: 'ticked the blank', options: ['a', '', 'c'], correct: 1 },
+    ] }]);
+    assert.strictEqual(q.questions.length, 2);
+    assert.deepStrictEqual(q.questions[0].options, ['b', 'c']);
+    assert.strictEqual(q.questions[0].options[q.questions[0].correct], 'b');
+    assert.strictEqual(q.questions[1].options[q.questions[1].correct], 'c');
+});
+
 ok('ids survive a save, so results keep pointing at their quiz', () => {
     const [q] = Q.sanitizeQuizzes([{ id: 'sop', title: 'Renamed entirely', questions: [] }]);
     assert.strictEqual(q.id, 'sop');

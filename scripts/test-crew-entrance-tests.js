@@ -210,6 +210,34 @@ async function waitForServer() {
     const all = await call('GET', '/api/crew/am/entrance-tests', null, owner);
     check('staff list every test', all.status === 200 && all.body.tests.length === 2 && all.body.quizzes.length === 1, all.body);
 
+    /* ---- a test handed out by hand shows up under Applications ------------ */
+    // No email, so the link went over the IFC: no application behind it. A
+    // pass from them is somebody waiting to be let in all the same.
+    const samToken = loose.body.test.link.split('t=')[1];
+    await call('POST', `/api/crew/am/test/${samToken}`, { answers: [0, 1] });
+    const withSam = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
+    const samWaiting = (withSam.body.waitingTests || []).find((x) => x.ifcName === 'sam_flies');
+    check('a hand-sent pass is listed with the applications', !!samWaiting && samWaiting.status === 'passed' && samWaiting.onRoster === false, withSam.body.waitingTests);
+    check('…but an applicant’s pass is not listed twice', !(withSam.body.waitingTests || []).some((x) => x.ifcName === 'Rae_Okafor'), withSam.body.waitingTests);
+    DB.members.push({ _id: id(), name: 'Sam', ifcName: 'sam_flies' });
+    const samAdded = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
+    check('…and leaves once they are on the roster', !(samAdded.body.waitingTests || []).some((x) => x.ifcName === 'sam_flies'), samAdded.body.waitingTests);
+    const panel = await call('GET', '/api/crew/am/entrance-tests', null, owner);
+    check('the panel knows they are on the roster too', (panel.body.tests || []).some((x) => x.ifcName === 'sam_flies' && x.onRoster === true), panel.body.tests);
+
+    // Sent by hand to somebody who HAS applied: it is their application's test.
+    const kai = await call('POST', '/api/crew/am/apply', {
+        ifcName: 'Kai_Ross', callsignPrefix: 'AEROMEXICO', callsignNumber: '414', grade: 3, answers: [],
+    });
+    const byHand = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', name: 'Kai', ifcName: 'kai_ross' }, owner);
+    check('a test typed in for an applicant is tied to their application', byHand.status === 201
+        && DB.attempts[0].applicationId === kai.body.applicationId, DB.attempts[0]);
+    // …and one sent that way before this existed is found by IFC username.
+    DB.attempts[0].applicationId = null;
+    const kaiCards = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
+    const kaiCard = (kaiCards.body.applications || []).find((a) => String(a._id) === String(kai.body.applicationId));
+    check('…and an older one is matched to the card by IFC username', kaiCard && kaiCard.test && /^kai_ross$/i.test(kaiCard.test.ifcName), kaiCard && kaiCard.test);
+
     /* ---- a pilot's own quiz is not opened by the public route ------------- */
     DB.attempts.unshift({ _id: id(), quizId: 'entrance', token: 'b'.repeat(32), memberId: 'm-pilot', status: 'issued', attemptsUsed: 0, maxAttempts: 0, passMark: 80 });
     const pilotPaper = await call('GET', `/api/crew/am/test/${'b'.repeat(32)}`);

@@ -19,7 +19,7 @@
     "test:schema-sql": "bash scripts/test-crew-schema.sh",
     "test:forgot": "node scripts/test-crew-password-reset.js",
     "test:routes": "node scripts/test-route-library.js",
-    "test:featured": "node scripts/test-crew-featured.js",
+    "test:featured": "node scripts/test-crew-featured.js && node scripts/test-crew-featured-routes.js",
     "test:clubs": "node scripts/test-crew-clubs.js",
     "test:streaks": "node scripts/test-crew-streaks.js",
     "test:badges": "node scripts/test-crew-badges.js",

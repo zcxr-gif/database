@@ -173,6 +173,7 @@ const crewHealth = require('./crewHealth');
 // shape as the three above — decisions only, no I/O, and nothing here is a
 // gate: what a pilot MAY fly is still publicRoute's business.
 const crewFeatured = require('./crewFeatured');
+const crewFeaturedCard = require('./crewFeaturedCard');
 // v16. The second ladder: what a pilot's flying earns them automatically, and
 // what that is worth. A rank is something the airline GIVES you — staff sign a
 // check-ride off; a club is a count nobody has to remember to apply. Same shape
@@ -1130,6 +1131,28 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         weekPeriod: { type: String, trim: true, default: '' },
         dayRouteId: { type: String, trim: true, default: '' },
         dayPeriod: { type: String, trim: true, default: '' },
+        // Staff-built weeks and days (see crewFeatured.js, "staff plans"). A
+        // plan is drafted, then released; only a released one is seen by
+        // pilots or posted. One per period; old periods are pruned on write.
+        plans: {
+            type: [{
+                _id: false,
+                id: String, period: String, periodKey: String, status: String,
+                title: String, note: String,
+                legs: { type: [{ _id: false, routeId: String, bonus: Number }], default: [] },
+                createdBy: String, createdAt: Date,
+                releasedAt: Date, releasedBy: String, postedAt: Date,
+            }],
+            default: [],
+        },
+        // Post the rotation's own pick to Discord when a week or day turns
+        // over. On by default: a featured route nobody hears about is a
+        // featured route nobody flies. A released plan is always posted.
+        autoPost: { type: Boolean, default: true },
+        // The last period each card went out for — the sweep's claim, so two
+        // servers (or two ticks) never post the same week twice.
+        postedWeek: { type: String, trim: true, default: '' },
+        postedDay: { type: String, trim: true, default: '' },
     },
 
     // --- Recruitment / join settings ---
@@ -1194,6 +1217,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             // a VA usually wants the second one where staff will actually see
             // it rather than in the channel that pings on every application.
             retention:   { type: String, trim: true, default: '' },
+            // The Route of the Week and the Route of the Day, posted as cards
+            // when staff release them and when the rotation turns over. Falls
+            // back to the route feed before the main one: it is news about the
+            // network, and a VA that split routes out meant it to go there.
+            featured:    { type: String, trim: true, default: '' },
         }, { _id: false }),
         default: () => ({}),
         select: false,
@@ -1790,13 +1818,18 @@ const REQ_META = {
 // Post a small embed to a VA's crew webhook. Fire-and-forget: never let a
 // webhook hiccup fail the applicant's request.
 const CREW_COLORS = { new: 0xF59E0B, accepted: 0x16A34A, declined: 0x6E685D };
-async function postCrewNotice(url, { title, description, color, fields, image }) {
+async function postCrewNotice(url, { title, description, color, fields, image, thumbnail, author }) {
     if (!url || !isDiscordWebhookUrl(url)) return false;
     // A malformed image URL makes Discord reject the WHOLE post with a 400,
     // silently dropping the notice — so anything that is not plainly an https
     // URL is left off rather than sent and hoped for. Same rule vaEventCard.js
     // follows for every URL it puts in an embed.
     const art = /^https:\/\/\S+$/i.test(String(image || '')) ? String(image) : '';
+    const thumb = /^https:\/\/\S+$/i.test(String(thumbnail || '')) ? String(thumbnail) : '';
+    const by = author && author.name ? {
+        name: String(author.name).slice(0, 256),
+        ...(/^https:\/\/\S+$/i.test(String(author.icon || '')) ? { icon_url: String(author.icon) } : {}),
+    } : undefined;
     try {
         await axios.post(url, {
             embeds: [{
@@ -1805,6 +1838,8 @@ async function postCrewNotice(url, { title, description, color, fields, image })
                 color: color != null ? color : 0x1C1A16,
                 fields: Array.isArray(fields) ? fields.slice(0, 10) : [],
                 image: art ? { url: art } : undefined,
+                thumbnail: thumb ? { url: thumb } : undefined,
+                author: by,
                 footer: { text: 'Inflight · Crew Center' },
                 timestamp: new Date().toISOString(),
             }],
@@ -1959,7 +1994,9 @@ function crewCredentialsHtml({ username, password, signInUrl }) {
 
 // The feeds a VA can point at a Discord channel. Adding one here is most of the
 // work of adding a new notification category.
-const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events', 'retention'];
+const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events', 'retention', 'featured'];
+// Where a feed with no channel of its own goes before the main webhook.
+const CREW_FEED_PARENT = { featured: 'routes' };
 
 /**
  * Load a VA's (secret) webhook URL for one feed.
@@ -1974,7 +2011,8 @@ async function crewWebhookUrlFor(vaId, feed = 'recruitment') {
     try {
         const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl +crewWebhooks').lean();
         if (!doc) return '';
-        const specific = CREW_FEEDS.includes(feed) ? (doc.crewWebhooks && doc.crewWebhooks[feed]) : '';
+        const hooks = doc.crewWebhooks || {};
+        const specific = CREW_FEEDS.includes(feed) ? (hooks[feed] || hooks[CREW_FEED_PARENT[feed]] || '') : '';
         const u = specific || doc.crewWebhookUrl;
         return u && isDiscordWebhookUrl(u) ? u : '';
     } catch { return ''; }
@@ -1994,6 +2032,8 @@ function pirepFields(p) {
     return [
         leg ? { name: 'Route', value: leg, inline: true } : null,
         p.flightNumber ? { name: 'Flight', value: String(p.flightNumber), inline: true } : null,
+        p.featured ? { name: 'Flown as', value: p.featured === 'week' ? '🗓️ Route of the Week' : '☀️ Route of the Day', inline: true }
+            : p.eventId ? { name: 'Flown as', value: '🎟️ Event flight', inline: true } : null,
         p.aircraftName ? { name: 'Aircraft', value: String(p.aircraftName).slice(0, 60), inline: true } : null,
         hours ? { name: 'Hours', value: `${hours}`, inline: true } : null,
         Number(p.landings) ? { name: 'Landings', value: String(p.landings), inline: true } : null,
@@ -2277,9 +2317,14 @@ function postRouteNotice(va, event, route, actor, before) {
         // Staying quiet is the right call; a feed that fires on no-ops is noise.
         if (!changed.length) return;
     }
+    const codeshare = route.kind === 'codeshare';
     crewWebhookUrlFor(va._id, 'routes')
         .then((hook) => hook && postCrewNotice(hook, {
-            title: `${event === 'added' ? '🛫 Route added' : event === 'removed' ? '🗑️ Route removed' : '✏️ Route updated'} — ${routeLabel(route)}`,
+            // A codeshare carries the partner's own logo, so the channel can
+            // see whose metal it is at a glance.
+            ...(codeshare && route.partnerName ? { author: { name: `Codeshare · ${route.partnerName}`, icon: route.partnerLogo } } : {}),
+            thumbnail: codeshare ? route.partnerLogo : '',
+            title: `${event === 'added' ? (codeshare ? '🤝 Codeshare route added' : '🛫 Route added') : event === 'removed' ? '🗑️ Route removed' : '✏️ Route updated'} — ${routeLabel(route)}`,
             description: [changed.join('\n'), who ? `By ${who}.` : ''].filter(Boolean).join('\n\n') || undefined,
             color: ROUTE_COLORS[event] || ROUTE_COLORS.updated,
             fields: [
@@ -6321,7 +6366,22 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
         const declaredPartners = (networkDoc && networkDoc.crewPartners) || [];
         const routes = await store.listRoutes();
         const viewer = await crewViewer(req, store);
-        const out = routes.map((r) => publicRoute(r, va.ranks, viewer));
+        // This period's featured legs are open to every pilot whatever their
+        // rank, here as on the featured tiles — a leg the whole airline is
+        // pointed at that the route list still says is locked is two answers.
+        const sets = featuredSets(va, routes.filter((r) => r.active !== false), { slug: req.params.slug });
+        const featuredIn = new Map();
+        for (const period of ['day', 'week']) {
+            for (const l of ((sets[period] && sets[period].legs) || [])) {
+                featuredIn.set(String(l.route._id || l.route.id), { period, bonus: l.bonus });
+            }
+        }
+        const out = routes.map((r) => {
+            const f = featuredIn.get(String(r._id || r.id));
+            return f
+                ? { ...publicRoute(r, va.ranks, viewer), locked: false, hoursUntilUnlock: 0, featured: f.period, featuredBonus: f.bonus }
+                : publicRoute(r, va.ranks, viewer);
+        });
         res.json({
             routes: out,
             counts: {
@@ -6534,52 +6594,201 @@ function readBusy(src) {
     return (atc.length || Object.keys(inbound).length) ? { atc, inbound } : null;
 }
 
+/** The staff plans on the VA record, cleaned. */
+const featuredPlans = (va) => crewFeatured.normalizePlans(va && va.crewFeatured);
+
 /**
- * One featured route, with everything a tile needs and nothing it does not.
+ * Both featured sets — the week's legs and the day's — for one moment.
  *
- * The period key travels with it so a page can cache it honestly: "this is
- * 2026-W38's leg" is a fact that stops being true at a known moment, which is
- * a different and much more useful thing than a max-age.
+ * The one place every reader resolves them: the pilot page, the planner, the
+ * Discord card, the pay. Four callers computing it four ways would be four
+ * answers to "is this leg featured", and the pay is the one that has to agree
+ * with the card a pilot was shown.
  */
-const publicFeatured = (pick, ranks, viewer) => (pick ? {
-    period: pick.period,
-    periodKey: pick.periodKey,
-    pinned: pick.pinned,
-    estimatedMin: crewFeatured.legMinutes(pick.route),
-    route: publicRoute(pick.route, ranks, viewer),
-} : null);
+function featuredSets(va, routes, { now = new Date(), includeDrafts = false, slug = '' } = {}) {
+    const pins = featuredPins(va);
+    const plans = featuredPlans(va);
+    const key = String((va && va.slug) || slug || '').toLowerCase();
+    return {
+        week: crewFeatured.featuredSet(routes, { period: 'week', now, slug: key, pin: pins.week, plans, includeDrafts }),
+        day: crewFeatured.featuredSet(routes, { period: 'day', now, slug: key, pin: pins.day, weekPin: pins.week, plans, includeDrafts }),
+    };
+}
+
+const httpsUrl = (v) => (/^https:\/\/\S+$/i.test(String(v || '')) ? String(v) : '');
+
+/**
+ * The logo to draw beside each leg: the partner's on a codeshare, our own on
+ * everything else.
+ *
+ * A codeshare's logo is found the way a partner tile finds it — the leg's own
+ * logo first, then the partner crew centre's (for a codeshare agreed here),
+ * then the partner the VA declared by hand — so a leg whose partner was typed
+ * in without a logo still gets one when the VA has given it anywhere at all.
+ */
+async function legLogos(va, routes) {
+    const doc = await VirtualAirlineAd.findById(va._id).select('crewPartners logoUrl').lean().catch(() => null);
+    const own = httpsUrl((doc && doc.logoUrl) || va.logoUrl);
+    const declared = new Map();
+    for (const p of (doc && doc.crewPartners) || []) {
+        if (p && p.name && httpsUrl(p.logo)) declared.set(String(p.name).trim().toLowerCase(), p.logo);
+    }
+    const slugs = [...new Set((routes || [])
+        .filter((r) => r && r.kind === 'codeshare' && r.partnerSlug && !httpsUrl(r.partnerLogo))
+        .map((r) => String(r.partnerSlug).toLowerCase()))];
+    const bySlug = new Map();
+    if (slugs.length) {
+        const vas = await VirtualAirlineAd.find({ slug: { $in: slugs } }).select('slug logoUrl').lean().catch(() => []);
+        for (const v of vas || []) if (httpsUrl(v.logoUrl)) bySlug.set(String(v.slug).toLowerCase(), v.logoUrl);
+    }
+    const logos = new Map();
+    for (const r of routes || []) {
+        if (!r) continue;
+        const id = String(r._id || r.id);
+        logos.set(id, r.kind === 'codeshare'
+            ? (httpsUrl(r.partnerLogo) || bySlug.get(String(r.partnerSlug || '').toLowerCase())
+                || declared.get(String(r.partnerName || '').trim().toLowerCase()) || '')
+            : own);
+    }
+    return { logos, own };
+}
+
+/**
+ * A route as a featured tile reads it.
+ *
+ * NEVER LOCKED. A featured leg is open to every pilot on the roster whatever
+ * their rank — that is the feature. The rank gate still applies to the leg on
+ * any other day.
+ */
+const featuredRoute = (route, ranks, viewer, period, logos) => ({
+    ...publicRoute(route, ranks, viewer),
+    locked: false,
+    hoursUntilUnlock: 0,
+    featured: period,
+    logo: (logos && logos.get(String(route._id || route.id))) || '',
+});
+
+/**
+ * One featured set, with everything a tile needs and nothing it does not.
+ *
+ * `route`, `estimatedMin` and `pinned` are the headline leg's, for every
+ * reader written before the week became seven legs. `legs` is the whole set.
+ * The period key travels with it so a page can cache it honestly: "this is
+ * 2026-W38's set" is a fact that stops being true at a known moment.
+ */
+const publicFeatured = (set, ranks, viewer, logos) => {
+    if (!set || !set.legs || !set.legs.length) return null;
+    const legs = set.legs.map((l) => ({
+        route: featuredRoute(l.route, ranks, viewer, set.period, logos),
+        bonus: l.bonus,
+        estimatedMin: crewFeatured.legMinutes(l.route),
+    }));
+    return {
+        period: set.period,
+        periodKey: set.periodKey,
+        startsAt: crewFeatured.periodStart(set.period, set.periodKey),
+        source: set.source,
+        pinned: set.source === 'pinned',
+        planned: set.source === 'plan',
+        planId: set.planId || '',
+        route: legs[0].route,
+        bonus: legs[0].bonus,
+        estimatedMin: legs[0].estimatedMin,
+        legs,
+    };
+};
+
+/** Is the shop paying anything, and in what? Bonuses are only shown when it is. */
+function featuredCurrency(va) {
+    const shop = crewShop.fromRecord(va && va.crewShop);
+    return shop.enabled ? { name: shop.currency.name, short: shop.currency.short } : null;
+}
+
+/** A plan as the planner draws it: its legs with their routes resolved. */
+function planView(plan, byId, ranks, logos) {
+    return {
+        ...plan,
+        startsAt: crewFeatured.periodStart(plan.period, plan.periodKey),
+        legs: plan.legs.map((l) => {
+            const r = byId.get(String(l.routeId));
+            return {
+                routeId: l.routeId,
+                bonus: l.bonus,
+                // A leg since withdrawn from the network stays on the plan, said
+                // to be missing, rather than vanishing from under the person who
+                // chose it.
+                route: r ? featuredRoute(r, ranks, null, plan.period, logos) : null,
+                estimatedMin: r ? crewFeatured.legMinutes(r) : 0,
+            };
+        }),
+    };
+}
+
+/**
+ * Everything the featured screens read, in one answer.
+ *
+ * Pilots get the two live sets. Staff (routes.manage) also get the planner:
+ * every plan on the books, the periods they may plan for, the network to pick
+ * from, and whether anything will actually reach Discord.
+ */
+async function featuredPayload(req, va, store, { canManage } = {}) {
+    const routes = await store.listRoutes({ activeOnly: true });
+    const viewer = await crewViewer(req, store);
+    const now = new Date();
+    const sets = featuredSets(va, routes, { now, slug: req.params.slug });
+    const pool = crewFeatured.eligible(routes);
+    const { logos } = await legLogos(va, canManage ? pool
+        : [...((sets.week && sets.week.legs) || []), ...((sets.day && sets.day.legs) || [])].map((l) => l.route));
+    const out = {
+        week: publicFeatured(sets.week, va.ranks, viewer, logos),
+        day: publicFeatured(sets.day, va.ranks, viewer, logos),
+        canManage: !!canManage,
+        // So a back office can say "this is the rotation's pick" rather than
+        // leaving staff unsure whether their plan took.
+        network: pool.length,
+        currency: featuredCurrency(va),
+    };
+    if (canManage) {
+        const byId = new Map(pool.map((r) => [String(r._id || r.id), r]));
+        const plans = featuredPlans(va);
+        const keyed = (period) => crewFeatured.upcomingKeys(period, now, crewFeatured.PLAN_AHEAD[period] + 1)
+            .map((key) => ({ key, startsAt: crewFeatured.periodStart(period, key) }));
+        Object.assign(out, {
+            plans: plans.map((p) => planView(p, byId, va.ranks, logos)),
+            upcoming: { week: keyed('week'), day: keyed('day') },
+            maxLegs: crewFeatured.MAX_LEGS,
+            bonusSteps: crewFeatured.BONUS_STEPS,
+            autoPost: !(va.crewFeatured && va.crewFeatured.autoPost === false),
+            webhook: !!(await crewWebhookUrlFor(va._id, 'featured')),
+            // What staff pick from. Every published leg, codeshares included.
+            routes: pool.map((r) => ({
+                id: r._id || r.id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+                aircraft: r.aircraft, distanceNm: r.distanceNm,
+                kind: r.kind === 'codeshare' ? 'codeshare' : 'own', partnerName: r.partnerName || '',
+                logo: logos.get(String(r._id || r.id)) || '',
+                estimatedMin: crewFeatured.legMinutes(r),
+            })),
+        });
+    }
+    return out;
+}
 
 /**
  * Both features, for anybody.
  *
- * Public for the reason /routes is: the featured leg is what a VA advertises,
- * and it is the thing a Discord bot or a VA's own website most wants to print.
- * `publicRoute` still decides per-viewer what is locked, so a pilot who cannot
- * yet fly this week's leg is told that rather than shown a route that is not
- * theirs — "unlocks in 12h" being exactly the sentence that makes a rank ladder
- * worth climbing.
+ * Public for the reason /routes is: the featured legs are what a VA
+ * advertises, and they are the thing a Discord bot or a VA's own website most
+ * wants to print. Every leg is open to every pilot — see featuredRoute.
  */
 app.get('/api/crew/:slug/featured-routes', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const routes = await store.listRoutes({ activeOnly: true });
-        const viewer = await crewViewer(req, store);
-        const pins = featuredPins(va);
-        const slug = String(req.params.slug || '').toLowerCase();
-        const week = crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week });
-        const day = crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day });
+        const canManage = !(await requireCap(req, req.params.slug, 'routes.manage')).error;
         // No cache header. The pick turns over at a wall-clock moment and a
         // pilot who opens the page at 00:01Z should see the new one, not the
         // last five minutes of yesterday's.
         res.set('Cache-Control', 'no-store');
-        res.json({
-            week: publicFeatured(week, va.ranks, viewer),
-            day: publicFeatured(day, va.ranks, viewer),
-            canManage: !(await requireCap(req, req.params.slug, 'routes.manage')).error,
-            // So a back office can say "this is the rotation's pick" rather than
-            // leaving staff unsure whether their pin took.
-            network: crewFeatured.eligible(routes).length,
-        });
+        res.json(await featuredPayload(req, va, store, { canManage }));
     } catch (err) { crewFail(res, err, { log: 'featured routes error', message: 'Could not work out this week’s route.' }); }
 });
 
@@ -6589,7 +6798,8 @@ app.get('/api/crew/:slug/featured-routes', async (req, res) => {
  * `routes.manage`, because this is an editorial decision about the network and
  * it is the same people who make every other one. Body is
  * `{ week: '<routeId>' }` / `{ day: '' }` — an empty id clears that pin, which
- * is how staff put the slot back on the rotation.
+ * is how staff put the slot back on the rotation. A pin on the week makes that
+ * leg the headline; the rotation still fills the other six.
  *
  * The period is stamped by crewFeatured rather than taken from the request: a
  * pin is always for the period it is set in, and letting a caller name its own
@@ -6620,17 +6830,381 @@ app.post('/api/crew/:slug/featured-routes', async (req, res) => {
         if (!Object.keys(patch).length) return res.status(400).json({ error: 'Say which one you are pinning.' });
 
         const record = crewFeatured.toPinRecord(patch, (va && va.crewFeatured) || {}, new Date());
-        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewFeatured: record } });
-
-        const routes = await store.listRoutes({ activeOnly: true });
-        const pins = crewFeatured.normalizePins(record);
-        const slug = String(req.params.slug || '').toLowerCase();
-        res.json({
-            week: publicFeatured(crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week }), va.ranks, null),
-            day: publicFeatured(crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day }), va.ranks, null),
-        });
+        const set = {};
+        for (const k of ['weekRouteId', 'weekPeriod', 'dayRouteId', 'dayPeriod']) set[`crewFeatured.${k}`] = record[k] || '';
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: set });
+        va.crewFeatured = { ...(va.crewFeatured || {}), ...record };
+        res.json(await featuredPayload(req, va, store, { canManage: true }));
     } catch (err) { crewFail(res, err, { log: 'featured pin error', message: 'That could not be saved.' }); }
 });
+
+/* ---- The planner: staff build a week or a day, then release it ---------- */
+
+const FEATURED_PERIOD_WORD = { week: 'Route of the Week', day: 'Route of the Day' };
+
+/** Write the plans back, and keep the in-hand record in step with what was written. */
+async function saveFeaturedPlans(va, plans) {
+    await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { 'crewFeatured.plans': plans } });
+    va.crewFeatured = { ...(va.crewFeatured || {}), plans };
+}
+
+/**
+ * A released plan for the period that is on NOW goes to Discord straight
+ * away. One for a later period waits for the sweep, which posts it the moment
+ * its week or day begins.
+ */
+async function postIfCurrent(va, store, plan) {
+    if (!plan || plan.status !== 'released') return false;
+    if (plan.periodKey !== crewFeatured.periodKey(plan.period, new Date())) return false;
+    const field = plan.period === 'week' ? 'postedWeek' : 'postedDay';
+    await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { [`crewFeatured.${field}`]: plan.periodKey } }).catch(() => {});
+    return postFeaturedCard(va, store, plan.period, { reason: 'release' });
+}
+
+/** Every leg on a plan must be a published leg of this network. */
+async function checkPlanLegs(store, plan) {
+    const routes = await store.listRoutes({ activeOnly: true });
+    const ids = new Set(crewFeatured.eligible(routes).map((r) => String(r._id || r.id)));
+    const missing = plan.legs.filter((l) => !ids.has(String(l.routeId)));
+    return missing.length ? 'One of those routes is not a published leg of your network any more.' : '';
+}
+
+/** Staff asked for the bonuses to be rolled for them. */
+function rollPlanBonuses(plan) {
+    if (plan.period !== 'week') return plan;
+    const seed = Math.floor(Math.random() * 0xFFFFFFFF);
+    const bonuses = crewFeatured.rollBonuses(plan.legs.length, seed);
+    return { ...plan, legs: plan.legs.map((l, i) => ({ ...l, bonus: bonuses[i] })) };
+}
+
+// Staff: build a plan — as a draft, or released in the same breath.
+// { period, periodKey?, legs: [{ routeId, bonus? }], title?, note?, release?, randomBonuses? }
+app.post('/api/crew/:slug/featured-routes/plans', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const now = new Date();
+        const existing = featuredPlans(va);
+        const b = req.body || {};
+        // The period's plan if it has one: a period has one plan, and building
+        // "another" for the same week is editing that one.
+        const same = existing.find((p) => p.period === b.period && p.periodKey === b.periodKey);
+        const cleaned = crewFeatured.cleanPlan(b, { now, id: (same && same.id) || require('crypto').randomBytes(6).toString('hex') });
+        if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+        let plan = cleaned.plan;
+        const bad = await checkPlanLegs(store, plan);
+        if (bad) return res.status(409).json({ error: bad });
+        if (b.randomBonuses) plan = rollPlanBonuses(plan);
+        const by = (gate.p && (gate.p.name || gate.p.uname)) || '';
+        plan = {
+            ...plan,
+            createdBy: (same && same.createdBy) || by,
+            createdAt: (same && same.createdAt) || now,
+            releasedAt: plan.status === 'released' ? now : null,
+            releasedBy: plan.status === 'released' ? by : '',
+        };
+        await saveFeaturedPlans(va, crewFeatured.upsertPlan(existing, plan, now));
+        const posted = await postIfCurrent(va, store, plan);
+        res.status(201).json({ ...(await featuredPayload(req, va, store, { canManage: true })), planId: plan.id, posted });
+    } catch (err) { crewFail(res, err, { log: 'featured plan error', message: 'That plan could not be saved.' }); }
+});
+
+// Staff: change a plan, release it, take it back to draft, or re-roll its bonuses.
+// { action?: 'release'|'unrelease'|'roll', legs?, title?, note? }
+app.patch('/api/crew/:slug/featured-routes/plans/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const now = new Date();
+        const existing = featuredPlans(va);
+        const current = existing.find((p) => p.id === String(req.params.id));
+        if (!current) return res.status(404).json({ error: 'That plan is not on the books any more.' });
+        const b = req.body || {};
+        const action = String(b.action || '');
+        const releasing = action === 'release';
+        const cleaned = crewFeatured.cleanPlan({
+            period: current.period,
+            periodKey: current.periodKey,
+            legs: b.legs !== undefined ? b.legs : current.legs,
+            title: b.title !== undefined ? b.title : current.title,
+            note: b.note !== undefined ? b.note : current.note,
+            release: releasing || (current.status === 'released' && action !== 'unrelease'),
+        }, { now, id: current.id });
+        if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+        let plan = cleaned.plan;
+        if (b.legs !== undefined) {
+            const bad = await checkPlanLegs(store, plan);
+            if (bad) return res.status(409).json({ error: bad });
+        }
+        if (action === 'roll' || b.randomBonuses) plan = rollPlanBonuses(plan);
+        const by = (gate.p && (gate.p.name || gate.p.uname)) || '';
+        plan = {
+            ...plan,
+            createdBy: current.createdBy, createdAt: current.createdAt,
+            releasedAt: plan.status === 'released' ? (releasing ? now : current.releasedAt || now) : null,
+            releasedBy: plan.status === 'released' ? (releasing ? by : current.releasedBy) : '',
+        };
+        await saveFeaturedPlans(va, crewFeatured.upsertPlan(existing, plan, now));
+        // Posted on release, and again when a released plan for today's period
+        // is changed — the channel should not keep advertising the old legs.
+        const changedLive = current.status === 'released' && plan.status === 'released' && (b.legs !== undefined || action === 'roll');
+        const posted = (releasing || changedLive) ? await postIfCurrent(va, store, plan) : false;
+        res.json({ ...(await featuredPayload(req, va, store, { canManage: true })), planId: plan.id, posted });
+    } catch (err) { crewFail(res, err, { log: 'featured plan update error', message: 'That plan could not be saved.' }); }
+});
+
+app.delete('/api/crew/:slug/featured-routes/plans/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = featuredPlans(va);
+        if (!existing.some((p) => p.id === String(req.params.id))) {
+            return res.status(404).json({ error: 'That plan is not on the books any more.' });
+        }
+        await saveFeaturedPlans(va, existing.filter((p) => p.id !== String(req.params.id)));
+        res.json(await featuredPayload(req, va, store, { canManage: true }));
+    } catch (err) { crewFail(res, err, { log: 'featured plan delete error', message: 'That plan could not be removed.' }); }
+});
+
+// Staff: whether the rotation's own pick is posted when a week or day turns over.
+app.post('/api/crew/:slug/featured-routes/settings', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const autoPost = !!(req.body || {}).autoPost;
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { 'crewFeatured.autoPost': autoPost } });
+        va.crewFeatured = { ...(va.crewFeatured || {}), autoPost };
+        res.json(await featuredPayload(req, va, store, { canManage: true }));
+    } catch (err) { crewFail(res, err, { log: 'featured settings error', message: 'That could not be saved.' }); }
+});
+
+// Staff: post this week's (or today's) card to Discord now. { period }
+app.post('/api/crew/:slug/featured-routes/post', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const period = (req.body || {}).period === 'day' ? 'day' : 'week';
+        if (!(await crewWebhookUrlFor(va._id, 'featured'))) {
+            return res.status(409).json({ error: 'Add a Discord webhook first — Settings → Alerts.', code: 'no_webhook' });
+        }
+        const ok = await postFeaturedCard(va, store, period, { reason: 'manual' });
+        if (!ok) return res.status(502).json({ error: 'Discord didn’t take it. Check the webhook under Settings → Alerts.' });
+        res.json({ posted: true });
+    } catch (err) { crewFail(res, err, { log: 'featured post error', message: 'Could not post it.' }); }
+});
+
+/* ---- The card, to Discord ------------------------------------------------ */
+
+/**
+ * One webhook message carrying pictures: the embeds reference them as
+ * attachment://<name>. If the upload fails for any reason the embeds are sent
+ * again without the pictures, so the words still arrive.
+ */
+async function postEmbedsWithImages(hook, embeds, files) {
+    const list = (files || []).filter((f) => f && f.buf);
+    if (list.length) {
+        try {
+            const form = new FormData();
+            form.append('payload_json', JSON.stringify({ embeds, attachments: list.map((f, id) => ({ id, filename: f.name })) }));
+            list.forEach((f, i) => form.append(`files[${i}]`, new Blob([f.buf], { type: 'image/png' }), f.name));
+            await axios.post(hook, form, { timeout: 15000 });
+            return true;
+        } catch (err) {
+            console.warn('card upload failed, posting the embed alone —', (err && err.message) || err);
+        }
+    }
+    const bare = embeds
+        .map(({ image, ...e }) => (image && /^attachment:/.test(image.url || '') ? e : { ...e, ...(image ? { image } : {}) }))
+        .filter((e) => e.title || e.description || (e.fields && e.fields.length));
+    await axios.post(hook, { embeds: bare }, { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+    return true;
+}
+
+/**
+ * A new codeshare, announced on one airline's route feed: both logos on a
+ * card, theirs again as the embed's thumbnail. Called for BOTH airlines when an
+ * agreement is accepted — it is news on each side.
+ */
+async function postCodeshareCard(vaId, { us = {}, them = {}, weFly = 0, theyFly = 0, reply = '', link = '' } = {}) {
+    try {
+        const hook = await crewWebhookUrlFor(vaId, 'routes');
+        if (!hook) return false;
+        const doc = await VirtualAirlineAd.findById(vaId).select('crewAccent').lean().catch(() => null);
+        const accent = /^#?[0-9a-f]{6}$/i.test(String((doc && doc.crewAccent) || '')) ? `#${String(doc.crewAccent).replace('#', '')}` : '#2563eb';
+        let card = null;
+        try {
+            card = await crewFeaturedCard.renderCodeshareCard({
+                accent,
+                left: { name: us.name, logoUrl: us.logo },
+                right: { name: them.name, logoUrl: them.logo },
+                headline: `${weFly} of their routes for our pilots`,
+                subline: `${theyFly} of ours for theirs`,
+            });
+        } catch (err) { console.warn('codeshare card render failed —', (err && err.message) || err); }
+        const embed = {
+            color: parseInt(accent.slice(1), 16),
+            author: { name: String(them.name || 'Partner').slice(0, 250), ...(httpsUrl(them.logo) ? { icon_url: them.logo } : {}) },
+            title: `🤝 New codeshare — ${us.name || 'Us'} × ${them.name || 'Partner'}`.slice(0, 256),
+            ...(httpsUrl(link) ? { url: link } : {}),
+            description: [
+                reply ? `“${String(reply).slice(0, 600)}”` : '',
+                `Their flights are on our network now, marked as codeshares with their logo — fly them like any of ours.`,
+            ].filter(Boolean).join('\n\n'),
+            ...(httpsUrl(them.logo) ? { thumbnail: { url: them.logo } } : {}),
+            fields: [
+                { name: 'Our pilots now fly', value: `${weFly} of their routes`, inline: true },
+                { name: 'Their pilots fly', value: `${theyFly} of ours`, inline: true },
+            ],
+            ...(card ? { image: { url: 'attachment://codeshare.png' } } : {}),
+            footer: { text: 'Inflight · Crew Center' },
+            timestamp: new Date().toISOString(),
+        };
+        return await postEmbedsWithImages(hook, [embed], card ? [{ name: 'codeshare.png', buf: card }] : []);
+    } catch (err) {
+        console.warn('codeshare post failed —', (err && err.message) || err);
+        return false;
+    }
+}
+
+/**
+ * Post one period's featured set as a card.
+ *
+ * The picture is drawn in the crew center's own tile style (crewFeaturedCard.js)
+ * and framed by an embed carrying the same legs as text — the part somebody can
+ * copy, quote or search for. The day's card gets the route map underneath, like
+ * a flight's departure card does.
+ *
+ * Never throws and never blocks: a webhook that is down, a render that fails or
+ * a partner logo that will not load each degrade to less, never to nothing. If
+ * the picture cannot be uploaded the embed goes out on its own.
+ */
+async function postFeaturedCard(va, store, period, { now = new Date(), routes = null } = {}) {
+    try {
+        const hook = await crewWebhookUrlFor(va._id, 'featured');
+        if (!hook) return false;
+        const rts = routes || await store.listRoutes({ activeOnly: true });
+        const set = featuredSets(va, rts, { now })[period];
+        if (!set || !set.legs.length) return false;
+        const { logos, own } = await legLogos(va, set.legs.map((l) => l.route));
+        const currency = featuredCurrency(va);
+        const showBonus = !!currency;
+        const legs = set.legs.map((l) => ({
+            flightNumber: l.route.flightNumber || '',
+            origin: l.route.origin,
+            destination: l.route.destination,
+            aircraft: l.route.aircraft || '',
+            minutes: crewFeatured.legMinutes(l.route),
+            distanceNm: Number(l.route.distanceNm) || 0,
+            bonus: l.bonus,
+            logoUrl: logos.get(String(l.route._id || l.route.id)) || '',
+            partnerName: l.route.kind === 'codeshare' ? (l.route.partnerName || '') : '',
+        }));
+        const label = crewFeaturedCard.periodLabel(period, set.periodKey, crewFeatured.periodStart(period, set.periodKey));
+        const plan = set.source === 'plan' ? featuredPlans(va).find((p) => p.id === set.planId) : null;
+        const accent = /^#?[0-9a-f]{6}$/i.test(String(va.crewAccent || '')) ? `#${String(va.crewAccent).replace('#', '')}` : '#2563eb';
+        const vaName = va.name || va.callsign || 'Crew Center';
+
+        let card = null;
+        try {
+            card = period === 'week'
+                ? await crewFeaturedCard.renderWeekCard({ vaName, vaLogoUrl: own, accent, periodLabel: label, legs, showBonus })
+                : await crewFeaturedCard.renderDayCard({ vaName, vaLogoUrl: own, accent, periodLabel: label, leg: legs[0], showBonus });
+        } catch (err) { console.warn('featured card render failed —', (err && err.message) || err); card = null; }
+        let map = null;
+        if (period === 'day' && card) {
+            try { map = await renderVaRouteMapImage({ origin: legs[0].origin, destination: legs[0].destination }, { mapStyle: 'dark' }); } catch { map = null; }
+        }
+
+        const link = `${SITE_ORIGIN}/crew/${encodeURIComponent(String(va.slug || '').toLowerCase())}`;
+        const anyBonus = showBonus && legs.some((l) => l.bonus > 1);
+        const word = FEATURED_PERIOD_WORD[period];
+        const description = [
+            plan && plan.title ? `**${plan.title}**` : '',
+            plan && plan.note ? plan.note : '',
+            legs.map((l) => crewFeaturedCard.legLine(l, { showBonus })).join('\n'),
+            '',
+            `✈️ Every pilot can fly ${period === 'week' ? 'these' : 'it'}, whatever their rank. File your PIREP as **${word}**`
+                + (anyBonus ? ` to collect the ${currency.name} bonus.` : '.'),
+        ].filter((x, i, a) => x || (i > 0 && a[i - 1])).join('\n').slice(0, 4000);
+        const embed = {
+            color: parseInt(accent.slice(1), 16),
+            author: { name: String(vaName).slice(0, 250), ...(own ? { icon_url: own } : {}) },
+            title: `${period === 'week' ? '🗓️' : '☀️'} ${word} — ${label}`.slice(0, 256),
+            url: link,
+            description,
+            ...(card ? { image: { url: 'attachment://card.png' } } : {}),
+            footer: { text: 'Inflight · Crew Center' },
+            timestamp: new Date().toISOString(),
+        };
+        const embeds = [embed];
+        if (card && map) embeds.push({ color: embed.color, image: { url: 'attachment://map.png' } });
+        return await postEmbedsWithImages(hook, embeds, [
+            card ? { name: 'card.png', buf: card } : null,
+            card && map ? { name: 'map.png', buf: map } : null,
+        ]);
+    } catch (err) {
+        console.warn('featured post failed —', (err && err.message) || err);
+        return false;
+    }
+}
+
+/**
+ * The sweep: post each airline's week when the week turns over and its day
+ * when the day does.
+ *
+ * A released plan is always posted; the rotation's own pick only where the VA
+ * has left auto-posting on. The claim (`postedWeek` / `postedDay`) is written
+ * with a conditional update BEFORE the post, so two servers, or two ticks that
+ * overlap, cannot both post the same week — at worst one post is lost to a
+ * crash between the claim and the send, which is the better way round.
+ */
+async function runFeaturedPostSweepAll({ now = new Date() } = {}) {
+    let vas = [];
+    try {
+        vas = await VirtualAirlineAd.find({
+            status: 'approved',
+            $or: [
+                { crewWebhookUrl: { $nin: [null, ''] } },
+                { 'crewWebhooks.featured': { $nin: [null, ''] } },
+                { 'crewWebhooks.routes': { $nin: [null, ''] } },
+            ],
+        }).select(`${crewStore.SELECT} logoUrl`).lean();
+    } catch (err) {
+        console.error('[featured] could not list VAs:', err && err.message);
+        return { vas: 0, posted: 0 };
+    }
+    const totals = { vas: 0, posted: 0 };
+    for (const va of vas) {
+        totals.vas += 1;
+        const plans = featuredPlans(va);
+        const auto = !(va.crewFeatured && va.crewFeatured.autoPost === false);
+        let store = null;
+        for (const period of crewFeatured.PERIODS) {
+            try {
+                const key = crewFeatured.periodKey(period, now);
+                const field = period === 'week' ? 'postedWeek' : 'postedDay';
+                if (va.crewFeatured && va.crewFeatured[field] === key) continue;
+                const released = plans.some((p) => p.period === period && p.periodKey === key && p.status === 'released');
+                if (!released && !auto) continue;
+                const claim = await VirtualAirlineAd.updateOne(
+                    { _id: va._id, [`crewFeatured.${field}`]: { $ne: key } },
+                    { $set: { [`crewFeatured.${field}`]: key } },
+                );
+                if (!claim || !claim.modifiedCount) continue;
+                if (!store) store = await crewStore.forVa(va);
+                if (await postFeaturedCard(va, store, period, { now })) totals.posted += 1;
+            } catch (err) {
+                console.error(`[featured] ${va.slug || va._id} ${period} failed:`, err && err.message);
+            }
+        }
+    }
+    return totals;
+}
 
 /**
  * What THIS pilot should fly next.
@@ -6664,18 +7238,22 @@ app.get('/api/crew/:slug/suggestions', async (req, res) => {
             : [];
 
         const profile = crewFeatured.flyingProfile(flights);
-        const pins = featuredPins(va);
-        const week = crewFeatured.pickFeatured(routes, { period: 'week', slug, pin: pins.week });
-        const day = crewFeatured.pickFeatured(routes, { period: 'day', slug, pin: pins.day });
+        const sets = featuredSets(va, routes, { slug });
+        const featuredLegs = [...((sets.week && sets.week.legs) || []), ...((sets.day && sets.day.legs) || [])];
+        const { logos } = await legLogos(va, featuredLegs.map((l) => l.route));
 
         // The features are scored UP rather than pulled out of the list: they
         // are legs of this network like any other, and a pilot for whom this
         // week's route is also their best match should see one strong tile
         // rather than the same sector twice.
-        const featuredIds = [week, day].filter(Boolean).map((p) => String(p.route.id || p.route._id));
+        const featuredIds = featuredLegs.map((l) => String(l.route.id || l.route._id));
+        const featuredSetIds = new Set(featuredIds);
         // `locked` is decided per viewer, so the scoring sees what this pilot
         // sees — a leg above their rank is not a suggestion, it is a tease.
-        const visible = routes.map((r) => publicRoute(r, va.ranks, viewer));
+        // Except a featured leg, which is every pilot's to fly this period.
+        const visible = routes.map((r) => (featuredSetIds.has(String(r._id || r.id))
+            ? { ...publicRoute(r, va.ranks, viewer), locked: false, hoursUntilUnlock: 0 }
+            : publicRoute(r, va.ranks, viewer)));
         const picks = crewFeatured.suggest(visible, profile, {
             busy: readBusy(req.query),
             limit,
@@ -6691,8 +7269,9 @@ app.get('/api/crew/:slug/suggestions', async (req, res) => {
             // pinning a leg they are already looking at. The same capability
             // that governs every other editorial decision about the network.
             canManage: !(await requireCap(req, req.params.slug, 'routes.manage')).error,
-            week: publicFeatured(week, va.ranks, viewer),
-            day: publicFeatured(day, va.ranks, viewer),
+            week: publicFeatured(sets.week, va.ranks, viewer, logos),
+            day: publicFeatured(sets.day, va.ranks, viewer, logos),
+            currency: featuredCurrency(va),
             // So the panel can tell "you have not flown enough for us to lean on
             // your habits yet" apart from "the network is empty", which are two
             // different empty states with two different sentences.
@@ -7252,6 +7831,7 @@ const crewNetwork = require('./crewNetworkRoutes')(app, {
     mongoose, VirtualAirlineAd, crewStore, crewCsv, crewRanks,
     resolveCrewVa, resolveCrewStore, requireCap, crewFail, withDrift, crewViewer,
     cleanRoute, publicRoute, eachLimited, crewWebhookUrlFor, postCrewNotice, SITE_ORIGIN,
+    postCodeshareCard: (...a) => postCodeshareCard(...a),
 });
 // A route changed on this airline: the partners that sell it follow, shortly.
 // A function declaration so the route handlers above can call it; by the time
@@ -12144,31 +12724,33 @@ async function priceFlight(store, pirep, va, settings) {
     const rates = (settings || crewShop.fromRecord(va && va.crewShop)).earn;
     const streakCfg = crewStreaks.fromRecord(va && va.crewStreaks);
 
-    // v20. Is this the leg the whole airline is being pointed at this week?
-    // Only asked where the VA pays for it AND the report matched a route at
-    // all: the featured pick is drawn from the network, so a leg that is not on
-    // the network cannot be it, and that test is free.
+    // v20. Is this one of the legs the whole airline is being pointed at — a
+    // Route of the Week leg or the Route of the Day — and does it carry one of
+    // the week's bonuses? Only asked where the shop pays anything at all AND the
+    // report matched a route: the featured legs are drawn from the network, so
+    // a leg that is not on the network cannot be one, and that test is free.
+    //
+    // Resolved as of WHEN IT WAS FLOWN rather than when it was approved: a
+    // pilot who flew this week's route on Sunday and had it approved on
+    // Tuesday flew the featured route, and telling them otherwise because
+    // staff were slow is the bad half of every rule in this file.
     let isFeatured = false;
-    if (rates.featuredBonus && pirep.routeId) {
+    let featuredMultiplier = 1;
+    let featuredLabel = '';
+    const shopPays = Object.values(rates || {}).some((v) => Number(v) > 0);
+    if (shopPays && pirep.routeId) {
         try {
             const routes = await store.listRoutes({ activeOnly: true });
-            const pins = crewFeatured.normalizePins(va && va.crewFeatured);
-            const flownAt = pirep.flownAt || new Date();
-            // Both periods count. A VA that has set a featured bonus means "the
-            // leg we are pointing people at", and the day's pick is as much
-            // that as the week's.
-            //
-            // Resolved as of WHEN IT WAS FLOWN rather than when it was
-            // approved: a pilot who flew this week's route on Sunday and had it
-            // approved on Tuesday flew the featured route, and telling them
-            // otherwise because staff were slow is the bad half of every rule
-            // in this file.
-            isFeatured = crewFeatured.PERIODS.some((period) => {
-                const pick = crewFeatured.pickFeatured(routes, {
-                    period, now: flownAt, slug: va.slug, pin: pins[period],
-                });
-                return !!(pick && String(pick.route.id || pick.route._id) === String(pirep.routeId));
-            });
+            const sets = featuredSets(va, routes, { now: pirep.flownAt || new Date() });
+            for (const period of ['day', 'week']) {
+                const b = crewFeatured.featuredBonusFor(sets[period], pirep.routeId);
+                if (!b) continue;
+                isFeatured = true;
+                if (b > featuredMultiplier) {
+                    featuredMultiplier = b;
+                    featuredLabel = period === 'week' ? 'Route of the Week' : 'Route of the Day';
+                }
+            }
         } catch (err) {
             console.warn('featured bonus skipped —', (err && err.message) || err);
         }
@@ -12217,7 +12799,7 @@ async function priceFlight(store, pirep, va, settings) {
     }
 
     return crewShop.payFor({ ...pirep, isFeatured }, rates, {
-        clubName, clubPercent, streakWeeks, streakPercent, milestone,
+        clubName, clubPercent, streakWeeks, streakPercent, milestone, featuredMultiplier, featuredLabel,
     });
 }
 // Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
@@ -12238,6 +12820,8 @@ async function reversePirepHours(store, pirep, va) {
 }
 const publicPirep = (p) => ({
     id: p._id, memberId: p.memberId, routeId: p.routeId, eventId: p.eventId || null,
+    // v26. 'week' / 'day' when filed as a featured leg.
+    featured: p.featured || '',
     pilotName: p.pilotName, callsign: p.callsign, flightNumber: p.flightNumber,
     origin: p.origin, destination: p.destination,
     aircraftName: p.aircraftName, liveryName: p.liveryName,
@@ -12734,13 +13318,48 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             }
         }
 
+        /* Filed AS the Route of the Week or of the Day. The claim is checked
+         * here, against the legs that were featured when the flight was flown
+         * — not when it is filed, so Sunday's flight filed on Monday still
+         * counts as last week's. A leg named by id fills in the airports and
+         * the aeroplane a hand-filed report left blank; one named only by its
+         * airports has to be on the list. Either way the flight is a normal
+         * flight after this, reviewed and paid by the same code. */
+        const featuredAs = b.featured === 'week' || b.featured === 'day' ? b.featured : '';
+        let featuredLeg = null;
+        let routesEarly = null;
+        if (featuredAs) {
+            routesEarly = await store.listRoutes({ activeOnly: true });
+            const when = (picked && picked.flownAt) || (b.flownAt ? new Date(b.flownAt) : new Date());
+            const set = featuredSets(va, routesEarly, { now: when, slug: req.params.slug })[featuredAs];
+            const legs = (set && set.legs) || [];
+            const word = featuredAs === 'week' ? 'one of the Route of the Week legs' : 'the Route of the Day';
+            if (b.routeId) {
+                featuredLeg = legs.find((l) => String(l.route._id || l.route.id) === String(b.routeId)) || null;
+            } else {
+                const o = (picked && picked.origin) || icao(b.origin);
+                const d = (picked && picked.destination) || icao(b.destination);
+                featuredLeg = legs.find((l) => icao(l.route.origin) === o && icao(l.route.destination) === d) || null;
+            }
+            if (!featuredLeg) {
+                return res.status(409).json({ error: `That flight isn’t ${word} for when it was flown.`, code: 'not_featured' });
+            }
+        }
+
         // A picked flight's own values win over anything typed, for the reason
         // above: they are the record, not a description of it.
-        const origin = (picked && picked.origin) || icao(b.origin) || (event ? event.origin : '') || (schedule ? schedule.origin : '');
-        const destination = (picked && picked.destination) || icao(b.destination) || (event ? event.destination : '') || (schedule ? schedule.destination : '');
+        const leg = featuredLeg && featuredLeg.route;
+        const origin = (picked && picked.origin) || icao(b.origin) || (leg ? icao(leg.origin) : '') || (event ? event.origin : '') || (schedule ? schedule.origin : '');
+        const destination = (picked && picked.destination) || icao(b.destination) || (leg ? icao(leg.destination) : '') || (event ? event.destination : '') || (schedule ? schedule.destination : '');
         if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
+        if (leg && (icao(leg.origin) !== origin || icao(leg.destination) !== destination)) {
+            return res.status(409).json({
+                error: `That leg is ${leg.origin} → ${leg.destination}, but this flight went ${origin} → ${destination}.`,
+                code: 'not_featured',
+            });
+        }
         const aircraftName = (picked && picked.aircraftName)
-            || String(b.aircraftName || b.aircraft || (event && event.aircraft) || (schedule && schedule.aircraft) || '').trim().slice(0, 60);
+            || String(b.aircraftName || b.aircraft || (leg && leg.aircraft) || (event && event.aircraft) || (schedule && schedule.aircraft) || '').trim().slice(0, 60);
         const liveryName = (picked && picked.liveryName) || String(b.liveryName || b.livery || '').trim().slice(0, 80);
         // Duration accepts either a minutes number or hours+minutes fields.
         let durationMin = picked ? picked.durationMin : Math.round(Number(b.durationMin) || 0);
@@ -12752,8 +13371,9 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
 
         // Compare against the current network to judge whether the route is real.
         const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
-        const routes = await store.listRoutes({ activeOnly: true });
-        const route = matchRoute(routes, origin, destination, aircraftName);
+        const routes = routesEarly || await store.listRoutes({ activeOnly: true });
+        // A featured leg IS the route; anything else is matched as before.
+        const route = leg || matchRoute(routes, origin, destination, aircraftName);
         const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
         // If the pilot typed a flight number, note when it disagrees with the route's.
         const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || (schedule && schedule.flightNumber) || '').trim().slice(0, 12);
@@ -12783,6 +13403,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             routeId: (route && route._id) || (event && event.routeId) || (schedule && schedule.routeId) || null,
             eventId: event ? event._id : null,
             scheduleId: schedule ? schedule._id : null,
+            featured: featuredAs,
             pilotName: (member && member.name) || p.name || '',
             callsign: String((picked && picked.callsign) || b.callsign || (member && member.callsign) || '').slice(0, 20),
             flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
@@ -13565,32 +14186,80 @@ app.get('/api/crew/:slug/applications', async (req, res) => {
         // Each applicant's entrance test (v25), newest first, so the card staff
         // accept from says how they did. Best-effort: a project that cannot
         // record tests still lists its applications.
-        const tests = await applicationTests(va, store, req.params.slug);
+        const { byApp, waiting } = await applicationTests(va, store, req.params.slug, rows || []);
         // Live passwords may be in here, so keep it out of every cache.
         res.set('Cache-Control', 'no-store');
         res.json({
             applications: (rows || []).map((a) => ({
                 ...staffApplication(a, va, req.params.slug),
-                test: tests.get(String(a._id)) || null,
+                test: byApp.get(String(a._id)) || null,
             })),
+            // Passed an entrance test that was handed out by hand, never
+            // applied, and not on the roster yet: people waiting to be let in
+            // just as much as an application is.
+            waitingTests: status === 'pending' ? waiting : [],
         });
     } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
-/** applicationId -> that applicant's latest entrance test, as staff see it. */
-async function applicationTests(va, store, slug) {
-    const out = new Map();
+/**
+ * Each applicant's latest entrance test, as staff see it (applicationId ->
+ * test), and the passed tests nobody has acted on that have no application.
+ */
+async function applicationTests(va, store, slug, apps) {
+    const byApp = new Map();
+    let waiting = [];
     try {
         const ad = await crewQuizDoc(slug);
         const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
         const rows = await store.listQuizAttempts({ candidates: true, limit: 500 });
-        for (const a of rows) {   // newest first, so the first one seen wins
-            if (a.applicationId && !out.has(String(a.applicationId))) {
-                out.set(String(a.applicationId), staffEntrance(va, quizzes, a, slug));
-            }
+        const tests = await placeCandidateTests(store, rows.map((a) => staffEntrance(va, quizzes, a, slug)), apps);
+        for (const t of tests) {   // newest first, so the first one seen wins
+            if (t.applicationId && !byApp.has(String(t.applicationId))) byApp.set(String(t.applicationId), t);
         }
+        waiting = tests.filter(waitingToBeAdded);
     } catch { /* no tests on this project — the cards simply carry none */ }
-    return out;
+    return { byApp, waiting };
 }
+
+const candidateKey = (s) => String(s || '').trim().replace(/^@/, '').toLowerCase();
+
+/**
+ * Where a test sent BY HAND belongs.
+ *
+ * A test sent to a name typed in, rather than from an application, carries no
+ * application — which is how a VA without email works: copy the message, paste
+ * it on the IFC. Staff still need two things from one: whether that person
+ * has applied too (then it belongs on their application card), and whether
+ * they are on the roster already (then there is nobody left to let in).
+ * Matched on the IFC username, which is the one name both sides were given.
+ */
+async function placeCandidateTests(store, tests, apps) {
+    const byIfc = new Map();
+    for (const a of apps || []) {
+        const k = candidateKey(a.ifcName);
+        if (k && !byIfc.has(k)) byIfc.set(k, String(a._id));
+    }
+    const crew = new Set();
+    const members = await store.listMembers({ limit: 5000 }).catch(() => []);
+    for (const m of members || []) {
+        if (m.ifcName) crew.add('ifc:' + candidateKey(m.ifcName));
+        if (m.name) crew.add('name:' + candidateKey(m.name));
+    }
+    return tests.map((t) => {
+        const out = { ...t };
+        const k = candidateKey(out.ifcName);
+        if (!out.applicationId && k && byIfc.has(k)) out.applicationId = byIfc.get(k);
+        // By IFC username when the test has one: two pilots can share a
+        // first name, and hiding a pass behind somebody else's is worse than
+        // showing one twice. By name only when that is all there is.
+        out.onRoster = !out.applicationId && (k ? crew.has('ifc:' + k)
+            : !!out.pilotName && crew.has('name:' + candidateKey(out.pilotName)));
+        return out;
+    });
+}
+
+/** A pass from somebody who never applied and is not crew yet. */
+const waitingToBeAdded = (t) => t.status === 'passed' && !t.applicationId && !t.onRoster;
 
 // Staff: accept / decline an application. Accept creates the pilot.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
@@ -14994,6 +15663,13 @@ app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
             appDoc = await store.getApplication(String(b.applicationId));
             if (!appDoc) return res.status(404).json({ error: 'That application no longer exists.' });
             if (appDoc.status === 'declined') return res.status(409).json({ error: 'That application was declined.' });
+        } else if (ifcName) {
+            // Typed in by hand for somebody who has, as it happens, applied:
+            // it is their application's test, and belongs on that card.
+            const pending = await store.listApplications({ status: 'pending' }).catch(() => []);
+            appDoc = (pending || []).find((a) => candidateKey(a.ifcName) === candidateKey(ifcName)) || null;
+        }
+        if (appDoc) {
             ifcName = appDoc.ifcName || ifcName;
             name = name || appDoc.ifcName || '';
         }
@@ -15071,9 +15747,11 @@ app.get('/api/crew/:slug/entrance-tests', async (req, res) => {
         const ad = await crewQuizDoc(req.params.slug);
         const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
         const rows = await store.listQuizAttempts({ candidates: true, limit: 300 });
+        const pending = await store.listApplications({ status: 'pending' }).catch(() => []);
+        const tests = await placeCandidateTests(store, rows.map((a) => staffEntrance(va, quizzes, a, req.params.slug)), pending);
         res.set('Cache-Control', 'no-store');
         res.json(withDrift(store, {
-            tests: rows.map((a) => staffEntrance(va, quizzes, a, req.params.slug)),
+            tests,
             quizzes: quizzes.filter(crewQuizzes.isReady).map((q) => ({ id: q.id, title: q.title, passMark: q.passMark, retakeHours: q.retakeHours })),
         }));
     } catch (err) { crewFail(res, err, { log: 'entrance tests list error', message: 'Could not load the entrance tests.' }); }
@@ -17291,6 +17969,7 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
                 pireps: 'Flight reports — filed, approved and rejected — and pilot promotions will show up here.',
                 routes: 'Route network changes will show up here.',
                 events: 'Events published, changed and cancelled will show up here. Signups will not — a busy event would fire dozens of them in an evening.',
+                featured: 'The Route of the Week and the Route of the Day will be posted here, as cards — when staff release them and when a new week or day starts.',
             }[feed] || 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.';
             const ok = await postCrewNotice(target, {
                 title: `🔔 ${ad.name || 'Crew Center'} — test message`,
@@ -23556,6 +24235,36 @@ if (String(process.env.REMINDER_SWEEP_DISABLED || '').toLowerCase() !== '1') {
         } finally { reminding = false; }
     };
     setTimeout(() => { remind(); setInterval(remind, REMINDER_SWEEP_MS).unref(); }, REMINDER_FIRST_RUN_MS).unref();
+}
+
+// ---- The featured-route cards, on a timer ----
+//
+// Every ten minutes, because what it waits for is a wall-clock moment —
+// Monday 00:00Z for the week, every midnight Z for the day — and a card that
+// lands ten minutes into the period is on time as far as a Discord channel is
+// concerned. Each tick is cheap: a VA whose card for this period has already
+// gone out is skipped on a string comparison, without touching its database.
+//
+// Re-running is safe by construction: the post is claimed with a conditional
+// update before it is sent (see runFeaturedPostSweepAll), so overlapping ticks
+// and a second server cannot both post one week. Waits twelve minutes after
+// boot, between the sweeps above. FEATURED_SWEEP_DISABLED=1 turns it off; the
+// "Post to Discord now" button keeps working either way.
+const FEATURED_SWEEP_MS = 10 * 60 * 1000;
+const FEATURED_FIRST_RUN_MS = 12 * 60 * 1000;
+if (String(process.env.FEATURED_SWEEP_DISABLED || '').toLowerCase() !== '1') {
+    let featuring = false;
+    const feature = async () => {
+        if (featuring) return;
+        featuring = true;
+        try {
+            const t = await runFeaturedPostSweepAll();
+            if (t.posted) console.log(`[featured] ${t.posted} card(s) posted across ${t.vas} VA(s)`);
+        } catch (err) {
+            console.error('[featured] sweep failed:', err && err.message);
+        } finally { featuring = false; }
+    };
+    setTimeout(() => { feature(); setInterval(feature, FEATURED_SWEEP_MS).unref(); }, FEATURED_FIRST_RUN_MS).unref();
 }
 
 // Boot the live diagnostics sampler and feed it the two external state sources

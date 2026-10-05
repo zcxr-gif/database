@@ -221,6 +221,282 @@ function toPinRecord(patch, current, now) {
 }
 
 /* ===========================================================================
+ * THE WHOLE FEATURE: SEVEN LEGS A WEEK, ONE A DAY, AND THE BONUSES
+ *
+ * The Route of the Week is a SET — up to seven legs, one for every evening —
+ * and the Route of the Day is one. `pickFeatured` above still decides the
+ * headline leg of each (it is what a pin overrides, and what every older
+ * caller reads); `featuredSet` builds the rest around it.
+ *
+ * Three sources, in order:
+ *
+ *   PLAN      staff built this period's legs by hand and RELEASED them. A plan
+ *             still in draft is invisible to everybody but staff, which is the
+ *             point of drafting: put the week together on Thursday, release it
+ *             on Sunday night.
+ *   PIN       the older single-leg override, kept so nothing a VA already set
+ *             stops working. It becomes the headline; the rotation fills in.
+ *   ROTATION  derived from the network and the period, exactly as before.
+ *
+ * Codeshare legs are in the pool like any other — they are legs this airline's
+ * pilots fly, and featuring a partner's route is half of what a codeshare is
+ * for.
+ *
+ * BONUSES ARE A MULTIPLIER ON WHAT THE FLIGHT PAYS, and they are random the
+ * way the pick is random: a seeded roll, so every reader of every surface sees
+ * the same legs carrying the same bonus all week, and the next week rolls
+ * again. Staff can set them by hand on a plan instead.
+ *
+ * NOTHING HERE LOCKS ANYBODY OUT. A featured leg is open to every pilot on the
+ * roster whatever their rank — that is the server's to apply (see `featured`
+ * on publicRoute's callers), and the reason is the whole feature: a route the
+ * whole airline is pointed at that half the airline may not fly is a route the
+ * Discord argues about rather than flies.
+ * ======================================================================== */
+
+/** How many legs each period holds. */
+const MAX_LEGS = { week: 7, day: 1 };
+/** The multipliers a bonus can be. Staff pick from these; the roll draws them. */
+const BONUS_STEPS = [1.25, 1.5, 2];
+/** How likely the roll is to put a bonus on any one leg of the week. */
+const BONUS_CHANCE = 0.35;
+
+/** A small seeded generator. Deterministic, which is the whole requirement. */
+function seeded(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/** A bonus, clamped to something real. 1 (or anything below) is "none". */
+function cleanBonus(v) {
+    const n = Math.round((Number(v) || 0) * 100) / 100;
+    if (!(n > 1)) return 1;
+    return Math.min(3, n);
+}
+
+/**
+ * The week's random bonuses, as a list of multipliers lined up with `legs`.
+ *
+ * At least one leg carries one whenever there are two or more — a "bonuses at
+ * random" week that happens to roll none is a week the feature looks broken.
+ */
+function rollBonuses(count, seed) {
+    const rand = seeded(seed);
+    const out = [];
+    for (let i = 0; i < count; i++) {
+        if (rand() < BONUS_CHANCE) {
+            const r = rand();
+            out.push(r < 0.5 ? BONUS_STEPS[0] : r < 0.85 ? BONUS_STEPS[1] : BONUS_STEPS[2]);
+        } else out.push(1);
+    }
+    if (count >= 2 && !out.some((b) => b > 1)) out[seed % count] = BONUS_STEPS[1];
+    return out;
+}
+
+const routeKey = (r) => String((r && (r.id || r._id)) || '');
+
+/**
+ * The legs featured for one period, with their bonuses.
+ *
+ * `plans` are the staff plans on the VA record (see normalizePlans); only a
+ * RELEASED one for this very period is used, unless `includeDrafts` — which is
+ * staff previewing what they are about to release.
+ *
+ * Returns { period, periodKey, source: 'plan'|'pinned'|'auto', planId, legs:
+ * [{ route, bonus }] } or null for an empty network.
+ */
+function featuredSet(routes, { period = 'week', now, slug = '', pin = null, weekPin = null, plans = [], includeDrafts = false } = {}) {
+    const pool = eligible(routes);
+    const key = periodKey(period, now);
+    const byId = new Map(pool.map((r) => [routeKey(r), r]));
+    const max = MAX_LEGS[period] || 1;
+
+    const plan = (plans || []).find((p) => p && p.period === period && p.periodKey === key
+        && (p.status === 'released' || includeDrafts));
+    if (plan) {
+        const legs = (plan.legs || [])
+            .map((l) => ({ route: byId.get(String(l.routeId)), bonus: cleanBonus(l.bonus) }))
+            .filter((l) => l.route)
+            .slice(0, max);
+        // A released plan whose every leg has since left the network is not a
+        // plan any more. Fall through to the rotation rather than featuring
+        // nothing — an empty Route of the Week reads as a broken page.
+        if (legs.length) {
+            return { period, periodKey: key, source: 'plan', planId: plan.id || '', status: plan.status, legs };
+        }
+    }
+    if (!pool.length) return null;
+
+    if (period === 'day') {
+        // A pin, as it always worked.
+        const pinned = pickFeatured(pool, { period: 'day', now, slug, pin });
+        if (pinned && pinned.pinned) {
+            return { period, periodKey: key, source: 'pinned', planId: '', legs: [{ route: pinned.route, bonus: 1 }] };
+        }
+        // Otherwise one leg that is not in this week's set, where the network
+        // is big enough to have one: the same leg in both is one feature and a
+        // wasted slot on the page.
+        const week = featuredSet(routes, { period: 'week', now, slug, pin: weekPin, plans });
+        const taken = new Set(((week && week.legs) || []).map((l) => routeKey(l.route)));
+        const rest = pool.filter((r) => !taken.has(routeKey(r)));
+        const from = (rest.length ? rest : pool).slice().sort((a, b) => routeKey(a).localeCompare(routeKey(b)));
+        const seed = hash([String(slug || '').toLowerCase(), 'day-set', key].join('|'));
+        return { period, periodKey: key, source: 'auto', planId: '', legs: [{ route: from[seed % from.length], bonus: 1 }] };
+    }
+
+    // The week. The headline is what pickFeatured would say (pin included),
+    // and the other six are a seeded draw from the rest.
+    const head = pickFeatured(pool, { period: 'week', now, slug, pin });
+    const seed = hash([String(slug || '').toLowerCase(), 'week-set', key].join('|'));
+    const rand = seeded(seed);
+    const rest = pool.filter((r) => routeKey(r) !== routeKey(head.route))
+        .sort((a, b) => routeKey(a).localeCompare(routeKey(b)));
+    // Fisher–Yates on the seeded generator: every leg equally likely, and the
+    // same order for every reader.
+    for (let i = rest.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    const routesPicked = [head.route, ...rest.slice(0, max - 1)];
+    const bonuses = rollBonuses(routesPicked.length, hash(`${seed}|bonus`));
+    return {
+        period,
+        periodKey: key,
+        source: head.pinned ? 'pinned' : 'auto',
+        planId: '',
+        legs: routesPicked.map((route, i) => ({ route, bonus: bonuses[i] })),
+    };
+}
+
+/** Is this route one of the period's legs? Returns its bonus, or 0 when not. */
+function featuredBonusFor(set, routeId) {
+    if (!set || !routeId) return 0;
+    const leg = set.legs.find((l) => routeKey(l.route) === String(routeId));
+    return leg ? leg.bonus : 0;
+}
+
+/* ---- Staff plans -------------------------------------------------------- */
+
+const PLAN_STATUSES = ['draft', 'released'];
+/** How far ahead a plan may be built. Two months of weeks, a month of days. */
+const PLAN_AHEAD = { week: 8, day: 31 };
+/** How many plans the record keeps. Old periods are pruned past this. */
+const MAX_PLANS = 60;
+
+const WEEK_KEY_RE = /^\d{4}-W\d{2}$/;
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The next n period keys, starting with the current one. */
+function upcomingKeys(period, now, n) {
+    const start = now instanceof Date ? now : new Date(now || Date.now());
+    const step = period === 'day' ? 86400000 : 7 * 86400000;
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(periodKey(period, new Date(start.getTime() + i * step)));
+    return out;
+}
+
+/** The start (Z) of the period a key names, for display. */
+function periodStart(period, key) {
+    if (period === 'day') return DAY_KEY_RE.test(key) ? new Date(`${key}T00:00:00Z`) : null;
+    if (!WEEK_KEY_RE.test(key)) return null;
+    const [y, w] = key.split('-W').map(Number);
+    const jan4 = new Date(Date.UTC(y, 0, 4));
+    const monday = new Date(jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86400000);
+    return new Date(monday.getTime() + (w - 1) * 7 * 86400000);
+}
+
+function cleanLegs(legs, period) {
+    const seen = new Set();
+    const out = [];
+    for (const l of Array.isArray(legs) ? legs : []) {
+        const id = str(l && l.routeId, 64);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push({ routeId: id, bonus: cleanBonus(l && l.bonus) });
+        if (out.length >= (MAX_LEGS[period] || 1)) break;
+    }
+    return out;
+}
+
+/** The plans on a VA record, cleaned. Never throws. */
+function normalizePlans(rec) {
+    const list = Array.isArray(rec && rec.plans) ? rec.plans : [];
+    return list.map((p) => {
+        const period = PERIODS.includes(p && p.period) ? p.period : '';
+        const key = str(p && p.periodKey, 12);
+        if (!period || !(period === 'day' ? DAY_KEY_RE : WEEK_KEY_RE).test(key)) return null;
+        return {
+            id: str(p.id, 40),
+            period,
+            periodKey: key,
+            status: PLAN_STATUSES.includes(p.status) ? p.status : 'draft',
+            title: str(p.title, 80),
+            note: str(p.note, 400),
+            legs: cleanLegs(p.legs, period),
+            createdBy: str(p.createdBy, 60),
+            createdAt: p.createdAt || null,
+            releasedAt: p.releasedAt || null,
+            releasedBy: str(p.releasedBy, 60),
+            postedAt: p.postedAt || null,
+        };
+    }).filter(Boolean);
+}
+
+/**
+ * A plan from staff, checked.
+ *
+ * The period key must name the current period or one within PLAN_AHEAD of it:
+ * a plan for a week that is over can never be seen, and one for 2031 is a
+ * typo. Returns { plan } or { error }.
+ */
+function cleanPlan(input, { now = new Date(), id = '' } = {}) {
+    const b = input || {};
+    const period = PERIODS.includes(b.period) ? b.period : '';
+    if (!period) return { error: 'Say whether this is the route of the week or of the day.' };
+    const allowed = upcomingKeys(period, now, PLAN_AHEAD[period] + 1);
+    const key = str(b.periodKey, 12) || allowed[0];
+    if (!allowed.includes(key)) {
+        return { error: period === 'day'
+            ? 'Pick today or a day in the next month.'
+            : 'Pick this week or one of the next eight.' };
+    }
+    const legs = cleanLegs(b.legs, period);
+    if (!legs.length) return { error: 'Add at least one route.' };
+    return {
+        plan: {
+            id: id || str(b.id, 40),
+            period,
+            periodKey: key,
+            status: b.release ? 'released' : 'draft',
+            title: str(b.title, 80),
+            note: str(b.note, 400),
+            legs,
+        },
+    };
+}
+
+/**
+ * The plans with this one written in — replacing the plan for the same
+ * period, because a period has one plan — and old periods pruned.
+ */
+function upsertPlan(plans, plan, now = new Date()) {
+    const current = { week: periodKey('week', now), day: periodKey('day', now) };
+    const kept = (plans || []).filter((p) => !(p.period === plan.period && p.periodKey === plan.periodKey)
+        && p.id !== plan.id
+        // A plan for a period that has ended is history; nothing reads it.
+        && p.periodKey >= current[p.period]);
+    return [...kept, plan]
+        .sort((a, b) => (a.period + a.periodKey).localeCompare(b.period + b.periodKey))
+        .slice(-MAX_PLANS);
+}
+
+/* ===========================================================================
  * WHAT A PILOT ACTUALLY FLIES
  *
  * Read off their own approved reports and nothing else. Not the roster's hours
@@ -536,6 +812,18 @@ module.exports = {
     pickFeatured,
     normalizePins,
     toPinRecord,
+    MAX_LEGS,
+    BONUS_STEPS,
+    PLAN_AHEAD,
+    cleanBonus,
+    rollBonuses,
+    featuredSet,
+    featuredBonusFor,
+    upcomingKeys,
+    periodStart,
+    normalizePlans,
+    cleanPlan,
+    upsertPlan,
     flyingProfile,
     legMinutes,
     lengthFit,
