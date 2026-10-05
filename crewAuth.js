@@ -1538,7 +1538,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
             const can = (c) => caps.includes(c);
             const body = req.body || {};
             const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero', 'ui'].some(f => body[f] !== undefined);
-            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
+            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'acceptCreatesLogin', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             // Openings ride with the team, not with recruitment. A job advert
             // for a staff role points AT a staff role and hands out its
             // permissions when it is accepted, so the person who may write one
@@ -1757,6 +1757,10 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                 }
                 ad.crewDiscordInvite = inv;
             }
+            // The default for "Create a crew center login" on every accept card.
+            if (typeof req.body?.acceptCreatesLogin === 'boolean') {
+                ad.crewAcceptCreatesLogin = req.body.acceptCreatesLogin;
+            }
             if (req.body?.applicationForm !== undefined) {
                 const f = sanitizeForm(req.body.applicationForm);
                 if (f) ad.applicationForm = f;
@@ -1803,6 +1807,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 callsignReservedMax: crewCallsign.reservedMaxOf(ad),
                 discordInvite: ad.crewDiscordInvite || '',
+                acceptCreatesLogin: ad.crewAcceptCreatesLogin !== false,
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
                 staffOpenings: ad.staffOpenings || [],
