@@ -387,6 +387,42 @@ function candidateView(a) {
 }
 
 /**
+ * One finished paper, question by question, for STAFF.
+ *
+ * The attempt row keeps what was picked and whether it was right, never the
+ * question text — so this is read back against the airline's copy of the quiz.
+ * A question deleted since the paper was sat is still listed (marked `gone`)
+ * rather than skipped: the score staff are looking at counted it.
+ *
+ * Staff only. This is the answer key, and myAttemptView exists precisely so a
+ * taker never receives it.
+ */
+function answerReview(quiz, attempt) {
+    const qs = (quiz && Array.isArray(quiz.questions)) ? quiz.questions : [];
+    const byId = new Map(qs.map((q) => [String(q.id), q]));
+    const given = Array.isArray(attempt && attempt.answers) ? attempt.answers : [];
+    return given.map((a, i) => {
+        const q = byId.get(String(a && a.id));
+        const chosen = Number.isInteger(a && a.chosen) ? a.chosen : -1;
+        if (!q) {
+            return { n: i + 1, id: a && a.id, gone: true, question: '', options: [], chosen, chosenText: '', correct: -1, correctText: '', right: !!(a && a.right) };
+        }
+        return {
+            n: i + 1,
+            id: q.id,
+            gone: false,
+            question: q.text,
+            options: q.options.slice(),
+            chosen,
+            chosenText: chosen >= 0 ? (q.options[chosen] || '') : '',
+            correct: q.correct,
+            correctText: q.options[q.correct] || '',
+            right: !!(a && a.right),
+        };
+    });
+}
+
+/**
  * The message a staff member pastes to the person they are testing — the same
  * shape as the welcome a VA writes by hand ("Welcome to …! Before you take to
  * the virtual skies, please complete our Entrance Test…"), filled in from the
@@ -483,5 +519,5 @@ module.exports = {
     isReady, publicQuiz, grade,
     sanitizeGate, sanitizeBanners, sanitizeReminders,
     attemptView, myAttemptView, takeFailure, gateState, attemptToken,
-    retryAfter, waitText, candidateView, buildTestMessage,
+    retryAfter, waitText, candidateView, buildTestMessage, answerReview,
 };
