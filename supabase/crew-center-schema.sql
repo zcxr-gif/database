@@ -2497,9 +2497,22 @@ begin
     end if;
 end $$;
 
+-- v26. FLOWN AS THE ROUTE OF THE WEEK / OF THE DAY.
+--
+-- A pilot filing a flight says it was one of the airline's featured legs, the
+-- way an event flight says which event (event_id). '' is an ordinary flight,
+-- which is every row written before this and most rows after it. The claim is
+-- checked by the backend against the legs that were featured when the flight
+-- was flown; staff see it on the report, and the featured bonus is paid off the
+-- leg itself, so a project still on v25 loses only the label.
+alter table crew_pireps add column if not exists featured text not null default '';
+do $$ begin
+    alter table crew_pireps add constraint crew_pireps_featured_chk check (featured in ('', 'week', 'day'));
+exception when duplicate_object then null; end $$;
+
 -- ----------------------------------------------------------------------------
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 25)
+insert into crew_schema_info (id, version) values (1, 26)
 on conflict (id) do update set version = excluded.version, updated_at = now();
