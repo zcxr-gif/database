@@ -4330,6 +4330,10 @@ function crewCanManage(req, slug) {
 // Capability gate: like crewCanManage, but a staff member must additionally
 // hold `capability`. Owner + Inflight always pass. Async because a staff
 // member's permissions live on the VA (staffRoles/staffAssignments).
+// `capability` may be a list, meaning any one of them will do. That is how a
+// job that has been split out of a bigger permission keeps answering the old
+// one too: quizzes moved to tests.manage, and a recruiter whose role says only
+// applications.review can still send the entrance tests they always could.
 async function requireCap(req, slug, capability) {
     const base = crewCanManage(req, slug);
     if (base.error) return base;
@@ -4337,7 +4341,9 @@ async function requireCap(req, slug, capability) {
     if (p.kind === 'inflight' || p.role === 'owner') return { p };
     // staff: resolve their role's permissions from the VA.
     const va = await VirtualAirlineAd.findById(p.vaId).select('staffRoles staffAssignments').lean();
-    if (effectiveCaps(va, p).includes(capability)) return { p };
+    const held = effectiveCaps(va, p);
+    const wanted = Array.isArray(capability) ? capability : [capability];
+    if (wanted.some((c) => held.includes(c))) return { p };
     return { error: 403 };
 }
 
@@ -4752,7 +4758,7 @@ const publicTrainingRequest = (r, byId, flights, myId) => {
 app.get('/api/crew/:slug/training', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const canManage = !(await requireCap(req, req.params.slug, 'training.manage')).error;
         const viewer = await crewViewer(req, store);
         const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
         // Neither a pilot nor staff: there is nothing here for the public. The
@@ -4847,7 +4853,7 @@ app.post('/api/crew/:slug/training/requests', async (req, res) => {
 app.patch('/api/crew/:slug/training/requests/:id', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const gate = await requireCap(req, req.params.slug, 'roster.manage');
+        const gate = await requireCap(req, req.params.slug, 'training.manage');
         const canManage = !gate.error;
         const by = (gate.p && gate.p.name) || '';
         const action = String((req.body || {}).action || '').trim();
@@ -4983,7 +4989,7 @@ app.patch('/api/crew/:slug/training/requests/:id', async (req, res) => {
 
 // ---- What each rung asks for, beyond the hours ----
 app.post('/api/crew/:slug/training/settings', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    const gate = await requireCap(req, req.params.slug, 'training.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -5403,9 +5409,9 @@ app.post('/api/crew/:slug/crew-health/nudge', async (req, res) => {
  *
  * WHO MAY DO WHAT. Buying is any signed-in pilot, on their own wallet. Stocking
  * the shelf, setting the rates and working the order queue are
- * `settings.branding` — the same capability the dashboard already uses to decide
- * who is shown the shop at all, so the tile and the back office cannot disagree
- * about who runs this.
+ * `shop.manage` (v26; settings.branding passes it on, see CAPABILITY_HEIRS) —
+ * the same capability the dashboard uses to decide who is shown the shop at
+ * all, so the tile and the back office cannot disagree about who runs this.
  * ======================================================================== */
 
 /** The VA's shop settings, in the shape everything below reads them in. */
@@ -5443,7 +5449,7 @@ const shelfItem = (item, { clubs, clubKey, canManage, now }) => ({
 app.get('/api/crew/:slug/shop', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const canManage = !(await requireCap(req, req.params.slug, 'shop.manage')).error;
         const settings = shopSettingsFor(va);
 
         // A shop that is off has nothing to say beyond the fact that it is off,
@@ -5573,7 +5579,7 @@ app.get('/api/crew/:slug/shop/crew', async (req, res) => {
         const settings = shopSettingsFor(va);
         if (!settings.enabled) return res.json({ enabled: false, currency: settings.currency, crew: [] });
 
-        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const canManage = !(await requireCap(req, req.params.slug, 'shop.manage')).error;
         const viewer = await crewViewer(req, store);
         const me = await crewPilot(req, store);
         const myId = (me && me.memberId) ? String(me.memberId) : '';
@@ -5849,7 +5855,7 @@ app.get('/api/crew/:slug/streaks/suggested', async (req, res) => {
 
 // ---- Turning it on, naming the currency, setting the rates ----
 app.post('/api/crew/:slug/shop/settings', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    const gate = await requireCap(req, req.params.slug, 'shop.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va } = await resolveCrewStore(req.params.slug);
@@ -5875,7 +5881,7 @@ app.post('/api/crew/:slug/shop/settings', async (req, res) => {
 
 // ---- The shelf ----
 app.post('/api/crew/:slug/shop/items', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    const gate = await requireCap(req, req.params.slug, 'shop.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -5887,7 +5893,7 @@ app.post('/api/crew/:slug/shop/items', async (req, res) => {
 });
 
 app.patch('/api/crew/:slug/shop/items/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    const gate = await requireCap(req, req.params.slug, 'shop.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -5899,7 +5905,7 @@ app.patch('/api/crew/:slug/shop/items/:id', async (req, res) => {
 });
 
 app.delete('/api/crew/:slug/shop/items/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    const gate = await requireCap(req, req.params.slug, 'shop.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -5917,7 +5923,7 @@ app.delete('/api/crew/:slug/shop/items/:id', async (req, res) => {
 app.get('/api/crew/:slug/shop/orders', async (req, res) => {
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const canManage = !(await requireCap(req, req.params.slug, 'settings.branding')).error;
+        const canManage = !(await requireCap(req, req.params.slug, 'shop.manage')).error;
         const viewer = await crewViewer(req, store);
         const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
         if (!canManage && !myId) {
@@ -6041,7 +6047,7 @@ app.post('/api/crew/:slug/shop/orders', async (req, res) => {
  * the order still being open so pressing Refund twice refunds once.
  */
 app.patch('/api/crew/:slug/shop/orders/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.branding');
+    const gate = await requireCap(req, req.params.slug, 'shop.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
@@ -14347,8 +14353,8 @@ app.get('/api/crew/:slug/quizzes', async (req, res) => {
             return res.status(401).json({ error: 'Sign in to see your airline’s quizzes.', code: 'not_authenticated' });
         }
         const isStaff = !!(who && (who.role === 'staff' || who.role === 'owner'));
-        const build = await requireCap(req, req.params.slug, 'settings.recruitment');
-        const review = await requireCap(req, req.params.slug, 'applications.review');
+        const build = await requireCap(req, req.params.slug, ['tests.manage', 'settings.recruitment']);
+        const review = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
         const canBuild = !build.error;
         const canReview = !review.error;
 
@@ -14408,7 +14414,7 @@ app.get('/api/crew/:slug/quizzes', async (req, res) => {
  * screen saving does not have to send back a quiz bank it never read.
  */
 app.post('/api/crew/:slug/quizzes', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'settings.recruitment']);
     if (gate.error) {
         return res.status(gate.error).json({
             error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to edit the quizzes.',
@@ -14497,7 +14503,7 @@ app.post('/api/crew/:slug/staff-reminders/send', async (req, res) => {
  * named quiz.
  */
 app.post('/api/crew/:slug/quizzes/banner', upload.single('image'), async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'settings.recruitment');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'settings.recruitment']);
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
@@ -14545,7 +14551,7 @@ app.post('/api/crew/:slug/quizzes/banner', upload.single('image'), async (req, r
 // half needs nothing but the URL. The same link is also posted to their inbox,
 // because a link pasted in Discord is a link that scrolls.
 app.post('/api/crew/:slug/quiz-attempts', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
     if (gate.error) {
         return res.status(gate.error).json({
             error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to send quizzes.',
@@ -14620,7 +14626,7 @@ app.post('/api/crew/:slug/quiz-attempts', async (req, res) => {
 
 /* ---- The queue ---------------------------------------------------------- */
 app.get('/api/crew/:slug/quiz-attempts', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
     if (gate.error) {
         return res.status(gate.error).json({
             error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to read quiz results.',
@@ -14646,9 +14652,41 @@ app.get('/api/crew/:slug/quiz-attempts', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'quiz attempts list error', message: 'Could not load the quiz results.' }); }
 });
 
+/* ---- What somebody actually answered ---------------------------------------
+ *
+ * The list above says 79%. This says which questions — what they picked, what
+ * the right answer was. For a pilot's type-rating quiz and for an entrance test
+ * sat by somebody with no account at all: both are rows in the same table, and
+ * the person deciding whether to let them in is the one who needs to read it.
+ *
+ * Staff only, and never part of any taker-facing view: it is the answer key.
+ */
+app.get('/api/crew/:slug/quiz-attempts/:id/answers', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to read quiz answers.',
+        });
+    }
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const attempt = await store.getQuizAttempt(req.params.id);
+        if (!attempt) return res.status(404).json({ error: 'That quiz result no longer exists.' });
+        const ad = await crewQuizDoc(req.params.slug);
+        const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
+        const quiz = quizzes.find((q) => q.id === attempt.quizId) || null;
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, {
+            attempt: { ...crewQuizzes.candidateView(attempt), entrance: !attempt.memberId },
+            quizGone: !quiz,
+            answers: crewQuizzes.answerReview(quiz, attempt),
+        }));
+    } catch (err) { crewFail(res, err, { log: 'quiz answers read error', message: 'Could not load those answers.' }); }
+});
+
 /* ---- Taking a link back, giving another go, opening the door by hand ---- */
 app.patch('/api/crew/:slug/quiz-attempts/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
     if (gate.error) {
         return res.status(gate.error).json({
             error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to decide quiz results.',
@@ -14964,7 +15002,7 @@ function staffEntrance(va, quizzes, a, slug) {
 
 // Staff: send one.  { quizId, applicationId? | name, ifcName?, note? }
 app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
     if (gate.error) {
         return res.status(gate.error).json({
             error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to send entrance tests.',
@@ -15058,7 +15096,7 @@ app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
 
 // Staff: every entrance test, newest first, with what to do next.
 app.get('/api/crew/:slug/entrance-tests', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    const gate = await requireCap(req, req.params.slug, ['tests.manage', 'applications.review']);
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);

@@ -448,6 +448,21 @@ const CREW_CAPABILITIES = [
     // the liveries" is rarely the person who writes the operations manual, and a
     // VA should be able to hand out the first without the second.
     { id: 'links.manage',           group: 'Communications', label: 'Curate the quick-links board' },
+    // v26. Three jobs that were hiding inside bigger permissions.
+    //
+    // Running check-rides needed roster.manage — "add, edit & remove pilots" —
+    // so a VA's examiners could delete the roster. Quizzes needed the join
+    // settings to build and the application queue to send and mark, so the
+    // person who writes the type-rating exam had to be a recruiter. The shop
+    // needed settings.branding, so whoever hands out the prizes could also
+    // repaint the airline and rewrite the rank ladder.
+    //
+    // Each is its own tick now. Nobody loses anything: roster.manage and
+    // settings.branding pass their old powers on (CAPABILITY_HEIRS), and the
+    // quiz routes still answer the two permissions that used to open them.
+    { id: 'training.manage',        group: 'Training',       label: 'Run check-rides & the training queue' },
+    { id: 'tests.manage',           group: 'Training',       label: 'Build quizzes, send tests & see everyone’s answers' },
+    { id: 'shop.manage',            group: 'Shop',           label: 'Stock the shop & hand over orders' },
 
     // ---- Owner-grade. Read the note under CREW_OWNER_GRADE_CAPS. ----
     //
@@ -537,8 +552,24 @@ const CREW_ROLE_PRESETS = [
         id: 'recruiter',
         name: 'Recruiter',
         color: '#16A34A',
-        description: 'Handles applications and how the airline recruits.',
-        permissions: ['applications.review', 'settings.recruitment', 'roster.manage'],
+        description: 'Handles applications, entrance tests and how the airline recruits.',
+        permissions: ['applications.review', 'settings.recruitment', 'roster.manage', 'tests.manage'],
+    },
+    {
+        id: 'training-captain',
+        name: 'Training captain',
+        color: '#7C3AED',
+        description: 'Runs check-rides, writes the quizzes and marks the tests.',
+        // Reads flight reports too: whether somebody is ready for a check-ride
+        // is answered by how they have been flying.
+        permissions: ['training.manage', 'tests.manage', 'flights.review'],
+    },
+    {
+        id: 'examiner',
+        name: 'Examiner',
+        color: '#9333EA',
+        description: 'Sends quizzes and entrance tests and reads every answer — nothing else.',
+        permissions: ['tests.manage'],
     },
     {
         id: 'ops-manager',
@@ -568,6 +599,29 @@ const CREW_ROLE_PRESETS = [
         description: 'Writes to the crew, keeps the manuals & links, looks after Discord & email.',
         permissions: ['announcements.manage', 'members.message', 'documents.manage',
             'links.manage', 'settings.notifications', 'events.manage'],
+    },
+    {
+        id: 'community-manager',
+        name: 'Community manager',
+        color: '#0D9488',
+        description: 'Keeps the crew talking — notices, messages, events and links.',
+        permissions: ['announcements.manage', 'members.message', 'events.manage', 'links.manage'],
+    },
+    {
+        id: 'shop-manager',
+        name: 'Shop manager',
+        color: '#C026D3',
+        description: 'Stocks the shop and hands over what pilots buy.',
+        permissions: ['shop.manage'],
+    },
+    {
+        id: 'web-editor',
+        name: 'Website editor',
+        color: '#2563EB',
+        description: 'Builds and publishes the public website.',
+        // site.manage is owner-grade (CREW_OWNER_GRADE_CAPS): picking this
+        // preset is the owner ticking it, having read the line.
+        permissions: ['site.manage'],
     },
     {
         id: 'brand-manager',
@@ -1088,7 +1142,8 @@ function sanitizeAssignments(arr) {
  * split will want the same treatment and should not have to rediscover why.
  */
 const CAPABILITY_HEIRS = {
-    'roster.manage': ['announcements.manage'],
+    'roster.manage': ['announcements.manage', 'training.manage'],
+    'settings.branding': ['shop.manage'],
 };
 
 /**
