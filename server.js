@@ -230,6 +230,8 @@ const ifBeta = require('./ifBeta');
 
 // The pictures that open and close a welcome message pasted on the IFC.
 const crewInviteBanner = require('./crewInviteBanner');
+const crewAnnounceBanner = require('./crewAnnounceBanner');
+const crewFeeds = require('./crewFeeds');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -1194,6 +1196,18 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             // a VA usually wants the second one where staff will actually see
             // it rather than in the channel that pings on every application.
             retention:   { type: String, trim: true, default: '' },
+            // Notices staff write and choose to post, with their banner. Falls
+            // back to the main webhook like the feeds above.
+            announcements: { type: String, trim: true, default: '' },
+            // The four below are OFF until set — no fallback (see crewFeeds.js).
+            // Joins, leaves and staff appointments.
+            roster:      { type: String, trim: true, default: '' },
+            // Awards earned, check-rides passed, quiz results.
+            awards:      { type: String, trim: true, default: '' },
+            // Documents published or revised, departures added to the schedule.
+            library:     { type: String, trim: true, default: '' },
+            // Shop orders: bought, handed over, refunded.
+            shop:        { type: String, trim: true, default: '' },
         }, { _id: false }),
         default: () => ({}),
         select: false,
@@ -1951,9 +1965,10 @@ function crewCredentialsHtml({ username, password, signInUrl }) {
         + (signInUrl ? `<br><br>Sign in: <a href="${escHtml(signInUrl)}">${escHtml(signInUrl)}</a>` : '');
 }
 
-// The feeds a VA can point at a Discord channel. Adding one here is most of the
-// work of adding a new notification category.
-const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events', 'retention'];
+// The feeds a VA can point at a Discord channel, and which of them are off
+// until given a channel of their own. See crewFeeds.js.
+const CREW_FEEDS = crewFeeds.FEEDS;
+const CREW_OPT_IN_FEEDS = crewFeeds.OPT_IN;
 
 /**
  * Load a VA's (secret) webhook URL for one feed.
@@ -1964,14 +1979,24 @@ const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events', 'retention'];
  *
  * Returns '' when unset or not a real Discord webhook.
  */
-async function crewWebhookUrlFor(vaId, feed = 'recruitment') {
+async function crewWebhookUrlFor(vaId, feed = 'recruitment', { fallbackFeed = '' } = {}) {
     try {
         const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl +crewWebhooks').lean();
         if (!doc) return '';
-        const specific = CREW_FEEDS.includes(feed) ? (doc.crewWebhooks && doc.crewWebhooks[feed]) : '';
-        const u = specific || doc.crewWebhookUrl;
-        return u && isDiscordWebhookUrl(u) ? u : '';
+        return crewHookFrom(doc, feed, fallbackFeed);
     } catch { return ''; }
+}
+
+function crewHookFrom(doc, feed, fallbackFeed = '') {
+    return crewFeeds.hookFrom(doc, feed, { fallbackFeed, isValid: isDiscordWebhookUrl });
+}
+
+/** Post one notice to one feed. Fire-and-forget, like every notice here. */
+function postFeedNotice(va, feed, notice, opts) {
+    if (!va || !va._id) return;
+    crewWebhookUrlFor(va._id, feed, opts)
+        .then((hook) => hook && postCrewNotice(hook, notice))
+        .catch(() => {});
 }
 
 // ---- Flight report notices ----
@@ -2161,8 +2186,32 @@ function shouldPruneAnnouncements(slug) {
     return true;
 }
 
-function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null, authorName = '' }) {
+// Which Discord feed carries each kind of generated notice. A promotion is
+// absent because postPromotionNotice already puts it on the flight-reports
+// feed, where the approval that caused it was; a schedule is absent because
+// postScheduleNotice has its own, richer post. Anything else may name its feed
+// at the call (a library notice does).
+const NOTICE_FEED = { join: 'roster', leave: 'roster', staff: 'roster' };
+const NOTICE_LOOK = {
+    join: { emoji: '👋', color: 0x16A34A },
+    leave: { emoji: '🛫', color: 0x6E685D },
+    staff: { emoji: '🧑‍✈️', color: 0x4F46E5 },
+    library: { emoji: '📚', color: 0x0EA5E9 },
+};
+
+function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null, authorName = '', feed = '' }) {
     if (!va || !title) return;
+    // Discord first and independently: a crew whose noticeboard table is
+    // missing can still be told in their channel, and the other way round.
+    const discordFeed = feed || NOTICE_FEED[kind] || '';
+    if (discordFeed) {
+        const look = NOTICE_LOOK[kind] || NOTICE_LOOK[discordFeed] || {};
+        postFeedNotice(va, discordFeed, {
+            title: `${look.emoji ? `${look.emoji} ` : ''}${title}`,
+            description: [body, authorName && kind === 'staff' ? `Appointed by ${authorName}.` : ''].filter(Boolean).join('\n\n') || undefined,
+            color: look.color,
+        });
+    }
     Promise.resolve()
         .then(async () => {
             const store = await crewStore.forVaOrNull(va);
@@ -2408,7 +2457,7 @@ function postScheduleNotice(va, action, schedule, actor, count = 1) {
     const departsAt = schedule.departsAt ? new Date(schedule.departsAt) : null;
     const stamp = departsAt && !Number.isNaN(departsAt.getTime())
         ? `<t:${Math.floor(departsAt.getTime() / 1000)}:F>` : '';
-    crewWebhookUrlFor(va._id, 'events')
+    crewWebhookUrlFor(va._id, 'library', { fallbackFeed: 'events' })
         .then((hook) => hook && postCrewNotice(hook, {
             title,
             description: [
@@ -4602,6 +4651,20 @@ async function recordCheckride(va, store, member, rung, { pass = true, by = '' }
 
     const saved = await store.updateMember(member._id, { checksPassed: after });
     const promotion = crewRanks.promotionForCheck(va.ranks, saved.hours, before, after);
+    // Only a NEW sign-off: the set union makes a repeated pass a no-op, and it
+    // should be a silent one in the channel too.
+    const newlyPassed = pass && !before.some((c) => String(c).toLowerCase() === rung.name.toLowerCase());
+    if (newlyPassed) {
+        postFeedNotice(va, 'awards', {
+            title: `🎓 ${saved.name || 'A pilot'} passed their ${rung.name} check-ride`,
+            description: [
+                promotion ? `Promoted to ${promotion.to.name}.` : `${rung.name} follows once they have the hours.`,
+                by ? `Signed off by ${by}.` : '',
+            ].filter(Boolean).join(' '),
+            color: 0x7C3AED,
+            fields: saved.callsign ? [{ name: 'Callsign', value: saved.callsign, inline: true }] : [],
+        });
+    }
     if (promotion) {
         postPromotionNotice(va, saved, promotion, { by, viaCheck: true });
         postAnnouncement(va, {
@@ -6018,6 +6081,15 @@ app.post('/api/crew/:slug/shop/orders', async (req, res) => {
         }
 
         const { order, wallet } = await store.buyShopItem(viewer.memberId, itemId);
+        postFeedNotice(va, 'shop', {
+            title: `🛍️ ${(member && member.name) || 'A pilot'} bought ${(order && order.itemName) || (item && item.name) || 'something'}`,
+            color: 0xDB2777,
+            fields: [
+                order && Number(order.price) >= 0 ? { name: 'Price', value: `${order.price} ${settings.currency.short}`, inline: true } : null,
+                member && member.callsign ? { name: 'Callsign', value: member.callsign, inline: true } : null,
+            ].filter(Boolean),
+            image: item && item.image,
+        });
         // The shelf as it is now: one item's stock has just moved, and the panel
         // behind the pay sheet is showing the old number.
         const items = await store.listShopItems({ activeOnly: true }).catch(() => null);
@@ -6059,10 +6131,21 @@ app.patch('/api/crew/:slug/shop/orders/:id', async (req, res) => {
             return res.status(400).json({ error: 'Unknown action.' });
         }
 
+        const member = order.memberId ? await store.getMember(order.memberId).catch(() => null) : null;
+        postFeedNotice(va, 'shop', {
+            title: action === 'fulfil'
+                ? `📦 Handed over — ${order.itemName || 'an order'}`
+                : `↩️ Refunded — ${order.itemName || 'an order'}`,
+            description: [
+                member && member.name ? `For ${member.name}.` : '',
+                by ? `By ${by}.` : '',
+            ].filter(Boolean).join(' ') || undefined,
+            color: action === 'fulfil' ? 0x16A34A : 0x6E685D,
+        });
+
         // And tell the pilot, because an order they cannot see the state of is
         // one they will ask staff about in Discord.
         if (order.memberId) {
-            const member = await store.getMember(order.memberId).catch(() => null);
             if (member) {
                 notifyPilot(va, member, {
                     kind: 'order',
@@ -7357,14 +7440,177 @@ app.post('/api/crew/:slug/announcements', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'announcements.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const body = cleanAnnouncement(req.body);
         if (!body.title) return res.status(400).json({ error: 'Give the notice a title.' });
         const a = await store.createAnnouncement({
             ...body, source: 'staff', authorName: (gate.p && gate.p.name) || '',
         });
-        res.status(201).json(withDrift(store, { announcement: publicAnnouncement(a) }));
+        // "Also post to Discord" on the composer. Awaited, unlike the generated
+        // notices, because a person pressed a button and is waiting to hear
+        // whether their channel got it. The notice is saved either way.
+        const share = discordShareOptions(req.body);
+        const discord = share ? await shareAnnouncement(va, a, { ...share, authorName: a.authorName }) : undefined;
+        res.status(201).json(withDrift(store, { announcement: publicAnnouncement(a), ...(discord ? { discord } : {}) }));
     } catch (err) { crewFail(res, err, { log: 'announcement add error', message: 'Could not post the notice.' }); }
+});
+
+/* ---- Announcements in Discord ---------------------------------------------
+ *
+ * A notice staff write can also go to the airline's Discord, opening with a
+ * banner: one we draw in the airline's colours (crewAnnounceBanner.js) in one of
+ * four styles, or artwork staff uploaded themselves. It goes to the
+ * announcements feed, and to the main webhook when that feed has no channel of
+ * its own.
+ */
+const ANNOUNCE_STYLE_COLORS = { celebration: 0xE0A526, urgent: 0xDC2626 };
+const ANNOUNCE_PINGS = ['none', 'here', 'everyone'];
+
+/** The share options off a request body, or null when it was not asked for. */
+function discordShareOptions(b) {
+    b = b || {};
+    if (!b.discord) return null;
+    const imageUrl = String(b.bannerImage || '').trim();
+    return {
+        style: crewAnnounceBanner.styleOf(String(b.bannerStyle || '')),
+        imageUrl: /^https:\/\/\S+$/i.test(imageUrl) ? imageUrl.slice(0, 500) : '',
+        banner: b.banner !== false,
+        ping: ANNOUNCE_PINGS.includes(b.ping) ? b.ping : 'none',
+    };
+}
+
+async function crewBrandFor(va) {
+    const doc = await VirtualAirlineAd.findById(va._id).select('name slug callsign logoUrl crewAccent').lean().catch(() => null);
+    const d = doc || va || {};
+    return {
+        name: d.name || 'Crew Center',
+        slug: d.slug || va.slug || '',
+        logoUrl: /^https:\/\//i.test(String(d.logoUrl || '')) ? d.logoUrl : '',
+        accent: crewInviteBanner.accentOf(d.crewAccent),
+    };
+}
+
+/**
+ * Post one notice to the announcements feed. Resolves to { sent, error? } and
+ * never throws — the notice itself is already saved, and the answer is only
+ * there to tell the person who pressed the button.
+ */
+async function shareAnnouncement(va, a, { style = 'notice', imageUrl = '', banner = true, ping = 'none', authorName = '' } = {}) {
+    const hook = await crewWebhookUrlFor(va._id, 'announcements');
+    if (!hook) return { sent: false, error: 'No Discord webhook is set up. Add one under Settings → Alerts.' };
+    const brand = await crewBrandFor(va);
+    const crewUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(brand.slug)}`;
+    const embed = {
+        title: String(a.title || '').slice(0, 256),
+        description: a.body ? String(a.body).slice(0, 4000) : undefined,
+        url: crewUrl,
+        color: ANNOUNCE_STYLE_COLORS[style] != null ? ANNOUNCE_STYLE_COLORS[style] : parseInt(brand.accent.slice(1), 16),
+        author: { name: brand.name.slice(0, 256), ...(brand.logoUrl ? { icon_url: brand.logoUrl } : {}) },
+        footer: { text: `${authorName ? `Posted by ${authorName} · ` : ''}Inflight · Crew Center` },
+        timestamp: new Date().toISOString(),
+    };
+    const content = ping === 'everyone' ? '@everyone' : ping === 'here' ? '@here' : undefined;
+    // Pinging is opt-in per post, and nothing else in the text may ping: a
+    // notice that quotes "@everyone" must not page the whole server.
+    const allowed_mentions = { parse: content ? ['everyone'] : [] };
+
+    let png = null;
+    if (banner && imageUrl) embed.image = { url: imageUrl };
+    else if (banner) {
+        try {
+            png = await crewAnnounceBanner.render({
+                title: a.title, body: a.body, style, name: brand.name, logoUrl: brand.logoUrl, accent: brand.accent, url: crewUrl,
+            });
+        } catch (err) { console.warn('announcement banner: could not draw —', err?.message || err); }
+    }
+    try {
+        if (png) {
+            embed.image = { url: 'attachment://banner.png' };
+            const form = new FormData();
+            form.append('payload_json', JSON.stringify({ content, allowed_mentions, embeds: [embed], attachments: [{ id: 0, filename: 'banner.png' }] }));
+            form.append('files[0]', new Blob([png], { type: 'image/png' }), 'banner.png');
+            await axios.post(hook, form, { timeout: 15000 });
+        } else {
+            await axios.post(hook, { content, allowed_mentions, embeds: [embed] }, { timeout: 8000 });
+        }
+        return { sent: true };
+    } catch (err) {
+        // The picture is the likeliest thing to be refused (size, a URL Discord
+        // will not fetch); the words are what matter. One retry without it.
+        if (png || embed.image) {
+            try {
+                delete embed.image;
+                await axios.post(hook, { content, allowed_mentions, embeds: [embed] }, { timeout: 8000 });
+                return { sent: true, warning: 'Posted without the banner — Discord would not take the picture.' };
+            } catch { /* fall through */ }
+        }
+        console.error('announcement discord post failed:', err?.message || err);
+        return { sent: false, error: 'Discord didn’t accept the post. Check the webhook under Settings → Alerts.' };
+    }
+}
+
+// Share a notice that is already on the board — the "Post to Discord" button on
+// an existing row, for a notice written before the box was ticked.
+app.post('/api/crew/:slug/announcements/:id/discord', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const a = await store.getAnnouncement(req.params.id);
+        if (!a) return res.status(404).json({ error: 'Notice not found.' });
+        const share = discordShareOptions({ ...(req.body || {}), discord: true });
+        const discord = await shareAnnouncement(va, a, { ...share, authorName: (gate.p && gate.p.name) || a.authorName || '' });
+        if (!discord.sent) return res.status(discord.error && /No Discord webhook/.test(discord.error) ? 409 : 502).json({ error: discord.error, discord });
+        res.json({ ok: true, discord });
+    } catch (err) { crewFail(res, err, { log: 'announcement share error', message: 'Could not post that to Discord.' }); }
+});
+
+// The drawn banner, for the composer's preview. Staff only: it puts any words
+// at all under the airline's name and logo, which is not a picture the public
+// should be able to make.
+app.get('/api/crew/:slug/announcements/banner.png', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const brand = await crewBrandFor(va);
+        const png = await crewAnnounceBanner.render({
+            title: String(req.query.title || '').slice(0, 160),
+            body: String(req.query.body || '').slice(0, 400),
+            style: String(req.query.style || ''),
+            name: brand.name, logoUrl: brand.logoUrl, accent: brand.accent,
+            url: `${SITE_ORIGIN}/crew/${encodeURIComponent(brand.slug)}`,
+        });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'private, no-store');
+        res.send(png);
+    } catch (err) {
+        console.error('announcement banner preview error:', err?.message || err);
+        res.status(500).json({ error: 'Could not draw that banner.' });
+    }
+});
+
+// Staff's own artwork for an announcement. Stored like every other VA image and
+// handed back as a URL; the composer sends it with the post as `bannerImage`.
+app.post('/api/crew/:slug/announcements/banner', upload.single('image'), async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        let url;
+        try {
+            url = await uploadVaImage(s3Client, req.file, String(va._id), 'banner');
+        } catch (err) {
+            if (err && err.status) return res.status(err.status).json({ error: err.message });
+            console.warn('announcement banner: could not read the upload —', err && err.message);
+            return res.status(400).json({ error: 'That file could not be read as an image. Try a JPG, PNG or GIF.' });
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({ url });
+    } catch (err) { crewFail(res, err, { log: 'announcement banner upload error', message: 'Could not upload that banner.' }); }
 });
 
 app.patch('/api/crew/:slug/announcements/:id', async (req, res) => {
@@ -7585,6 +7831,7 @@ app.patch('/api/crew/:slug/documents/:id', async (req, res) => {
                 body: saved.revision ? `Revision ${saved.revision}.` : (saved.summary || ''),
                 refId: saved._id,
                 authorName: (gate.p && gate.p.name) || '',
+                feed: 'library',
             });
         }
         res.json(withDrift(store, { document: publicDocument(saved) }));
@@ -11915,6 +12162,42 @@ async function findIfFlight(ifUserId, flightId, meta, hintPage = 1) {
 // before against the rank held after means a single long flight that clears two
 // rungs reports the rung actually reached, and nothing else has to know the
 // ladder exists.
+/**
+ * Tell the awards feed about any badge this one approved flight just earned.
+ *
+ * Awards are computed from the log rather than stored (crewAwards.js), so
+ * "just earned" is the difference between the log with this flight and the log
+ * without it. Only worked out when the VA has given the feed a channel — it
+ * reads the pilot's whole log, and nobody should pay for that to post nowhere.
+ */
+const AWARD_TIER_COLORS = { bronze: 0xB45309, silver: 0x94A3B8, gold: 0xEAB308, platinum: 0x7DD3FC };
+function postAwardNotices(va, store, member, pirep) {
+    if (!va || !member || !pirep) return;
+    crewWebhookUrlFor(va._id, 'awards')
+        .then(async (hook) => {
+            if (!hook) return;
+            const id = String(pirep._id || '');
+            const log = await store.listPirepsForMember(member._id, { limit: 5000 });
+            const withIt = (log || []).filter((p) => String(p._id || '') !== id).concat([{ ...pirep, status: 'approved' }]);
+            const without = withIt.filter((p) => String(p._id || '') !== id);
+            const had = new Set(crewAwards.forMember({ member, pireps: without }).earned.map((a) => a.id));
+            const fresh = crewAwards.forMember({ member, pireps: withIt }).earned.filter((a) => !had.has(a.id));
+            for (const a of fresh.slice(0, 3)) {
+                const full = crewAwards.CATALOG.find((c) => c.id === a.id) || {};
+                await postCrewNotice(hook, {
+                    title: `🏅 ${member.name || 'A pilot'} earned ${a.name}`,
+                    description: full.desc || undefined,
+                    color: AWARD_TIER_COLORS[a.tier] || 0xD97706,
+                    fields: [
+                        a.tier ? { name: 'Tier', value: a.tier[0].toUpperCase() + a.tier.slice(1), inline: true } : null,
+                        member.callsign ? { name: 'Callsign', value: member.callsign, inline: true } : null,
+                    ].filter(Boolean),
+                });
+            }
+        })
+        .catch(() => {});
+}
+
 async function applyPirepHours(store, pirep, va) {
     if (!pirep || pirep.hoursApplied || !pirep.memberId) return pirep;
     const hrs = (Number(pirep.durationMin) || 0) / 60;
@@ -11949,6 +12232,7 @@ async function applyPirepHours(store, pirep, va) {
                 // after is what makes it once rather than on every subsequent
                 // flight, which would be a weekly nag for a pilot nobody has
                 // got round to yet.
+                postAwardNotices(va, store, after, pirep);
                 const wasWaiting = crewRanks.awaitingCheck(va.ranks, before.hours, before.checksPassed);
                 const nowWaiting = crewRanks.awaitingCheck(va.ranks, after.hours, after.checksPassed);
                 if (nowWaiting && (!wasWaiting || wasWaiting.name !== nowWaiting.name)) {
@@ -14819,7 +15103,7 @@ app.post('/api/crew/:slug/quiz/:token', async (req, res) => {
         // already use — same people, same channel. Fire-and-forget, always: a
         // paper that was marked must never be reported as a failure because the
         // notice about it could not be sent.
-        crewWebhookUrlFor(va._id, 'recruitment')
+        crewWebhookUrlFor(va._id, 'awards', { fallbackFeed: 'recruitment' })
             .then(url => postCrewNotice(url, {
                 title: result.passed ? '✅ Quiz passed' : '📝 Quiz not passed',
                 description: `**${attempt.pilotName || 'A pilot'}** scored **${result.score}/${result.total}** (${result.percent}%) on **${attempt.quizTitle}**.`,
@@ -17210,6 +17494,10 @@ app.post('/api/crew/:slug/password-requests/:id', async (req, res) => {
     }
 });
 
+function crewFeedStates(doc) {
+    return crewFeeds.states(doc, { mask: maskWebhookUrl });
+}
+
 // Staff: read the crew webhook state (never the secret URL itself, just a hint).
 app.get('/api/crew/:slug/webhook', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'settings.notifications');
@@ -17218,7 +17506,6 @@ app.get('/api/crew/:slug/webhook', async (req, res) => {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const doc = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl +crewWebhooks').lean();
-        const hooks = (doc && doc.crewWebhooks) || {};
         res.set('Cache-Control', 'no-store');
         res.json({
             configured: !!(doc && doc.crewWebhookUrl),
@@ -17226,15 +17513,7 @@ app.get('/api/crew/:slug/webhook', async (req, res) => {
             // Per-feed state. `usingDefault` is the bit that matters in the UI:
             // it says "this feed is going to your main channel" rather than
             // leaving a blank box that looks like nothing is configured.
-            feeds: CREW_FEEDS.reduce((acc, feed) => {
-                const url = hooks[feed] || '';
-                acc[feed] = {
-                    configured: !!url,
-                    hint: maskWebhookUrl(url),
-                    usingDefault: !url && !!(doc && doc.crewWebhookUrl),
-                };
-                return acc;
-            }, {}),
+            feeds: crewFeedStates(doc),
         });
     } catch (err) { console.error('crew webhook get error:', err); res.status(500).json({ error: 'Could not load the webhook.' }); }
 });
@@ -17276,15 +17555,22 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
             // Test what this feed would actually use, fallback included — the
             // question a VA is asking is "will my messages arrive", not "is
             // this box full".
-            const target = feed
-                ? ((ad.crewWebhooks && ad.crewWebhooks[feed]) || ad.crewWebhookUrl)
-                : ad.crewWebhookUrl;
-            if (!target) return res.status(400).json({ error: 'Add a webhook URL first.' });
+            const target = feed ? crewHookFrom(ad, feed) : ad.crewWebhookUrl;
+            if (!target) {
+                return res.status(400).json({ error: CREW_OPT_IN_FEEDS.includes(feed)
+                    ? 'This feed is off until it has its own webhook. Paste one first.'
+                    : 'Add a webhook URL first.' });
+            }
             const blurb = {
                 recruitment: 'New applications, and accept / decline decisions, will show up here.',
                 pireps: 'Flight reports — filed, approved and rejected — and pilot promotions will show up here.',
                 routes: 'Route network changes will show up here.',
                 events: 'Events published, changed and cancelled will show up here. Signups will not — a busy event would fire dozens of them in an evening.',
+                announcements: 'Announcements your staff post from the crew center — with their banner — will show up here.',
+                roster: 'Pilots joining and leaving, and people joining the staff team, will show up here.',
+                awards: 'Awards earned, check-rides passed and quiz results will show up here.',
+                library: 'Documents published or revised, and departures added to the schedule, will show up here.',
+                shop: 'Shop orders — bought, handed over and refunded — will show up here.',
             }[feed] || 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.';
             const ok = await postCrewNotice(target, {
                 title: `🔔 ${ad.name || 'Crew Center'} — test message`,
@@ -17294,16 +17580,11 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
             if (!ok) return res.status(502).json({ error: 'We couldn’t deliver a message to that webhook. Double-check the URL.' });
         }
 
-        const hooks = ad.crewWebhooks || {};
         res.set('Cache-Control', 'no-store');
         res.json({
             configured: !!ad.crewWebhookUrl,
             hint: maskWebhookUrl(ad.crewWebhookUrl),
-            feeds: CREW_FEEDS.reduce((acc, f) => {
-                const url = hooks[f] || '';
-                acc[f] = { configured: !!url, hint: maskWebhookUrl(url), usingDefault: !url && !!ad.crewWebhookUrl };
-                return acc;
-            }, {}),
+            feeds: crewFeedStates(ad),
         });
     } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
 });

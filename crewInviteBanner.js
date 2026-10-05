@@ -210,4 +210,4 @@ async function cached(opts) {
     return png;
 }
 
-module.exports = { render, cached, accentOf, shade, initialsOf, prettyUrl, SIZES };
+module.exports = { render, cached, accentOf, shade, initialsOf, prettyUrl, fetchLogo, logoPlate, esc, clamp, PLANE, FONT, SIZES };
