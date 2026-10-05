@@ -13565,32 +13565,80 @@ app.get('/api/crew/:slug/applications', async (req, res) => {
         // Each applicant's entrance test (v25), newest first, so the card staff
         // accept from says how they did. Best-effort: a project that cannot
         // record tests still lists its applications.
-        const tests = await applicationTests(va, store, req.params.slug);
+        const { byApp, waiting } = await applicationTests(va, store, req.params.slug, rows || []);
         // Live passwords may be in here, so keep it out of every cache.
         res.set('Cache-Control', 'no-store');
         res.json({
             applications: (rows || []).map((a) => ({
                 ...staffApplication(a, va, req.params.slug),
-                test: tests.get(String(a._id)) || null,
+                test: byApp.get(String(a._id)) || null,
             })),
+            // Passed an entrance test that was handed out by hand, never
+            // applied, and not on the roster yet: people waiting to be let in
+            // just as much as an application is.
+            waitingTests: status === 'pending' ? waiting : [],
         });
     } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
-/** applicationId -> that applicant's latest entrance test, as staff see it. */
-async function applicationTests(va, store, slug) {
-    const out = new Map();
+/**
+ * Each applicant's latest entrance test, as staff see it (applicationId ->
+ * test), and the passed tests nobody has acted on that have no application.
+ */
+async function applicationTests(va, store, slug, apps) {
+    const byApp = new Map();
+    let waiting = [];
     try {
         const ad = await crewQuizDoc(slug);
         const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
         const rows = await store.listQuizAttempts({ candidates: true, limit: 500 });
-        for (const a of rows) {   // newest first, so the first one seen wins
-            if (a.applicationId && !out.has(String(a.applicationId))) {
-                out.set(String(a.applicationId), staffEntrance(va, quizzes, a, slug));
-            }
+        const tests = await placeCandidateTests(store, rows.map((a) => staffEntrance(va, quizzes, a, slug)), apps);
+        for (const t of tests) {   // newest first, so the first one seen wins
+            if (t.applicationId && !byApp.has(String(t.applicationId))) byApp.set(String(t.applicationId), t);
         }
+        waiting = tests.filter(waitingToBeAdded);
     } catch { /* no tests on this project — the cards simply carry none */ }
-    return out;
+    return { byApp, waiting };
 }
+
+const candidateKey = (s) => String(s || '').trim().replace(/^@/, '').toLowerCase();
+
+/**
+ * Where a test sent BY HAND belongs.
+ *
+ * A test sent to a name typed in, rather than from an application, carries no
+ * application — which is how a VA without email works: copy the message, paste
+ * it on the IFC. Staff still need two things from one: whether that person
+ * has applied too (then it belongs on their application card), and whether
+ * they are on the roster already (then there is nobody left to let in).
+ * Matched on the IFC username, which is the one name both sides were given.
+ */
+async function placeCandidateTests(store, tests, apps) {
+    const byIfc = new Map();
+    for (const a of apps || []) {
+        const k = candidateKey(a.ifcName);
+        if (k && !byIfc.has(k)) byIfc.set(k, String(a._id));
+    }
+    const crew = new Set();
+    const members = await store.listMembers({ limit: 5000 }).catch(() => []);
+    for (const m of members || []) {
+        if (m.ifcName) crew.add('ifc:' + candidateKey(m.ifcName));
+        if (m.name) crew.add('name:' + candidateKey(m.name));
+    }
+    return tests.map((t) => {
+        const out = { ...t };
+        const k = candidateKey(out.ifcName);
+        if (!out.applicationId && k && byIfc.has(k)) out.applicationId = byIfc.get(k);
+        // By IFC username when the test has one: two pilots can share a
+        // first name, and hiding a pass behind somebody else's is worse than
+        // showing one twice. By name only when that is all there is.
+        out.onRoster = !out.applicationId && (k ? crew.has('ifc:' + k)
+            : !!out.pilotName && crew.has('name:' + candidateKey(out.pilotName)));
+        return out;
+    });
+}
+
+/** A pass from somebody who never applied and is not crew yet. */
+const waitingToBeAdded = (t) => t.status === 'passed' && !t.applicationId && !t.onRoster;
 
 // Staff: accept / decline an application. Accept creates the pilot.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
@@ -14994,6 +15042,13 @@ app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
             appDoc = await store.getApplication(String(b.applicationId));
             if (!appDoc) return res.status(404).json({ error: 'That application no longer exists.' });
             if (appDoc.status === 'declined') return res.status(409).json({ error: 'That application was declined.' });
+        } else if (ifcName) {
+            // Typed in by hand for somebody who has, as it happens, applied:
+            // it is their application's test, and belongs on that card.
+            const pending = await store.listApplications({ status: 'pending' }).catch(() => []);
+            appDoc = (pending || []).find((a) => candidateKey(a.ifcName) === candidateKey(ifcName)) || null;
+        }
+        if (appDoc) {
             ifcName = appDoc.ifcName || ifcName;
             name = name || appDoc.ifcName || '';
         }
@@ -15071,9 +15126,11 @@ app.get('/api/crew/:slug/entrance-tests', async (req, res) => {
         const ad = await crewQuizDoc(req.params.slug);
         const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
         const rows = await store.listQuizAttempts({ candidates: true, limit: 300 });
+        const pending = await store.listApplications({ status: 'pending' }).catch(() => []);
+        const tests = await placeCandidateTests(store, rows.map((a) => staffEntrance(va, quizzes, a, req.params.slug)), pending);
         res.set('Cache-Control', 'no-store');
         res.json(withDrift(store, {
-            tests: rows.map((a) => staffEntrance(va, quizzes, a, req.params.slug)),
+            tests,
             quizzes: quizzes.filter(crewQuizzes.isReady).map((q) => ({ id: q.id, title: q.title, passMark: q.passMark, retakeHours: q.retakeHours })),
         }));
     } catch (err) { crewFail(res, err, { log: 'entrance tests list error', message: 'Could not load the entrance tests.' }); }
