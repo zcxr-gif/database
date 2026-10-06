@@ -305,6 +305,10 @@ function payFor(pirep, rates, {
     // (1.5 pays half as much again). The Route of the Week's random bonuses
     // and staff-set ones arrive here; see crewFeatured.featuredSet.
     featuredMultiplier = 1, featuredLabel = '',
+    // A temporary multiplier staff put on this event or route
+    // (crewMultipliers.js): everything the flight earned, times this. The
+    // milestone stays out of it, for the same reason as the featured bonus.
+    boostMultiplier = 1, boostLabel = '',
 } = {}) {
     const lines = earnLines(pirep, rates);
     const base = Math.max(0, Math.round(lines.reduce((n, l) => n + l.amount, 0)));
@@ -343,6 +347,15 @@ function payFor(pirep, rates, {
             rate: mult, units: 1, amount: featuredExtra,
         });
     }
+    const boost = Math.min(5, Math.max(1, Number(boostMultiplier) || 1));
+    const boostExtra = boost > 1 ? Math.round((withBonus + featuredExtra) * (boost - 1)) : 0;
+    if (boostExtra) {
+        extras.push({
+            key: 'boostMultiplier',
+            label: `${boostLabel || 'Bonus'} ${boost}×`,
+            rate: boost, units: 1, amount: boostExtra,
+        });
+    }
     const bonus = Math.max(0, Math.round(Number(milestone && milestone.bonus) || 0));
     if (bonus) {
         extras.push({
@@ -358,7 +371,8 @@ function payFor(pirep, rates, {
         streakPercent: streak,
         milestone: bonus ? { weeks: milestone.weeks, bonus } : null,
         featuredMultiplier: featuredExtra ? mult : 1,
-        total: Math.max(0, withBonus + featuredExtra + bonus),
+        boostMultiplier: boostExtra ? boost : 1,
+        total: Math.max(0, withBonus + featuredExtra + boostExtra + bonus),
     };
 }
 
