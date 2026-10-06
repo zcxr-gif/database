@@ -938,6 +938,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         firstFlightDays: { type: Number, default: 7, min: 1, max: 90 },
         firstFlightAction: { type: String, enum: ['remove', 'inactive'], default: 'remove' },
         firstFlightWarnDays: { type: Number, default: 2, min: 0, max: 30 },
+        // 0 = any one flight. Above it, that many set routes, picked at random
+        // or by staff (crewRetention, "PROBATION ROUTES").
+        firstFlightRoutes: { type: Number, default: 0, min: 0, max: 10 },
+        firstFlightRoutePick: { type: String, enum: ['random', 'staff'], default: 'random' },
         // Inactivity: no validated flight in inactivityDays.
         inactivity: { type: Boolean, default: false },
         inactivityDays: { type: Number, default: 30, min: 7, max: 365 },
@@ -947,6 +951,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         // the same as flying it.
         exemptStaff: { type: Boolean, default: true },
     },
+    // memberId → { routeIds, by: 'random'|'staff', at } — the routes each new
+    // pilot was handed for probation. Pruned by the sweep as pilots leave.
+    crewProbationRoutes: { type: mongoose.Schema.Types.Mixed, default: {} },
 
     // --- The shop (v15) ---
     //
@@ -2541,21 +2548,49 @@ async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) 
         return result;
     }
 
-    const due = crewRetention.assess({ members, pireps, rules, now });
+    // Probation on set routes: hand routes to new pilots who have none, then
+    // judge everybody against what they were handed. A route list that cannot
+    // be read skips the hand-out but never the sweep's safety: with no routes,
+    // nobody's assignment counts and the plain first-flight rule applies.
+    let assignments = {};
+    let routes = [];
+    if (rules.enabled && rules.firstFlight && rules.firstFlightRoutes) {
+        try {
+            const doc = await VirtualAirlineAd.findById(va._id).select('crewProbationRoutes').lean();
+            routes = await store.listRoutes({ limit: 5000 });
+            const next = crewRetention.assignMissing({ members, pireps, rules, assignments: (doc && doc.crewProbationRoutes) || {}, routes, now });
+            assignments = next.assignments;
+            if (next.changed && !dryRun) await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewProbationRoutes: assignments } });
+            result.assigned = next.added.length;
+        } catch (err) {
+            result.skipped = `probation routes unavailable (${err && err.message})`;
+            return result;
+        }
+    }
+
+    const due = crewRetention.assess({ members, pireps, rules, now, assignments, routes });
     result.checked = due.checked;
+    result.awaitingRoutes = due.awaitingRoutes.map((a) => ({ id: a.member._id, name: a.member.name, callsign: a.member.callsign }));
+    const routeName = (id) => {
+        const r = routes.find((x) => String(x._id || x.id) === String(id));
+        return r ? [r.flightNumber, `${r.origin}→${r.destination}`].filter(Boolean).join(' ') : '';
+    };
+    const routesLine = (w) => (w.routes ? ` They have flown ${w.routes.done.length} of their ${w.routes.required} probation routes; still to fly: ${w.routes.left.map(routeName).filter(Boolean).join(', ')}.` : '');
 
     // Warnings first, and only warnings. A pilot warned on this run has not
     // also run out of time on it — assess() puts them in one list or the other.
     for (const w of [...due.probationWarn, ...due.inactivityWarn]) {
         const m = w.member;
         const first = due.probationWarn.includes(w);
-        result.warned.push({ id: m._id, name: m.name, callsign: m.callsign, rule: first ? 'first-flight' : 'inactivity', days: w.days });
+        result.warned.push({ id: m._id, name: m.name, callsign: m.callsign, rule: first ? (w.routes ? 'probation-routes' : 'first-flight') : 'inactivity', days: w.days });
         if (dryRun) continue;
         try {
             await store.updateMember(m._id, { retentionWarnedAt: new Date(now).toISOString() });
             postRetentionNotice(va, 'warn', {
                 title: `⏳ ${pilotLabel(m)} — ${w.days} day${w.days === 1 ? '' : 's'} left`,
-                description: first
+                description: first && w.routes
+                    ? `Probation ends <t:${Math.floor(w.dueAt.getTime() / 1000)}:D>.${routesLine(w)} If they are not all flown by then their account will be ${w.action === 'remove' ? 'removed' : 'marked inactive'}.`
+                    : first
                     ? `They joined ${rules.firstFlightDays} days ago and have not logged a flight yet. If none arrives by <t:${Math.floor(w.dueAt.getTime() / 1000)}:D> their account will be ${w.action === 'remove' ? 'removed' : 'marked inactive'}.`
                     : `No flight logged in ${rules.inactivityDays} days. If none arrives by <t:${Math.floor(w.dueAt.getTime() / 1000)}:D> they will be ${w.action === 'remove' ? 'removed' : 'marked inactive'}.`,
                 fields: [{ name: 'Rule', value: first ? 'First flight' : 'Inactivity', inline: true }],
@@ -2570,7 +2605,7 @@ async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) 
         const m = d.member;
         const first = due.probationDue.includes(d);
         const remove = d.action === 'remove';
-        const row = { id: m._id, name: m.name, callsign: m.callsign, rule: first ? 'first-flight' : 'inactivity', hours: m.hours };
+        const row = { id: m._id, name: m.name, callsign: m.callsign, rule: first ? (d.routes ? 'probation-routes' : 'first-flight') : 'inactivity', hours: m.hours };
         (remove ? result.removed : result.deactivated).push(row);
         if (dryRun) continue;
         try {
@@ -2596,7 +2631,9 @@ async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) 
                 title: remove
                     ? `🗑️ ${pilotLabel(m)} removed from the roster`
                     : `💤 ${pilotLabel(m)} marked inactive`,
-                description: first
+                description: first && d.routes
+                    ? `Probation routes not flown within ${rules.firstFlightDays} days (${d.routes.done.length} of ${d.routes.required} done).`
+                    : first
                     ? `No first flight within ${rules.firstFlightDays} days of joining.`
                     : `No flight logged in ${rules.inactivityDays} days.`,
                 fields: [
@@ -15933,6 +15970,8 @@ app.get('/api/crew/:slug/retention', async (req, res) => {
                 warned: preview.warned,
                 removed: preview.removed,
                 deactivated: preview.deactivated,
+                assigned: preview.assigned || 0,
+                awaitingRoutes: preview.awaitingRoutes || [],
             },
         });
     } catch (err) { crewFail(res, err, { log: 'retention preview error', message: 'Could not read the roster sweep.' }); }
@@ -15961,6 +16000,113 @@ app.post('/api/crew/:slug/retention/run', async (req, res) => {
             failed: out.failed,
         });
     } catch (err) { crewFail(res, err, { log: 'retention run error', message: 'Could not run the roster sweep.' }); }
+});
+
+/* =========================================================================
+ * Probation routes — the set routes a new pilot flies to finish probation
+ * (crewRetention, "PROBATION ROUTES").
+ *
+ *   GET /probation                 a pilot: their own routes and progress.
+ *                                  roster.manage: every pilot on probation,
+ *                                  or one with ?memberId=
+ *   PUT /probation/:memberId       roster.manage. { routeIds } assigns those,
+ *                                  { random: true } draws again, { clear: true }
+ *                                  takes the assignment away.
+ *
+ * Assigning is roster.manage rather than retention.manage: choosing somebody's
+ * first three flights is everyday staff work, while switching on the rule that
+ * removes people stays with whoever an owner trusted with that.
+ * ========================================================================= */
+const probationRouteView = (r, flown) => ({
+    id: String(r._id || r.id), flightNumber: r.flightNumber || '', origin: r.origin, destination: r.destination,
+    aircraft: r.aircraft || '', flown: !!flown,
+});
+
+function probationFor(member, assignment, pireps, routes, rules) {
+    const byId = new Map(crewRetention.assignableRoutes(routes).map((r) => [String(r._id || r.id), r]));
+    if (!assignment) return { assigned: false, routes: [], required: rules.firstFlightRoutes, done: 0, dueAt: null, by: '' };
+    const prog = crewRetention.probationProgress(member, assignment, pireps, byId);
+    const joined = member.createdAt ? new Date(member.createdAt).getTime() : 0;
+    const start = Math.max(joined, new Date(assignment.at).getTime());
+    return {
+        assigned: true,
+        by: assignment.by,
+        assignedAt: assignment.at,
+        required: prog.required,
+        done: prog.done.length,
+        complete: prog.required > 0 && !prog.left.length,
+        dueAt: new Date(start + rules.firstFlightDays * crewRetention.DAY_MS).toISOString(),
+        routes: assignment.routeIds.filter((id) => byId.has(id)).map((id) => probationRouteView(byId.get(id), prog.done.includes(id))),
+    };
+}
+
+app.get('/api/crew/:slug/probation', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const rules = crewRetention.normalizeRules(va.crewRetention);
+        const on = rules.enabled && rules.firstFlight && rules.firstFlightRoutes > 0;
+        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const viewer = await crewViewer(req, store);
+        const myId = viewer && viewer.memberId ? String(viewer.memberId) : '';
+        const askedId = canManage ? String(req.query.memberId || '').slice(0, 80) : '';
+        if (!canManage && !myId) return res.status(401).json({ error: 'Sign in to see your probation routes.', code: 'not_authenticated' });
+        const base = { enabled: on, required: rules.firstFlightRoutes, pick: rules.firstFlightRoutePick, days: rules.firstFlightDays, canManage };
+        res.set('Cache-Control', 'no-store');
+        if (!on) return res.json({ ...base, mine: null, pilots: [] });
+
+        const [doc, routes] = await Promise.all([
+            VirtualAirlineAd.findById(va._id).select('crewProbationRoutes').lean(),
+            store.listRoutes({ limit: 5000 }),
+        ]);
+        const given = crewRetention.cleanAssignments(doc && doc.crewProbationRoutes);
+        const one = askedId || (!canManage || req.query.mine ? myId : '');
+        if (one) {
+            const member = await store.getMember(one);
+            if (!member) return res.status(404).json({ error: 'No such pilot.' });
+            const pireps = await store.listPirepsForMember(one, { limit: 500 });
+            return res.json({ ...base, mine: { memberId: one, name: member.name, ...probationFor(member, given[one], pireps, routes, rules) } });
+        }
+        // Staff: everybody with an assignment still to finish, plus (staff
+        // mode) the new pilots waiting for somebody to choose.
+        const [members, pireps] = await Promise.all([store.listMembers({ limit: 5000 }), store.listPireps({ status: 'approved', limit: 20000 })]);
+        const due = crewRetention.assess({ members, pireps, rules, assignments: given, routes });
+        const waiting = new Set(due.awaitingRoutes.map((a) => String(a.member._id)));
+        const pilots = members.filter((m) => given[String(m._id)] || waiting.has(String(m._id))).map((m) => ({
+            memberId: String(m._id), name: m.name, callsign: m.callsign,
+            ...probationFor(m, given[String(m._id)], pireps, routes, rules),
+        })).filter((p) => !p.complete);
+        res.json({ ...base, mine: null, pilots, routes: crewRetention.assignableRoutes(routes).map((r) => probationRouteView(r, false)) });
+    } catch (err) { crewFail(res, err, { log: 'probation read error', message: 'Could not read the probation routes.' }); }
+});
+
+app.put('/api/crew/:slug/probation/:memberId', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to assign probation routes.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const rules = crewRetention.normalizeRules(va.crewRetention);
+        const id = String(req.params.memberId || '').slice(0, 80);
+        const member = await store.getMember(id);
+        if (!member) return res.status(404).json({ error: 'No such pilot.' });
+        const b = req.body || {};
+        const routes = await store.listRoutes({ limit: 5000 });
+        const live = new Set(crewRetention.assignableRoutes(routes).map((r) => String(r._id || r.id)));
+        const doc = await VirtualAirlineAd.findById(va._id).select('crewProbationRoutes');
+        const given = crewRetention.cleanAssignments(doc.crewProbationRoutes);
+        if (b.clear) delete given[id];
+        else {
+            const routeIds = b.random
+                ? crewRetention.pickRoutes(routes, rules.firstFlightRoutes || 1)
+                : [...new Set((Array.isArray(b.routeIds) ? b.routeIds : []).map(String))].filter((x) => live.has(x)).slice(0, crewRetention.MAX_PROBATION_ROUTES);
+            if (!routeIds.length) return res.status(400).json({ error: b.random ? 'There are no published routes to draw from.' : 'Pick at least one of your published routes.' });
+            given[id] = { routeIds, by: b.random ? 'random' : 'staff', at: new Date().toISOString() };
+        }
+        doc.crewProbationRoutes = given;
+        doc.markModified('crewProbationRoutes');
+        await doc.save();
+        const pireps = await store.listPirepsForMember(id, { limit: 500 });
+        res.json({ ok: true, pilot: { memberId: id, name: member.name, callsign: member.callsign, ...probationFor(member, given[id], pireps, routes, rules) } });
+    } catch (err) { crewFail(res, err, { log: 'probation assign error', message: 'Could not save those routes.' }); }
 });
 
 app.get('/api/crew/:slug/insights', async (req, res) => {

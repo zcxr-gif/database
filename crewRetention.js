@@ -60,6 +60,10 @@ const DAY_MS = 24 * 3600 * 1000;
 /** What a rule may do when its deadline passes. */
 const ACTIONS = ['remove', 'inactive'];
 
+/** Who chooses a new pilot's probation routes. */
+const PICKS = ['random', 'staff'];
+const MAX_PROBATION_ROUTES = 10;
+
 const int = (v, lo, hi, def) => {
     const n = Math.round(Number(v));
     return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def;
@@ -98,6 +102,11 @@ function normalizeRules(cfg) {
         firstFlightAction: action(c.firstFlightAction, 'remove'),
         // Days BEFORE the deadline to warn. 0 turns the warning off.
         firstFlightWarnDays: int(c.firstFlightWarnDays, 0, 30, 2),
+        // 0 is the rule as it always was: any one validated flight. Above it,
+        // the new pilot has that many SET routes to fly in the window — picked
+        // at random from the network, or handed to them by staff.
+        firstFlightRoutes: int(c.firstFlightRoutes, 0, MAX_PROBATION_ROUTES, 0),
+        firstFlightRoutePick: PICKS.includes(c.firstFlightRoutePick) ? c.firstFlightRoutePick : 'random',
 
         // --- Inactivity: the long silence ---
         inactivity: !!c.inactivity,
@@ -219,12 +228,15 @@ const isStaff = (member) => !!String((member && member.role) || '').trim();
  * whether to write anything, which is what lets the same function power both
  * the sweep and the dry run a VA reads before switching this on.
  */
-function assess({ members = [], pireps = [], rules = {}, now = Date.now() } = {}) {
+function assess({ members = [], pireps = [], rules = {}, now = Date.now(), assignments = {}, routes = [] } = {}) {
     const r = normalizeRules(rules);
     const out = {
         rules: r,
         probationWarn: [], probationDue: [],
         inactivityWarn: [], inactivityDue: [],
+        // Staff mode: new pilots with no routes chosen yet. Not on a clock —
+        // nobody is removed for a list their staff have not written.
+        awaitingRoutes: [],
         exempt: [],
         checked: 0,
     };
@@ -232,6 +244,8 @@ function assess({ members = [], pireps = [], rules = {}, now = Date.now() } = {}
 
     const index = lastFlightIndex(pireps);
     const t = now instanceof Date ? now.getTime() : Number(now);
+    const routesById = new Map(assignableRoutes(routes).map((x) => [routeKey(x), x]));
+    const given = cleanAssignments(assignments);
 
     for (const m of members) {
         if (!m) continue;
@@ -241,6 +255,31 @@ function assess({ members = [], pireps = [], rules = {}, now = Date.now() } = {}
 
         const flown = lastFlightFor(m, index);
         const joined = when(m.createdAt);
+
+        // PROBATION ON SET ROUTES — through only when every assigned route
+        // that still exists has been flown. Clocked from the later of joining
+        // and being handed the routes.
+        if (r.firstFlight && r.firstFlightRoutes) {
+            const a = given[String(m._id || m.id || '')];
+            const prog = a ? probationProgress(m, a, pireps, routesById) : null;
+            if (prog && prog.required) {
+                if (!prog.left.length) { /* through probation — on to inactivity below */ } else {
+                    const start = Math.max(joined ? joined.getTime() : 0, when(a.at).getTime());
+                    const dueAt = new Date(start + r.firstFlightDays * DAY_MS);
+                    const daysLeft = Math.ceil((dueAt.getTime() - t) / DAY_MS);
+                    const extra = { routes: prog, by: a.by };
+                    if (t >= dueAt.getTime()) {
+                        out.probationDue.push({ member: m, dueAt, days: r.firstFlightDays, action: r.firstFlightAction, ...extra });
+                    } else if (r.firstFlightWarnDays && daysLeft <= r.firstFlightWarnDays && !alreadyWarned(m, new Date(start))) {
+                        out.probationWarn.push({ member: m, dueAt, days: daysLeft, action: r.firstFlightAction, ...extra });
+                    }
+                    continue;
+                }
+            } else if (!flown && r.firstFlightRoutePick === 'staff' && !a) {
+                out.awaitingRoutes.push({ member: m });
+                continue;
+            }
+        }
 
         // PROBATION — never flown at all. Anchored on the join date, so a
         // roster imported wholesale does not have its entire membership swept
@@ -272,6 +311,102 @@ function assess({ members = [], pireps = [], rules = {}, now = Date.now() } = {}
     return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * PROBATION ROUTES
+ *
+ * "Fly one flight in your first week" proves somebody can file a report. A VA
+ * that wants to know they can fly ITS network asks for set routes instead:
+ * three legs, say, either drawn at random from what the airline publishes or
+ * chosen by staff for that pilot.
+ *
+ * The assignment is stored per pilot (memberId → { routeIds, by, at }) on the
+ * VA's record, beside the rules. It is handed out only to a pilot who has not
+ * flown yet — so switching this on never puts an established pilot back on
+ * probation — and the clock starts when it is handed out, not at the join
+ * date, so a pilot whose staff took four days to choose still gets the full
+ * window.
+ *
+ * A route deleted from the network after it was assigned cannot be flown, so
+ * it stops counting: the requirement shrinks rather than becoming impossible.
+ * ------------------------------------------------------------------------- */
+
+/** Routes a new pilot may be handed: our own, published, with both airports. */
+const assignableRoutes = (routes = []) => routes.filter((r) => r && (r.kind || 'own') === 'own'
+    && r.active !== false && r.origin && r.destination && (r._id || r.id));
+const routeKey = (r) => String((r && (r._id || r.id)) || '');
+
+/** `n` distinct routes, at random. `rand` is injectable so tests can pin it. */
+function pickRoutes(routes, n, rand = Math.random) {
+    const pool = assignableRoutes(routes).map(routeKey);
+    for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    return pool.slice(0, Math.max(0, n));
+}
+
+/** The stored assignments, bounded. Anything unreadable is dropped. */
+function cleanAssignments(raw) {
+    const out = {};
+    if (!raw || typeof raw !== 'object') return out;
+    for (const [id, a] of Object.entries(raw)) {
+        if (!id || !a || typeof a !== 'object') continue;
+        const routeIds = [...new Set((Array.isArray(a.routeIds) ? a.routeIds : []).map((x) => String(x || '').slice(0, 80)).filter(Boolean))]
+            .slice(0, MAX_PROBATION_ROUTES);
+        const at = when(a.at);
+        if (!routeIds.length || !at) continue;
+        out[String(id).slice(0, 80)] = { routeIds, by: a.by === 'staff' ? 'staff' : 'random', at: at.toISOString() };
+    }
+    return out;
+}
+
+/**
+ * Which of a pilot's assigned routes they have flown, from their validated
+ * reports. A report counts for a route when it names it, or — because plenty
+ * of pilots file without picking the route — when it flew the same airports.
+ */
+function probationProgress(member, assignment, pireps = [], routesById = new Map()) {
+    const ids = ((assignment && assignment.routeIds) || []).filter((id) => routesById.has(id));
+    const mid = String((member && (member._id || member.id)) || '');
+    const ifu = member && member.ifUserId ? String(member.ifUserId) : '';
+    const mine = pireps.filter((p) => p && p.status === 'approved'
+        && ((mid && String(p.memberId || '') === mid) || (ifu && String(p.ifUserId || '') === ifu)));
+    const up = (v) => String(v || '').trim().toUpperCase();
+    const done = ids.filter((id) => {
+        const r = routesById.get(id);
+        return mine.some((p) => (p.routeId && String(p.routeId) === id)
+            || (up(p.origin) && up(p.origin) === up(r.origin) && up(p.destination) === up(r.destination)));
+    });
+    return { required: ids.length, done, left: ids.filter((id) => !done.includes(id)) };
+}
+
+/**
+ * Hand routes to every new pilot who needs them and has none, and forget the
+ * assignments of pilots no longer on the roster. Random mode only — in staff
+ * mode a person chooses. Returns { assignments, added: [memberId], changed }.
+ */
+function assignMissing({ members = [], pireps = [], rules = {}, assignments = {}, routes = [], now = Date.now(), rand = Math.random } = {}) {
+    const r = normalizeRules(rules);
+    const next = cleanAssignments(assignments);
+    const before = JSON.stringify(next);
+    const onRoster = new Set(members.filter(Boolean).map((m) => String(m._id || m.id || '')));
+    for (const id of Object.keys(next)) if (!onRoster.has(id)) delete next[id];
+    const added = [];
+    if (r.enabled && r.firstFlight && r.firstFlightRoutes && r.firstFlightRoutePick === 'random') {
+        const index = lastFlightIndex(pireps);
+        const t = now instanceof Date ? now.getTime() : Number(now);
+        for (const m of members) {
+            const id = String((m && (m._id || m.id)) || '');
+            if (!id || next[id] || exemptReason(m, r, t) || !when(m.createdAt) || lastFlightFor(m, index)) continue;
+            const routeIds = pickRoutes(routes, r.firstFlightRoutes, rand);
+            if (!routeIds.length) break; // no network to draw from; the plain rule applies
+            next[id] = { routeIds, by: 'random', at: new Date(t).toISOString() };
+            added.push(id);
+        }
+    }
+    return { assignments: next, added, changed: JSON.stringify(next) !== before };
+}
+
 /** A one-line summary of a sweep, for a log or a webhook footer. */
 function summarize(result) {
     const n = (a) => (a || []).length;
@@ -286,6 +421,13 @@ function summarize(result) {
 
 module.exports = {
     ACTIONS,
+    PICKS,
+    MAX_PROBATION_ROUTES,
+    assignableRoutes,
+    pickRoutes,
+    cleanAssignments,
+    probationProgress,
+    assignMissing,
     DAY_MS,
     normalizeRules,
     publicRules,
