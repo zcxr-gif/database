@@ -1234,6 +1234,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // (a one-time or role-specific invite). Validated as a real Discord invite
     // link — see isDiscordInviteUrl.
     crewDiscordInvite: { type: String, trim: true, default: '' },
+    // The airline's own lines in every invitation staff hand out (Roster → Add
+    // pilot, Logins): written once, sent with each — crewPasswordReset.
+    crewInviteNote: { type: String, trim: true, default: '', maxlength: 800 },
     // Whether accepting an application makes the pilot a crew center login.
     // The default each accept card starts from — staff can still flip it on
     // one card. On unless a VA turns it off: some airlines live in Discord and
@@ -4148,7 +4151,7 @@ async function resolveCrewVa(slug) {
     // bannerUrl/logoUrl/tagline ride along for the IFC welcome message's
     // pictures (inviteArt) — three short strings, and it saves a second read on
     // every acceptance.
-    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite`;
+    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite crewInviteNote`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
@@ -4552,6 +4555,106 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs), ...(invite ? { invite } : {}) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
+/* ---- Inviting somebody: the background check -------------------------------
+ *
+ * Staff who invite a pilot directly skip the join form — and with it every
+ * check the join form makes. This puts them back, for staff to READ rather
+ * than to be refused by: the IF account and its real stats, the airline's own
+ * join requirements marked pass or fail, whether they are already on this
+ * roster or have an application waiting, which other airlines here have them
+ * on their roster, and the next free callsign. Nothing is decided here; the
+ * person inviting decides with it in front of them.
+ *
+ * POST /api/crew/:slug/invite-check  { ifcName }      roster.manage
+ * GET  /api/crew/:slug/invite-note                    roster.manage
+ * PUT  /api/crew/:slug/invite-note   { note }         roster.manage
+ * ------------------------------------------------------------------------- */
+app.post('/api/crew/:slug/invite-check', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const name = String(req.body?.ifcName || '').trim().replace(/^@/, '').slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'Type their IFC username first.' });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await VirtualAirlineAd.findById(va._id).select('joinRequirements minGrade name').lean();
+        const check = await verifyIfUser(name);
+        res.set('Cache-Control', 'no-store');
+        if (!check.ok) return res.json({ available: false });
+        if (!check.found) return res.json({ available: true, found: false, name });
+
+        const reqs = Array.isArray(ad && ad.joinRequirements) ? ad.joinRequirements.slice() : [];
+        if (ad && ad.minGrade > 0 && !reqs.some((r) => r.type === 'grade')) reqs.push({ type: 'grade', value: ad.minGrade });
+        const stats = check.stats || (check.grade != null ? { grade: check.grade } : null);
+        const requirements = reqs.filter((r) => REQ_META[r.type]).map((r) => {
+            const meta = REQ_META[r.type];
+            const have = stats && stats[meta.stat] != null ? Number(stats[meta.stat]) || 0 : null;
+            const ok = have == null ? null : (meta.cmp === 'max' ? have <= r.value : have >= r.value);
+            return { label: meta.label, cmp: meta.cmp, need: r.value, have, ok };
+        });
+
+        const [members, pending] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            store.listApplications({ status: 'pending', limit: 1000 }).catch(() => []),
+        ]);
+        const keys = new Set(vaPilots.rosterMatchKeys(check.username));
+        const same = (n, uid) => (uid && String(uid) === String(check.userId))
+            || vaPilots.rosterMatchKeys(n || '').some((k) => keys.has(k));
+        const onRoster = members.find((m) => same(m.ifcName, m.ifUserId));
+        const application = (pending || []).find((a) => same(a.ifcName, a.ifUserId));
+
+        // Other airlines on this platform that have them on their roster.
+        let otherVas = [];
+        try {
+            const rows = await VaPilot.find({ usernameLower: { $in: [...keys] }, vaAdId: { $ne: va._id } }).select('vaAdId').lean();
+            const ids = [...new Set(rows.map((r) => String(r.vaAdId)))];
+            if (ids.length) {
+                otherVas = (await VirtualAirlineAd.find({ _id: { $in: ids }, status: 'approved' }).select('name').lean()).map((a) => a.name).filter(Boolean);
+            }
+        } catch (_) { /* a missing line in the report, never a failed check */ }
+
+        const fmt = crewCallsign.primaryFormat(va);
+        const free = crewCallsign.nextFree(fmt, [
+            ...members.map((m) => ({ callsign: m.callsign })),
+            ...(pending || []).map((a) => ({ callsign: applicationCallsign(a, va) })),
+        ], { reservedMax: crewCallsign.reservedMaxOf(va) });
+
+        res.json({
+            available: true, found: true,
+            username: check.username, userId: check.userId,
+            grade: check.grade, stats: check.stats || null,
+            requirements,
+            meets: requirements.every((r) => r.ok !== false),
+            onRoster: onRoster ? { name: onRoster.name, callsign: onRoster.callsign, status: onRoster.status } : null,
+            application: application ? { createdAt: application.createdAt || null } : null,
+            otherVas,
+            suggestedCallsign: free ? free.callsign : '',
+        });
+    } catch (err) { crewFail(res, err, { log: 'invite check error', message: 'Could not run the check.' }); }
+});
+
+app.get('/api/crew/:slug/invite-note', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        res.set('Cache-Control', 'no-store');
+        res.json({ note: va.crewInviteNote || '' });
+    } catch (err) { crewFail(res, err, { log: 'invite note read error', message: 'Could not read the welcome note.' }); }
+});
+
+app.put('/api/crew/:slug/invite-note', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const note = String(req.body?.note || '').replace(/\r\n/g, '\n').trim().slice(0, 800);
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewInviteNote: note } });
+        res.json({ note });
+    } catch (err) { crewFail(res, err, { log: 'invite note save error', message: 'Could not save the welcome note.' }); }
+});
+
 // Edit a member.
 app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
@@ -17255,6 +17358,7 @@ function inviteView(va, member, account, signInUrl) {
         const words = {
             vaName: va.name, name: member.name, username: account.username, callsign: member.callsign,
             link: out.link, expiresAt: inv.expiresAt, discordInvite: va.crewDiscordInvite || '',
+            note: va.crewInviteNote || '', carried: Number(member.hours) > 0,
         };
         // Framed for the IFC, where most of these are pasted; the plain one
         // for Discord, where a markdown image is just text.
@@ -17315,6 +17419,7 @@ async function issueSetupInvites({ va, store, ids, by, slug }) {
                 vaName: va.name, name: m.name, username: account.username, callsign: m.callsign,
                 link: out.link, expiresAt: out.expiresAt, password: out.password, signInUrl,
                 discordInvite: va.crewDiscordInvite || '',
+                note: va.crewInviteNote || '', carried: Number(m.hours) > 0,
             };
             out.message = crewPasswordReset.buildSetupMessage({ ...words, ...inviteArt(va, slug), format: 'ifc' });
             out.plainMessage = crewPasswordReset.buildSetupMessage(words);

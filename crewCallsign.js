@@ -310,7 +310,27 @@ function validate(fmt, number, { reservedMax = DEFAULT_RESERVED_MAX, staff = fal
     return { ok: true, n, callsign: build(fmt, n) };
 }
 
+/**
+ * The first number above the reserved range that nobody holds, as a callsign —
+ * what staff are offered when they invite somebody, so they do not have to go
+ * and look. `holders` is every { callsign } already taken (roster and pending
+ * applications). Null when the VA has no callsign shape.
+ */
+function nextFree(fmt, holders, { reservedMax = DEFAULT_RESERVED_MAX } = {}) {
+    if (!fmt || !fmt.base) return null;
+    const taken = new Set();
+    for (const h of (Array.isArray(holders) ? holders : [])) {
+        const x = h && split(h.callsign);
+        if (x && x.n != null && x.base === fmt.base) taken.add(x.n);
+    }
+    for (let n = reservedMaxFrom(reservedMax) + 1; n <= MAX_NUMBER; n++) {
+        if (!taken.has(n)) return { n, callsign: build(fmt, n) };
+    }
+    return null;
+}
+
 module.exports = {
+    nextFree,
     DEFAULT_DIGITS,
     DEFAULT_RESERVED_MAX,
     MAX_NUMBER,

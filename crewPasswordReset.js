@@ -347,9 +347,9 @@ const sentPatch = ({ sent = true, by = '' } = {}, now = new Date()) => (sent
 function buildSetupMessage({
     vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
     password = '', signInUrl = '', bannerUrl = '', footerUrl = '', format = 'plain',
-    discordInvite = '',
+    discordInvite = '', note = '', carried = true,
 } = {}) {
-    let body = plainSetupMessage({ vaName, name, username, callsign, link, expiresAt, password, signInUrl });
+    let body = plainSetupMessage({ vaName, name, username, callsign, link, expiresAt, password, signInUrl, note, carried });
     // The crew's Discord, when the VA hands one to new pilots — the same line
     // an accepted applicant's welcome ends with (crewInvite.buildInviteMessage).
     if (/^https:\/\/\S+$/i.test(String(discordInvite || ''))) body += `\n\nJoin the crew on Discord: ${discordInvite}`;
@@ -360,25 +360,32 @@ function buildSetupMessage({
 
 function plainSetupMessage({
     vaName = '', name = '', username = '', callsign = '', link = '', expiresAt = null,
-    password = '', signInUrl = '',
+    password = '', signInUrl = '', note = '', carried = true,
 } = {}) {
     const who = String(name || '').trim();
     const va = String(vaName || '').trim() || 'the crew';
     const until = asDate(expiresAt);
     const lines = [];
     lines.push(who ? `${who} — your ${va} crew center login is ready.` : `Your ${va} crew center login is ready.`);
+    // The airline's own words, written once and sent with every invitation
+    // (crewInviteNote on the VA): what to do first, who to talk to.
+    const said = String(note || '').trim();
+    if (said) lines.push('', said);
     lines.push('');
+    // "Carried over" is true of a pilot moved across from another system, and
+    // nonsense to somebody joining today with no hours to carry.
+    const kept = carried ? ' Your hours and rank have already been carried over.' : '';
     if (username) lines.push(`  Username: ${username}`);
     if (callsign) lines.push(`  Callsign: ${callsign}`);
     if (link) {
         lines.push('', 'Open this link to choose your password:', `  ${link}`);
-        lines.push('', `It works once${until ? `, until ${until.toISOString().slice(0, 10)}` : ''}. Your hours and rank have already been carried over.`);
+        lines.push('', `It works once${until ? `, until ${until.toISOString().slice(0, 10)}` : ''}.${kept}`);
     } else {
         // A project too old for links: the fallback is the temporary password
         // every crew center has always handed out, with the same promise.
         if (password) lines.splice(lines.length - (callsign ? 1 : 0), 0, `  Temporary password: ${password}`);
         if (signInUrl) lines.push('', `Sign in: ${signInUrl}`);
-        lines.push('', 'You\'ll be asked to choose your own password the first time you sign in. Your hours and rank have already been carried over.');
+        lines.push('', `You'll be asked to choose your own password the first time you sign in.${kept}`);
     }
     return lines.join('\n');
 }
