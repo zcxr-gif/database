@@ -78,6 +78,8 @@ const crewQuizzes = require('./crewQuizzes');
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
 // reported to each VA's webhook at end of day and then erased. See vaStats.js.
 const vaStats = require('./vaStats');
+// The bot in each VA's own Discord server. See the head of vaBot.js.
+const vaBot = require('./vaBot');
 
 // Where a VA's crew data lives. Rosters, flight reports and applications belong
 // to the VA and are stored in the VA's OWN Supabase project; we keep only their
@@ -1855,6 +1857,8 @@ async function postCrewNotice(url, { title, description, color, fields, image, t
 // that wants applicant emails plugs in their own provider (below); otherwise no
 // email is ever sent and applicants rely on the status page.
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
+// The VA bot calls this same process over loopback, and links pilots to the site.
+vaBot.configure({ apiBase: `http://127.0.0.1:${PORT}`, siteOrigin: SITE_ORIGIN });
 // Where THIS backend is reachable from the open internet — for pictures we draw
 // and somebody else's page hotlinks (the IFC welcome banners). Same variable
 // and fallback vaSites.js uses for a hosted site's crew endpoints.
@@ -2407,6 +2411,8 @@ function postEventNotice(va, action, event, actor) {
         removed: `🗑️ Event removed — ${eventLabel(event)}`,
     }[action];
     if (!title) return;
+    // Linked Discord servers get a post with a thread of its own (vaBot.js).
+    vaBot.hub.emit('event', { va, action, event });
     const startsAt = event.startsAt ? new Date(event.startsAt) : null;
     const stamp = startsAt && !Number.isNaN(startsAt.getTime())
         ? `<t:${Math.floor(startsAt.getTime() / 1000)}:F>` : '';
@@ -4051,6 +4057,8 @@ pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 // postAnnouncement is handed over rather than imported: crewAuth cannot require
 // this file back. See announceToBoard there.
 registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign });
+// Crew Center → Alerts → Discord bot: link codes and linked servers.
+vaBot.registerRoutes(app, { requireCap, resolveCrewVa });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they
@@ -4385,6 +4393,11 @@ function crewCanManage(req, slug) {
 // hold `capability`. Owner + Inflight always pass. Async because a staff
 // member's permissions live on the VA (staffRoles/staffAssignments).
 async function requireCap(req, slug, capability) {
+    // The Discord bot acting for this VA (vaBot.botCallerFrom): a loopback
+    // request carrying this process's key, held to vaBot.BOT_CAPS and to
+    // nothing crewCanManage would otherwise let through.
+    const bot = vaBot.botCallerFrom(req, slug);
+    if (bot) return vaBot.botMay(capability) ? { p: bot } : { error: 403 };
     const base = crewCanManage(req, slug);
     if (base.error) return base;
     const p = base.p;
@@ -15947,6 +15960,14 @@ app.post('/api/crew/:slug/test/:token', async (req, res) => {
             answers: result.marks.map((m) => ({ id: m.id, chosen: m.chosen, right: m.right })),
             submittedAt: new Date(),
         });
+
+        // The applicant's Discord ticket, when they applied through the bot.
+        if (attempt.applicationId) {
+            vaBot.hub.emit('entranceTest', {
+                vaId: va._id, applicationId: attempt.applicationId, passed: result.passed,
+                score: result.score, total: result.total, percent: result.percent, quizTitle: attempt.quizTitle,
+            });
+        }
 
         // Staff hear it where applications land — with what to do next.
         crewWebhookUrlFor(va._id, 'recruitment')

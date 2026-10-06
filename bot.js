@@ -32,6 +32,8 @@ const util = require('util');
 
 // Import the local aircraft registry for auto-registration lookup
 const aircraftRegistry = require('./aircraft.json');
+// The same bot inside every VA's own server — see the head of vaBot.js.
+const vaBot = require('./vaBot');
 // --- NEW AIRPORT CONFIGURATION ---
 const AIRPORT_SUBMISSION_CHANNEL_ID = '1463634001020325959';
 const AIRPORT_ADMIN_CHANNEL_ID = '1463636133685628989';
@@ -562,6 +564,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         ]
     });
     botClientRef = client; // expose to the diagnostics terminal (getBotStats)
+
+    // INFLIGHT'S OWN SERVER, AND EVERYBODY ELSE'S.
+    //
+    // Every channel and role id at the top of this file belongs to one server.
+    // The bot is also invited into VA servers (vaBot.js), where none of those
+    // ids exist — so the commands built from them are registered to this
+    // server only, and the member-join welcome only fires here. Set
+    // DISCORD_HOME_GUILD_ID; without it, it is read off the admin channel at
+    // startup.
+    let homeGuildId = String(process.env.DISCORD_HOME_GUILD_ID || '').trim();
+    const isHomeGuild = (id) => !!homeGuildId && id === homeGuildId;
+    const vaBotInstance = vaBot.createVaBot({ client, VirtualAirlineAd, isHomeGuild });
+    client.on('guildDelete', (guild) => { vaBotInstance.onGuildDelete(guild).catch(() => {}); });
 
     // Discord client error surface — without these, transport errors bubble up
     // as unhandled rejections and (without the process-level guards in server.js)
@@ -2693,8 +2708,24 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
         ].map(c => c.toJSON());
 
+        if (!homeGuildId) {
+            const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+            homeGuildId = (adminChannel && adminChannel.guildId) || '';
+        }
         try {
-            await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: commands });
+            if (homeGuildId) {
+                // Inflight's commands where their channels are; /crew and
+                // /crew-admin everywhere. A global PUT replaces the global set,
+                // which is also what clears the Inflight commands out of VA
+                // servers on the first deploy of this.
+                await rest.put(Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, homeGuildId), { body: commands });
+                await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: vaBotInstance.commands() });
+            } else {
+                // Home server unknown: keep the old behaviour rather than
+                // losing every Inflight command.
+                console.warn('⚠️ DISCORD_HOME_GUILD_ID unset and the admin channel is unreachable — registering all commands globally.');
+                await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: [...commands, ...vaBotInstance.commands()] });
+            }
             console.log('✅ Commands registered.');
         } catch (e) { console.error('❌ Error registering commands:', e); }
 
@@ -2703,6 +2734,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     });
 
     client.on('guildMemberAdd', async (member) => {
+        // A VA's server is not ours to welcome people into.
+        if (!isHomeGuild(member.guild.id)) return;
         if (MEMBER_ROLE_ID) {
             try { 
                 const role = await member.guild.roles.fetch(MEMBER_ROLE_ID); 
@@ -2860,6 +2893,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
 client.on('interactionCreate', async (interaction) => {
       try {
+        // /crew, /crew-admin and every `vab:` component belong to vaBot.js.
+        if (await vaBotInstance.handleInteraction(interaction)) return;
+
         // --- 1. AUTOCOMPLETE HANDLERS ---
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
@@ -4620,7 +4656,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         
         if (interaction.commandName === 'setup_tickets') {
-            if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
+            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
                 return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
             }
 
@@ -4658,7 +4694,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (interaction.commandName === 'migrate_legacy') {
-            if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
+            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
                 return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
             }
 
