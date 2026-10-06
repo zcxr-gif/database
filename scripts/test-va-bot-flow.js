@@ -59,10 +59,11 @@ VaBotGuild.findOneAndUpdate = (f, { $set }) => {
 };
 
 let liveCode = null;
-VaBotLinkCode.findOneAndDelete = (f) => {
-    const hit = liveCode && f.codeHash === liveCode.codeHash ? liveCode : null;
-    liveCode = null;
-    return q(hit);
+VaBotLinkCode.findOne = (f) => q(liveCode && f.codeHash === liveCode.codeHash ? liveCode : null);
+VaBotLinkCode.deleteOne = async (f) => {
+    const hit = liveCode && String(f._id) === String(liveCode._id);
+    if (hit) liveCode = null;
+    return { deletedCount: hit ? 1 : 0 };
 };
 
 const tickets = [];
@@ -198,7 +199,7 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
 
     // Setup without Manage Server is refused before the code is even read.
     const code = v.makeLinkCode();
-    liveCode = { codeHash: v.hashCode(code), vaId };
+    liveCode = { _id: 'code1', codeHash: v.hashCode(code), vaId };
     it = interaction('command', { command: 'crew-admin', sub: 'setup', options: { code } });
     await run(it);
     check('setup needs Manage Server', /Manage Server/.test(lastText(it)));
@@ -291,6 +292,11 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     await run(it);
     check('the pilot reads their login', lastText(it).includes('pilot.one') && lastText(it).includes('Temp-Pass-123'), lastText(it));
 
+    const reviews = calls.filter((c) => c.path === 'review').length;
+    it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:accept:${ticket._id}` });
+    await run(it);
+    check('a second Accept after auto-invite does nothing', /Already accepted/.test(lastText(it)) && calls.filter((c) => c.path === 'review').length === reviews, lastText(it));
+
     it = interaction('button', { customId: `vab:close:${ticket._id}` });
     await run(it);
     check('closing locks and archives the thread', ticket.status === 'closed' && thread.locked && thread.archived);
@@ -304,6 +310,22 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     guilds.push({ guildId: 'OTHER', vaId, settings: {} });
     await run(it);
     check('a ticket is only reachable from its own server', /no longer exists/.test(lastText(it)), lastText(it));
+
+    // A server already linked to another airline is refused, and the code
+    // survives for the owner to use after unlinking.
+    const otherVa = new mongoose.Types.ObjectId();
+    guilds.push({ guildId: 'TAKEN', vaId: otherVa, settings: {} });
+    const code2 = v.makeLinkCode();
+    liveCode = { _id: 'code2', codeHash: v.hashCode(code2), vaId };
+    it = interaction('command', { perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'setup', options: { code: code2 } });
+    it.guildId = 'TAKEN';
+    await run(it);
+    check('a server linked to another airline is refused', /already linked to another/.test(lastText(it)), lastText(it));
+    check('…and the code is not spent', liveCode && liveCode._id === 'code2');
+    it = interaction('command', { perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'setup', options: { code: code2 } });
+    it.guildId = 'TAKEN';
+    await run(it);
+    check('a second try straight away waits', /try again in/.test(lastText(it)), lastText(it));
 
     // Inflight's own server cannot be linked to an airline.
     it = interaction('command', { perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'setup', options: { code: 'AAAA-BBBB' } });

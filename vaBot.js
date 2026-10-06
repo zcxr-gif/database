@@ -422,6 +422,11 @@ function inviteUrl() {
     return `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(id)}&scope=bot%20applications.commands&permissions=${perms}`;
 }
 
+/* Which airline each server is linked to. Module-level rather than per bot so
+ * that unlinking from the dashboard (registerRoutes) takes effect at once
+ * instead of a minute later. */
+const guildCache = makeCache(CACHE_TTL_MS);
+
 const crewUrl = (slug) => `${config.siteOrigin}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
 
 /* ===========================================================================
@@ -441,8 +446,10 @@ async function api(method, path, { body, slug, actor, asBot = false } = {}) {
         const res = await axios({
             method, url: `${config.apiBase}${path}`, data: body, headers,
             timeout: API_TIMEOUT_MS, validateStatus: () => true,
-            // Loopback is plain http; never send the key through a proxy.
-            proxy: false,
+            // Loopback is plain http; never send the key through a proxy, and
+            // never follow a redirect — it would carry the key to wherever it
+            // pointed.
+            proxy: false, maxRedirects: 0,
         });
         const data = res.data && typeof res.data === 'object' ? res.data : {};
         const ok = res.status >= 200 && res.status < 300;
@@ -502,11 +509,11 @@ function eventEmbed(va, event, action) {
  *   isHomeGuild       (guildId) => true for Inflight's own server
  */
 function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
-    const guildCache = makeCache(CACHE_TTL_MS);
     const vaCache = makeCache(CACHE_TTL_MS);
     const joinCache = makeCache(CACHE_TTL_MS, 500);
     const ticketCooldown = makeCooldown(TICKET_COOLDOWN_MS);
     const commandCooldown = makeCooldown(3000);
+    const setupCooldown = makeCooldown(5000);
 
     /* ---- lookups ------------------------------------------------------- */
 
@@ -629,15 +636,21 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const code = interaction.options.getString('code', true);
         await interaction.deferReply({ flags: EPHEMERAL });
         if (normalizeCode(code).length !== 8) return say(interaction, 'That is not a link code. It looks like `ABCD-2345` — get one from Crew Center → Alerts → Discord bot.');
-        const found = await VaBotLinkCode.findOneAndDelete({ codeHash: hashCode(code), expiresAt: { $gt: new Date() } }).lean().catch(() => null);
+        const codeHash = hashCode(code);
+        const found = await VaBotLinkCode.findOne({ codeHash, expiresAt: { $gt: new Date() } }).lean().catch(() => null);
         if (!found) return say(interaction, 'That code is wrong or has expired. Codes last 15 minutes and work once — make a new one in the crew center.');
         const va = await VirtualAirlineAd.findById(found.vaId).select('name slug status').lean().catch(() => null);
         if (!va || va.status !== 'approved') return say(interaction, 'That crew center is not active.');
 
+        // Refused here, the code is left unspent: the owner unlinks and tries
+        // the same one again rather than going back for another.
         const existing = await VaBotGuild.findOne({ guildId: interaction.guildId }).lean();
         if (existing && String(existing.vaId) !== String(va._id)) {
             return say(interaction, 'This server is already linked to another crew center. Run `/crew-admin unlink` first.');
         }
+        // Spent now. Two servers racing the same code: one delete wins.
+        const spent = await VaBotLinkCode.deleteOne({ _id: found._id }).catch(() => null);
+        if (!spent || !spent.deletedCount) return say(interaction, 'That code was just used. Make a new one in the crew center.');
         await VaBotGuild.updateOne(
             { guildId: interaction.guildId },
             {
@@ -1201,6 +1214,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     async function acceptButton(interaction, ctx, ticket) {
         if (!isStaff(interaction, ctx.settings)) return say(interaction, 'Only staff can accept an application.');
         if (!ticket.applicationId) return say(interaction, 'There is no application on this ticket yet.');
+        // A second press (or a press after auto-invite) would post a second
+        // welcome. Reissuing a lost login is the crew center's job.
+        if (ticket.stage === 'accepted') return say(interaction, 'Already accepted. To reissue their login, use Roster → Applications in the crew center.');
         await interaction.deferReply({ flags: EPHEMERAL });
         const out = await acceptTicket({ interaction, ctx, ticket, actor: actorOf(interaction) });
         if (out.error) return say(interaction, `⚠️ ${out.error}`);
@@ -1393,6 +1409,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             }
             if (sub === 'setup') {
                 if (isHomeGuild(interaction.guildId)) return say(interaction, 'This is Inflight’s own server — it is not linked to an airline.');
+                // One try per server every few seconds: a code is short, and
+                // this is the only place one can be guessed at.
+                const wait = setupCooldown.hit(interaction.guildId);
+                if (wait) return say(interaction, `One moment — try again in ${wait}s.`);
                 return adminSetup(interaction);
             }
             const ctx = await context(interaction);
@@ -1532,8 +1552,10 @@ function registerRoutes(app, { requireCap, resolveCrewVa }) {
         try {
             const ctx = await gateFor(req, res);
             if (!ctx) return;
-            const r = await VaBotGuild.deleteOne({ vaId: ctx.va._id, guildId: String(req.params.guildId || '') });
+            const guildId = String(req.params.guildId || '');
+            const r = await VaBotGuild.deleteOne({ vaId: ctx.va._id, guildId });
             if (!r.deletedCount) return res.status(404).json({ error: 'That server is not linked.' });
+            guildCache.del(guildId);
             res.json({ ok: true });
         } catch (err) { console.error('discord bot unlink error:', err); res.status(500).json({ error: 'Could not unlink that server.' }); }
     });

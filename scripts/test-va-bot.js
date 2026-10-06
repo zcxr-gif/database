@@ -183,6 +183,15 @@ async function principal() {
     check('the right key from off the box is nobody', v.botCallerFrom(fakeReq('203.0.113.9'), 'my-va') === null);
     check('…and from IPv6 loopback it is the bot', !!v.botCallerFrom(fakeReq('::1'), 'my-va'));
 
+    // A redirect must not carry the key anywhere.
+    let leaked = null;
+    const elsewhere = http.createServer((req, res) => { leaked = req.headers['x-inflight-bot-key'] || ''; res.end('{}'); });
+    await new Promise((r) => elsewhere.listen(0, '127.0.0.1', r));
+    app.get('/api/crew/:slug/bounce', (req, res) => res.redirect(`http://127.0.0.1:${elsewhere.address().port}/catch`));
+    const bounced = await v.api('get', '/api/crew/my-va/bounce', { asBot: true, slug: 'my-va' });
+    check('a redirect is not followed', bounced.status === 302 && leaked === null, { status: bounced.status, leaked });
+    elsewhere.close();
+
     const down = await (v.configure({ apiBase: 'http://127.0.0.1:1' }), v.api('get', '/x'));
     check('a crew center that does not answer is an error, not a throw', down.ok === false && down.status === 0 && !!down.error);
     server.close();

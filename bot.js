@@ -2734,8 +2734,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     });
 
     client.on('guildMemberAdd', async (member) => {
-        // A VA's server is not ours to welcome people into.
-        if (!isHomeGuild(member.guild.id)) return;
+        // A VA's server is not ours to welcome people into. With the home
+        // server unknown, behave as before rather than welcome nobody.
+        if (homeGuildId && member.guild.id !== homeGuildId) return;
         if (MEMBER_ROLE_ID) {
             try { 
                 const role = await member.guild.roles.fetch(MEMBER_ROLE_ID); 
