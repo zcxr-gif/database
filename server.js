@@ -119,6 +119,7 @@ const crewRanks = require('./crewRanks');
 // glued to a number), whether it is already held, and which low numbers are
 // staff-issue only. See crewCallsign.js.
 const crewCallsign = require('./crewCallsign');
+const crewMultipliers = require('./crewMultipliers');
 
 // Events, and the gate board that stops a dozen aircraft spawning on the same
 // stand. Everything that is a decision rather than a database write lives
@@ -1241,6 +1242,8 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // (a one-time or role-specific invite). Validated as a real Discord invite
     // link — see isDiscordInviteUrl.
     crewDiscordInvite: { type: String, trim: true, default: '' },
+    // Temporary multipliers on one event or one route — crewMultipliers.js.
+    crewMultipliers: { type: mongoose.Schema.Types.Mixed, default: [] },
     // Whether accepting an application makes the pilot a crew center login.
     // The default each accept card starts from — staff can still flip it on
     // one card. On unless a VA turns it off: some airlines live in Discord and
@@ -4185,7 +4188,7 @@ async function resolveCrewVa(slug) {
     // bannerUrl/logoUrl/tagline ride along for the IFC welcome message's
     // pictures (inviteArt) — three short strings, and it saves a second read on
     // every acceptance.
-    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite`;
+    const sel = `${crewStore.SELECT} bannerUrl logoUrl tagline crewDiscordInvite crewMultipliers`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
@@ -4589,6 +4592,63 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         res.status(201).json({ member: publicMember(m, va.ranks, va.crewClubs), ...(invite ? { invite } : {}) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
+/* ---- Temporary multipliers on events and routes (crewMultipliers.js) -------
+ *
+ * GET /api/crew/:slug/multipliers   public: live and upcoming ones, so pilots
+ *                                   can see what is boosted. Staff with
+ *                                   routes.manage or events.manage get the
+ *                                   whole list, finished ones included.
+ * PUT /api/crew/:slug/multipliers   { multipliers: [...] }. A staff member may
+ *                                   change only the kind they manage — route
+ *                                   ones with routes.manage, event ones with
+ *                                   events.manage; the rest are kept as stored.
+ * ------------------------------------------------------------------------- */
+async function multiplierCaps(req, slug) {
+    const [r, e] = await Promise.all([requireCap(req, slug, 'routes.manage'), requireCap(req, slug, 'events.manage')]);
+    return { route: !r.error, event: !e.error, error: r.error && e.error ? r.error : 0 };
+}
+
+app.get('/api/crew/:slug/multipliers', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const caps = await multiplierCaps(req, req.params.slug);
+        const all = crewMultipliers.sanitizeList(va.crewMultipliers);
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            multipliers: caps.route || caps.event ? all : crewMultipliers.upcoming(all),
+            canManage: { route: caps.route, event: caps.event },
+            min: crewMultipliers.MIN_FACTOR, max: crewMultipliers.MAX_FACTOR,
+        });
+    } catch (err) { crewFail(res, err, { log: 'multipliers read error', message: 'Could not read the multipliers.' }); }
+});
+
+app.put('/api/crew/:slug/multipliers', async (req, res) => {
+    const caps = await multiplierCaps(req, req.params.slug);
+    if (caps.error) return res.status(caps.error).json({ error: caps.error === 401 ? 'Not authenticated.' : 'You don’t have permission to set multipliers.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const stored = crewMultipliers.sanitizeList(va.crewMultipliers);
+        const may = (k) => (k === 'route' ? caps.route : caps.event);
+        const sent = Array.isArray(req.body && req.body.multipliers) ? req.body.multipliers : [];
+        const kept = stored.filter((m) => !may(m.kind));
+        const byId = new Map(stored.map((m) => [m.id, m]));
+        const mine = [];
+        for (const m of sent) {
+            if (!m || !may(m.kind)) continue;
+            const prev = m.id && byId.get(String(m.id));
+            if (prev && !may(prev.kind)) continue;
+            const clean = crewMultipliers.sanitize(m, prev || null);
+            if (!clean) return res.status(400).json({ error: 'Each multiplier needs an event or route, a factor, and an end after its start.' });
+            mine.push(clean);
+        }
+        const next = crewMultipliers.sanitizeList([...kept, ...mine]);
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { crewMultipliers: next } });
+        res.json({ multipliers: next });
+    } catch (err) { crewFail(res, err, { log: 'multipliers save error', message: 'Could not save the multipliers.' }); }
+});
+
 // Edit a member.
 app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
@@ -12538,9 +12598,48 @@ async function findIfFlight(ifUserId, flightId, meta, hintPage = 1) {
 // before against the rank held after means a single long flight that clears two
 // rungs reports the rung actually reached, and nothing else has to know the
 // ladder exists.
+/* ---- Multiplied hours, and the ledger that lets them be taken back ----
+ *
+ * A multiplier (crewMultipliers.js) credits a flight MORE hours than it took.
+ * Taking that flight back — a rejection, a deletion, an edit — has to take back
+ * what was credited, not what was flown, or a pilot keeps the bonus of a flight
+ * that no longer counts. The flight report has no column for it in older VA
+ * projects, so the credited figure is kept here, one row per multiplied flight.
+ * A flight with no row was credited plainly, which is every flight before this.
+ */
+const CrewHoursCreditSchema = new mongoose.Schema({
+    vaAdId:  { type: mongoose.Schema.Types.ObjectId, required: true },
+    pirepId: { type: String, required: true },
+    hours:   { type: Number, required: true },
+    factor:  { type: Number, default: 1 },
+    at:      { type: Date, default: Date.now },
+});
+CrewHoursCreditSchema.index({ vaAdId: 1, pirepId: 1 }, { unique: true });
+const CrewHoursCredit = mongoose.models.CrewHoursCredit || mongoose.model('CrewHoursCredit', CrewHoursCreditSchema);
+
+/** The multiplier this flight was flown under, or null. Best-effort. */
+async function flightMultiplier(va, pirep) {
+    if (!va || !pirep || (!pirep.routeId && !pirep.eventId)) return null;
+    try {
+        let list = va.crewMultipliers;
+        if (list === undefined) list = ((await VirtualAirlineAd.findById(va._id).select('crewMultipliers').lean()) || {}).crewMultipliers;
+        return crewMultipliers.forFlight(list, { routeId: pirep.routeId, eventId: pirep.eventId, at: pirep.flownAt || pirep.createdAt || new Date() });
+    } catch (err) {
+        console.warn('multiplier lookup skipped —', (err && err.message) || err);
+        return null;
+    }
+}
+const creditKey = (va, pirepId) => ({ vaAdId: va._id, pirepId: String(pirepId) });
+
 async function applyPirepHours(store, pirep, va) {
     if (!pirep || pirep.hoursApplied || !pirep.memberId) return pirep;
-    const hrs = (Number(pirep.durationMin) || 0) / 60;
+    let hrs = (Number(pirep.durationMin) || 0) / 60;
+    const boost = hrs > 0 ? await flightMultiplier(va, pirep) : null;
+    if (boost) {
+        hrs *= boost.factor;
+        await CrewHoursCredit.updateOne(creditKey(va, pirep._id), { $set: { hours: hrs, factor: boost.factor, at: new Date() } }, { upsert: true })
+            .catch((err) => console.warn('hours credit not recorded —', (err && err.message) || err));
+    }
     if (hrs > 0) {
         const before = va ? await store.getMember(pirep.memberId).catch(() => null) : null;
         await store.addMemberHours(pirep.memberId, hrs);
@@ -12835,15 +12934,23 @@ async function priceFlight(store, pirep, va, settings) {
         console.warn('flight bonuses skipped —', (err && err.message) || err);
     }
 
+    const boost = await flightMultiplier(va, pirep);
     return crewShop.payFor({ ...pirep, isFeatured }, rates, {
         clubName, clubPercent, streakWeeks, streakPercent, milestone, featuredMultiplier, featuredLabel,
+        boostMultiplier: boost ? boost.factor : 1,
+        boostLabel: boost ? (boost.label || (boost.kind === 'event' ? 'Event' : 'Route')) : '',
     });
 }
 // Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
 // at 0 by the store.
 async function reversePirepHours(store, pirep, va) {
     if (!pirep || !pirep.hoursApplied || !pirep.memberId) return pirep;
-    const hrs = (Number(pirep.durationMin) || 0) / 60;
+    let hrs = (Number(pirep.durationMin) || 0) / 60;
+    // A multiplied flight gives back what it was credited.
+    if (va) {
+        const credit = await CrewHoursCredit.findOneAndDelete(creditKey(va, pirep._id)).lean().catch(() => null);
+        if (credit && Number(credit.hours) > 0) hrs = Number(credit.hours);
+    }
     if (hrs > 0) await store.addMemberHours(pirep.memberId, -hrs);
     // v15. And what it paid, where it paid anything. Clearing the figure is what
     // lets a re-approval pay again — which is right, because the flight would be
@@ -13788,7 +13895,15 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
             p = await store.updatePirep(p._id, patch) || p;
 
             if (wasCredited && p.memberId) {
-                const deltaHrs = ((Math.max(0, Number(p.durationMin) || 0)) - wasMin) / 60;
+                let deltaHrs = ((Math.max(0, Number(p.durationMin) || 0)) - wasMin) / 60;
+                // A multiplied flight moves by the multiplied difference, and
+                // its ledger row follows so a later reversal is still exact.
+                const credit = await CrewHoursCredit.findOne(creditKey(va, p._id)).lean().catch(() => null);
+                if (credit && credit.factor > 1) {
+                    const now = (Math.max(0, Number(p.durationMin) || 0) / 60) * credit.factor;
+                    deltaHrs = now - Number(credit.hours || 0);
+                    await CrewHoursCredit.updateOne(creditKey(va, p._id), { $set: { hours: now } }).catch(() => {});
+                }
                 if (deltaHrs) await store.addMemberHours(p.memberId, deltaHrs);
                 // Re-priced only where there is a shop to re-price it in.
                 // creditFlightPoints is itself inert for a VA with no shop, but
