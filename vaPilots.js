@@ -223,7 +223,7 @@ const listPilots = async (VaPilot, vaAdId, { q = '', limit = 500, skip = 0 } = {
     const sk = Math.max(0, Number(skip) || 0);
     const [rows, total, rosterTotal] = await Promise.all([
         VaPilot.find(filter).sort({ addedAt: -1, _id: -1 }).skip(sk).limit(lim)
-            .select('username addedAt addedBy').lean(),
+            .select('username addedAt addedBy source').lean(),
         VaPilot.countDocuments(filter),
         VaPilot.countDocuments({ vaAdId }),
     ]);
@@ -235,6 +235,7 @@ const listPilots = async (VaPilot, vaAdId, { q = '', limit = 500, skip = 0 } = {
             username: r.username,
             addedAt: r.addedAt,
             addedBy: r.addedBy || '',
+            source: r.source || '',
         })),
     };
 };
@@ -290,8 +291,49 @@ const clearPilots = async (VaPilot, vaAdId) => {
     return { removed: r.deletedCount || 0 };
 };
 
+// Mirror a VA's Crew Center pilots onto its roster.
+//
+// The Crew Center keeps its own member list (crew_members, in the VA's project
+// or our legacy store) and every pilot there carries their IF Community name.
+// The webhooks, embeds and IF cards all read THIS roster, so without a mirror a
+// pilot who joined through the Crew Center was invisible to all three until
+// someone typed their name in again by hand.
+//
+// Rows written here are tagged source:'crew' and are the only ones this ever
+// removes — a name staff added by hand stays put whether or not the Crew Center
+// also has it, and a crew pilot who is already on the roster by hand is not
+// duplicated. `members` must be the COMPLETE list: a pilot missing from it is
+// taken off, so callers only call this after a successful full read.
+// Returns { added, removed }.
+const CREW_SOURCE = 'crew';
+const syncCrewPilots = async (VaPilot, vaAdId, members) => {
+    const wanted = new Map();
+    for (const m of members || []) {
+        const p = normalizePilotUsername(m && m.ifcName);
+        if (p && !wanted.has(p.usernameLower)) wanted.set(p.usernameLower, p);
+    }
+    const rows = await VaPilot.find({ vaAdId }).select('usernameLower source').lean();
+    const have = new Set(rows.map((r) => r.usernameLower));
+    const stale = rows.filter((r) => r.source === CREW_SOURCE && !wanted.has(r.usernameLower)).map((r) => r._id);
+    const docs = [...wanted.values()]
+        .filter((p) => !have.has(p.usernameLower))
+        .map((p) => ({ vaAdId, username: p.username, usernameLower: p.usernameLower, addedBy: 'Crew Center', source: CREW_SOURCE }));
+
+    let removed = 0;
+    if (stale.length) removed = (await VaPilot.deleteMany({ vaAdId, _id: { $in: stale } })).deletedCount || 0;
+    if (docs.length) {
+        try {
+            await VaPilot.insertMany(docs, { ordered: false });
+        } catch (err) {
+            // Same benign race as addPilots: a concurrent add already wrote it.
+            if (!(err && (err.code === 11000 || err.writeErrors))) throw err;
+        }
+    }
+    return { added: docs.length, removed };
+};
+
 module.exports = {
     normalizePilotUsername, parsePilotUsernames, rosterMatchKeys,
-    countPilots, listPilots, addPilots, removePilot, clearPilots,
+    countPilots, listPilots, addPilots, removePilot, clearPilots, syncCrewPilots, CREW_SOURCE,
     MAX_USERNAME_LEN, MAX_BULK,
 };

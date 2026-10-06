@@ -2966,6 +2966,9 @@ const VaPilotSchema = new mongoose.Schema({
     usernameLower: { type: String, required: true },             // lowercased match/de-dupe key
     addedBy:       { type: String, default: '' },                // staff/owner who added it (audit)
     addedAt:       { type: Date, default: Date.now },
+    // '' = typed in by staff; 'crew' = mirrored from the VA's Crew Center
+    // (vaPilots.syncCrewPilots), and removed again when the pilot leaves it.
+    source:        { type: String, default: '' },
 });
 // One username per VA (case-insensitive), and the fast "who's on this VA's
 // roster" path.
@@ -24172,6 +24175,71 @@ if (String(process.env.RETENTION_SWEEP_DISABLED || '').toLowerCase() !== '1') {
         } finally { sweeping = false; }
     };
     setTimeout(() => { sweep(); setInterval(sweep, RETENTION_SWEEP_MS).unref(); }, RETENTION_FIRST_RUN_MS).unref();
+}
+
+// ---- Crew Center pilots onto the VA's pilot roster ----
+//
+// Webhooks, embeds and IF cards match flights against VaPilot; the Crew Center
+// keeps its own members. syncCrewRoster mirrors the second onto the first (see
+// vaPilots.syncCrewPilots for what it will and won't touch). It runs a few
+// seconds after any member add/rename/removal — debounced per VA so a CSV
+// import of 500 pilots is one sync, not 500 — and on a timer, which is both the
+// backfill for pilots who joined before this existed and the catch-up for edits
+// a VA makes straight in its own Supabase project.
+const CREW_ROSTER_DEBOUNCE_MS = 3000;
+const CREW_ROSTER_SWEEP_MS = 3 * 3600 * 1000;
+const CREW_ROSTER_FIRST_RUN_MS = 2 * 60 * 1000;
+const crewRosterTimers = new Map();
+
+async function syncCrewRoster(va) {
+    if (!va || !va._id) return null;
+    const store = await crewStore.forVaOrNull(va);
+    if (!store) return null;
+    // A failed or partial read must not reach the sync: it would take every
+    // pilot it didn't get back off the roster.
+    const members = await store.listMembers({ limit: 5000 });
+    return vaPilots.syncCrewPilots(VaPilot, va._id, members);
+}
+
+crewStore.onMembersChanged((va) => {
+    const key = String(va._id);
+    clearTimeout(crewRosterTimers.get(key));
+    crewRosterTimers.set(key, setTimeout(() => {
+        crewRosterTimers.delete(key);
+        syncCrewRoster(va).catch((err) => console.error(`[crew-roster] ${va.slug || key}:`, err && err.message));
+    }, CREW_ROSTER_DEBOUNCE_MS).unref());
+});
+
+async function syncCrewRosterAll() {
+    const vas = await VirtualAirlineAd.find({ slug: { $nin: [null, ''] } }).select(crewStore.SELECT).lean();
+    const totals = { vas: 0, added: 0, removed: 0 };
+    for (const va of vas) {
+        try {
+            const r = await syncCrewRoster(va);
+            if (!r) continue;
+            totals.vas += 1;
+            totals.added += r.added;
+            totals.removed += r.removed;
+        } catch (err) {
+            console.error(`[crew-roster] ${va.slug || va._id} sync failed:`, err && err.message);
+        }
+    }
+    return totals;
+}
+
+if (String(process.env.CREW_ROSTER_SYNC_DISABLED || '').toLowerCase() !== '1') {
+    let syncing = false;
+    const sweep = async () => {
+        if (syncing) return;
+        syncing = true;
+        try {
+            const t = await syncCrewRosterAll();
+            if (t.added || t.removed) console.log(`[crew-roster] synced ${t.vas} VA(s) — ${t.added} added, ${t.removed} removed`);
+        } catch (err) {
+            console.error('[crew-roster] sweep failed:', err && err.message);
+        } finally { syncing = false; }
+    };
+    setTimeout(() => { sweep(); setInterval(sweep, CREW_ROSTER_SWEEP_MS).unref(); }, CREW_ROSTER_FIRST_RUN_MS).unref();
 }
 
 // ---- The event-artwork sweep, on a timer ----

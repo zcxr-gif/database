@@ -1562,6 +1562,7 @@ class SupabaseStore {
         this.owned = true;              // the VA owns this data
         this.slug = String(va.slug || '').toLowerCase();
         this.db = new Postgrest(va.supabaseUrl, va.supabaseServiceKey);
+        this.va = va;                   // for onMembersChanged
     }
 
     /**
@@ -3259,6 +3260,7 @@ class LegacyStore {
         this.owned = false;             // hosted by us — the thing we're moving away from
         this.vaAdId = va._id;
         this.slug = String(va.slug || '').toLowerCase();
+        this.va = va;                   // for onMembersChanged
     }
 
     get q() { return { vaAdId: this.vaAdId }; }
@@ -3847,6 +3849,37 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // through here. None of the three is a secret.
 const SELECT = '_id slug callsign callsigns callsignMatch callsignPrefix callsignReservedMax name contactEmail crewAccent ranks crewShop crewClubs crewStreaks crewFeatured crewRetention supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
+// ---------------------------------------------------------------------------
+// Member-change hook.
+//
+// The pilot roster that webhooks, embeds and IF cards read lives outside this
+// store (VaPilot, server.js) and mirrors the Crew Center's members. Rather than
+// make every route that adds, renames or removes a pilot remember to tell it,
+// the four verbs that can change WHO is on the list announce it here. Hours,
+// ranks and the rest of a member's row do not, so a PIREP approval stays free.
+// The hook is fire-and-forget: a roster that lags must never fail the write.
+// ---------------------------------------------------------------------------
+let membersChangedHook = null;
+function onMembersChanged(fn) { membersChangedHook = typeof fn === 'function' ? fn : null; }
+const announceMembers = (store) => {
+    if (!membersChangedHook || !store.va) return;
+    try { Promise.resolve(membersChangedHook(store.va)).catch(() => {}); } catch { /* never the write's problem */ }
+};
+for (const Store of [SupabaseStore, LegacyStore]) {
+    const wrap = (name, touchesRoster) => {
+        const orig = Store.prototype[name];
+        Store.prototype[name] = async function (...args) {
+            const out = await orig.apply(this, args);
+            if (touchesRoster(...args)) announceMembers(this);
+            return out;
+        };
+    };
+    wrap('createMember', (data) => !!(data && data.ifcName));
+    wrap('updateMember', (_id, patch) => !!(patch && patch.ifcName !== undefined));
+    wrap('deleteMember', () => true);
+    wrap('purgeMember', () => true);
+}
+
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);
 }
@@ -3872,6 +3905,7 @@ async function forVaOrNull(va) {
 
 module.exports = {
     configure,
+    onMembersChanged,
     forVa,
     forVaOrNull,
     forgetLegacyData,
