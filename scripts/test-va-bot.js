@@ -145,6 +145,44 @@ const join = {
     check('…and drops a banner that is not https', !e.image);
 }
 
+/* ------------------------------------------------------ one at a time */
+async function locksAndLimits() {
+    const { makeLocks, makeLimiter } = v;
+    const locks = makeLocks();
+    const order = [];
+    const slow = (tag, ms) => async () => { order.push(`${tag}+`); await new Promise((r) => setTimeout(r, ms)); order.push(`${tag}-`); };
+    check('a free key is not busy', !locks.busy('t'));
+    const a = locks.run('t', slow('a', 30));
+    check('…and is busy the moment it is claimed', locks.busy('t'));
+    const b = locks.run('t', slow('b', 5));
+    const c = locks.run('other', slow('c', 5));
+    await Promise.all([a, b, c]);
+    check('the same key runs one after the other', order.indexOf('a-') < order.indexOf('b+'), order);
+    check('a different key does not wait', order.indexOf('c+') < order.indexOf('a-'), order);
+    check('a finished key is let go', !locks.busy('t') && locks.size() === 0);
+    const boom = locks.run('t', async () => { throw new Error('x'); });
+    let caught = false;
+    await boom.catch(() => { caught = true; });
+    check('a failure reaches its caller…', caught);
+    let after = false;
+    await locks.run('t', async () => { after = true; });
+    check('…and does not jam the key for the next one', after && locks.size() === 0);
+
+    const lim = makeLimiter(3, { queueMax: 5, waitMs: 200 });
+    let now = 0; let peak = 0;
+    const job = () => lim.run(async () => { now++; peak = Math.max(peak, now); await new Promise((r) => setTimeout(r, 20)); now--; return 'done'; }, 'busy');
+    const out = await Promise.all(Array.from({ length: 8 }, job));
+    check('the limiter never runs more than its max', peak === 3, peak);
+    check('…and finishes everything it queued', out.every((x) => x === 'done'), out);
+    const flood = await Promise.all(Array.from({ length: 20 }, job));
+    check('past its queue it answers busy at once instead of growing', flood.filter((x) => x === 'busy').length === 12, flood.filter((x) => x === 'busy').length);
+    const stuck = makeLimiter(1, { queueMax: 5, waitMs: 50 });
+    const hold = stuck.run(() => new Promise((r) => setTimeout(r, 300)), 'busy');
+    check('a wait that runs out is busy, not forever', (await stuck.run(async () => 'ran', 'busy')) === 'busy');
+    await hold;
+    check('…and leaves nothing queued behind it', stuck.stats().active === 0 && stuck.stats().queued === 0, stuck.stats());
+}
+
 /* ------------------------------------------------- the bot principal, for real */
 async function principal() {
     const app = express();
@@ -214,6 +252,7 @@ async function hubNeverThrows() {
 }
 
 (async () => {
+    await locksAndLimits();
     await principal();
     await hubNeverThrows();
     if (fails.length) {

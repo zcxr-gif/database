@@ -404,6 +404,69 @@ function makeCache(ttl, max = 2000) {
     };
 }
 
+/**
+ * One thing at a time per key.
+ *
+ * `busy(key)` and `run(key, fn)` are both synchronous up to the point fn
+ * starts, so "check, then claim" cannot be split by another interaction —
+ * this process is single-threaded and there is no await between them. A
+ * button pressed while the same ticket is mid-change is told to wait rather
+ * than queued, because Discord gives an interaction three seconds to answer
+ * and a queue could outlast that. Background work (the hub) queues instead.
+ */
+function makeLocks() {
+    const tails = new Map();
+    return {
+        busy: (key) => tails.has(key),
+        run(key, fn) {
+            const prev = tails.get(key) || Promise.resolve();
+            // Let go before the caller resumes, so the key is free the moment
+            // its work is done — not a tick later.
+            const work = prev.then(() => fn()).finally(() => { if (tails.get(key) === tail) tails.delete(key); });
+            const tail = work.then(() => {}, () => {});
+            tails.set(key, tail);
+            return work;
+        },
+        size: () => tails.size,
+    };
+}
+
+/**
+ * At most `max` calls in flight; the rest wait their turn, up to `queueMax`
+ * of them and for up to `waitMs`. Past either, the caller is told "busy"
+ * straight away — a crowd of slash commands must not become a crowd of
+ * requests against the crew center, nor an unbounded queue in memory.
+ */
+function makeLimiter(max, { queueMax = 500, waitMs = 10000 } = {}) {
+    let active = 0;
+    const queue = [];
+    const next = () => {
+        while (active < max && queue.length) {
+            const w = queue.shift();
+            if (w.done) continue;
+            w.done = true;
+            clearTimeout(w.timer);
+            active++;
+            w.resolve(true);
+        }
+    };
+    return {
+        async run(fn, busyValue) {
+            if (active >= max) {
+                if (queue.length >= queueMax) return busyValue;
+                const got = await new Promise((resolve) => {
+                    const w = { resolve, done: false };
+                    w.timer = setTimeout(() => { if (!w.done) { w.done = true; resolve(false); } }, waitMs);
+                    queue.push(w);
+                });
+                if (!got) return busyValue;
+            } else active++;
+            try { return await fn(); } finally { active--; next(); }
+        },
+        stats: () => ({ active, queued: queue.filter((w) => !w.done).length }),
+    };
+}
+
 /** The permissions the bot asks for when it is invited. */
 const INVITE_PERMISSIONS = [
     'ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory',
@@ -440,7 +503,17 @@ const callerHeaders = (slug, actor) => ({
     'x-inflight-bot-actor': encodeURIComponent(String(actor || '').slice(0, 80)),
 });
 
-async function api(method, path, { body, slug, actor, asBot = false } = {}) {
+/* Every server's bot traffic shares one crew center process: eight requests
+ * at a time between them, whatever is happening in Discord. */
+const API_CONCURRENCY = 8;
+const apiLimiter = makeLimiter(API_CONCURRENCY, { queueMax: 500, waitMs: 10000 });
+const BUSY = { ok: false, status: 503, data: {}, error: 'The crew center is busy right now. Try again in a moment.' };
+
+function api(method, path, opts = {}) {
+    return apiLimiter.run(() => apiNow(method, path, opts), BUSY);
+}
+
+async function apiNow(method, path, { body, slug, actor, asBot = false } = {}) {
     const headers = { Accept: 'application/json', ...(asBot ? callerHeaders(slug, actor) : {}) };
     try {
         const res = await axios({
@@ -514,6 +587,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     const ticketCooldown = makeCooldown(TICKET_COOLDOWN_MS);
     const commandCooldown = makeCooldown(3000);
     const setupCooldown = makeCooldown(5000);
+    // One change at a time per ticket — see makeLocks.
+    const ticketLocks = makeLocks();
+    const eventLocks = makeLocks();
+    const MUTATING = new Set(['formsub', 'submit', 'test', 'testpick', 'accept', 'declinesub', 'close']);
 
     /* ---- lookups ------------------------------------------------------- */
 
@@ -1312,38 +1389,48 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     /** An entrance test was marked. Post the result where the applicant is. */
     hub.on('entranceTest', async ({ vaId, applicationId, passed, score, total, percent, quizTitle }) => {
         if (!vaId || !applicationId) return;
-        const tickets = await VaBotTicket.find({ vaId, applicationId: String(applicationId), status: 'open' }).limit(5);
-        for (const ticket of tickets) {
-            const link = await guildLink(ticket.guildId);
-            if (!link || String(link.vaId) !== String(vaId)) continue;
-            const va = await vaById(vaId);
-            if (!va) continue;
-            const ctx = { link, va, settings: link.settings || {} };
-            const thread = await fetchChannel(ticket.threadId);
-            const staff = ctx.settings.staffRoleId;
-            const auto = passed && ctx.settings.autoInvite && ticket.stage !== 'accepted';
-            const e = vaEmbed(va).setColor(passed ? 0x16A34A : 0xD97706)
-                .setTitle(passed ? '✅ Entrance test passed' : '📝 Entrance test not passed')
-                .setDescription(`<@${ticket.userId}> scored **${score}/${total}** (${percent}%) on **${clean(quizTitle, 120)}**.`
-                    + (passed ? (auto ? '\n\nSending the crew center login now…' : '\n\nStaff: accept to send the crew center login.') : '\n\nThe test page says when they can try again and what to read meanwhile.'));
-            await send(thread, {
-                content: !auto && staff ? `<@&${staff}>` : undefined,
-                embeds: [e],
-                components: auto ? [] : [staffRow(ticket, { test: !passed, accept: passed })],
-                allowedMentions: { roles: !auto && staff ? [staff] : [] },
-            });
-            if (auto) {
-                const out = await acceptTicket({ interaction: null, ctx, ticket, actor: 'Auto-invite' });
-                if (out.error) {
-                    await send(thread, {
-                        content: `⚠️ Auto-invite could not accept this application: ${out.error}${staff ? ` <@&${staff}>` : ''}`,
-                        components: [staffRow(ticket, { test: false })],
-                        allowedMentions: { roles: staff ? [staff] : [] },
-                    });
-                }
-            }
+        const found = await VaBotTicket.find({ vaId, applicationId: String(applicationId), status: 'open' }).limit(5);
+        for (const t of found) {
+            // Behind any staff press on the same ticket, and read again once
+            // it is our turn: a staff Accept that just finished means there is
+            // nothing left for auto-invite to do.
+            await ticketLocks.run(String(t._id), () => postTestResult(String(t._id), { vaId, passed, score, total, percent, quizTitle }))
+                .catch((err) => console.error('🤖 vaBot test result failed:', err && err.message ? err.message : err));
         }
     });
+
+    async function postTestResult(ticketId, { vaId, passed, score, total, percent, quizTitle }) {
+        const ticket = await VaBotTicket.findOne({ _id: ticketId, status: 'open' });
+        if (!ticket) return;
+        const link = await guildLink(ticket.guildId);
+        if (!link || String(link.vaId) !== String(vaId)) return;
+        const va = await vaById(vaId);
+        if (!va) return;
+        const ctx = { link, va, settings: link.settings || {} };
+        const thread = await fetchChannel(ticket.threadId);
+        const staff = ctx.settings.staffRoleId;
+        const auto = passed && ctx.settings.autoInvite && ticket.stage !== 'accepted';
+        const e = vaEmbed(va).setColor(passed ? 0x16A34A : 0xD97706)
+            .setTitle(passed ? '✅ Entrance test passed' : '📝 Entrance test not passed')
+            .setDescription(`<@${ticket.userId}> scored **${score}/${total}** (${percent}%) on **${clean(quizTitle, 120)}**.`
+                + (passed ? (auto ? '\n\nSending the crew center login now…' : '\n\nStaff: accept to send the crew center login.') : '\n\nThe test page says when they can try again and what to read meanwhile.'));
+        await send(thread, {
+            content: !auto && staff ? `<@&${staff}>` : undefined,
+            embeds: [e],
+            components: auto ? [] : [staffRow(ticket, { test: !passed, accept: passed })],
+            allowedMentions: { roles: !auto && staff ? [staff] : [] },
+        });
+        if (auto) {
+            const out = await acceptTicket({ interaction: null, ctx, ticket, actor: 'Auto-invite' });
+            if (out.error) {
+                await send(thread, {
+                    content: `⚠️ Auto-invite could not accept this application: ${out.error}${staff ? ` <@&${staff}>` : ''}`,
+                    components: [staffRow(ticket, { test: false })],
+                    allowedMentions: { roles: staff ? [staff] : [] },
+                });
+            }
+        }
+    }
 
     /** An event was published, changed, cancelled or removed. */
     hub.on('event', async ({ va: rawVa, action, event }) => {
@@ -1354,31 +1441,38 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!va) return;
         const eventId = String(event._id);
         for (const link of links) {
-            const post = await VaBotEventPost.findOne({ guildId: link.guildId, eventId });
-            const embed = eventEmbed(va, event, action);
-            if (!post) {
-                if (action !== 'published' && action !== 'updated') continue;
-                const ch = await fetchChannel(link.settings.eventsChannelId);
-                const msg = await send(ch, { embeds: [embed], allowedMentions: { parse: [] } });
-                if (!msg) continue;
-                const thread = await msg.startThread({ name: (clean(event.title, 90) || 'Event chat'), autoArchiveDuration: THREAD_ARCHIVE_MIN }).catch(() => null);
-                await VaBotEventPost.create({ guildId: link.guildId, vaId: va._id, eventId, channelId: ch.id, messageId: msg.id, threadId: thread ? thread.id : '' }).catch(() => {});
-                continue;
-            }
-            const ch = await fetchChannel(post.channelId);
-            const msg = ch && ch.messages ? await ch.messages.fetch(post.messageId).catch(() => null) : null;
-            if (msg) await msg.edit({ embeds: [embed] }).catch(() => {});
-            const thread = await fetchChannel(post.threadId);
-            if (thread) {
-                const note = { updated: '✏️ The event details were updated.', cancelled: '⚠️ This event has been cancelled.', removed: '🗑️ This event was removed.' }[action];
-                if (note) await send(thread, { content: note, allowedMentions: { parse: [] } });
-                if (action === 'cancelled' || action === 'removed') {
-                    await thread.setLocked(true).catch(() => {});
-                    await thread.setArchived(true).catch(() => {});
-                }
-            }
+            // Publish-then-edit in quick succession must not make two posts:
+            // each server's post for an event changes one step at a time.
+            await eventLocks.run(`${link.guildId}:${eventId}`, () => postEvent(link, va, event, eventId, action))
+                .catch((err) => console.error('🤖 vaBot event post failed:', err && err.message ? err.message : err));
         }
     });
+
+    async function postEvent(link, va, event, eventId, action) {
+        const post = await VaBotEventPost.findOne({ guildId: link.guildId, eventId });
+        const embed = eventEmbed(va, event, action);
+        if (!post) {
+            if (action !== 'published' && action !== 'updated') return;
+            const ch = await fetchChannel(link.settings.eventsChannelId);
+            const msg = await send(ch, { embeds: [embed], allowedMentions: { parse: [] } });
+            if (!msg) return;
+            const thread = await msg.startThread({ name: (clean(event.title, 90) || 'Event chat'), autoArchiveDuration: THREAD_ARCHIVE_MIN }).catch(() => null);
+            await VaBotEventPost.create({ guildId: link.guildId, vaId: va._id, eventId, channelId: ch.id, messageId: msg.id, threadId: thread ? thread.id : '' }).catch(() => {});
+            return;
+        }
+        const ch = await fetchChannel(post.channelId);
+        const msg = ch && ch.messages ? await ch.messages.fetch(post.messageId).catch(() => null) : null;
+        if (msg) await msg.edit({ embeds: [embed] }).catch(() => {});
+        const thread = await fetchChannel(post.threadId);
+        if (thread) {
+            const note = { updated: '✏️ The event details were updated.', cancelled: '⚠️ This event has been cancelled.', removed: '🗑️ This event was removed.' }[action];
+            if (note) await send(thread, { content: note, allowedMentions: { parse: [] } });
+            if (action === 'cancelled' || action === 'removed') {
+                await thread.setLocked(true).catch(() => {});
+                await thread.setArchived(true).catch(() => {});
+            }
+        }
+    }
 
     /* ===================================================================
      * DISPATCH
@@ -1395,6 +1489,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             if (isCmd) await routeCommand(interaction);
             else await routeComponent(interaction, parsed);
         } catch (err) {
+            // Unknown / already-acknowledged interaction: Discord gave up on it
+            // (three seconds passed, or a second tab answered). Nothing to say.
+            if (err && (err.code === 10062 || err.code === 40060)) return true;
             console.error('🤖 vaBot interaction error:', err && err.stack ? err.stack : err);
             await say(interaction, 'Something went wrong on our side. Try again in a moment.');
         }
@@ -1442,6 +1539,17 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (action === 'open') return openTicket(interaction, ctx, args[0] === 'support' ? 'support' : 'apply');
         if (action === 'links') return showLinks(interaction, ctx);
 
+        // A change to a ticket claims it first and only then reads it, so two
+        // presses cannot both see "not sent yet" and both send.
+        if (MUTATING.has(action)) {
+            const key = String(args[0] || '');
+            if (ticketLocks.busy(key)) return say(interaction, 'Still working on the last press — one moment.');
+            return ticketLocks.run(key, () => ticketAction(interaction, ctx, action, args));
+        }
+        return ticketAction(interaction, ctx, action, args);
+    }
+
+    async function ticketAction(interaction, ctx, action, args) {
         const ticket = await loadTicket(interaction, args[0]);
         if (!ticket) return say(interaction, 'That ticket no longer exists.');
         if (String(ticket.vaId) !== String(ctx.va._id)) return say(interaction, 'That ticket belongs to a different crew center.');
@@ -1478,7 +1586,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     }
 
     /** For diagnostics: what this module holds in memory. */
-    const stats = () => ({ guildCache: guildCache.size(), vaCache: vaCache.size(), joinCache: joinCache.size(), cooldowns: ticketCooldown.size() + commandCooldown.size() });
+    const stats = () => ({
+        guildCache: guildCache.size(), vaCache: vaCache.size(), joinCache: joinCache.size(),
+        cooldowns: ticketCooldown.size() + commandCooldown.size() + setupCooldown.size(),
+        locks: ticketLocks.size() + eventLocks.size(), api: apiLimiter.stats(),
+    });
 
     return { commands, handleInteraction, onGuildDelete, stats };
 }
@@ -1567,6 +1679,6 @@ module.exports = {
     // Pure, for the tests.
     makeLinkCode, normalizeCode, hashCode, cid, parseCid, pageCount, pageQuestions,
     matchOption, pickAirline, agreeLabels, describeRequirements, draftProblems, applyBody,
-    isStaff, threadName, makeCooldown, makeCache, inviteUrl, eventEmbed, shortLabel,
+    isStaff, threadName, makeCooldown, makeCache, makeLocks, makeLimiter, inviteUrl, eventEmbed, shortLabel,
     models: { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost },
 };

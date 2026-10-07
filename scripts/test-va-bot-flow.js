@@ -30,7 +30,7 @@ const check = (what, ok, extra) => {
 };
 
 /* ------------------------------------------------------------ in-memory Mongo */
-const { VaBotGuild, VaBotLinkCode, VaBotTicket } = v.models;
+const { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost } = v.models;
 const plain = (d) => (d && d.toObject ? d.toObject() : d ? JSON.parse(JSON.stringify(d)) : d);
 const q = (val) => {
     const p = Promise.resolve(val);
@@ -73,6 +73,10 @@ VaBotTicket.findOne = (f) => q(tickets.find((t) => matches(t, f)) || null);
 VaBotTicket.find = (f) => q(tickets.filter((t) => matches(t, f)));
 VaBotTicket.countDocuments = async (f) => tickets.filter((t) => matches(t, f)).length;
 
+const eventPosts = [];
+VaBotEventPost.findOne = (f) => q(eventPosts.find((e) => matches(e, f)) || null);
+VaBotEventPost.create = async (d) => { eventPosts.push(d); return d; };
+
 const vaId = new mongoose.Types.ObjectId();
 const VA = { _id: vaId, name: 'Test Air', slug: 'test-air', status: 'approved', crewAccent: '#112233' };
 const VirtualAirlineAd = { findById: () => ({ select: () => q(VA) }) };
@@ -80,9 +84,19 @@ const VirtualAirlineAd = { findById: () => ({ select: () => q(VA) }) };
 /* ---------------------------------------------------------- fake crew center */
 const calls = [];
 let invite = null;
+// How slow the crew center is, and how many requests it is serving at once —
+// the concurrency phase widens the window so races actually overlap.
+const load = { delayMs: 0, inflight: 0, maxInflight: 0 };
 function crewCenter() {
     const app = express();
     app.use(express.json());
+    app.use(async (req, res, next) => {
+        load.inflight++;
+        load.maxInflight = Math.max(load.maxInflight, load.inflight);
+        res.on('finish', () => { load.inflight--; });
+        if (load.delayMs) await new Promise((r) => setTimeout(r, load.delayMs));
+        next();
+    });
     const staffOnly = (req, res, next) => {
         const p = v.botCallerFrom(req, req.params.slug);
         if (!p || !v.botMay('applications.review')) return res.status(401).json({ error: 'Not authenticated.' });
@@ -98,7 +112,7 @@ function crewCenter() {
     }));
     app.post('/api/crew/:slug/apply', (req, res) => {
         calls.push({ path: 'apply', body: req.body });
-        res.json({ status: 'pending', callsign: 'TEST 123T', applicationId: 'app1', ifVerified: true, grade: 3 });
+        res.json({ status: 'pending', callsign: 'TEST 123T', applicationId: req.body.ifcName === 'Pilot_One' ? 'app1' : `app-${req.body.ifcName}`, ifVerified: true, grade: 3 });
     });
     app.get('/api/crew/:slug/entrance-tests', staffOnly, (req, res) => res.json({ quizzes: [{ id: 'q1', title: 'SOP test', passMark: 80 }] }));
     app.post('/api/crew/:slug/entrance-tests', staffOnly, (req, res) => {
@@ -332,6 +346,81 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     it.guildId = 'HOME';
     await run(it);
     check('the home server refuses setup', /Inflight’s own server/.test(lastText(it)));
+
+    /* ---- many things at once ------------------------------------------- */
+    let unhandled = 0;
+    process.on('unhandledRejection', () => { unhandled++; });
+    load.delayMs = 150;
+    const settled = (its) => Promise.allSettled(its.map((x) => run(x)));
+    const answered = (x) => x.out.replies.length > 0 || !!x.out.modal;
+
+    // A second applicant, form filled in.
+    const TWO = { id: '444', username: 'pilot_two', tag: 'pilot_two' };
+    it = interaction('button', { user: TWO, customId: 'vab:open:apply' });
+    await run(it);
+    const t2 = tickets.find((t) => t.userId === TWO.id);
+    const thread2 = channels.get(t2.threadId);
+    await run(interaction('modal', { user: TWO, customId: `vab:formsub:${t2._id}:0`, fields: { ifc: 'Pilot_Two', num: '222', email: '' } }));
+    await run(interaction('modal', { user: TWO, customId: `vab:formsub:${t2._id}:1`, fields: { q0: 'Yes' } }));
+
+    // Ten presses of Submit in the same instant.
+    const presses = Array.from({ length: 10 }, () => interaction('button', { user: TWO, customId: `vab:submit:${t2._id}` }));
+    let results = await settled(presses);
+    const applies = calls.filter((c) => c.path === 'apply' && c.body.ifcName === 'Pilot_Two').length;
+    check('ten Submits at once send ONE application', applies === 1, applies);
+    check('…none of them throws', results.every((r) => r.status === 'fulfilled'), results.filter((r) => r.status === 'rejected').map((r) => String(r.reason)));
+    check('…and every press gets an answer', presses.every(answered), presses.map((x) => x.out.replies.length));
+    check('…one staff card in the thread, not ten', thread2.sent.filter((m) => buttonIds(m).includes(`vab:test:${t2._id}`)).length === 1);
+
+    // Five staff press Accept while auto-invite fires for the same pass.
+    const accepts = Array.from({ length: 5 }, () => interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:accept:${t2._id}` }));
+    const before = calls.filter((c) => c.path === 'review').length;
+    v.hub.emit('entranceTest', { vaId, applicationId: 'app-Pilot_Two', passed: true, score: 9, total: 10, percent: 90, quizTitle: 'SOP test' });
+    results = await settled(accepts);
+    await new Promise((r) => setTimeout(r, 1500));
+    const accepted = calls.filter((c) => c.path === 'review').length - before;
+    check('five Accepts and an auto-invite accept ONCE', accepted === 1, accepted);
+    check('…one welcome in the thread', thread2.sent.filter((m) => buttonIds(m).includes(`vab:login:${t2._id}`)).length === 1,
+        thread2.sent.filter((m) => buttonIds(m).includes(`vab:login:${t2._id}`)).length);
+    check('…and every staff press gets an answer', accepts.every(answered));
+
+    // Two hundred people ask for the links at once.
+    const crowd = Array.from({ length: 200 }, (_, i) => interaction('command', { user: { id: String(10000 + i), username: `u${i}` }, command: 'crew', sub: 'links' }));
+    load.maxInflight = 0;
+    results = await settled(crowd);
+    check('two hundred commands at once: none throws', results.every((r) => r.status === 'fulfilled'));
+    check('…every one is answered', crowd.every(answered), crowd.filter((x) => !answered(x)).length);
+    check('…and the crew center is never hit by all of them at once', load.maxInflight <= 8, load.maxInflight);
+
+    // Discord failing under the bot is not the bot failing.
+    thread2.send = async () => { throw new Error('Missing Access'); };
+    thread2.setLocked = async () => { throw new Error('Missing Access'); };
+    it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:close:${t2._id}` });
+    await run(it);
+    check('a thread Discord will not let us touch still closes cleanly', /Closed/.test(lastText(it)), lastText(it));
+    const broken = interaction('command', { command: 'crew', sub: 'stats' });
+    broken.deferReply = async () => { throw Object.assign(new Error('Unknown interaction'), { code: 10062 }); };
+    broken.reply = broken.deferReply;
+    check('an interaction that expired mid-way does not throw', (await run(broken)) === true);
+
+    // An event published and edited in the same breath: one post, one thread.
+    const eventsChannel = {
+        id: '500000000002', type: 0, sent: [],
+        send: async (m) => { await new Promise((r) => setTimeout(r, 100)); eventsChannel.sent.push(m); return { id: String(nextId++), startThread: async () => fakeThread(eventsChannel) }; },
+        messages: { fetch: async () => ({ edit: async () => {} }) },
+    };
+    channels.set(eventsChannel.id, eventsChannel);
+    guilds[0].settings.eventsChannelId = eventsChannel.id;
+    const ev = { _id: 'ev1', title: 'Fly-in', origin: 'EGLL', destination: 'KJFK', startsAt: '2030-01-01T12:00:00Z' };
+    v.hub.emit('event', { va: VA, action: 'published', event: ev });
+    v.hub.emit('event', { va: VA, action: 'updated', event: { ...ev, title: 'Fly-in (moved)' } });
+    v.hub.emit('event', { va: VA, action: 'updated', event: { ...ev, title: 'Fly-in (moved again)' } });
+    await new Promise((r) => setTimeout(r, 800));
+    check('publish + two quick edits make ONE event post', eventsChannel.sent.length === 1 && eventPosts.length === 1, { posts: eventsChannel.sent.length, rows: eventPosts.length });
+
+    await new Promise((r) => setTimeout(r, 300));
+    check('nothing rejected unhandled through all of it', unhandled === 0, unhandled);
+    load.delayMs = 0;
 
     // Not ours at all.
     check('other interactions are left for bot.js', (await bot.handleInteraction({ isChatInputCommand: () => true, commandName: 'lookup' })) === false);
