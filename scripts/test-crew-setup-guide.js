@@ -49,6 +49,23 @@ console.log('\n half-way');
     T('sharing waits for the essentials', state(g, 'launch'), 'todo');
 }
 
+console.log('\n the Discord bot');
+{
+    const step = (discordBot) => guide.evaluate({ va: {}, store: { connected: false }, discordBot }).steps.find((x) => x.id === 'discord-bot');
+    T('no bot on this deployment: no step', step(null), undefined);
+    T('…nor when the deployment says it has none', step({ available: false, guilds: [] }), undefined);
+    const fresh = step({ available: true, guilds: [] });
+    T('not linked yet is a to-do in Connections, and optional', [fresh.state, fresh.group, fresh.required], ['todo', 'connections', false]);
+    const half = step({ available: true, guilds: [{ name: 'Test Air', staffRole: false, ticketChannel: false }] });
+    T('linked with no staff role or ticket channel needs a hand, and names both',
+        [half.state, /staff role and a ticket channel/.test(half.summary), /Test Air/.test(half.summary)], ['attention', true, true]);
+    const noPanel = step({ available: true, guilds: [{ name: 'Test Air', staffRole: true, ticketChannel: true, panel: false }] });
+    T('set up but no Apply panel still needs a hand', [noPanel.state, /crew-admin panel/.test(noPanel.summary)], ['attention', true]);
+    const done = step({ available: true, guilds: [{ name: 'Test Air', staffRole: true, ticketChannel: true, panel: true, autoInvite: true }, { name: 'Other' }] });
+    T('linked, set up and panel posted is done, and says where', [done.state, /Test Air and 1 other server/.test(done.summary), /automatically/.test(done.summary)], ['done', true, true]);
+    T('it never becomes the essential next step', guide.evaluate({ va: {}, store: { connected: false }, discordBot: { available: true, guilds: [] } }).next, 'database');
+}
+
 console.log('\n invitations made, not sent');
 {
     const g = guide.evaluate({

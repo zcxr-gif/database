@@ -34,7 +34,8 @@
     "test:if-beta": "node scripts/test-if-beta.js",
     "test:invite-banner": "node scripts/test-crew-invite-banner.js",
     "test:entrance": "node scripts/test-crew-entrance-tests.js",
-    "test:multipliers": "node scripts/test-crew-multipliers.js"
+    "test:multipliers": "node scripts/test-crew-multipliers.js",
+    "test:va-bot": "node scripts/test-va-bot.js && node scripts/test-va-bot-flow.js"
   },
   "keywords": [],
   "author": "Antony",

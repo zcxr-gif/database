@@ -53,6 +53,43 @@ const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const has = (v) => typeof v === 'string' ? v.trim().length > 0 : !!v;
 
 /**
+ * The Inflight bot in the VA's own Discord (vaBot.js), from vaBot.guideState.
+ *
+ * Left out entirely on a deployment with no bot — a step nobody can complete
+ * is noise. Done means a pilot can actually press Apply: the server is linked,
+ * tickets have somewhere to open and someone to answer them, and the panel
+ * with the button is posted. Anything short of that is "attention" with the
+ * one command that finishes it, because a linked server with no panel looks
+ * set up to the owner and does nothing for a recruit.
+ */
+function botStep(bot) {
+    if (!bot || !bot.available) return null;
+    const guilds = Array.isArray(bot.guilds) ? bot.guilds : [];
+    const step = { id: 'discord-bot', group: 'connections', title: 'Discord bot', required: false };
+    if (!guilds.length) {
+        return {
+            ...step, state: 'todo',
+            summary: 'Recruitment inside your Discord: Apply opens a private ticket, staff send the entrance test from it, and the pilot gets their login there.',
+        };
+    }
+    const g = guilds[0];
+    const where = `${g.name || 'your server'}${guilds.length > 1 ? ` and ${plural(guilds.length - 1, 'other server')}` : ''}`;
+    const missing = [];
+    if (!g.staffRole) missing.push('a staff role');
+    if (!g.ticketChannel) missing.push('a ticket channel');
+    if (missing.length) {
+        return { ...step, state: 'attention', summary: `Linked to ${where}. Run /crew-admin settings there to choose ${missing.join(' and ')}.` };
+    }
+    if (!g.panel) {
+        return { ...step, state: 'attention', summary: `Linked to ${where}. Post the Apply button with /crew-admin panel in your recruitment channel.` };
+    }
+    return {
+        ...step, state: 'done',
+        summary: `Running in ${where}${g.autoInvite ? ', sending logins automatically on a pass' : ''}.`,
+    };
+}
+
+/**
  * Where the database stands, from crewStore's health answer.
  * @returns {{ready: boolean, step: Object}}
  */
@@ -88,7 +125,7 @@ function storeStep(store) {
  * @param {number} [input.staffAccounts]  central staff logins for this VA
  * @returns {{groups, steps, progress: {required, requiredDone, total, done}, next}}
  */
-function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0, ifLocked = false, you = null } = {}) {
+function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0, ifLocked = false, you = null, discordBot = null } = {}) {
     const steps = [];
     const db = storeStep(store);
     steps.push(db.step);
@@ -216,6 +253,8 @@ function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0, ifLoc
             ? `Posting to ${plural(hookCount, 'channel')}.`
             : 'Applications, flight reports, promotions and new routes posted to your Discord as they happen.',
     });
+    const bot = botStep(discordBot);
+    if (bot) steps.push(bot);
     steps.push({
         id: 'email', group: 'connections', title: 'Email', required: false,
         state: va.crewEmailConfigured ? 'done' : 'todo',

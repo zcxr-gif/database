@@ -112,6 +112,11 @@ const check = (what, ok, saw) => {
     else fails.push(what + (saw === undefined ? '' : `  (saw ${JSON.stringify(saw).slice(0, 400)})`));
 };
 
+// What the Discord bot hears when a test is marked (vaBot.js).
+const vaBot = require('../vaBot');
+const hubSeen = [];
+vaBot.hub.on('entranceTest', (p) => { hubSeen.push(p); });
+
 require('../server.js');
 
 const base = `http://127.0.0.1:${process.env.PORT}`;
@@ -237,6 +242,24 @@ async function waitForServer() {
     const kaiCards = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
     const kaiCard = (kaiCards.body.applications || []).find((a) => String(a._id) === String(kai.body.applicationId));
     check('…and an older one is matched to the card by IFC username', kaiCard && kaiCard.test && /^kai_ross$/i.test(kaiCard.test.ifcName), kaiCard && kaiCard.test);
+
+    /* ---- the Discord bot as a caller (vaBot.botCallerFrom) ---------------- */
+    // Through requireCap for real: the loopback key opens recruitment for the
+    // airline it names, and nothing else.
+    {
+        const heard = hubSeen.find((h) => String(h.applicationId) === String(appId) && h.passed);
+        check('a marked test is told to the bot, with its application', !!heard && heard.percent === 100 && String(heard.vaId) === 'va1', hubSeen);
+        const asBot = { asBot: true, slug: 'am', actor: 'boss' };
+        const list = await vaBot.api('get', '/api/crew/am/entrance-tests', asBot);
+        check('the bot may list entrance tests', list.status === 200 && Array.isArray(list.data.tests), list);
+        const wrongVa = await vaBot.api('get', '/api/crew/am/entrance-tests', { ...asBot, slug: 'other' });
+        check('…but not with another airline’s name on it', wrongVa.status === 401, wrongVa.status);
+        const roster = await vaBot.api('post', '/api/crew/am/roster', { ...asBot, body: { name: 'Nope', callsign: '999' } });
+        check('…and may not touch the roster', roster.status === 403, roster.status);
+        const accept = await vaBot.api('patch', `/api/crew/am/applications/${kai.body.applicationId}`, { ...asBot, body: { action: 'accept' } });
+        check('the bot accepts an application', accept.status === 200 && accept.data.status === 'accepted', accept.data);
+        check('…which puts the pilot on the roster', DB.members.some((m) => m.name === 'Kai_Ross'), DB.members.map((m) => m.name));
+    }
 
     /* ---- a pilot's own quiz is not opened by the public route ------------- */
     DB.attempts.unshift({ _id: id(), quizId: 'entrance', token: 'b'.repeat(32), memberId: 'm-pilot', status: 'issued', attemptsUsed: 0, maxAttempts: 0, passMark: 80 });
