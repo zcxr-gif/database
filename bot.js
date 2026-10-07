@@ -2729,14 +2729,21 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             console.log('✅ Commands registered.');
         } catch (e) { console.error('❌ Error registering commands:', e); }
 
+        // VA servers: the inactivity sweep (vaBot.js), every few hours.
+        vaBotInstance.startSchedules();
+
         updateLeaderboard();
         setInterval(updateLeaderboard, 86400000);
     });
 
     client.on('guildMemberAdd', async (member) => {
-        // A VA's server is not ours to welcome people into. With the home
-        // server unknown, behave as before rather than welcome nobody.
-        if (homeGuildId && member.guild.id !== homeGuildId) return;
+        // A VA's server is not ours to welcome people into — that airline's
+        // own welcome lives in vaBot.js. With the home server unknown, behave
+        // as before rather than welcome nobody.
+        if (homeGuildId && member.guild.id !== homeGuildId) {
+            vaBotInstance.onMemberJoin(member).catch(() => {});
+            return;
+        }
         if (MEMBER_ROLE_ID) {
             try { 
                 const role = await member.guild.roles.fetch(MEMBER_ROLE_ID); 

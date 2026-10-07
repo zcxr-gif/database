@@ -30,7 +30,7 @@ const check = (what, ok, extra) => {
 };
 
 /* ------------------------------------------------------------ in-memory Mongo */
-const { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost } = v.models;
+const { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost, VaBotInactive } = v.models;
 const plain = (d) => (d && d.toObject ? d.toObject() : d ? JSON.parse(JSON.stringify(d)) : d);
 const q = (val) => {
     const p = Promise.resolve(val);
@@ -39,7 +39,10 @@ const q = (val) => {
 const matches = (doc, f) => Object.entries(f).every(([k, want]) => {
     const have = k.split('.').reduce((o, p) => (o == null ? o : o[p]), doc);
     if (want && typeof want === 'object' && '$ne' in want) return have !== want.$ne;
-    if (want && typeof want === 'object' && '$gt' in want) return have > want.$gt;
+    if (want === null) return have == null;
+    if (want && typeof want === 'object' && ('$gt' in want || '$lte' in want)) {
+        return (!('$gt' in want) || (have != null && have > want.$gt)) && (!('$lte' in want) || (have != null && have <= want.$lte));
+    }
     return String(have) === String(want);
 });
 
@@ -73,9 +76,22 @@ VaBotTicket.findOne = (f) => q(tickets.find((t) => matches(t, f)) || null);
 VaBotTicket.find = (f) => q(tickets.filter((t) => matches(t, f)));
 VaBotTicket.countDocuments = async (f) => tickets.filter((t) => matches(t, f)).length;
 
+const inactive = [];
+VaBotInactive.find = (f) => q(inactive.filter((r) => matches(r, f)));
+VaBotInactive.deleteOne = async (f) => { const i = inactive.findIndex((r) => matches(r, f)); if (i >= 0) inactive.splice(i, 1); return { deletedCount: i >= 0 ? 1 : 0 }; };
+VaBotInactive.deleteMany = async (f) => { for (let i = inactive.length - 1; i >= 0; i--) if (matches(inactive[i], f)) inactive.splice(i, 1); return {}; };
+VaBotInactive.updateOne = async (f, { $set }, opts = {}) => {
+    let r = inactive.find((x) => matches(x, f));
+    if (!r && opts.upsert) { r = { _id: new mongoose.Types.ObjectId(), ...f }; inactive.push(r); }
+    if (r) Object.assign(r, $set);
+    return {};
+};
+
 const eventPosts = [];
 VaBotEventPost.findOne = (f) => q(eventPosts.find((e) => matches(e, f)) || null);
-VaBotEventPost.create = async (d) => { eventPosts.push(d); return d; };
+VaBotEventPost.create = async (d) => { const row = { _id: new mongoose.Types.ObjectId(), ...d }; eventPosts.push(row); return row; };
+VaBotEventPost.find = (f) => q(eventPosts.filter((e) => matches(e, f)));
+VaBotEventPost.updateOne = async (f, { $set }) => { const e = eventPosts.find((x) => matches(x, f)); if (e) Object.assign(e, $set); return {}; };
 
 const vaId = new mongoose.Types.ObjectId();
 const VA = { _id: vaId, name: 'Test Air', slug: 'test-air', status: 'approved', crewAccent: '#112233' };
@@ -84,6 +100,11 @@ const VirtualAirlineAd = { findById: () => ({ select: () => q(VA) }) };
 /* ---------------------------------------------------------- fake crew center */
 const calls = [];
 let invite = null;
+let rosterPilots = [];
+let rosterDown = false;
+const eventSignups = new Map();
+let eventStart = '2030-01-01T12:00:00Z';
+const linkRefused = new Set();
 // How slow the crew center is, and how many requests it is serving at once —
 // the concurrency phase widens the window so races actually overlap.
 const load = { delayMs: 0, inflight: 0, maxInflight: 0 };
@@ -125,6 +146,60 @@ function crewCenter() {
         res.json({ status: 'accepted', account: { username: 'pilot.one', password: 'Temp-Pass-123', created: true }, invite, signInUrl: invite.signInUrl });
     });
     app.get('/api/crew/:slug/applications/:id/invite', staffOnly, (req, res) => res.json({ invite }));
+    app.get('/api/crew/:slug/discord-bot/pilots', staffOnly, (req, res) => (rosterDown ? res.status(503).json({ error: 'store down' }) : res.json({ pilots: rosterPilots, unlinked: 2 })));
+    app.get('/api/crew/:slug/discord-bot/pilot/:id', staffOnly, (req, res) => res.json({ pilot: rosterPilots.find((p) => p.discordId === req.params.id) || null }));
+    app.post('/api/crew/:slug/discord-bot/link-pilot', staffOnly, (req, res) => {
+        calls.push({ path: 'link', body: req.body });
+        res.json(linkRefused.has(req.body.applicationId) ? { linked: false, reason: 'taken' } : { linked: true });
+    });
+    // The pilot endpoints, as server.js answers them for the bot: the pilot is
+    // whoever's login the pressing Discord account is linked to, or nobody.
+    const pilotFor = (req) => {
+        const id = v.botCallerFrom(req, req.params.slug) ? v.botPilotFrom(req) : '';
+        return rosterPilots.find((x) => x.discordId === id) || null;
+    };
+    const going = (id) => { if (!eventSignups.has(id)) eventSignups.set(id, new Set()); return eventSignups.get(id); };
+    app.get('/api/crew/:slug/events', (req, res) => res.json({ events: [{ id: 'ev1', title: 'Fly-in', origin: 'EGLL', destination: 'KJFK', startsAt: eventStart, status: 'published', going: going('ev1').size }] }));
+    app.get('/api/crew/:slug/events/:id', (req, res) => res.json({ event: { id: req.params.id, title: 'Fly-in', origin: 'EGLL', destination: 'KJFK', startsAt: eventStart, status: 'published', going: going(req.params.id).size, slots: 20, waitlisted: 0 } }));
+    app.post('/api/crew/:slug/events/:id/signup', (req, res) => {
+        const me = pilotFor(req);
+        if (!me) return res.status(401).json({ error: 'Sign in to your crew center to join an event.' });
+        if (going(req.params.id).has(me.discordId)) return res.status(409).json({ error: 'You are already signed up for this event.', code: 'already_signed_up' });
+        going(req.params.id).add(me.discordId);
+        res.status(201).json({ signup: {}, waitlisted: false });
+    });
+    app.delete('/api/crew/:slug/events/:id/signup', (req, res) => {
+        const me = pilotFor(req);
+        if (!me) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        going(req.params.id).delete(me.discordId);
+        res.json({ ok: true });
+    });
+    app.get('/api/crew/:slug/discord-bot/events/:id/attendees', staffOnly, (req, res) => res.json({
+        event: { title: 'Fly-in', startsAt: eventStart, status: 'published' }, discordIds: [...going(req.params.id)],
+    }));
+    app.get('/api/crew/:slug/me/flying', (req, res) => {
+        const me = pilotFor(req);
+        if (!me) return res.json({ pilot: null, rank: null, flights: [], totals: null });
+        res.json({
+            pilot: { name: me.name, callsign: me.callsign, hours: 12.34, status: 'active' },
+            rank: { name: 'First Officer', next: { name: 'Captain', hoursAway: 37.66, requiresCheck: false } },
+            totals: { flights: 5, flights30d: 2, minutes30d: 180, lastFlightAt: new Date().toISOString(), pending: 1 },
+            streak: { weeks: 3 },
+        });
+    });
+    app.get('/api/crew/:slug/standings', (req, res) => {
+        const me = pilotFor(req);
+        res.json({
+            window: Number(req.query.window),
+            board: [{ name: 'Ace', callsign: 'TEST 001T', hours: 50, flights: 9 }, { name: 'Flyer', callsign: 'TEST 901T', hours: 12.3, flights: 5 }],
+            me: me ? { rank: 2, of: 2, hours: 12.3 } : null,
+        });
+    });
+    app.get('/api/crew/:slug/routes', (req, res) => res.json({ routes: [
+        { origin: 'EGLL', destination: 'KJFK', aircraft: 'B777-300ER', distanceNm: 2999, flightNumber: 'TS1' },
+        { origin: 'KJFK', destination: 'EGLL', aircraft: 'A350', locked: true },
+        { origin: 'EGLL', destination: 'LFPG', aircraft: 'A320', active: false },
+    ] }));
     return http.createServer(app);
 }
 
@@ -154,9 +229,39 @@ const logChannel = { id: '500000000001', type: 0, sent: [], send: async (m) => {
 channels.set(logChannel.id, logChannel);
 
 const GUILD = '7000';
+// Members with real role sets, so a swap can be seen; `absent` are not in the server.
+const memberState = new Map();
+const absent = new Set();
+const dms = [];
+const stateOf = (id) => { if (!memberState.has(id)) memberState.set(id, { roles: new Set(), kicked: false }); return memberState.get(id); };
+const guild = {
+    id: GUILD, name: 'Test Air Discord', memberCount: 42,
+    members: {
+        me: { permissions: new PermissionsBitField([PermissionsBitField.Flags.KickMembers, PermissionsBitField.Flags.ManageRoles]) },
+        fetch: async (id) => {
+            const st = stateOf(id);
+            if (absent.has(id) || st.kicked) throw new Error('Unknown Member');
+            return memberObj(id);
+        },
+    },
+};
+function memberObj(id) {
+    const st = stateOf(id);
+    return {
+        id, guild, displayName: `u${id}`, kickable: true,
+        user: { id, username: `u${id}`, bot: false, avatar: '', displayAvatarURL: () => 'https://cdn.discordapp.com/embed/avatars/0.png' },
+        roles: {
+            cache: { keys: () => st.roles.keys() },
+            add: async (r) => { roleAdds.push({ id, r }); st.roles.add(r); },
+            remove: async (r) => { st.roles.delete(r); },
+        },
+        kick: async () => { st.kicked = true; },
+    };
+}
 const client = {
     channels: { fetch: async (id) => channels.get(id) || null },
-    guilds: { cache: new Map([[GUILD, { members: { fetch: async (id) => ({ roles: { add: async (r) => { roleAdds.push({ id, r }); } } }) } }]]) },
+    guilds: { cache: new Map([[GUILD, guild]]) },
+    users: { fetch: async (id) => ({ send: async (p) => { dms.push({ id, p }); return {}; } }) },
 };
 
 const APPLICANT = { id: '111', username: 'pilot_one', tag: 'pilot_one' };
@@ -167,7 +272,7 @@ const PILOT_ROLE = '3002';
 function interaction(kind, { user = APPLICANT, roles = [], perms = [], customId, command, sub, options = {}, fields = {}, values } = {}) {
     const out = { replies: [], modal: null, deferred: false, replied: false };
     const it = {
-        out, user, guildId: GUILD, customId, values,
+        out, user, guildId: GUILD, customId, values, channelId: options.channelId,
         guild: { name: 'Test Air Discord' },
         channel: ticketChannel,
         member: { roles },
@@ -181,6 +286,8 @@ function interaction(kind, { user = APPLICANT, roles = [], perms = [], customId,
             getRole: (n) => options[n] ?? null,
             getChannel: (n) => options[n] ?? null,
             getBoolean: (n) => (n in options ? options[n] : null),
+            getInteger: (n) => (n in options ? options[n] : null),
+            getUser: (n) => options[n] ?? null,
         },
         fields: { getTextInputValue: (id) => { if (!(id in fields)) throw new Error('no field'); return fields[id]; } },
         reply: async (p) => { it.replied = true; out.replies.push(p); return p; },
@@ -302,9 +409,13 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     check('a pass with auto-invite accepts with a login', review2 && review2.body.action === 'accept' && review2.body.createAccount === true, review2);
     check('…recorded as auto-invite', review2 && review2.actor === 'Auto-invite (Discord)', review2 && review2.actor);
     check('the pilot role is given', roleAdds.some((x) => x.id === APPLICANT.id && x.r === PILOT_ROLE), roleAdds);
+    const linkCall = calls.find((c) => c.path === 'link');
+    check('…and their Discord is linked to the new login', linkCall && linkCall.body.discordId === APPLICANT.id && linkCall.body.applicationId === 'app1', linkCall);
     const welcome = thread.sent[thread.sent.length - 1];
     check('the welcome offers Show my login', buttonIds(welcome).includes(`vab:login:${ticket._id}`), buttonIds(welcome));
     check('…and never prints the password in the thread', !thread.sent.some((m) => JSON.stringify(m).includes('Temp-Pass-123')));
+    check('…and tells them Discord sign-in already works', /Discord is linked/.test(JSON.stringify(welcome.embeds)));
+    check('passing the test tells them their Discord will be linked too', thread.sent.some((m) => /Discord will be linked/.test(JSON.stringify(m.embeds || []))));
 
     it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:login:${ticket._id}` });
     await run(it);
@@ -353,6 +464,123 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     it.guildId = 'HOME';
     await run(it);
     check('the home server refuses setup', /Inflight’s own server/.test(lastText(it)));
+
+    /* ---- a help ticket: open, close with a reason, reopen ---------------- */
+    const ADMIN = { user: STAFF, perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin' };
+    const HELP = { id: '555000000', username: 'needs_help', tag: 'needs_help' };
+    it = interaction('button', { user: HELP, customId: 'vab:open:support' });
+    await run(it);
+    check('Contact staff asks what it is about first', it.out.modal && it.out.modal.custom_id === 'vab:opensub:support', it.out.modal);
+    it = interaction('modal', { user: HELP, customId: 'vab:opensub:support', fields: { topic: 'Can’t sign in', details: 'It says wrong password' } });
+    await run(it);
+    const help = tickets.find((t) => t.userId === HELP.id);
+    const helpThread = help && channels.get(help.threadId);
+    check('a help ticket opens with its topic', help && help.kind === 'support' && help.topic === 'Can’t sign in' && /ticket is open/.test(lastText(it)), lastText(it));
+    check('…the staff are pinged with the details', helpThread && helpThread.sent[0].content.includes(`<@&${STAFF_ROLE}>`)
+        && JSON.stringify(helpThread.sent[0].embeds).includes('wrong password'));
+    it = interaction('button', { user: HELP, customId: 'vab:open:support' });
+    await run(it);
+    check('one open help ticket per person', /already have a ticket open/.test(lastText(it)), lastText(it));
+
+    it = interaction('command', { user: HELP, command: 'crew', sub: 'add', options: { member: { id: '556000000', bot: false }, channelId: help.threadId } });
+    await run(it);
+    check('only staff add people to a ticket', /Only staff/.test(lastText(it)));
+    it = interaction('command', { user: STAFF, roles: [STAFF_ROLE], command: 'crew', sub: 'close', options: { reason: 'Password reset sent', channelId: help.threadId } });
+    await run(it);
+    check('/crew close in the thread closes it with the reason', help.status === 'closed' && help.closeReason === 'Password reset sent' && helpThread.locked, lastText(it));
+    check('…offers Reopen', buttonIds(helpThread.sent[helpThread.sent.length - 1]).includes(`vab:reopen:${help._id}`));
+    check('…and the member hears why, kindly, by DM', dms.some((d) => d.id === HELP.id && /Password reset sent/.test(JSON.stringify(d.p))));
+    it = interaction('button', { user: HELP, customId: `vab:reopen:${help._id}` });
+    await run(it);
+    check('the member can reopen it', help.status === 'open' && !helpThread.locked && !helpThread.archived, lastText(it));
+
+    it = interaction('button', { user: { id: '557000000', username: 'away' }, customId: 'vab:open:support:loa' });
+    await run(it);
+    check('Request leave opens a ticket already titled for it', JSON.stringify(it.out.modal || {}).includes('Leave of absence'));
+
+    /* ---- welcome ------------------------------------------------------- */
+    const welcomeChannel = { id: '500000000003', type: 0, sent: [], send: async (m) => { welcomeChannel.sent.push(m); return {}; } };
+    channels.set(welcomeChannel.id, welcomeChannel);
+    it = interaction('command', { ...ADMIN, sub: 'welcome', options: { channel: welcomeChannel, role: { id: '3003' }, message: 'Hi {user}, welcome to {airline}!' } });
+    await run(it);
+    check('welcome settings are saved', guilds[0].settings.welcomeChannelId === welcomeChannel.id && guilds[0].settings.welcomeRoleId === '3003', guilds[0].settings);
+    await bot.onMemberJoin(memberObj('666000000'));
+    const greeting = welcomeChannel.sent[welcomeChannel.sent.length - 1];
+    check('a newcomer is greeted in their words', greeting && JSON.stringify(greeting.embeds).includes('Hi <@666000000>, welcome to Test Air!'), greeting);
+    check('…with Apply and Contact staff', greeting && buttonIds(greeting).includes('vab:open:apply') && buttonIds(greeting).includes('vab:open:support'));
+    check('…and the welcome role', stateOf('666000000').roles.has('3003'));
+    rosterPilots = [{ discordId: '777000000', name: 'Back Again', callsign: 'TEST 777T', status: 'active' }];
+    await bot.onMemberJoin(memberObj('777000000'));
+    check('a pilot who rejoins is welcomed back with their role', /Welcome back/.test(JSON.stringify(welcomeChannel.sent[welcomeChannel.sent.length - 1].embeds))
+        && stateOf('777000000').roles.has(PILOT_ROLE));
+
+    it = interaction('command', { user: { id: '777000000', username: 'u777000000' }, command: 'crew', sub: 'link' });
+    await run(it);
+    check('/crew link says who a linked pilot is', /linked to \*\*Back Again/.test(lastText(it)), lastText(it));
+    it = interaction('command', { user: { id: '778000000', username: 'u778000000' }, command: 'crew', sub: 'link' });
+    await run(it);
+    check('…and gives everyone else the one-button link', lastText(it).includes('Link your crew center account')
+        && buttonIds(it.out.replies[it.out.replies.length - 1]).includes('https://inflight.example/crew-pilot.html?va=test-air&link=discord'));
+
+    /* ---- inactivity ---------------------------------------------------- */
+    const inactiveChannel = { id: '500000000004', type: 0, sent: [], send: async (m) => { inactiveChannel.sent.push(m); return {}; } };
+    channels.set(inactiveChannel.id, inactiveChannel);
+    const INACTIVE_ROLE = '3004';
+    it = interaction('command', { ...ADMIN, sub: 'inactivity', options: { role: { id: PILOT_ROLE } } });
+    await run(it);
+    check('the pilot role cannot double as the inactive role', /its own role/.test(lastText(it)));
+    it = interaction('command', { ...ADMIN, sub: 'inactivity', options: { role: { id: INACTIVE_ROLE }, channel: inactiveChannel, after_days: 30, kick_after_days: 30 } });
+    await run(it);
+    check('inactivity settings are saved', guilds[0].settings.inactiveRoleId === INACTIVE_ROLE && guilds[0].settings.kickDays === 30, guilds[0].settings);
+
+    const DAY = 24 * 3600 * 1000;
+    const daysAgo = (d) => new Date(Date.now() - d * DAY).toISOString();
+    stateOf('801000000').roles.add(PILOT_ROLE);
+    absent.add('803000000');
+    rosterPilots = [
+        { discordId: '801000000', name: 'Quiet', callsign: 'TEST 801T', status: 'active', lastFlightAt: daysAgo(45) },
+        { discordId: '802000000', name: 'Busy', callsign: 'TEST 802T', status: 'active', lastFlightAt: daysAgo(2) },
+        { discordId: '803000000', name: 'Gone', callsign: 'TEST 803T', status: 'active', lastFlightAt: daysAgo(90) },
+        { discordId: '804000000', name: 'Staff', callsign: 'TEST 804T', status: 'active', staff: true, lastFlightAt: daysAgo(90) },
+    ];
+    it = interaction('command', { ...ADMIN, sub: 'sweep', options: {} });
+    await run(it);
+    check('the preview names who would be moved', /Preview/.test(lastText(it)) && lastText(it).includes('<@801000000>') && !lastText(it).includes('<@802000000>'), lastText(it));
+    check('…and changes nothing', !stateOf('801000000').roles.has(INACTIVE_ROLE) && !inactive.length);
+
+    rosterDown = true;
+    it = interaction('command', { ...ADMIN, sub: 'sweep', options: { apply: true } });
+    await run(it);
+    check('a crew center that cannot answer means no sweep at all', /Nothing done/.test(lastText(it)) && !inactive.length, lastText(it));
+    rosterDown = false;
+
+    it = interaction('command', { ...ADMIN, sub: 'sweep', options: { apply: true } });
+    await run(it);
+    check('a quiet pilot gets the inactive role instead of the pilot role', stateOf('801000000').roles.has(INACTIVE_ROLE) && !stateOf('801000000').roles.has(PILOT_ROLE));
+    check('…is told kindly how to stay, in the inactive channel', inactiveChannel.sent.some((m) => m.content === '<@801000000>' && /We miss you/.test(JSON.stringify(m.embeds))
+        && buttonIds(m).includes('vab:open:support:loa')));
+    check('…with a removal date a month out', inactive.length === 1 && inactive[0].userId === '801000000' && new Date(inactive[0].kickAt).getTime() > Date.now() + 29 * DAY, inactive);
+    check('somebody not in the server, staff, and the busy are left alone', !stateOf('802000000').roles.has(INACTIVE_ROLE) && !stateOf('804000000').roles.has(INACTIVE_ROLE) && !inactive.some((r) => r.userId === '803000000'));
+
+    rosterPilots[0].lastFlightAt = new Date().toISOString();
+    await bot.sweepGuild(guilds[0]);
+    check('flying again swaps the roles back', !stateOf('801000000').roles.has(INACTIVE_ROLE) && stateOf('801000000').roles.has(PILOT_ROLE) && !inactive.length);
+    check('…with a welcome back', dms.some((d) => d.id === '801000000' && /Welcome back/.test(JSON.stringify(d.p))));
+
+    rosterPilots[0].lastFlightAt = daysAgo(45);
+    await bot.sweepGuild(guilds[0]);
+    inactive[0].kickAt = new Date(Date.now() + 3 * DAY);
+    await bot.sweepGuild(guilds[0]);
+    await bot.sweepGuild(guilds[0]);
+    check('a week before removal: one reminder, not one per sweep', dms.filter((d) => d.id === '801000000' && /friendly reminder/i.test(JSON.stringify(d.p))).length === 1);
+    inactive[0].kickAt = new Date(Date.now() - 1000);
+    await bot.sweepGuild(guilds[0]);
+    check('past the deadline: a kind goodbye, then removed', stateOf('801000000').kicked && inactive[0].status === 'kicked'
+        && dms.some((d) => d.id === '801000000' && /Thanks for flying with Test Air/.test(JSON.stringify(d.p))));
+
+    it = interaction('command', { ...ADMIN, sub: 'inactivity', options: { kick_after_days: 0 } });
+    await run(it);
+    check('removal can be switched off', guilds[0].settings.kickDays === 0 && /never removed/.test(lastText(it)), lastText(it));
 
     /* ---- many things at once ------------------------------------------- */
     let unhandled = 0;
@@ -424,6 +652,87 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     v.hub.emit('event', { va: VA, action: 'updated', event: { ...ev, title: 'Fly-in (moved again)' } });
     await new Promise((r) => setTimeout(r, 800));
     check('publish + two quick edits make ONE event post', eventsChannel.sent.length === 1 && eventPosts.length === 1, { posts: eventsChannel.sent.length, rows: eventPosts.length });
+
+    /* ---- accepted from the dashboard: the ticket still links them ------ */
+    load.delayMs = 0;
+    const DASH = '903000000';
+    const dashThread = fakeThread(ticketChannel);
+    const dash = await VaBotTicket.create({ guildId: GUILD, vaId, threadId: dashThread.id, userId: DASH, userTag: 'dash', kind: 'apply', stage: 'submitted', applicationId: 'app-dash' });
+    v.hub.emit('applicationAccepted', { vaId, applicationId: 'app-dash' });
+    await new Promise((r) => setTimeout(r, 300));
+    const dashWelcome = dashThread.sent[dashThread.sent.length - 1];
+    check('accepted in the crew center: the ticket gets the welcome', dash.stage === 'accepted' && dashWelcome && /Welcome to Test Air/.test(JSON.stringify(dashWelcome.embeds)), dashThread.sent);
+    check('…their Discord is linked to the new login', calls.some((c) => c.path === 'link' && c.body.applicationId === 'app-dash' && c.body.discordId === DASH));
+    check('…and they get the pilot role', stateOf(DASH).roles.has(PILOT_ROLE));
+    v.hub.emit('applicationAccepted', { vaId, applicationId: 'app-dash' });
+    await new Promise((r) => setTimeout(r, 200));
+    check('a second accepted signal posts nothing new', dashThread.sent.filter((m) => /Welcome to Test Air/.test(JSON.stringify(m.embeds || []))).length === 1);
+
+    const REFUSED = '904000000';
+    linkRefused.add('app-taken');
+    const refusedThread = fakeThread(ticketChannel);
+    await VaBotTicket.create({ guildId: GUILD, vaId, threadId: refusedThread.id, userId: REFUSED, userTag: 'r', kind: 'apply', stage: 'submitted', applicationId: 'app-taken' });
+    v.hub.emit('applicationAccepted', { vaId, applicationId: 'app-taken' });
+    await new Promise((r) => setTimeout(r, 300));
+    const refusedWelcome = refusedThread.sent[refusedThread.sent.length - 1];
+    check('a link that cannot be made automatically hands them the Link button', refusedWelcome
+        && buttonIds(refusedWelcome).includes('https://inflight.example/crew-pilot.html?va=test-air&link=discord')
+        && /One last step/.test(JSON.stringify(refusedWelcome.embeds)));
+    check('…and staff are told why', logChannel.sent.some((m) => m.content.includes(`<@${REFUSED}>`) && /could not be linked automatically/.test(m.content)));
+
+    /* ---- events from Discord ------------------------------------------ */
+    const edits = [];
+    eventsChannel.messages = { fetch: async () => ({ edit: async (m) => { edits.push(m); } }) };
+    check('an event post has I’m in / Can’t make it', buttonIds(eventsChannel.sent[0]).includes('vab:rsvp:ev1') && buttonIds(eventsChannel.sent[0]).includes('vab:unrsvp:ev1'), buttonIds(eventsChannel.sent[0]));
+    const FLYER = { id: '901000000', username: 'flyer' };
+    rosterPilots = [{ discordId: FLYER.id, name: 'Flyer', callsign: 'TEST 901T', status: 'active' }];
+    it = interaction('button', { user: { id: '902000000', username: 'nolink' }, customId: 'vab:rsvp:ev1' });
+    await run(it);
+    check('an unlinked member is asked to link first', /Link your crew center account first/.test(lastText(it))
+        && buttonIds(it.out.replies[it.out.replies.length - 1]).includes('https://inflight.example/crew-pilot.html?va=test-air&link=discord'), lastText(it));
+    it = interaction('button', { user: FLYER, customId: 'vab:rsvp:ev1' });
+    await run(it);
+    check('a linked pilot signs up from Discord', /You’re in for \*\*Fly-in/.test(lastText(it)) && (eventSignups.get('ev1') || new Set()).has(FLYER.id), lastText(it));
+    check('…and the post shows the head count', edits.some((m) => /Going/.test(JSON.stringify(m.embeds)) && /✈️ 1 of 20/.test(JSON.stringify(m.embeds))), edits);
+    it = interaction('command', { user: FLYER, command: 'crew', sub: 'events' });
+    await run(it);
+    const listed = it.out.replies[it.out.replies.length - 1];
+    check('/crew events offers a sign-up menu', JSON.stringify(listed.components || []).includes('vab:rsvpick'));
+
+    // An hour before: the people going are pinged in the event's thread, once.
+    eventStart = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    eventPosts[0].startsAt = new Date(eventStart);
+    const evThread = channels.get(eventPosts[0].threadId);
+    const before2 = evThread.sent.length;
+    await bot.remindEvents();
+    check('an hour before, the people going are pinged in the thread', evThread.sent.length === before2 + 1 && evThread.sent[before2].content.includes(`<@${FLYER.id}>`) && /starts/.test(evThread.sent[before2].content), evThread.sent.slice(before2));
+    await bot.remindEvents();
+    check('…once', evThread.sent.length === before2 + 1);
+
+    it = interaction('button', { user: FLYER, customId: 'vab:unrsvp:ev1' });
+    await run(it);
+    check('Can’t make it takes them off the list', /off the list/.test(lastText(it)) && !(eventSignups.get('ev1') || new Set()).has(FLYER.id), lastText(it));
+
+    /* ---- pilot commands ------------------------------------------------ */
+    it = interaction('command', { user: FLYER, command: 'crew', sub: 'me' });
+    await run(it);
+    check('/crew me shows rank, hours and the next rank', /First Officer/.test(lastText(it)) && /Captain — 37.7 h to go/.test(lastText(it)) && /#2 of 2/.test(lastText(it)) && /3 weeks/.test(lastText(it)), lastText(it));
+    it = interaction('command', { user: { id: '902000000', username: 'nolink' }, command: 'crew', sub: 'me' });
+    await run(it);
+    check('…and asks an unlinked member to link', /Link your crew center account first/.test(lastText(it)));
+    it = interaction('command', { user: FLYER, command: 'crew', sub: 'leaderboard', options: { window: '90' } });
+    await run(it);
+    check('/crew leaderboard lists the top pilots and where you are', /last 90 days/.test(lastText(it)) && /🥇/.test(lastText(it)) && /Ace/.test(lastText(it)) && /#2 of 2/.test(lastText(it)), lastText(it));
+    it = interaction('command', { user: FLYER, command: 'crew', sub: 'route', options: { from: 'egll' } });
+    await run(it);
+    check('/crew route suggests an open route from where you asked', /EGLL → KJFK/.test(lastText(it)) && /B777/.test(lastText(it)), lastText(it));
+    check('…with Another one', buttonIds(it.out.replies[it.out.replies.length - 1]).includes('vab:route:EGLL:-'));
+    it = interaction('command', { user: { id: '905000000', username: 'other' }, command: 'crew', sub: 'route', options: { from: 'KJFK' } });
+    await run(it);
+    check('…never a route their rank has not opened', /No open route matches/.test(lastText(it)), lastText(it));
+    it = interaction('button', { user: FLYER, customId: 'vab:route:EGLL:-' });
+    await run(it);
+    check('Another one suggests again', /EGLL → KJFK/.test(lastText(it)), lastText(it));
 
     await new Promise((r) => setTimeout(r, 300));
     check('nothing rejected unhandled through all of it', unhandled === 0, unhandled);
