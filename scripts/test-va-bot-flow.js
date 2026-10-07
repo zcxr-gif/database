@@ -210,6 +210,7 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     let it = interaction('command', { command: 'crew', sub: 'links' });
     await run(it);
     check('an unlinked server is told to run setup', /crew-admin setup/.test(lastText(it)), lastText(it));
+    check('…and where the setup guide is', lastText(it).includes('https://inflight.example/discord-bot'), lastText(it));
 
     // Setup without Manage Server is refused before the code is even read.
     const code = v.makeLinkCode();
@@ -228,6 +229,12 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     } });
     await run(it);
     check('settings are saved', guilds[0].settings.staffRoleId === STAFF_ROLE && guilds[0].settings.autoInvite === true, guilds[0].settings);
+
+    it = interaction('command', { user: STAFF, perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'panel', options: {} });
+    await run(it);
+    const panel = ticketChannel.sent[ticketChannel.sent.length - 1];
+    check('the panel is posted with Apply', panel && buttonIds(panel).includes('vab:open:apply'), lastText(it));
+    check('…and remembered, for the setup guide', !!guilds[0].panelAt && v.guildSummary(guilds[0]).panel === true);
 
     // The applicant opens a ticket from the panel.
     it = interaction('button', { customId: 'vab:open:apply' });

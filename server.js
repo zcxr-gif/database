@@ -16207,9 +16207,10 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const [hooks, staffAccounts] = await Promise.all([
+        const [hooks, staffAccounts, discordBot] = await Promise.all([
             VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl +crewWebhooks').lean().catch(() => null),
             VaPortalAccount.countDocuments({ vaAdId: va._id, role: 'staff' }).catch(() => 0),
+            vaBot.guideState(va._id).catch(() => null),
         ]);
 
         const storeState = { connected: crewStore.isConnected(va) };
@@ -16269,7 +16270,7 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
                 crewWebhooks: (hooks && hooks.crewWebhooks) || {},
                 hasLegacyWebhook: !!(hooks && hooks.crewWebhookUrl),
             },
-            store: storeState, counts, staffAccounts, you,
+            store: storeState, counts, staffAccounts, you, discordBot,
             ifLocked: ifBeta.isLocked(va.slug || req.params.slug),
         });
         res.set('Cache-Control', 'no-store');
@@ -16278,6 +16279,8 @@ app.get('/api/crew/:slug/setup-guide', async (req, res) => {
             links: {
                 signIn: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}`,
                 join: `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}/join`,
+                // The Discord bot's setup manual, for the guide's bot step.
+                discordBotGuide: vaBot.GUIDE_URL(),
                 // Absolute and from this request, for the reason the
                 // partnership route gives: the portal is served here, and the
                 // dashboard reading this is not.

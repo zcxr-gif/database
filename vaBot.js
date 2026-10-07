@@ -176,6 +176,8 @@ const VaBotGuildSchema = new Schema({
         eventsChannelId: { type: String, default: '' },
         autoInvite: { type: Boolean, default: false },
     },
+    // When the Apply panel was last posted — the setup guide's "done".
+    panelAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const VaBotLinkCodeSchema = new Schema({
@@ -490,6 +492,9 @@ function inviteUrl() {
  * instead of a minute later. */
 const guildCache = makeCache(CACHE_TTL_MS);
 
+/** The owner's setup manual (tracker: discord-bot.html). */
+const GUIDE_URL = () => `${config.siteOrigin}/discord-bot`;
+
 const crewUrl = (slug) => `${config.siteOrigin}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
 
 /* ===========================================================================
@@ -617,7 +622,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     /** The server's link and its airline, or a reply saying why there is none. */
     async function context(interaction) {
         const link = await guildLink(interaction.guildId);
-        if (!link) return { error: 'This server is not linked to a crew center yet. A server admin runs `/crew-admin setup` with the code from the crew center (Alerts → Discord bot).' };
+        if (!link) return { error: `This server is not linked to a crew center yet. A server admin runs \`/crew-admin setup\` with the code from the crew center (Alerts → Discord bot). Setup guide: ${GUIDE_URL()}` };
         const va = await vaById(link.vaId);
         if (!va) return { error: 'The crew center this server was linked to is no longer available.' };
         return { link, va, settings: link.settings || {} };
@@ -747,6 +752,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             '1. `/crew-admin settings` — pick your staff role, pilot role, ticket channel and events channel.',
             '2. `/crew-admin panel` in your recruitment channel.',
             '3. `/crew-admin check` to make sure the bot has the permissions it needs.',
+            '',
+            `The full setup guide: ${GUIDE_URL()}`,
         ].join('\n'));
     }
 
@@ -808,6 +815,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         );
         const posted = await send(channel, { embeds: [e], components: [row] });
         if (!posted) return say(interaction, `I could not post in ${channel}. Give me **View Channel**, **Send Messages** and **Embed Links** there.`);
+        await VaBotGuild.updateOne({ guildId: interaction.guildId }, { $set: { panelAt: new Date() } }).catch(() => {});
         return say(interaction, `Panel posted in ${channel}.${ctx.settings.ticketChannelId ? '' : ' Tickets will open as threads in that channel — set a different one with `/crew-admin settings ticket_channel`.'}`);
     }
 
@@ -848,6 +856,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 
         const join = await joinConfig(ctx.va);
         lines.push(join ? `✅ Crew center **${ctx.va.name}** is answering` : '❌ The crew center did not answer');
+        lines.push('', `Stuck on one of these? ${GUIDE_URL()}#troubleshooting`);
         return say(interaction, lines.join('\n'), { allowedMentions: { parse: [] } });
     }
 
@@ -1596,6 +1605,31 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 }
 
 /* ===========================================================================
+ * WHAT THE CREW CENTER IS TOLD ABOUT A LINKED SERVER
+ *
+ * Yes/no per setting, never the ids: the dashboard and the setup guide need
+ * to know what is missing, not which channel it is.
+ * ======================================================================== */
+
+const botAvailable = () => !!(process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_CLIENT_ID);
+
+function guildSummary(g) {
+    const s = (g && g.settings) || {};
+    return {
+        staffRole: !!s.staffRoleId, pilotRole: !!s.pilotRoleId,
+        ticketChannel: !!s.ticketChannelId, eventsChannel: !!s.eventsChannelId,
+        autoInvite: !!s.autoInvite, panel: !!(g && g.panelAt),
+    };
+}
+
+/** The setup guide's input: is there a bot, and how far along is each server. */
+async function guideState(vaId) {
+    if (!botAvailable()) return { available: false, guilds: [] };
+    const guilds = await VaBotGuild.find({ vaId }).sort({ linkedAt: -1 }).limit(20).lean();
+    return { available: true, guilds: guilds.map((g) => ({ name: g.guildName || '', ...guildSummary(g) })) };
+}
+
+/* ===========================================================================
  * CREW CENTER ROUTES — the dashboard's "Discord bot" card
  * ======================================================================== */
 
@@ -1618,13 +1652,7 @@ function registerRoutes(app, { requireCap, resolveCrewVa }) {
     const publicGuild = (g) => ({
         guildId: g.guildId, name: g.guildName || '', linkedAt: g.linkedAt,
         linkedBy: (g.linkedBy && g.linkedBy.tag) || '',
-        settings: {
-            staffRole: !!(g.settings && g.settings.staffRoleId),
-            pilotRole: !!(g.settings && g.settings.pilotRoleId),
-            ticketChannel: !!(g.settings && g.settings.ticketChannelId),
-            eventsChannel: !!(g.settings && g.settings.eventsChannelId),
-            autoInvite: !!(g.settings && g.settings.autoInvite),
-        },
+        settings: guildSummary(g),
     });
 
     app.get('/api/crew/:slug/discord-bot', async (req, res) => {
@@ -1634,8 +1662,9 @@ function registerRoutes(app, { requireCap, resolveCrewVa }) {
             const guilds = await VaBotGuild.find({ vaId: ctx.va._id }).sort({ linkedAt: -1 }).limit(20).lean();
             res.set('Cache-Control', 'no-store');
             res.json({
-                available: !!(process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_CLIENT_ID),
+                available: botAvailable(),
                 inviteUrl: inviteUrl(),
+                guideUrl: GUIDE_URL(),
                 guilds: guilds.map(publicGuild),
             });
         } catch (err) { console.error('discord bot status error:', err); res.status(500).json({ error: 'Could not load the Discord bot status.' }); }
@@ -1674,7 +1703,7 @@ function registerRoutes(app, { requireCap, resolveCrewVa }) {
 }
 
 module.exports = {
-    configure, createVaBot, registerRoutes, hub, api, callerHeaders,
+    configure, createVaBot, registerRoutes, hub, api, callerHeaders, guideState, guildSummary, GUIDE_URL,
     botCallerFrom, botMay, BOT_CAPS,
     // Pure, for the tests.
     makeLinkCode, normalizeCode, hashCode, cid, parseCid, pageCount, pageQuestions,

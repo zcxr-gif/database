@@ -614,6 +614,30 @@ If the test fails, the note under the buttons now prints **the provider's own
 error** ("The … domain is not verified"), so it names the fix. Free-mail From
 addresses are called out explicitly.
 
+### 8B.8 The same bot in a VA's own server (`/crew`, `/crew-admin`)
+The bot also runs inside each VA's **own** Discord server, for that VA's
+recruitment — a different job from everything above, which happens in ours.
+A VA owner links their server from **Crew Dashboard → Settings → Alerts →
+Discord bot** (a one-time code) plus `/crew-admin setup` in their server. From
+then on their recruits apply through private ticket threads, staff send the
+entrance test and accept from the ticket, and the pilot reads their login from a
+button only they can see.
+
+What this means for us:
+- **Our server's commands stay ours.** The Inflight commands in this chapter are
+  registered to our server only; VA servers see only `/crew` and `/crew-admin`.
+  Set `DISCORD_HOME_GUILD_ID` on the deployment so the bot knows which server is
+  home. Our server cannot be linked to a VA.
+- **We do not configure it for them.** The owner's guide is public at
+  **`/discord-bot`** on the site (inflight.info/discord-bot): setup, permissions,
+  every command and the troubleshooting table. Point owners there first; when
+  they ask for help, ask what `/crew-admin check` says.
+- **It acts with recruitment rights only.** In a VA's server the bot can review
+  applications and send entrance tests for that one VA, and nothing else — no
+  roster edits, no settings, no other airline.
+- **Removing it is the owner's call.** They can unlink from the dashboard or with
+  `/crew-admin unlink`, or simply kick the bot; any of the three disconnects it.
+
 ---
 
 ## 8C. The Inflight VA Rep & VA Partnership Tickets
