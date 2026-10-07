@@ -4058,7 +4058,7 @@ pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
 // this file back. See announceToBoard there.
 registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign });
 // Crew Center → Alerts → Discord bot: link codes and linked servers.
-vaBot.registerRoutes(app, { requireCap, resolveCrewVa });
+vaBot.registerRoutes(app, { requireCap, resolveCrewVa, resolveCrewStore });
 
 // ---- Infinite Flight aircraft + livery reference ----
 // The crew center fleet builder lets a VA declare which aircraft/liveries they

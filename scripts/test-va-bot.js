@@ -251,10 +251,154 @@ async function hubNeverThrows() {
     check('one listener failing does not stop the next', reached);
 }
 
+/* ------------------------------------------------------------- welcome */
+{
+    const t = v.renderWelcome('Hi {user} — welcome to {server}, home of {AIRLINE}. You are #{members}. {nope}', { userId: '123456', server: 'Test HQ', airline: 'Test Air', members: 1234 });
+    check('placeholders are filled, case-insensitively', t === 'Hi <@123456> — welcome to Test HQ, home of Test Air. You are #1,234. {nope}', t);
+    check('no message means the default, which names the airline', /Test Air/.test(v.renderWelcome('', { airline: 'Test Air' })));
+    check('a welcome never exceeds Discord’s 2000', v.renderWelcome('{airline}'.repeat(200), { airline: 'x'.repeat(100) }).length <= 2000);
+}
+
+/* ---------------------------------------------------------- inactivity */
+{
+    const DAY = 24 * 3600 * 1000;
+    const now = Date.parse('2026-10-01T00:00:00Z');
+    const ago = (d) => new Date(now - d * DAY).toISOString();
+    const P = (id, o = {}) => ({ discordId: String(100000 + id), memberId: `m${id}`, status: 'active', staff: false, lastFlightAt: null, joinedAt: ago(400), ...o });
+
+    check('flew last week: active', !v.isDormant(P(1, { lastFlightAt: ago(7) }), now, 30));
+    check('flew 31 days ago: quiet', v.isDormant(P(1, { lastFlightAt: ago(31) }), now, 30));
+    check('never flew, joined 40 days ago: quiet', v.isDormant(P(1, { joinedAt: ago(40) }), now, 30));
+    check('never flew, joined 10 days ago: not yet', !v.isDormant(P(1, { joinedAt: ago(10) }), now, 30));
+    check('nothing to count from is not quiet', !v.isDormant(P(1, { joinedAt: null }), now, 30));
+    check('leave of absence is never quiet', !v.isDormant(P(1, { status: 'loa', lastFlightAt: ago(300) }), now, 30));
+    check('staff are never quiet', !v.isDormant(P(1, { staff: true, lastFlightAt: ago(300) }), now, 30));
+    check('roster says inactive, nothing else to go on: quiet', v.isDormant(P(1, { status: 'inactive', joinedAt: null }), now, 30));
+    check('…unless they flew yesterday — flying wins', !v.isDormant(P(1, { status: 'inactive', lastFlightAt: ago(1) }), now, 30));
+
+    const pilots = [
+        P(1, { lastFlightAt: ago(2) }),             // flying
+        P(2, { lastFlightAt: ago(45) }),            // newly quiet
+        P(3, { lastFlightAt: ago(90) }),            // flagged long ago, past kick
+        P(4, { lastFlightAt: ago(60) }),            // flagged, a week left
+        P(5, { lastFlightAt: ago(1) }),             // flagged, flew again
+        P(6, { lastFlightAt: ago(200), staff: true }),
+        P(7, { lastFlightAt: ago(35) }), P(7, { lastFlightAt: ago(35) }), // a duplicate row
+        { discordId: 'not-a-snowflake', lastFlightAt: ago(99) },
+    ];
+    const rec = (id, o) => ({ userId: String(100000 + id), status: 'inactive', ...o });
+    const flagged = [
+        rec(3, { since: ago(40), kickAt: ago(10) }),
+        rec(4, { since: ago(25), kickAt: new Date(now + 5 * DAY).toISOString() }),
+        rec(5, { since: ago(10), kickAt: new Date(now + 20 * DAY).toISOString() }),
+    ];
+    const ids = (l) => l.map((x) => x.pilot.discordId.slice(-1)).sort().join('');
+    let plan = v.activityPlan({ pilots, flagged, now, inactiveDays: 30, kickDays: 30 });
+    check('newly quiet pilots are flagged, longest-quiet first, once each', ids(plan.flag) === '27' && plan.flag[0].pilot.discordId.endsWith('2'), ids(plan.flag));
+    check('…each with a removal date a month out', plan.flag.every((f) => f.kickAt && f.kickAt.getTime() === now + 30 * DAY));
+    check('past the deadline: removed', ids(plan.kick) === '3', ids(plan.kick));
+    check('a week left: reminded', ids(plan.remind) === '4', ids(plan.remind));
+    check('flew since being flagged: welcomed back', ids(plan.restore) === '5', ids(plan.restore));
+    check('staff and bad ids are left alone', !JSON.stringify(plan).includes('100006') && !JSON.stringify(plan).includes('not-a-snowflake'));
+
+    plan = v.activityPlan({ pilots, flagged, now, inactiveDays: 30, kickDays: 0 });
+    check('with removal off, nobody is removed or reminded', !plan.kick.length && !plan.remind.length && plan.flag.every((f) => f.kickAt === null));
+    plan = v.activityPlan({ pilots, flagged: [rec(4, { since: ago(25), kickAt: new Date(now + 5 * DAY).toISOString(), remindedAt: ago(1) })], now, inactiveDays: 30, kickDays: 30 });
+    check('a reminder is sent once', !plan.remind.length);
+    plan = v.activityPlan({ pilots: [P(9, { lastFlightAt: ago(100) })], flagged: [rec(9, { status: 'kicked', since: ago(80) })], now, inactiveDays: 30, kickDays: 30 });
+    check('somebody already removed (and back) starts afresh', plan.flag.length === 1 && !plan.kick.length);
+}
+
+/* ----------------------------------------------------- who the bot sees */
+{
+    const now = Date.parse('2026-10-01T00:00:00Z');
+    const members = [
+        { _id: 'm1', name: 'Rae', callsign: 'TST001', status: 'active', createdAt: '2026-01-01' },
+        { _id: 'm2', name: 'Kai', callsign: 'TST002', status: 'active', role: 'Events manager' },
+        { _id: 'm3', name: 'Ola', callsign: 'TST003', status: 'loa', loaUntil: '2026-09-01' },
+        { _id: 'm4', name: 'Bo', callsign: 'TST004' },
+    ];
+    const accounts = [
+        { _id: 'a1', memberId: 'm1', discordId: '111111', role: 'pilot', active: true },
+        { _id: 'a2', memberId: 'm2', discordId: '222222', role: 'pilot', active: true },
+        { _id: 'a3', memberId: 'm3', discordId: '333333', role: 'pilot', active: true },
+        { _id: 'a4', memberId: 'm4', discordId: '', role: 'pilot', active: true },
+        { _id: 'a5', memberId: 'm1', discordId: '555555', role: 'pilot', active: false },
+        { _id: 'a6', memberId: 'gone', discordId: '666666', role: 'pilot', active: true },
+    ];
+    const pireps = [
+        { memberId: 'm1', status: 'approved', flownAt: '2026-09-20' },
+        { memberId: 'm1', status: 'pending', flownAt: '2026-09-30' },
+    ];
+    const out = v.linkedPilots({ accounts, members, pireps, now });
+    const by = Object.fromEntries(out.pilots.map((p) => [p.discordId, p]));
+    check('only active, linked logins with a roster row', Object.keys(by).sort().join(',') === '111111,222222,333333', Object.keys(by));
+    check('…and the unlinked are counted', out.unlinked === 1, out.unlinked);
+    check('the last APPROVED flight is what counts', by['111111'].lastFlightAt === new Date('2026-09-20').toISOString(), by['111111'].lastFlightAt);
+    check('a job title on the roster makes them staff', by['222222'].staff === true && by['111111'].staff === false);
+    check('a leave that has ended is over', by['333333'].status === 'active', by['333333'].status);
+}
+
+/* ------------------------------------------------------------- burst */
+{
+    const b = v.makeBurst(3, 1000);
+    const r = [0, 1, 2, 3].map((i) => b.over('g', 1000 + i));
+    check('a burst limit lets the first few through', r.join() === 'false,false,false,true', r);
+    check('…and resets once the window passes', b.over('g', 5000) === false);
+}
+
+/* ------------------------------------------------- the bot's own routes */
+async function botRoutes() {
+    const app = express();
+    app.use(express.json());
+    const updates = [];
+    const store = {
+        listAccounts: async () => [{ _id: 'a1', memberId: 'm1', discordId: '111111', active: true }],
+        listMembers: async () => [{ _id: 'm1', name: 'Rae', callsign: 'TST001', status: 'active' }],
+        listPireps: async () => [],
+        getAccountByDiscord: async (id) => (id === '111111' ? { _id: 'a1', memberId: 'm1', discordId: '111111', active: true } : id === '999999' ? { _id: 'aX', discordId: '999999', active: true } : null),
+        getMember: async () => ({ _id: 'm1', name: 'Rae', callsign: 'TST001', status: 'active' }),
+        getApplication: async (id) => ({ app1: { status: 'accepted', inviteAccountId: 'a2' }, app2: { status: 'pending' } }[id] || null),
+        getAccount: async (id) => (id === 'a2' ? { _id: 'a2', discordId: '', active: true } : null),
+        getAccountByUsername: async () => null,
+        updateAccount: async (id, patch) => { updates.push({ id, patch }); return {}; },
+    };
+    v.registerRoutes(app, {
+        requireCap: async () => ({ error: 403 }), resolveCrewVa: async () => null,
+        resolveCrewStore: async () => ({ va: {}, store }),
+    });
+    const server = http.createServer(app);
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    v.configure({ apiBase: `http://127.0.0.1:${server.address().port}` });
+    const bot = { asBot: true, slug: 'my-va' };
+
+    const anon = await v.api('get', '/api/crew/my-va/discord-bot/pilots');
+    check('nobody but the bot reads who is which Discord account', anon.status === 401, anon.status);
+    const wrong = await v.api('get', '/api/crew/my-va/discord-bot/pilots', { asBot: true, slug: 'other-va' });
+    check('…and the bot only for the airline it names', wrong.status === 401, wrong.status);
+    const list = await v.api('get', '/api/crew/my-va/discord-bot/pilots', bot);
+    check('the bot gets the linked pilots', list.ok && list.data.pilots.length === 1 && list.data.pilots[0].callsign === 'TST001', list.data);
+
+    const one = await v.api('get', '/api/crew/my-va/discord-bot/pilot/111111', bot);
+    check('a pilot is found by Discord id', one.ok && one.data.pilot && one.data.pilot.name === 'Rae', one.data);
+    const none = await v.api('get', '/api/crew/my-va/discord-bot/pilot/222222', bot);
+    check('…and nobody is nobody', none.ok && none.data.pilot === null);
+
+    const linked = await v.api('post', '/api/crew/my-va/discord-bot/link-pilot', { ...bot, body: { applicationId: 'app1', discordId: '123456', username: 'rae', avatar: 'a_' + 'b'.repeat(32) } });
+    check('accepting links the applicant’s Discord to their new login', linked.ok && linked.data.linked === true
+        && updates.length === 1 && updates[0].id === 'a2' && updates[0].patch.discordId === '123456', { data: linked.data, updates });
+    const pending = await v.api('post', '/api/crew/my-va/discord-bot/link-pilot', { ...bot, body: { applicationId: 'app2', discordId: '123456' } });
+    check('…never for an application that is not accepted', pending.ok && pending.data.linked === false && updates.length === 1);
+    const taken = await v.api('post', '/api/crew/my-va/discord-bot/link-pilot', { ...bot, body: { applicationId: 'app1', discordId: '999999' } });
+    check('…and never a Discord already on another login', taken.ok && taken.data.linked === false && taken.data.reason === 'taken' && updates.length === 1, taken.data);
+    server.close();
+}
+
 (async () => {
     await locksAndLimits();
     await principal();
     await hubNeverThrows();
+    await botRoutes();
     if (fails.length) {
         console.error(`✗ ${fails.length} failed, ${pass} passed`);
         fails.forEach((f) => console.error('  ✗ ' + f));

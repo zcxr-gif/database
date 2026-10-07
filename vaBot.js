@@ -18,7 +18,15 @@
  *     the ticket, and on a pass the crew center login is issued from there;
  *   * the pilot reads their login from a button only they can open;
  *   * the airline's links, stats, events and roster answer slash commands;
- *   * published events get a post and a discussion thread of their own.
+ *   * published events get a post and a discussion thread of their own;
+ *   * newcomers are welcomed, and a pilot who rejoins gets their role back;
+ *   * any member can open a help ticket (not only applicants), and a ticket
+ *     can be closed with a reason and reopened;
+ *   * a pilot whose Discord is linked to their crew center login is moved to
+ *     an inactive role when they stop flying, reminded kindly, and — only if
+ *     the airline switched it on — removed from the server a month later;
+ *   * a pilot accepted through a ticket has their Discord linked to their new
+ *     login automatically, and anyone else links with `/crew link`.
  *
  * THE ONE RULE: THE BOT IS A CLIENT OF THE CREW CENTER, NOT A COPY OF IT
  * ---------------------------------------------------------------------
@@ -58,6 +66,7 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const crewRetention = require('./crewRetention');
 const {
     SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
     ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder,
@@ -84,6 +93,27 @@ const TICKET_COOLDOWN_MS = 20 * 1000;
 const MAX_OPEN_TICKETS_PER_GUILD = 250;
 const THREAD_ARCHIVE_MIN = 10080; // a week: an application can sit over a weekend
 const EPHEMERAL = MessageFlags.Ephemeral;
+const DAY_MS = 24 * 3600 * 1000;
+
+/* Inactivity. A day count is a setting; these are the guard rails around it.
+ * The caps per sweep are what stop a bad afternoon in the crew center (a
+ * flight log that came back empty, say) from becoming a server-wide purge:
+ * the worst one sweep can do is a handful, and staff hear about each. */
+const INACTIVE_DAYS_DEFAULT = 30;
+const KICK_DAYS_DEFAULT = 30;
+const REMIND_BEFORE_DAYS = 7;
+const MAX_FLAG_PER_SWEEP = 25;
+const MAX_KICK_PER_SWEEP = 10;
+const SWEEP_EVERY_MS = 6 * 3600 * 1000;
+const SWEEP_FIRST_MS = 10 * 60 * 1000;
+
+/* Welcome. Past this many joins a minute in one server it is a raid or a
+ * mass import, not a crowd of people to greet one by one: roles are still
+ * given, the posts stop until it calms down. */
+const WELCOME_BURST = 8;
+const WELCOME_WINDOW_MS = 60 * 1000;
+const DEFAULT_WELCOME = 'Welcome aboard, {user}! 👋 We’re really glad you’re here at **{airline}**.\n\n'
+    + 'Want to fly with us? Press **Apply** below. Got a question about anything at all? **Contact staff** opens a private chat with the team.';
 
 /* ===========================================================================
  * THE BOT AS A CALLER OF THE CREW CENTER
@@ -175,6 +205,17 @@ const VaBotGuildSchema = new Schema({
         logChannelId: { type: String, default: '' },
         eventsChannelId: { type: String, default: '' },
         autoInvite: { type: Boolean, default: false },
+        // Welcome. A channel to greet people in, a role everyone gets on
+        // joining, the airline's own words, and whether to DM it too.
+        welcomeChannelId: { type: String, default: '' },
+        welcomeRoleId: { type: String, default: '' },
+        welcomeMessage: { type: String, default: '' },
+        welcomeDm: { type: Boolean, default: false },
+        // Inactivity. Off while inactiveRoleId is empty. kickDays 0 = never.
+        inactiveRoleId: { type: String, default: '' },
+        inactiveChannelId: { type: String, default: '' },
+        inactiveDays: { type: Number, default: INACTIVE_DAYS_DEFAULT },
+        kickDays: { type: Number, default: 0 },
     },
     // When the Apply panel was last posted — the setup guide's "done".
     panelAt: { type: Date, default: null },
@@ -200,6 +241,10 @@ const VaBotTicketSchema = new Schema({
     status: { type: String, enum: ['open', 'closed'], default: 'open' },
     stage: { type: String, default: 'form' }, // form | submitted | testing | accepted | declined
     applicationId: { type: String, default: '' },
+    // What a help ticket is about, as the member typed it.
+    topic: { type: String, default: '' },
+    closedBy: { type: String, default: '' },
+    closeReason: { type: String, default: '' },
     draft: {
         ifcName: { type: String, default: '' },
         callsignNumber: { type: String, default: '' },
@@ -222,11 +267,29 @@ const VaBotEventPostSchema = new Schema({
 }, { timestamps: true });
 VaBotEventPostSchema.index({ guildId: 1, eventId: 1 }, { unique: true });
 
+/* A pilot the bot has moved to the inactive role, and when it will act next.
+ * One per person per server. Deleted the moment they fly again. */
+const VaBotInactiveSchema = new Schema({
+    guildId: { type: String, required: true },
+    vaId: { type: Schema.Types.ObjectId, required: true },
+    userId: { type: String, required: true },
+    memberId: { type: String, default: '' },
+    status: { type: String, enum: ['inactive', 'kicked'], default: 'inactive' },
+    since: { type: Date, default: Date.now },
+    kickAt: { type: Date, default: null },
+    remindedAt: { type: Date, default: null },
+    // Whether they held the pilot role when it was taken, so it is only ever
+    // given back to somebody who had it.
+    hadPilotRole: { type: Boolean, default: false },
+}, { timestamps: true });
+VaBotInactiveSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+
 const model = (name, schema) => mongoose.models[name] || mongoose.model(name, schema);
 const VaBotGuild = model('VaBotGuild', VaBotGuildSchema);
 const VaBotLinkCode = model('VaBotLinkCode', VaBotLinkCodeSchema);
 const VaBotTicket = model('VaBotTicket', VaBotTicketSchema);
 const VaBotEventPost = model('VaBotEventPost', VaBotEventPostSchema);
+const VaBotInactive = model('VaBotInactive', VaBotInactiveSchema);
 
 /* ===========================================================================
  * PURE HELPERS — everything that decides something without Discord
@@ -369,6 +432,110 @@ function threadName(kind, username) {
     return `${kind === 'support' ? 'help' : 'apply'}-${who}`.slice(0, 90);
 }
 
+/**
+ * The airline's welcome text with its placeholders filled in.
+ * {user} mentions the newcomer, {name} is their display name, {server},
+ * {airline} and {members} are what they say. Anything else is left alone.
+ */
+function renderWelcome(template, vars = {}) {
+    const t = clean(template, 1500) || DEFAULT_WELCOME;
+    const map = {
+        user: vars.userId ? `<@${vars.userId}>` : clean(vars.name, 80) || 'there',
+        name: clean(vars.name, 80) || 'there',
+        server: clean(vars.server, 100) || 'the server',
+        airline: clean(vars.airline, 100) || 'the airline',
+        members: Number(vars.members) > 0 ? Number(vars.members).toLocaleString('en-US') : '',
+    };
+    return t.replace(/\{(user|name|server|airline|members)\}/gi, (_, k) => map[k.toLowerCase()]).slice(0, 2000);
+}
+
+const toTime = (d) => {
+    const t = d ? new Date(d).getTime() : NaN;
+    return Number.isFinite(t) ? t : 0;
+};
+const clampInt = (v, lo, hi, dflt) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt;
+};
+
+/**
+ * Has this pilot gone quiet, by this server's rule?
+ *
+ * Flying recently always wins — over a stale 'inactive' status on the roster
+ * too, or the bot would restore somebody and flag them again on the next
+ * sweep. Leave of absence and staff are never quiet: LOA is the roster saying
+ * "they told us they would be away", and the person running the events
+ * calendar may go a month without flying it.
+ */
+function isDormant(p, now, inactiveDays) {
+    if (!p || p.status === 'loa' || p.staff) return false;
+    const window = Math.max(1, inactiveDays) * DAY_MS;
+    const last = toTime(p.lastFlightAt);
+    if (last && now - last < window) return false;
+    if (p.status === 'inactive') return true;
+    const anchor = last || toTime(p.joinedAt);
+    // Nothing to count from is not a reason to call somebody inactive.
+    return !!anchor && now - anchor >= window;
+}
+
+/**
+ * Who to move to the inactive role, remind, remove, or welcome back.
+ *
+ * Pure: hand it the linked pilots (from the crew center) and the people
+ * already flagged in this server, and it answers four lists. Nothing is
+ * applied here, which is what lets the same function power both the sweep
+ * and the preview an owner reads before switching this on.
+ */
+function activityPlan({ pilots = [], flagged = [], now = Date.now(), inactiveDays = INACTIVE_DAYS_DEFAULT, kickDays = 0, remindDays = REMIND_BEFORE_DAYS } = {}) {
+    const out = { flag: [], remind: [], kick: [], restore: [] };
+    const records = new Map((flagged || []).filter((f) => f && f.status !== 'kicked').map((f) => [String(f.userId), f]));
+    const seen = new Set();
+    for (const p of pilots || []) {
+        const id = String((p && p.discordId) || '');
+        if (!isSnowflake(id) || seen.has(id)) continue;
+        seen.add(id);
+        const rec = records.get(id);
+        const dormant = isDormant(p, now, inactiveDays);
+        const last = toTime(p.lastFlightAt);
+        if (rec) {
+            const flewSince = last && last > toTime(rec.since);
+            if (!dormant || flewSince) { out.restore.push({ pilot: p, record: rec }); continue; }
+            const kickAt = toTime(rec.kickAt);
+            if (kickDays > 0 && kickAt) {
+                if (now >= kickAt) out.kick.push({ pilot: p, record: rec });
+                else if (!rec.remindedAt && kickAt - now <= remindDays * DAY_MS) out.remind.push({ pilot: p, record: rec, kickAt: new Date(kickAt) });
+            }
+            continue;
+        }
+        if (!dormant) continue;
+        const anchor = last || toTime(p.joinedAt);
+        out.flag.push({
+            pilot: p,
+            days: anchor ? Math.floor((now - anchor) / DAY_MS) : null,
+            neverFlown: !last,
+            kickAt: kickDays > 0 ? new Date(now + kickDays * DAY_MS) : null,
+        });
+    }
+    // Longest quiet first, so a capped sweep starts with the clearest cases.
+    out.flag.sort((a, b) => (b.days || 0) - (a.days || 0));
+    return out;
+}
+
+/** At most `limit` hits per key in `windowMs`. True once over the limit. */
+function makeBurst(limit, windowMs, max = 2000) {
+    const hits = new Map();
+    return {
+        over(key, now = Date.now()) {
+            const list = (hits.get(key) || []).filter((t) => now - t < windowMs);
+            list.push(now);
+            if (!hits.has(key) && hits.size >= max) hits.delete(hits.keys().next().value);
+            hits.set(key, list.slice(-limit - 1));
+            return list.length > limit;
+        },
+        size: () => hits.size,
+    };
+}
+
 /** Bounded per-key cooldowns. Swept, so a raid of clicks cannot grow it forever. */
 function makeCooldown(ms, max = 5000) {
     const seen = new Map();
@@ -473,8 +640,12 @@ function makeLimiter(max, { queueMax = 500, waitMs = 10000 } = {}) {
 const INVITE_PERMISSIONS = [
     'ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory',
     'CreatePublicThreads', 'CreatePrivateThreads', 'SendMessagesInThreads', 'ManageThreads',
-    // Giving an accepted pilot the airline's pilot role.
+    // Giving an accepted pilot the airline's pilot role, a newcomer the
+    // welcome role, and a quiet pilot the inactive one.
     'ManageRoles',
+    // Removing a pilot who stayed inactive — only ever when the airline set
+    // kick_after_days, and never more than a handful in one sweep.
+    'KickMembers',
     // Pinging a staff role that is not set to "anyone can mention". Every
     // message the bot sends restricts mentions to the one role and the one
     // applicant it means, so this never reaches @everyone.
@@ -496,6 +667,12 @@ const guildCache = makeCache(CACHE_TTL_MS);
 const GUIDE_URL = () => `${config.siteOrigin}/discord-bot`;
 
 const crewUrl = (slug) => `${config.siteOrigin}/crew/${encodeURIComponent(String(slug || '').toLowerCase())}`;
+
+/* Where a pilot links Discord to their login. Their own pilot page: it signs
+ * them in first if it has to, then starts the same Discord consent screen the
+ * Link button on that page does — the identity comes from Discord itself, so
+ * a link pasted to somebody else links nothing of the sender's. */
+const linkUrl = (slug) => `${config.siteOrigin}/crew-pilot.html?va=${encodeURIComponent(String(slug || '').toLowerCase())}&link=discord`;
 
 /* ===========================================================================
  * THE CREW CENTER, OVER LOOPBACK
@@ -595,7 +772,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     // One change at a time per ticket — see makeLocks.
     const ticketLocks = makeLocks();
     const eventLocks = makeLocks();
-    const MUTATING = new Set(['formsub', 'submit', 'test', 'testpick', 'accept', 'declinesub', 'close']);
+    const sweepLocks = makeLocks();
+    const joinBurst = makeBurst(WELCOME_BURST, WELCOME_WINDOW_MS);
+    const MUTATING = new Set(['formsub', 'submit', 'test', 'testpick', 'accept', 'declinesub', 'close', 'reopen']);
 
     /* ---- lookups ------------------------------------------------------- */
 
@@ -670,6 +849,21 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         catch (err) { console.warn('🤖 vaBot send failed:', err && err.message ? err.message : err); return null; }
     }
 
+    /** A direct message, best-effort: plenty of people keep DMs closed. */
+    async function dm(userId, payload) {
+        if (!isSnowflake(userId) || !client.users) return null;
+        const user = await client.users.fetch(userId).catch(() => null);
+        if (!user) return null;
+        try { return await user.send({ allowedMentions: { parse: [] }, ...payload }); } catch { return null; }
+    }
+
+    /** One of the airline's pilots, by Discord id, from the crew center. */
+    async function pilotByDiscord(va, userId) {
+        if (!isSnowflake(userId)) return null;
+        const r = await api('get', crewPath(va.slug, `/discord-bot/pilot/${userId}`), { asBot: true, slug: va.slug, actor: 'Discord bot' });
+        return r.ok && r.data.pilot ? r.data.pilot : null;
+    }
+
     async function logToStaff(settings, text) {
         const ch = await fetchChannel(settings && settings.logChannelId);
         if (ch) await send(ch, { content: String(text).slice(0, 1900), allowedMentions: { parse: [] } });
@@ -683,7 +877,12 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const crew = new SlashCommandBuilder().setName('crew').setDescription('Your virtual airline')
             .setDMPermission(false)
             .addSubcommand((s) => s.setName('apply').setDescription('Apply to join — opens a private ticket with the staff'))
-            .addSubcommand((s) => s.setName('ticket').setDescription('Open a private ticket with the staff'))
+            .addSubcommand((s) => s.setName('ticket').setDescription('Open a private help ticket with the staff'))
+            .addSubcommand((s) => s.setName('close').setDescription('Close the ticket you are in')
+                .addStringOption((o) => o.setName('reason').setDescription('Why (shown to the member)').setMaxLength(300)))
+            .addSubcommand((s) => s.setName('add').setDescription('Staff: add someone to the ticket you are in')
+                .addUserOption((o) => o.setName('member').setDescription('Who to add').setRequired(true)))
+            .addSubcommand((s) => s.setName('link').setDescription('Link your Discord to your crew center login'))
             .addSubcommand((s) => s.setName('links').setDescription('The airline’s links'))
             .addSubcommand((s) => s.setName('stats').setDescription('Pilots, hours and flights'))
             .addSubcommand((s) => s.setName('events').setDescription('Upcoming events'))
@@ -702,8 +901,25 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 .addChannelOption((o) => o.setName('log_channel').setDescription('Where staff hear about tickets').addChannelTypes(ChannelType.GuildText))
                 .addChannelOption((o) => o.setName('events_channel').setDescription('Where events are posted, each with a thread').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
                 .addBooleanOption((o) => o.setName('auto_invite').setDescription('Accept and send the crew center login as soon as the entrance test is passed')))
-            .addSubcommand((s) => s.setName('panel').setDescription('Post the recruitment panel')
-                .addChannelOption((o) => o.setName('channel').setDescription('Where to post it (default: here)').addChannelTypes(ChannelType.GuildText)))
+            .addSubcommand((s) => s.setName('welcome').setDescription('Greet people who join the server')
+                .addChannelOption((o) => o.setName('channel').setDescription('Where to post the welcome').addChannelTypes(ChannelType.GuildText))
+                .addRoleOption((o) => o.setName('role').setDescription('A role everyone gets on joining'))
+                .addStringOption((o) => o.setName('message').setDescription('Your words. {user} {name} {server} {airline} {members}').setMaxLength(1500))
+                .addBooleanOption((o) => o.setName('dm').setDescription('Also send the welcome by DM'))
+                .addBooleanOption((o) => o.setName('test').setDescription('Post a sample welcome for you now'))
+                .addBooleanOption((o) => o.setName('off').setDescription('Turn the welcome off')))
+            .addSubcommand((s) => s.setName('inactivity').setDescription('Move pilots who stop flying to an inactive role')
+                .addRoleOption((o) => o.setName('role').setDescription('The inactive role'))
+                .addChannelOption((o) => o.setName('channel').setDescription('Where inactive pilots are told how to stay').addChannelTypes(ChannelType.GuildText))
+                .addIntegerOption((o) => o.setName('after_days').setDescription('Days without a flight before a pilot is inactive (default 30)').setMinValue(7).setMaxValue(365))
+                .addIntegerOption((o) => o.setName('kick_after_days').setDescription('Days in the inactive role before removal (0 = never)').setMinValue(0).setMaxValue(180))
+                .addBooleanOption((o) => o.setName('off').setDescription('Turn inactivity tracking off')))
+            .addSubcommand((s) => s.setName('sweep').setDescription('See who is inactive now — or apply it straight away')
+                .addBooleanOption((o) => o.setName('apply').setDescription('Make the changes now instead of only showing them')))
+            .addSubcommand((s) => s.setName('panel').setDescription('Post the recruitment or help panel')
+                .addChannelOption((o) => o.setName('channel').setDescription('Where to post it (default: here)').addChannelTypes(ChannelType.GuildText))
+                .addStringOption((o) => o.setName('type').setDescription('Which panel (default: recruitment)')
+                    .addChoices({ name: 'Recruitment — apply and contact staff', value: 'apply' }, { name: 'Help — open a support ticket', value: 'support' })))
             .addSubcommand((s) => s.setName('check').setDescription('Check the bot has everything it needs'))
             .addSubcommand((s) => s.setName('unlink').setDescription('Disconnect this server from the crew center'));
 
@@ -750,8 +966,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             '',
             'Next:',
             '1. `/crew-admin settings` — pick your staff role, pilot role, ticket channel and events channel.',
-            '2. `/crew-admin panel` in your recruitment channel.',
-            '3. `/crew-admin check` to make sure the bot has the permissions it needs.',
+            '2. `/crew-admin panel` in your recruitment channel (and `type: Help` wherever members ask for help).',
+            '3. `/crew-admin welcome` — greet newcomers. `/crew-admin inactivity` — look after pilots who stop flying.',
+            '4. `/crew-admin check` to make sure the bot has the permissions it needs.',
             '',
             `The full setup guide: ${GUIDE_URL()}`,
         ].join('\n'));
@@ -787,6 +1004,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             { name: 'Ticket channel', value: show(s.ticketChannelId), inline: true },
             { name: 'Log channel', value: show(s.logChannelId), inline: true },
             { name: 'Events channel', value: show(s.eventsChannelId), inline: true },
+            { name: 'Welcome', value: welcomeSummary(s), inline: false },
+            { name: 'Inactivity', value: inactivitySummary(s), inline: false },
         );
         return interaction.reply({ embeds: [e], flags: EPHEMERAL, allowedMentions: { parse: [] } });
     }
@@ -795,6 +1014,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const channel = interaction.options.getChannel('channel') || interaction.channel;
         if (!channel || channel.type !== ChannelType.GuildText) return say(interaction, 'Post the panel in an ordinary text channel.');
         await interaction.deferReply({ flags: EPHEMERAL });
+        if (interaction.options.getString('type') === 'support') return postHelpPanel(interaction, ctx, channel);
         const join = await joinConfig(ctx.va) || {};
         const reqs = describeRequirements(join);
         const e = vaEmbed(ctx.va)
@@ -817,6 +1037,153 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!posted) return say(interaction, `I could not post in ${channel}. Give me **View Channel**, **Send Messages** and **Embed Links** there.`);
         await VaBotGuild.updateOne({ guildId: interaction.guildId }, { $set: { panelAt: new Date() } }).catch(() => {});
         return say(interaction, `Panel posted in ${channel}.${ctx.settings.ticketChannelId ? '' : ' Tickets will open as threads in that channel — set a different one with `/crew-admin settings ticket_channel`.'}`);
+    }
+
+    /** The help panel: a ticket for anything, not only joining. */
+    async function postHelpPanel(interaction, ctx, channel) {
+        const e = vaEmbed(ctx.va)
+            .setTitle('Need a hand? 🎫')
+            .setDescription([
+                `Questions about ${clean(ctx.va.name, 100)}, the crew center, a flight, an event — or anything else?`,
+                'Press **Open a ticket**. A private thread opens that only you and the staff can see, and someone will be with you shortly.',
+            ].join('\n\n'));
+        const posted = await send(channel, {
+            embeds: [e],
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(cid('open', 'support')).setLabel('Open a ticket').setStyle(ButtonStyle.Primary).setEmoji('🎫'),
+                new ButtonBuilder().setCustomId(cid('link')).setLabel('Link my account').setStyle(ButtonStyle.Secondary).setEmoji('🔗'),
+                new ButtonBuilder().setURL(crewUrl(ctx.va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link),
+            )],
+        });
+        if (!posted) return say(interaction, `I could not post in ${channel}. Give me **View Channel**, **Send Messages** and **Embed Links** there.`);
+        return say(interaction, `Help panel posted in ${channel}.`);
+    }
+
+    const welcomeSummary = (s) => (s.welcomeChannelId || s.welcomeRoleId || s.welcomeDm
+        ? [s.welcomeChannelId ? `posts in <#${s.welcomeChannelId}>` : '', s.welcomeRoleId ? `gives <@&${s.welcomeRoleId}>` : '',
+            s.welcomeDm ? 'sends a DM' : '', s.welcomeMessage ? 'your own message' : 'the default message'].filter(Boolean).join(' · ')
+        : 'Off — `/crew-admin welcome`');
+    const inactivitySummary = (s) => (s.inactiveRoleId
+        ? [`<@&${s.inactiveRoleId}> after ${s.inactiveDays || INACTIVE_DAYS_DEFAULT} days without a flight`,
+            s.inactiveChannelId ? `told how to stay in <#${s.inactiveChannelId}>` : 'told by DM',
+            s.kickDays > 0 ? `removed after ${s.kickDays} more days` : 'never removed'].join(' · ')
+        : 'Off — `/crew-admin inactivity`');
+
+    /** A role the bot is about to hand out: one it is allowed to. */
+    function roleRefusal(role, guildId) {
+        if (!role) return '';
+        if (role.managed || role.id === guildId) return `${role} belongs to an integration or is @everyone — pick an ordinary role.`;
+        return '';
+    }
+
+    async function adminWelcome(interaction, ctx) {
+        const set = {};
+        if (interaction.options.getBoolean('off')) {
+            Object.assign(set, { 'settings.welcomeChannelId': '', 'settings.welcomeRoleId': '', 'settings.welcomeDm': false });
+        } else {
+            const ch = interaction.options.getChannel('channel');
+            const role = interaction.options.getRole('role');
+            const msg = interaction.options.getString('message');
+            const dm = interaction.options.getBoolean('dm');
+            const refused = roleRefusal(role, interaction.guildId);
+            if (refused) return say(interaction, refused);
+            if (ch) set['settings.welcomeChannelId'] = ch.id;
+            if (role) set['settings.welcomeRoleId'] = role.id;
+            if (msg !== null) set['settings.welcomeMessage'] = clean(msg, 1500).replace(/\\n/g, '\n');
+            if (dm !== null) set['settings.welcomeDm'] = dm;
+        }
+        let s = ctx.settings;
+        if (Object.keys(set).length) {
+            const doc = await VaBotGuild.findOneAndUpdate({ guildId: interaction.guildId }, { $set: set }, { new: true }).lean();
+            guildCache.del(interaction.guildId);
+            s = (doc && doc.settings) || s;
+        }
+        if (interaction.options.getBoolean('test')) {
+            await interaction.deferReply({ flags: EPHEMERAL });
+            const member = interaction.member && interaction.member.user ? interaction.member : { user: interaction.user, guild: interaction.guild };
+            const where = await fetchChannel(s.welcomeChannelId);
+            const payload = welcomePayload(ctx.va, s, { member, guild: interaction.guild, pilot: null });
+            const posted = where ? await send(where, payload) : null;
+            return say(interaction, posted ? `Sample posted in ${where}. ${welcomeSummary(s)}` : `${where ? `I could not post in ${where} — check my permissions there.` : 'Pick a channel first: `/crew-admin welcome channel:`.'}`,
+                { allowedMentions: { parse: [] } });
+        }
+        return say(interaction, `**Welcome:** ${welcomeSummary(s)}\n\nPreview of your message:\n>>> ${renderWelcome(s.welcomeMessage, { name: interaction.user.username, server: interaction.guild && interaction.guild.name, airline: ctx.va.name })}`,
+            { allowedMentions: { parse: [] } });
+    }
+
+    async function adminInactivity(interaction, ctx) {
+        const set = {};
+        if (interaction.options.getBoolean('off')) {
+            set['settings.inactiveRoleId'] = '';
+        } else {
+            const role = interaction.options.getRole('role');
+            const ch = interaction.options.getChannel('channel');
+            const after = interaction.options.getInteger ? interaction.options.getInteger('after_days') : null;
+            const kick = interaction.options.getInteger ? interaction.options.getInteger('kick_after_days') : null;
+            const refused = roleRefusal(role, interaction.guildId);
+            if (refused) return say(interaction, refused);
+            if (role && (role.id === ctx.settings.pilotRoleId || role.id === ctx.settings.staffRoleId)) {
+                return say(interaction, 'The inactive role has to be its own role — not the pilot role or the staff role.');
+            }
+            if (role) set['settings.inactiveRoleId'] = role.id;
+            if (ch) set['settings.inactiveChannelId'] = ch.id;
+            if (after !== null && after !== undefined) set['settings.inactiveDays'] = clampInt(after, 7, 365, INACTIVE_DAYS_DEFAULT);
+            if (kick !== null && kick !== undefined) set['settings.kickDays'] = clampInt(kick, 0, 180, 0);
+        }
+        let s = ctx.settings;
+        if (Object.keys(set).length) {
+            const doc = await VaBotGuild.findOneAndUpdate({ guildId: interaction.guildId }, { $set: set }, { new: true }).lean();
+            guildCache.del(interaction.guildId);
+            s = (doc && doc.settings) || s;
+        }
+        // A new removal deadline applies to people already inactive too — but
+        // never sooner than a reminder's worth of notice from today, so
+        // switching removal on can never remove anybody without warning.
+        if ('settings.kickDays' in set) {
+            const now = Date.now();
+            const days = set['settings.kickDays'];
+            const recs = await VaBotInactive.find({ guildId: interaction.guildId, status: 'inactive' }).limit(2000).lean().catch(() => []);
+            for (const r of recs) {
+                const kickAt = days > 0 ? new Date(Math.max(toTime(r.since) + days * DAY_MS, now + (REMIND_BEFORE_DAYS + 1) * DAY_MS)) : null;
+                await VaBotInactive.updateOne({ _id: r._id }, { $set: { kickAt, remindedAt: null } }).catch(() => {});
+            }
+        }
+        const lines = [`**Inactivity:** ${inactivitySummary(s)}`];
+        if (!s.inactiveRoleId && set['settings.inactiveRoleId'] === '') {
+            lines.push('', 'Anyone already in the inactive role keeps it until you remove it — turn this back on and they’ll be restored as soon as they fly.');
+        }
+        if (s.inactiveRoleId) {
+            lines.push('',
+                'How it works:',
+                `• Every few hours I check the crew center. A pilot whose Discord is linked and who has not flown for ${s.inactiveDays || INACTIVE_DAYS_DEFAULT} days gets <@&${s.inactiveRoleId}>${s.pilotRoleId ? ` instead of <@&${s.pilotRoleId}>` : ''}, and a friendly note on how to stay.`,
+                '• The moment they fly a route and it is approved, the role is swapped back and they get a welcome-back message.',
+                s.kickDays > 0 ? `• If they still have not flown ${s.kickDays} days later, they get a kind goodbye and are removed from the server (a reminder goes out ${REMIND_BEFORE_DAYS} days before).` : '• Nobody is ever removed. Set `kick_after_days` to change that.',
+                '• Pilots on leave of absence and staff are never touched.',
+                '',
+                'Run `/crew-admin sweep` to see who that is right now before anything happens.');
+        }
+        return say(interaction, lines.join('\n'), { allowedMentions: { parse: [] } });
+    }
+
+    async function adminSweep(interaction, ctx) {
+        if (!ctx.settings.inactiveRoleId) return say(interaction, 'Inactivity is off. Turn it on with `/crew-admin inactivity role:`.');
+        await interaction.deferReply({ flags: EPHEMERAL });
+        const apply = interaction.options.getBoolean('apply') === true;
+        if (sweepLocks.busy(interaction.guildId)) return say(interaction, 'A sweep is already running here — give it a moment.');
+        const out = await sweepLocks.run(interaction.guildId, () => sweepGuild(ctx.link, { apply }));
+        if (out.skipped) return say(interaction, `Nothing done: ${out.skipped}`);
+        const names = (list) => list.slice(0, 15).map((x) => `<@${x.pilot.discordId}>${x.pilot.callsign ? ` (${clean(x.pilot.callsign, 20)})` : ''}`).join(', ') + (list.length > 15 ? ` and ${list.length - 15} more` : '');
+        const p = out.plan;
+        const lines = [apply ? '**Sweep done.**' : '**Preview — nothing has changed yet.** Run `/crew-admin sweep apply:True` to do it now, or wait: it runs by itself every few hours.',
+            `Checked ${out.checked} pilot${out.checked === 1 ? '' : 's'} with a linked Discord.`, ''];
+        lines.push(p.flag.length ? `💤 Moved to inactive: ${names(p.flag)}` : '💤 Nobody new is inactive.');
+        if (p.remind.length) lines.push(`⏰ Reminded: ${names(p.remind)}`);
+        if (p.kick.length) lines.push(`👋 Removed from the server: ${names(p.kick)}`);
+        if (p.restore.length) lines.push(`✈️ Welcomed back: ${names(p.restore)}`);
+        if (out.capped) lines.push('', `Only the first ${MAX_FLAG_PER_SWEEP} new and ${MAX_KICK_PER_SWEEP} removals happen per sweep — the rest follow on the next one.`);
+        if (out.unlinked) lines.push('', `${out.unlinked} pilot${out.unlinked === 1 ? ' has' : 's have'} not linked Discord yet, so I cannot tell who they are here. \`/crew link\` takes them ten seconds.`);
+        if (out.errors && out.errors.length) lines.push('', `⚠️ ${out.errors.slice(0, 5).join('\n⚠️ ')}`);
+        return say(interaction, lines.join('\n'), { allowedMentions: { parse: [] } });
     }
 
     /** What the bot can and cannot do here, in words an owner can act on. */
@@ -853,6 +1220,26 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             else if (me.roles.highest.comparePositionTo(role) <= 0) lines.push(`❌ Pilot role ${role}: drag my role above it in Server Settings → Roles`);
             else lines.push(`✅ Pilot role ${role}`);
         } else lines.push('⚪ Pilot role: not set — accepted pilots get no role');
+
+        const giveable = async (id, label) => {
+            const role = await guild.roles.fetch(id).catch(() => null);
+            if (!role) return `❌ ${label}: deleted — pick another`;
+            if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) return `❌ ${label}: I need **Manage Roles** to give it out`;
+            if (me.roles.highest.comparePositionTo(role) <= 0) return `❌ ${label} ${role}: drag my role above it in Server Settings → Roles`;
+            return `✅ ${label} ${role}`;
+        };
+        if (s.welcomeChannelId) need(await fetchChannel(s.welcomeChannelId), ['ViewChannel', 'SendMessages', 'EmbedLinks'], 'Welcome channel');
+        if (s.welcomeRoleId) lines.push(await giveable(s.welcomeRoleId, 'Welcome role'));
+        if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm) lines.push('⚪ Welcome: off — `/crew-admin welcome`');
+        if (s.inactiveRoleId) {
+            lines.push(await giveable(s.inactiveRoleId, 'Inactive role'));
+            if (s.inactiveChannelId) need(await fetchChannel(s.inactiveChannelId), ['ViewChannel', 'SendMessages', 'EmbedLinks'], 'Inactive channel');
+            if (s.kickDays > 0) {
+                lines.push(me.permissions.has(PermissionsBitField.Flags.KickMembers)
+                    ? `✅ Removing pilots inactive for ${s.kickDays} more days`
+                    : '❌ Removal is on, but I need **Kick Members** — or set `kick_after_days:0`');
+            }
+        } else lines.push('⚪ Inactivity: off — `/crew-admin inactivity`');
 
         const join = await joinConfig(ctx.va);
         lines.push(join ? `✅ Crew center **${ctx.va.name}** is answering` : '❌ The crew center did not answer');
@@ -949,20 +1336,48 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
      * TICKETS
      * ================================================================ */
 
-    async function openTicket(interaction, ctx, kind) {
+    /** The open ticket of this kind for this person, if its thread is still there. */
+    async function openTicketOf(interaction, kind) {
+        const prior = await VaBotTicket.findOne({ guildId: interaction.guildId, userId: interaction.user.id, kind, status: 'open' });
+        if (!prior) return null;
+        const thread = await fetchChannel(prior.threadId);
+        if (thread) return { ticket: prior, thread };
+        prior.status = 'closed'; prior.closedAt = new Date();
+        await prior.save().catch(() => {});
+        return null;
+    }
+
+    /**
+     * A help ticket starts with two questions — what about, and anything
+     * else — so the staff who pick it up know where to start without a round
+     * of "hi, what's up?". A modal has to be the first answer to the click,
+     * so the checks before it are the cheap ones.
+     */
+    async function askSupport(interaction, ctx, preset) {
+        const open = await openTicketOf(interaction, 'support');
+        if (open) return say(interaction, `You already have a ticket open: ${open.thread}`);
+        const subject = new TextInputBuilder().setCustomId('topic').setLabel('What do you need help with?')
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100)
+            .setPlaceholder('e.g. Can’t sign in, question about a route, event idea…');
+        if (preset === 'loa') subject.setValue('Leave of absence');
+        const details = new TextInputBuilder().setCustomId('details').setLabel('Anything the staff should know? (optional)')
+            .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1500);
+        if (preset === 'loa') details.setPlaceholder('How long you’ll be away, and anything else you’d like the team to know.');
+        const modal = new ModalBuilder().setCustomId(cid('opensub', 'support'))
+            .setTitle(`Contact ${clean(ctx.va.name, 30)} staff`.slice(0, 45))
+            .addComponents(new ActionRowBuilder().addComponents(subject), new ActionRowBuilder().addComponents(details));
+        return interaction.showModal(modal);
+    }
+
+    async function openTicket(interaction, ctx, kind, { topic = '', details = '' } = {}) {
         const wait = ticketCooldown.hit(`${interaction.guildId}:${interaction.user.id}`);
         if (wait) return say(interaction, `Give it ${wait}s before opening another ticket.`);
         await interaction.deferReply({ flags: EPHEMERAL });
 
         // One open ticket of each kind per person. A second click points at the
         // first, unless that thread has gone, in which case the record is closed.
-        const prior = await VaBotTicket.findOne({ guildId: interaction.guildId, userId: interaction.user.id, kind, status: 'open' });
-        if (prior) {
-            const thread = await fetchChannel(prior.threadId);
-            if (thread) return say(interaction, `You already have a ticket open: ${thread}`);
-            prior.status = 'closed'; prior.closedAt = new Date();
-            await prior.save().catch(() => {});
-        }
+        const prior = await openTicketOf(interaction, kind);
+        if (prior) return say(interaction, `You already have a ticket open: ${prior.thread}`);
         const open = await VaBotTicket.countDocuments({ guildId: interaction.guildId, status: 'open' });
         if (open >= MAX_OPEN_TICKETS_PER_GUILD) return say(interaction, 'The staff have a lot of tickets open right now. Try again later.');
 
@@ -996,6 +1411,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             guildId: interaction.guildId, vaId: ctx.va._id, threadId: thread.id,
             userId: interaction.user.id, userTag: interaction.user.tag || interaction.user.username, kind,
             stage: kind === 'apply' ? 'form' : 'support',
+            topic: clean(topic, 100),
         });
 
         const staff = ctx.settings.staffRoleId;
@@ -1018,16 +1434,22 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 allowedMentions: { users: [interaction.user.id] },
             });
         } else {
+            const e = vaEmbed(ctx.va).setTitle(`🎫 ${clean(topic, 100) || 'Help'}`.slice(0, 256)).setDescription([
+                `Hi ${interaction.user}, thanks for reaching out! This thread is private — only you and the ${clean(ctx.va.name, 100)} staff can see it.`,
+                'Someone from the team will be with you shortly. While you wait, add anything that helps: screenshots, your callsign, a link.',
+            ].join('\n\n'));
+            if (clean(details, 1500)) e.addFields({ name: 'Details', value: clean(details, 1024) });
+            e.setFooter({ text: 'Sorted? Press Close ticket — you can reopen it if you need to.' });
             await send(thread, {
                 content: `${interaction.user}${staff ? ` <@&${staff}>` : ''}`,
-                embeds: [vaEmbed(ctx.va).setTitle('Ticket').setDescription('Tell the staff what you need — someone will be with you shortly.')],
+                embeds: [e],
                 components: [new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close ticket').setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close ticket').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
                 )],
                 allowedMentions: { users: [interaction.user.id], roles: staff ? [staff] : [] },
             });
         }
-        logToStaff(ctx.settings, `🎫 ${kind === 'apply' ? 'Application' : 'Support'} ticket opened by <@${interaction.user.id}>: ${thread}`).catch(() => {});
+        logToStaff(ctx.settings, `🎫 ${kind === 'apply' ? 'Application' : `Help ticket “${clean(topic, 100) || 'Help'}”`} opened by <@${interaction.user.id}>: ${thread}`).catch(() => {});
         return say(interaction, `Your ticket is open: ${thread}`);
     }
 
@@ -1267,13 +1689,27 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         // staff, not a reason the acceptance did not happen.
         let roleNote = '';
         const guild = client.guilds.cache.get(ticket.guildId);
-        if (ctx.settings.pilotRoleId && guild) {
-            const member = await guild.members.fetch(ticket.userId).catch(() => null);
-            if (member) {
-                await member.roles.add(ctx.settings.pilotRoleId, `Accepted into ${ctx.va.name}`)
-                    .catch(() => { roleNote = ' I could not give them the pilot role — run `/crew-admin check`.'; });
-            }
+        const member = guild ? await guild.members.fetch(ticket.userId).catch(() => null) : null;
+        if (ctx.settings.pilotRoleId && member) {
+            await member.roles.add(ctx.settings.pilotRoleId, `Accepted into ${ctx.va.name}`)
+                .catch(() => { roleNote = ' I could not give them the pilot role — run `/crew-admin check`.'; });
         }
+
+        // Their Discord, linked to the login just made for them. The bot is the
+        // one party that knows both halves for certain: the application came
+        // from this Discord account, and the crew center just said which login
+        // it produced. So a pilot who joined here never has to link anything —
+        // "Sign in with Discord" simply works the first time they try it.
+        const user = (member && member.user) || (interaction && interaction.user && interaction.user.id === ticket.userId ? interaction.user : null);
+        const linked = await api('post', crewPath(ctx.va.slug, '/discord-bot/link-pilot'), {
+            asBot: true, slug: ctx.va.slug, actor,
+            body: {
+                applicationId: ticket.applicationId, discordId: ticket.userId,
+                username: clean((user && (user.globalName || user.username)) || ticket.userTag, 40),
+                avatar: clean(user && user.avatar, 64),
+            },
+        });
+        const discordLinked = !!(linked.ok && linked.data.linked);
 
         const account = r.data.account || null;
         const thread = await fetchChannel(ticket.threadId);
@@ -1283,7 +1719,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             hasLogin
                 ? 'Press **Show my login** — only you can see it. You’ll choose your own password the first time you sign in.'
                 : (account && account.error) || 'Your crew center login will follow from the staff.',
-        ].join('\n\n'));
+            discordLinked ? '🔗 Your Discord is already linked to your crew center account, so next time you can just press **Sign in with Discord**.' : '',
+        ].filter(Boolean).join('\n\n'));
         const buttons = [];
         if (hasLogin) buttons.push(new ButtonBuilder().setCustomId(cid('login', ticket._id)).setLabel('Show my login').setStyle(ButtonStyle.Success).setEmoji('🔑'));
         buttons.push(new ButtonBuilder().setURL(r.data.signInUrl && isHttpUrl(r.data.signInUrl) ? r.data.signInUrl : crewUrl(ctx.va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link));
@@ -1374,21 +1811,101 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 
     /* ---- close --------------------------------------------------------- */
 
-    async function closeTicket(interaction, ctx, ticket) {
+    async function closeTicket(interaction, ctx, ticket, reason = '') {
         if (!isOwner(interaction, ticket) && !isStaff(interaction, ctx.settings)) return say(interaction, 'Only the ticket’s owner or staff can close it.');
         if (ticket.status === 'closed') return say(interaction, 'This ticket is already closed.');
-        await interaction.deferReply({ flags: EPHEMERAL });
+        if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: EPHEMERAL });
+        const why = clean(reason, 300);
         ticket.status = 'closed';
         ticket.closedAt = new Date();
+        ticket.closedBy = interaction.user.id;
+        ticket.closeReason = why;
         await ticket.save();
         const thread = await fetchChannel(ticket.threadId);
         if (thread) {
-            await send(thread, { content: `🔒 Closed by ${interaction.user}.`, allowedMentions: { parse: [] } });
+            const e = vaEmbed(ctx.va).setColor(0x6E685D).setTitle('🔒 Ticket closed').setDescription([
+                `Closed by ${interaction.user}.${why ? `\n**Reason:** ${why}` : ''}`,
+                'Thanks for getting in touch! If there’s anything else, press **Reopen** — or open a new ticket any time.',
+            ].join('\n\n'));
+            await send(thread, {
+                embeds: [e],
+                components: [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(cid('reopen', ticket._id)).setLabel('Reopen').setStyle(ButtonStyle.Secondary).setEmoji('🔓'),
+                )],
+                allowedMentions: { parse: [] },
+            });
             await thread.setLocked(true).catch(() => {});
             await thread.setArchived(true).catch(() => {});
         }
-        logToStaff(ctx.settings, `🔒 Ticket for <@${ticket.userId}> closed by ${interaction.user}.`).catch(() => {});
+        // Closed by somebody else: a short, kind note, so a ticket never just
+        // vanishes from their list without a word.
+        if (!isOwner(interaction, ticket)) {
+            dm(ticket.userId, {
+                embeds: [vaEmbed(ctx.va).setTitle('Your ticket was closed').setDescription([
+                    `Your ${ticket.kind === 'apply' ? 'application' : 'help'} ticket${ticket.topic ? ` “${clean(ticket.topic, 100)}”` : ''} in **${clean(interaction.guild && interaction.guild.name, 100) || ctx.va.name}** was closed by the staff.`,
+                    why ? `**Reason:** ${why}` : '',
+                    'Thanks for reaching out — if you still need a hand, you can reopen it from the thread or open a new one any time.',
+                ].filter(Boolean).join('\n\n'))],
+            }).catch(() => {});
+        }
+        logToStaff(ctx.settings, `🔒 Ticket for <@${ticket.userId}> closed by ${interaction.user}${why ? ` — ${why}` : ''}.`).catch(() => {});
         return say(interaction, 'Closed.');
+    }
+
+    async function reopenTicket(interaction, ctx, ticket) {
+        if (!isOwner(interaction, ticket) && !isStaff(interaction, ctx.settings)) return say(interaction, 'Only the ticket’s owner or staff can reopen it.');
+        if (ticket.status !== 'closed') return say(interaction, 'This ticket is already open.');
+        await interaction.deferReply({ flags: EPHEMERAL });
+        const thread = await fetchChannel(ticket.threadId);
+        if (!thread) return say(interaction, 'That thread is gone — open a new ticket instead.');
+        const other = await VaBotTicket.findOne({ guildId: ticket.guildId, userId: ticket.userId, kind: ticket.kind, status: 'open' });
+        if (other && String(other._id) !== String(ticket._id)) return say(interaction, `There is already another ticket open for them: <#${other.threadId}>`);
+        await thread.setArchived(false).catch(() => {});
+        await thread.setLocked(false).catch(() => {});
+        ticket.status = 'open';
+        ticket.closedAt = null;
+        await ticket.save();
+        const staff = ctx.settings.staffRoleId;
+        const byOwner = isOwner(interaction, ticket);
+        await send(thread, {
+            content: `🔓 Reopened by ${interaction.user}.${byOwner && staff ? ` <@&${staff}>` : ''}`,
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close ticket').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
+            )],
+            allowedMentions: { roles: byOwner && staff ? [staff] : [] },
+        });
+        logToStaff(ctx.settings, `🔓 Ticket for <@${ticket.userId}> reopened by ${interaction.user}: ${thread}`).catch(() => {});
+        return say(interaction, 'Reopened.');
+    }
+
+    /** The ticket whose thread this command was typed in. */
+    async function ticketHere(interaction) {
+        if (!isSnowflake(interaction.channelId)) return null;
+        return VaBotTicket.findOne({ guildId: interaction.guildId, threadId: interaction.channelId });
+    }
+
+    async function closeCommand(interaction, ctx) {
+        const ticket = await ticketHere(interaction);
+        if (!ticket || String(ticket.vaId) !== String(ctx.va._id)) return say(interaction, 'Run this inside the ticket thread you want to close.');
+        const key = String(ticket._id);
+        if (ticketLocks.busy(key)) return say(interaction, 'Still working on the last press — one moment.');
+        return ticketLocks.run(key, async () => {
+            const fresh = await loadTicket(interaction, key);
+            return closeTicket(interaction, ctx, fresh || ticket, interaction.options.getString('reason') || '');
+        });
+    }
+
+    async function addToTicket(interaction, ctx) {
+        if (!isStaff(interaction, ctx.settings)) return say(interaction, 'Only staff can add people to a ticket.');
+        const ticket = await ticketHere(interaction);
+        if (!ticket || ticket.status !== 'open') return say(interaction, 'Run this inside an open ticket thread.');
+        const user = interaction.options.getUser('member', true);
+        if (user.bot) return say(interaction, 'Bots don’t need adding.');
+        const thread = await fetchChannel(ticket.threadId);
+        const added = thread && await thread.members.add(user.id).then(() => true).catch(() => false);
+        if (!added) return say(interaction, 'I could not add them. Are they in this server?');
+        await send(thread, { content: `👋 <@${user.id}> was added to this ticket by ${interaction.user}.`, allowedMentions: { users: [user.id] } });
+        return say(interaction, 'Added.');
     }
 
     /* ===================================================================
@@ -1484,6 +2001,300 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     }
 
     /* ===================================================================
+     * LINKING DISCORD TO A CREW CENTER LOGIN
+     * ================================================================ */
+
+    async function linkAccount(interaction, ctx) {
+        await interaction.deferReply({ flags: EPHEMERAL });
+        const pilot = await pilotByDiscord(ctx.va, interaction.user.id);
+        if (pilot) {
+            let note = '';
+            const s = ctx.settings;
+            const member = interaction.member && interaction.member.roles && interaction.member.roles.add ? interaction.member : null;
+            const active = pilot.status !== 'inactive';
+            if (member && active && s.pilotRoleId && !memberRoleIds(member).includes(s.pilotRoleId)
+                && !memberRoleIds(member).includes(s.inactiveRoleId || '-')) {
+                const ok = await member.roles.add(s.pilotRoleId, 'Linked pilot').then(() => true).catch(() => false);
+                if (ok) note = `\nI’ve given you <@&${s.pilotRoleId}> too.`;
+            }
+            return say(interaction, `✅ You’re linked to **${clean(pilot.name, 60)}${pilot.callsign ? ` (${clean(pilot.callsign, 20)})` : ''}** at ${clean(ctx.va.name, 100)}. You can sign in to the crew center with Discord any time.${note}`,
+                { components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(crewUrl(ctx.va.slug)).setLabel('Open the crew center').setStyle(ButtonStyle.Link))], allowedMentions: { parse: [] } });
+        }
+        const e = vaEmbed(ctx.va).setTitle('🔗 Link your crew center account').setDescription([
+            'Takes about ten seconds, and then:',
+            '• you can sign in to the crew center with Discord — no more lost passwords;',
+            '• your pilot role here follows your roster status automatically.',
+            '',
+            '**1.** Press **Link my account** below.',
+            '**2.** Sign in to the crew center if it asks.',
+            '**3.** Press **Authorize** on the Discord screen. Done!',
+            '',
+            'Not a pilot yet? Press **Apply** on the recruitment panel instead.',
+        ].join('\n'));
+        return interaction.editReply({
+            embeds: [e],
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setURL(linkUrl(ctx.va.slug)).setLabel('Link my account').setStyle(ButtonStyle.Link).setEmoji('🔗'),
+            )],
+        });
+    }
+
+    /** Somebody linked Discord on the crew center: give them their role here. */
+    hub.on('discordLinked', async ({ vaId, discordId }) => {
+        if (!vaId || !isSnowflake(discordId)) return;
+        const links = await VaBotGuild.find({ vaId }).lean();
+        if (!links.length) return;
+        const va = await vaById(vaId);
+        if (!va) return;
+        const pilot = await pilotByDiscord(va, discordId);
+        let told = false;
+        for (const link of links.slice(0, 5)) {
+            const guild = client.guilds.cache.get(link.guildId);
+            const member = guild ? await guild.members.fetch(discordId).catch(() => null) : null;
+            if (!member) continue;
+            const s = link.settings || {};
+            if (pilot && pilot.status !== 'inactive' && s.pilotRoleId && !memberRoleIds(member).includes(s.inactiveRoleId || '-')) {
+                await member.roles.add(s.pilotRoleId, 'Linked their crew center account').catch(() => {});
+            }
+            if (!told) {
+                told = true;
+                await dm(discordId, {
+                    embeds: [vaEmbed(va).setColor(0x16A34A).setTitle('🔗 Linked!').setDescription(
+                        `Your Discord is now linked to your **${clean(va.name, 100)}** crew center account${pilot && pilot.callsign ? ` (${clean(pilot.callsign, 20)})` : ''}. From now on you can sign in with Discord — and your roles in **${clean(guild.name, 100)}** keep themselves up to date.`)],
+                });
+            }
+        }
+    });
+
+    /* ===================================================================
+     * WELCOME
+     * ================================================================ */
+
+    function welcomePayload(va, s, { member, guild, pilot }) {
+        const user = member.user || {};
+        const name = member.displayName || user.globalName || user.username || 'there';
+        const back = pilot && pilot.status !== 'inactive';
+        const text = back
+            ? `Welcome back, <@${user.id}>! ✈️ Great to see you again — you’re on the **${clean(va.name, 100)}** roster${pilot.callsign ? ` as **${clean(pilot.callsign, 20)}**` : ''}${s.pilotRoleId ? ', and your pilot role is back' : ''}.`
+            : renderWelcome(s.welcomeMessage, { userId: user.id, name, server: guild && guild.name, airline: va.name, members: guild && guild.memberCount });
+        const e = vaEmbed(va).setTitle(`Welcome to ${clean((guild && guild.name) || va.name, 200)}!`.slice(0, 256)).setDescription(text);
+        const avatar = typeof user.displayAvatarURL === 'function' ? user.displayAvatarURL() : '';
+        if (isHttpsUrl(avatar)) e.setThumbnail(avatar);
+        if (guild && guild.memberCount) e.setFooter({ text: `You’re member #${Number(guild.memberCount).toLocaleString('en-US')}` });
+        const buttons = back
+            ? [new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link)]
+            : [
+                new ButtonBuilder().setCustomId(cid('open', 'apply')).setLabel('Apply').setStyle(ButtonStyle.Success).setEmoji('✈️'),
+                new ButtonBuilder().setCustomId(cid('open', 'support')).setLabel('Contact staff').setStyle(ButtonStyle.Secondary).setEmoji('🎫'),
+                new ButtonBuilder().setCustomId(cid('link')).setLabel('Already a pilot? Link').setStyle(ButtonStyle.Secondary).setEmoji('🔗'),
+                new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link),
+            ];
+        return { content: `<@${user.id}>`, embeds: [e], components: [new ActionRowBuilder().addComponents(buttons)], allowedMentions: { users: [user.id] } };
+    }
+
+    /** Somebody joined a linked server. */
+    async function onMemberJoin(member) {
+        if (!member || !member.guild || !member.user || member.user.bot) return;
+        const guild = member.guild;
+        if (isHomeGuild(guild.id)) return;
+        try {
+            const link = await guildLink(guild.id);
+            if (!link) return;
+            const s = link.settings || {};
+            if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm && !s.pilotRoleId) return;
+            const va = await vaById(link.vaId);
+            if (!va) return;
+            if (s.welcomeRoleId) await member.roles.add(s.welcomeRoleId, 'Welcome role').catch(() => {});
+            // A raid, or a mass import: roles yes, a wall of greetings no.
+            if (joinBurst.over(guild.id)) return;
+
+            // Somebody coming back. A pilot who left (or was removed for
+            // being quiet) and is still on the roster gets their role again;
+            // the sweep is what decides whether they are still flying.
+            const pilot = s.pilotRoleId || s.welcomeChannelId ? await pilotByDiscord(va, member.user.id) : null;
+            if (pilot) {
+                await VaBotInactive.deleteOne({ guildId: guild.id, userId: member.user.id }).catch(() => {});
+                if (pilot.status !== 'inactive' && s.pilotRoleId) await member.roles.add(s.pilotRoleId, 'Returning pilot').catch(() => {});
+            }
+            if (!s.welcomeChannelId && !s.welcomeDm) return;
+            const payload = welcomePayload(va, s, { member, guild, pilot });
+            if (s.welcomeChannelId) await send(await fetchChannel(s.welcomeChannelId), payload);
+            if (s.welcomeDm) {
+                // Guild buttons do nothing in a DM, so the DM gets the links only.
+                await dm(member.user.id, {
+                    embeds: payload.embeds,
+                    components: [new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link),
+                    )],
+                });
+            }
+        } catch (err) {
+            console.warn('🤖 vaBot welcome failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    /* ===================================================================
+     * INACTIVITY
+     *
+     * Kind first, firm only when the airline asks for it. The bot never
+     * decides who has flown — the crew center's approved flight log does —
+     * and it only ever acts on people whose Discord is linked to their login,
+     * so it is never guessing who somebody is.
+     * ================================================================ */
+
+    const stayButtons = (va) => new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Open the crew center').setStyle(ButtonStyle.Link),
+        new ButtonBuilder().setCustomId(cid('open', 'support', 'loa')).setLabel('Request leave').setStyle(ButtonStyle.Secondary).setEmoji('🌴'),
+        new ButtonBuilder().setCustomId(cid('open', 'support')).setLabel('I need help').setStyle(ButtonStyle.Secondary).setEmoji('🎫'),
+    );
+
+    /** Post in the inactive channel, or DM when there is none (or it failed). */
+    async function tellInactive(s, userId, payload) {
+        const ch = await fetchChannel(s.inactiveChannelId);
+        const posted = ch ? await send(ch, { content: `<@${userId}>`, ...payload, allowedMentions: { users: [userId] } }) : null;
+        if (!posted) await dm(userId, { embeds: payload.embeds, components: [] });
+        return posted;
+    }
+
+    function inactiveEmbed(va, guild, { days, neverFlown, kickAt }) {
+        const quiet = neverFlown
+            ? `you joined **${clean(va.name, 100)}**${days ? ` ${days} days ago` : ''} and we haven’t seen your first flight yet`
+            : `it’s been **${days} days** since your last flight with **${clean(va.name, 100)}**`;
+        return vaEmbed(va).setColor(0xD97706).setTitle('We miss you in the skies ✈️').setDescription([
+            `Hey there! Just a friendly heads-up — ${quiet}, so you’ve been moved to the inactive role for now.`,
+            '**Staying is easy:** fly any route and file your PIREP in the crew center. As soon as it’s approved, your pilot role comes straight back — no need to ask anyone.',
+            kickAt
+                ? `If we don’t see a flight by ${stamp(kickAt, 'D')} (${stamp(kickAt, 'R')}), you’ll be removed from the server to keep the roster up to date. No hard feelings at all — you’re always welcome back.`
+                : '',
+            'Away for a while — exams, holiday, life? Press **Request leave** and the staff will sort it out. 💙',
+        ].filter(Boolean).join('\n\n'));
+    }
+
+    /**
+     * One server's sweep. `apply: false` is the preview: the same plan, with
+     * nothing written and nobody told.
+     */
+    async function sweepGuild(link, { apply = true, now = Date.now() } = {}) {
+        const s = (link && link.settings) || {};
+        if (!s.inactiveRoleId) return { skipped: 'inactivity is off.' };
+        const va = await vaById(link.vaId);
+        if (!va) return { skipped: 'the crew center is not available.' };
+        const guild = client.guilds.cache.get(link.guildId);
+        if (!guild) return { skipped: 'I am not in that server any more.' };
+        const r = await api('get', crewPath(va.slug, '/discord-bot/pilots'), { asBot: true, slug: va.slug, actor: 'Activity check' });
+        // Everything or nothing: acting on half a roster is how the pilots
+        // whose flights did not come back get flagged.
+        if (!r.ok || !Array.isArray(r.data.pilots)) return { skipped: r.error || 'the crew center did not answer.' };
+        const pilots = r.data.pilots;
+        const flagged = await VaBotInactive.find({ guildId: link.guildId }).lean();
+        const kickDays = clampInt(s.kickDays, 0, 180, 0);
+        const plan = activityPlan({ pilots, flagged, now, inactiveDays: clampInt(s.inactiveDays, 7, 365, INACTIVE_DAYS_DEFAULT), kickDays });
+        const out = { plan, checked: pilots.length, unlinked: Number(r.data.unlinked) || 0, errors: [], capped: false };
+        if (plan.flag.length > MAX_FLAG_PER_SWEEP || plan.kick.length > MAX_KICK_PER_SWEEP) {
+            out.capped = true;
+            plan.flag = plan.flag.slice(0, MAX_FLAG_PER_SWEEP);
+            plan.kick = plan.kick.slice(0, MAX_KICK_PER_SWEEP);
+        }
+        if (!apply) return out;
+
+        const fetchMember = (id) => guild.members.fetch(id).catch(() => null);
+        const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+
+        for (const { pilot } of plan.restore) {
+            const member = await fetchMember(pilot.discordId);
+            const rec = flagged.find((f) => f.userId === pilot.discordId);
+            await VaBotInactive.deleteOne({ guildId: link.guildId, userId: pilot.discordId }).catch(() => {});
+            if (!member) continue;
+            await member.roles.remove(s.inactiveRoleId, 'Flying again').catch(() => {});
+            if (s.pilotRoleId && (!rec || rec.hadPilotRole !== false)) await member.roles.add(s.pilotRoleId, 'Flying again').catch(() => {});
+            await dm(pilot.discordId, {
+                embeds: [vaEmbed(va).setColor(0x16A34A).setTitle('Welcome back to the flight deck! ✈️').setDescription(
+                    `Great to see you flying again, ${clean(member.displayName || pilot.name, 60)}! Your pilot role in **${clean(guild.name, 100)}** is back. Thanks for flying with ${clean(va.name, 100)} 💙`)],
+            });
+            logToStaff(s, `✈️ <@${pilot.discordId}>${pilot.callsign ? ` (${clean(pilot.callsign, 20)})` : ''} is flying again — inactive role removed.`).catch(() => {});
+        }
+
+        for (const f of plan.flag) {
+            const { pilot } = f;
+            const member = await fetchMember(pilot.discordId);
+            if (!member) continue; // not in this server: nothing to do here
+            const added = await member.roles.add(s.inactiveRoleId, `No flight in ${s.inactiveDays || INACTIVE_DAYS_DEFAULT} days`).then(() => true).catch(() => false);
+            if (!added) { out.errors.push(`I could not give <@${pilot.discordId}> the inactive role — run \`/crew-admin check\`.`); continue; }
+            const hadPilotRole = !!(s.pilotRoleId && memberRoleIds(member).includes(s.pilotRoleId));
+            if (hadPilotRole) await member.roles.remove(s.pilotRoleId, 'Inactive').catch(() => {});
+            await VaBotInactive.updateOne(
+                { guildId: link.guildId, userId: pilot.discordId },
+                { $set: { vaId: va._id, memberId: String(pilot.memberId || ''), status: 'inactive', since: new Date(now), kickAt: f.kickAt, remindedAt: null, hadPilotRole } },
+                { upsert: true },
+            ).catch(() => {});
+            await tellInactive(s, pilot.discordId, { embeds: [inactiveEmbed(va, guild, f)], components: [stayButtons(va)] });
+            logToStaff(s, `💤 <@${pilot.discordId}>${pilot.callsign ? ` (${clean(pilot.callsign, 20)})` : ''} moved to inactive — ${f.neverFlown ? 'no first flight yet' : `no flight in ${f.days} days`}.`).catch(() => {});
+        }
+
+        for (const { pilot, kickAt } of plan.remind) {
+            await VaBotInactive.updateOne({ guildId: link.guildId, userId: pilot.discordId }, { $set: { remindedAt: new Date(now) } }).catch(() => {});
+            if (!await fetchMember(pilot.discordId)) continue;
+            const e = vaEmbed(va).setColor(0xD97706).setTitle('A friendly reminder ⏰').setDescription([
+                `There’s still time! Fly any route with **${clean(va.name, 100)}** before ${stamp(kickAt, 'D')} (${stamp(kickAt, 'R')}) and you’ll keep your place here — your pilot role comes right back.`,
+                'Need a break instead? Press **Request leave** and the staff will pause this for you.',
+            ].join('\n\n'));
+            // In the channel and by DM: this is the one message that matters.
+            const posted = await tellInactive(s, pilot.discordId, { embeds: [e], components: [stayButtons(va)] });
+            if (posted) await dm(pilot.discordId, { embeds: [e], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Open the crew center').setStyle(ButtonStyle.Link))] });
+        }
+
+        const canKick = !!(me && me.permissions && me.permissions.has(PermissionsBitField.Flags.KickMembers));
+        for (const { pilot } of plan.kick) {
+            const member = await fetchMember(pilot.discordId);
+            if (!member) {
+                await VaBotInactive.updateOne({ guildId: link.guildId, userId: pilot.discordId }, { $set: { status: 'kicked' } }).catch(() => {});
+                continue;
+            }
+            if (!canKick || member.kickable === false) { out.errors.push(`I could not remove <@${pilot.discordId}> — I need **Kick Members** and a role above theirs.`); continue; }
+            const invite = isHttpsUrl(va.crewDiscordInvite) ? va.crewDiscordInvite : '';
+            await dm(pilot.discordId, {
+                embeds: [vaEmbed(va).setTitle(`Thanks for flying with ${clean(va.name, 100)} 💙`).setDescription([
+                    `We’ve removed you from **${clean(guild.name, 100)}** after a long stretch without a flight — it’s only to keep the roster up to date.`,
+                    'Your logbook is safe in the crew center, and you’re welcome back any time: rejoin, fly a route, and you’re straight back in.',
+                    invite ? `Server invite for when you’re ready: ${invite}` : '',
+                ].filter(Boolean).join('\n\n'))],
+                components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link))],
+            });
+            const kicked = await member.kick(`Inactive: no flight for ${s.kickDays} days after being marked inactive`).then(() => true).catch(() => false);
+            if (!kicked) { out.errors.push(`Removing <@${pilot.discordId}> failed — check my role is above theirs.`); continue; }
+            await VaBotInactive.updateOne({ guildId: link.guildId, userId: pilot.discordId }, { $set: { status: 'kicked' } }).catch(() => {});
+            logToStaff(s, `👋 <@${pilot.discordId}>${pilot.callsign ? ` (${clean(pilot.callsign, 20)})` : ''} removed from the server after ${s.kickDays} days inactive. They were sent a kind goodbye and can rejoin any time.`).catch(() => {});
+        }
+        return out;
+    }
+
+    /** Every server with inactivity on, one at a time. */
+    async function sweepAll({ now = Date.now() } = {}) {
+        const links = await VaBotGuild.find({ 'settings.inactiveRoleId': { $ne: '' } }).lean().catch(() => []);
+        for (const link of links) {
+            if (!client.guilds.cache.get(link.guildId)) continue;
+            if (sweepLocks.busy(link.guildId)) continue;
+            await sweepLocks.run(link.guildId, () => sweepGuild(link, { apply: true, now }))
+                .catch((err) => console.error('🤖 vaBot sweep failed:', err && err.message ? err.message : err));
+        }
+    }
+
+    let sweepTimer = null;
+    let firstSweep = null;
+    /** Called once the client is ready. Timers are unref'd: they never hold the process open. */
+    function startSchedules() {
+        if (sweepTimer) return;
+        firstSweep = setTimeout(() => { sweepAll().catch(() => {}); }, SWEEP_FIRST_MS);
+        sweepTimer = setInterval(() => { sweepAll().catch(() => {}); }, SWEEP_EVERY_MS);
+        if (firstSweep.unref) firstSweep.unref();
+        if (sweepTimer.unref) sweepTimer.unref();
+    }
+    function stopSchedules() {
+        clearTimeout(firstSweep); clearInterval(sweepTimer);
+        firstSweep = null; sweepTimer = null;
+    }
+
+    /* ===================================================================
      * DISPATCH
      * ================================================================ */
 
@@ -1525,6 +2336,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             if (ctx.error) return say(interaction, ctx.error);
             if (sub === 'settings') return adminSettings(interaction, ctx);
             if (sub === 'panel') return adminPanel(interaction, ctx);
+            if (sub === 'welcome') return adminWelcome(interaction, ctx);
+            if (sub === 'inactivity') return adminInactivity(interaction, ctx);
+            if (sub === 'sweep') return adminSweep(interaction, ctx);
             if (sub === 'check') return adminCheck(interaction, ctx);
             if (sub === 'unlink') return adminUnlink(interaction);
             return say(interaction, 'Unknown command.');
@@ -1534,7 +2348,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const ctx = await context(interaction);
         if (ctx.error) return say(interaction, ctx.error);
         if (sub === 'apply') return openTicket(interaction, ctx, 'apply');
-        if (sub === 'ticket') return openTicket(interaction, ctx, 'support');
+        if (sub === 'ticket') return askSupport(interaction, ctx);
+        if (sub === 'close') return closeCommand(interaction, ctx);
+        if (sub === 'add') return addToTicket(interaction, ctx);
+        if (sub === 'link') return linkAccount(interaction, ctx);
         if (sub === 'links') return showLinks(interaction, ctx);
         if (sub === 'stats') return showStats(interaction, ctx);
         if (sub === 'events') return showEvents(interaction, ctx);
@@ -1545,8 +2362,13 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     async function routeComponent(interaction, { action, args }) {
         const ctx = await context(interaction);
         if (ctx.error) return say(interaction, ctx.error);
-        if (action === 'open') return openTicket(interaction, ctx, args[0] === 'support' ? 'support' : 'apply');
+        if (action === 'open') return args[0] === 'support' ? askSupport(interaction, ctx, args[1]) : openTicket(interaction, ctx, 'apply');
+        if (action === 'opensub') {
+            const get = (id) => { try { return interaction.fields.getTextInputValue(id); } catch { return ''; } };
+            return openTicket(interaction, ctx, 'support', { topic: get('topic'), details: get('details') });
+        }
         if (action === 'links') return showLinks(interaction, ctx);
+        if (action === 'link') return linkAccount(interaction, ctx);
 
         // A change to a ticket claims it first and only then reads it, so two
         // presses cannot both see "not sent yet" and both send.
@@ -1562,7 +2384,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const ticket = await loadTicket(interaction, args[0]);
         if (!ticket) return say(interaction, 'That ticket no longer exists.');
         if (String(ticket.vaId) !== String(ctx.va._id)) return say(interaction, 'That ticket belongs to a different crew center.');
-        if (ticket.status === 'closed' && action !== 'login') return say(interaction, 'This ticket is closed.');
+        if (ticket.status === 'closed' && action !== 'login' && action !== 'reopen') return say(interaction, 'This ticket is closed.');
 
         switch (action) {
         case 'form': return showFormPage(interaction, ctx, ticket, args[1]);
@@ -1579,6 +2401,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         case 'declinesub': return declineSubmit(interaction, ctx, ticket);
         case 'login': return showLogin(interaction, ctx, ticket);
         case 'close': return closeTicket(interaction, ctx, ticket);
+        case 'reopen': return reopenTicket(interaction, ctx, ticket);
         default: return say(interaction, 'That button is from an older version of the bot. Open a new ticket.');
         }
     }
@@ -1590,6 +2413,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             await VaBotGuild.deleteOne({ guildId: guild.id });
             await VaBotTicket.updateMany({ guildId: guild.id, status: 'open' }, { $set: { status: 'closed', closedAt: new Date() } });
             await VaBotEventPost.deleteMany({ guildId: guild.id });
+            await VaBotInactive.deleteMany({ guildId: guild.id });
             guildCache.del(guild.id);
         } catch (err) { console.warn('🤖 vaBot guildDelete cleanup failed:', err && err.message ? err.message : err); }
     }
@@ -1597,11 +2421,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     /** For diagnostics: what this module holds in memory. */
     const stats = () => ({
         guildCache: guildCache.size(), vaCache: vaCache.size(), joinCache: joinCache.size(),
-        cooldowns: ticketCooldown.size() + commandCooldown.size() + setupCooldown.size(),
-        locks: ticketLocks.size() + eventLocks.size(), api: apiLimiter.stats(),
+        cooldowns: ticketCooldown.size() + commandCooldown.size() + setupCooldown.size() + joinBurst.size(),
+        locks: ticketLocks.size() + eventLocks.size() + sweepLocks.size(), api: apiLimiter.stats(),
     });
 
-    return { commands, handleInteraction, onGuildDelete, stats };
+    return { commands, handleInteraction, onGuildDelete, onMemberJoin, sweepGuild, sweepAll, startSchedules, stopSchedules, stats };
 }
 
 /* ===========================================================================
@@ -1633,11 +2457,61 @@ async function guideState(vaId) {
  * CREW CENTER ROUTES — the dashboard's "Discord bot" card
  * ======================================================================== */
 
+/* ===========================================================================
+ * WHAT THE BOT ASKS THE CREW CENTER ABOUT PILOTS
+ *
+ * Pure, so the rules are tested without a database: which roster rows the
+ * bot may act on, and what it is told about each.
+ * ======================================================================== */
+
 /**
- * @param deps.requireCap     server.js's capability gate
- * @param deps.resolveCrewVa  slug -> VA
+ * The bot's view of one linked pilot. Staff are marked so the sweep leaves
+ * them alone: an account role of staff/owner, a staff member's own pilot
+ * side, or a job title on the roster row (crewRetention.isStaff).
  */
-function registerRoutes(app, { requireCap, resolveCrewVa }) {
+function pilotRow(account, member, index, now = Date.now()) {
+    const m = member || {};
+    let status = String(m.status || 'active');
+    // A leave with an end date that has passed is over.
+    if (status === 'loa' && m.loaUntil && new Date(m.loaUntil).getTime() <= now) status = 'active';
+    const last = index ? crewRetention.lastFlightFor(m, index) : null;
+    return {
+        discordId: String(account.discordId || ''),
+        memberId: String(m._id || ''),
+        name: clean(m.name || account.displayName || account.username, 80),
+        callsign: clean(m.callsign, 20),
+        status,
+        staff: account.role === 'staff' || account.role === 'owner' || !!account.portalAccountId || crewRetention.isStaff(m),
+        lastFlightAt: last ? new Date(last).toISOString() : null,
+        joinedAt: m.createdAt ? new Date(m.createdAt).toISOString() : null,
+    };
+}
+
+/** Every active login with a linked Discord and a roster row, and how many have no Discord. */
+function linkedPilots({ accounts = [], members = [], pireps = [], now = Date.now() } = {}) {
+    const index = crewRetention.lastFlightIndex(pireps);
+    const byId = new Map(members.map((m) => [String(m._id), m]));
+    const pilots = [];
+    const seen = new Set();
+    let unlinked = 0;
+    for (const a of accounts) {
+        if (!a || a.active === false || !a.memberId) continue;
+        const m = byId.get(String(a.memberId));
+        if (!m) continue;
+        if (!isSnowflake(a.discordId)) { unlinked++; continue; }
+        if (seen.has(a.discordId)) continue;
+        seen.add(a.discordId);
+        pilots.push(pilotRow(a, m, index, now));
+    }
+    return { pilots, unlinked };
+}
+
+/**
+ * @param deps.requireCap       server.js's capability gate
+ * @param deps.resolveCrewVa    slug -> VA
+ * @param deps.resolveCrewStore slug -> { va, store }, for the bot's own routes
+ */
+function registerRoutes(app, { requireCap, resolveCrewVa, resolveCrewStore }) {
     const gateFor = async (req, res) => {
         const gate = await requireCap(req, req.params.slug, 'integrations.manage');
         if (gate.error) {
@@ -1700,6 +2574,84 @@ function registerRoutes(app, { requireCap, resolveCrewVa }) {
             res.json({ ok: true });
         } catch (err) { console.error('discord bot unlink error:', err); res.status(500).json({ error: 'Could not unlink that server.' }); }
     });
+
+    /* ---- the bot's own routes -------------------------------------------
+     *
+     * Answered to the bot and nobody else: the loopback key, not a capability,
+     * because no person — staff included — needs a list of who is which
+     * Discord account. Each one reads the VA's own store, the same as every
+     * crew route, and fails whole rather than answering with part of it. */
+    const botOnly = (req, res) => {
+        if (botCallerFrom(req, req.params.slug)) return true;
+        res.status(401).json({ error: 'Not authenticated.' });
+        return false;
+    };
+    const storeFail = (res, err, what) => {
+        const status = err && Number(err.status) >= 400 && Number(err.status) < 600 ? Number(err.status) : 500;
+        if (status >= 500) console.error(`discord bot ${what} error:`, err && err.message ? err.message : err);
+        res.status(status).json({ error: (err && err.status && err.message) || `Could not read ${what}.`, code: (err && err.code) || '' });
+    };
+
+    app.get('/api/crew/:slug/discord-bot/pilots', async (req, res) => {
+        if (!botOnly(req, res)) return;
+        try {
+            const { store } = await resolveCrewStore(req.params.slug);
+            const [accounts, members, pireps] = await Promise.all([
+                store.listAccounts({ limit: 5000 }),
+                store.listMembers({ limit: 5000 }),
+                store.listPireps({ status: 'approved', limit: 20000 }),
+            ]);
+            res.set('Cache-Control', 'no-store');
+            res.json(linkedPilots({ accounts, members, pireps }));
+        } catch (err) { storeFail(res, err, 'the roster'); }
+    });
+
+    app.get('/api/crew/:slug/discord-bot/pilot/:discordId', async (req, res) => {
+        if (!botOnly(req, res)) return;
+        const discordId = String(req.params.discordId || '');
+        if (!isSnowflake(discordId)) return res.status(400).json({ error: 'Not a Discord id.' });
+        try {
+            const { store } = await resolveCrewStore(req.params.slug);
+            const account = await store.getAccountByDiscord(discordId);
+            const member = account && account.active !== false && account.memberId ? await store.getMember(account.memberId) : null;
+            res.set('Cache-Control', 'no-store');
+            res.json({ pilot: member ? pilotRow(account, member, null) : null });
+        } catch (err) { storeFail(res, err, 'that pilot'); }
+    });
+
+    // Right after the bot accepted an application from a ticket: write the
+    // applicant's Discord onto the login that acceptance made. Never over a
+    // different Discord already on it, and never onto a second login.
+    app.post('/api/crew/:slug/discord-bot/link-pilot', async (req, res) => {
+        if (!botOnly(req, res)) return;
+        const b = req.body || {};
+        const discordId = String(b.discordId || '');
+        const applicationId = String(b.applicationId || '');
+        if (!isSnowflake(discordId) || !applicationId) return res.status(400).json({ error: 'Missing the application or the Discord id.' });
+        try {
+            const { store } = await resolveCrewStore(req.params.slug);
+            const appDoc = await store.getApplication(applicationId);
+            if (!appDoc || appDoc.status !== 'accepted') return res.json({ linked: false, reason: 'not_accepted' });
+            let account = appDoc.inviteAccountId ? await store.getAccount(appDoc.inviteAccountId) : null;
+            if (!account && appDoc.inviteUsername) account = await store.getAccountByUsername(appDoc.inviteUsername);
+            if (!account || account.active === false) return res.json({ linked: false, reason: 'no_login' });
+            if (account.discordId === discordId) return res.json({ linked: true });
+            if (account.discordId) return res.json({ linked: false, reason: 'other_discord' });
+            const taken = await store.getAccountByDiscord(discordId);
+            if (taken && String(taken._id) !== String(account._id)) return res.json({ linked: false, reason: 'taken' });
+            await store.updateAccount(account._id, {
+                discordId,
+                discordUsername: clean(b.username, 40),
+                discordAvatar: /^(a_)?[a-f0-9]{32}$/.test(String(b.avatar || '')) ? String(b.avatar) : '',
+                discordLinkedAt: new Date(),
+            });
+            res.json({ linked: true });
+        } catch (err) {
+            // The unique index firing on a race is "taken", not a failure.
+            if (err && err.code === 'store_conflict') return res.json({ linked: false, reason: 'taken' });
+            storeFail(res, err, 'that login');
+        }
+    });
 }
 
 module.exports = {
@@ -1709,5 +2661,6 @@ module.exports = {
     makeLinkCode, normalizeCode, hashCode, cid, parseCid, pageCount, pageQuestions,
     matchOption, pickAirline, agreeLabels, describeRequirements, draftProblems, applyBody,
     isStaff, threadName, makeCooldown, makeCache, makeLocks, makeLimiter, inviteUrl, eventEmbed, shortLabel,
-    models: { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost },
+    renderWelcome, isDormant, activityPlan, makeBurst, pilotRow, linkedPilots, linkUrl,
+    models: { VaBotGuild, VaBotLinkCode, VaBotTicket, VaBotEventPost, VaBotInactive },
 };

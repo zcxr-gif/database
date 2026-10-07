@@ -32,6 +32,9 @@ const crewAccounts = require('./crewAccounts');
 // Signing in with Discord. The rules and the two calls that touch the network
 // live there; the routes that use them are at the bottom of this file.
 const crewDiscord = require('./crewDiscord');
+// Only for its hub: a pilot who links Discord here gets their role in the
+// airline's server straight away. vaBot does not require crewAuth back.
+const vaBot = require('./vaBot');
 const crewInvite = require('./crewInvite');
 // Openings only — the applications themselves are server.js's business. This
 // module does not require crewAuth back, so there is no cycle.
@@ -2388,6 +2391,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                     discordAvatar: profile.avatar,
                     discordLinkedAt: new Date(),
                 });
+                vaBot.hub.emit('discordLinked', { vaId: va._id, discordId: profile.id });
                 return backToCrew(res, slug, 'linked', embed, back);
             }
 
