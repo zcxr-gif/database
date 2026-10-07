@@ -151,6 +151,16 @@ function botCallerFrom(req, slug) {
     return { kind: 'discord-bot', slug: claimed, name: actor ? `${actor} (Discord)` : 'Discord bot', uname: '' };
 }
 
+/**
+ * The Discord user a bot request is acting for, or ''. Only ever read after
+ * botCallerFrom has accepted the request (server.js's botPilot): on its own
+ * a header is just a claim.
+ */
+function botPilotFrom(req) {
+    const id = String(((req && req.headers) || {})['x-inflight-bot-pilot'] || '');
+    return /^[0-9]{5,25}$/.test(id) ? id : '';
+}
+
 /** requireCap's answer for the bot: allowed only what BOT_CAPS lists. */
 const botMay = (capability) => BOT_CAPS.has(capability);
 
@@ -264,8 +274,12 @@ const VaBotEventPostSchema = new Schema({
     channelId: String,
     messageId: String,
     threadId: String,
+    // For the one-hour reminder: when it starts, and whether it has been sent.
+    startsAt: { type: Date, default: null },
+    remindedAt: { type: Date, default: null },
 }, { timestamps: true });
 VaBotEventPostSchema.index({ guildId: 1, eventId: 1 }, { unique: true });
+VaBotEventPostSchema.index({ remindedAt: 1, startsAt: 1 });
 
 /* A pilot the bot has moved to the inactive role, and when it will act next.
  * One per person per server. Deleted the moment they fly again. */
@@ -679,10 +693,13 @@ const linkUrl = (slug) => `${config.siteOrigin}/crew-pilot.html?va=${encodeURICo
  * ======================================================================== */
 
 /** The headers that make a loopback request the bot's. Never sent anywhere else. */
-const callerHeaders = (slug, actor) => ({
+const callerHeaders = (slug, actor, pilot = '') => ({
     'x-inflight-bot-key': BOT_CALLER_KEY,
     'x-inflight-bot-slug': String(slug || '').toLowerCase(),
     'x-inflight-bot-actor': encodeURIComponent(String(actor || '').slice(0, 80)),
+    // The member who pressed the button, for the pilot endpoints. Their own
+    // Discord id, straight from the interaction — never typed by anyone.
+    ...(/^[0-9]{5,25}$/.test(String(pilot || '')) ? { 'x-inflight-bot-pilot': String(pilot) } : {}),
 });
 
 /* Every server's bot traffic shares one crew center process: eight requests
@@ -695,8 +712,8 @@ function api(method, path, opts = {}) {
     return apiLimiter.run(() => apiNow(method, path, opts), BUSY);
 }
 
-async function apiNow(method, path, { body, slug, actor, asBot = false } = {}) {
-    const headers = { Accept: 'application/json', ...(asBot ? callerHeaders(slug, actor) : {}) };
+async function apiNow(method, path, { body, slug, actor, asBot = false, pilot = '' } = {}) {
+    const headers = { Accept: 'application/json', ...(asBot || pilot ? callerHeaders(slug, actor, pilot) : {}) };
     try {
         const res = await axios({
             method, url: `${config.apiBase}${path}`, data: body, headers,
@@ -746,12 +763,28 @@ function eventEmbed(va, event, action) {
         event.server ? { name: 'Server', value: clean(event.server, 30), inline: true } : null,
         event.slots ? { name: 'Slots', value: String(event.slots), inline: true } : null,
         event.minRank ? { name: 'Opens at', value: clean(event.minRank, 40), inline: true } : null,
+        Number.isFinite(Number(event.going)) && event.going !== null
+            ? { name: 'Going', value: `✈️ ${Number(event.going)}${event.slots ? ` of ${event.slots}` : ''}${Number(event.waitlisted) ? ` · ${Number(event.waitlisted)} waiting` : ''}`, inline: true }
+            : null,
     ].filter(Boolean);
     if (fields.length) e.addFields(fields);
     if (isHttpsUrl(event.bannerUrl) && action !== 'removed') e.setImage(event.bannerUrl);
     if (action === 'cancelled' || action === 'removed') e.setColor(0xDC2626);
     return e;
 }
+
+/** "I'm in" / "Can't make it" under an event post — none once it is off. */
+function eventButtons(va, eventId, action) {
+    if (action === 'cancelled' || action === 'removed') return [];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(cid('rsvp', eventId)).setLabel('I’m in').setStyle(ButtonStyle.Success).setEmoji('✈️'),
+        new ButtonBuilder().setCustomId(cid('unrsvp', eventId)).setLabel('Can’t make it').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link),
+    )];
+}
+
+const EVENT_REMIND_BEFORE_MS = 60 * 60 * 1000;
+const EVENT_REMIND_EVERY_MS = 5 * 60 * 1000;
 
 /* ===========================================================================
  * THE BOT
@@ -883,9 +916,17 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             .addSubcommand((s) => s.setName('add').setDescription('Staff: add someone to the ticket you are in')
                 .addUserOption((o) => o.setName('member').setDescription('Who to add').setRequired(true)))
             .addSubcommand((s) => s.setName('link').setDescription('Link your Discord to your crew center login'))
+            .addSubcommand((s) => s.setName('me').setDescription('Your hours, rank, next rank and recent flying')
+                .addBooleanOption((o) => o.setName('share').setDescription('Show it to the channel instead of only you')))
+            .addSubcommand((s) => s.setName('leaderboard').setDescription('Top pilots by hours')
+                .addStringOption((o) => o.setName('window').setDescription('Which period (default: last 30 days)')
+                    .addChoices({ name: 'Last 30 days', value: '30' }, { name: 'Last 90 days', value: '90' }, { name: 'All time', value: '0' })))
+            .addSubcommand((s) => s.setName('route').setDescription('Suggest a route to fly')
+                .addStringOption((o) => o.setName('from').setDescription('Departure ICAO, e.g. EGLL').setMaxLength(4))
+                .addStringOption((o) => o.setName('aircraft').setDescription('Aircraft, e.g. A320').setMaxLength(30)))
             .addSubcommand((s) => s.setName('links').setDescription('The airline’s links'))
             .addSubcommand((s) => s.setName('stats').setDescription('Pilots, hours and flights'))
-            .addSubcommand((s) => s.setName('events').setDescription('Upcoming events'))
+            .addSubcommand((s) => s.setName('events').setDescription('Upcoming events — and sign up for one'))
             .addSubcommand((s) => s.setName('pilot').setDescription('Look a pilot up on the roster')
                 .addStringOption((o) => o.setName('who').setDescription('Callsign or name').setRequired(true).setMaxLength(60)));
 
@@ -1304,11 +1345,20 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         e.setDescription(events.length
             ? events.map((ev) => {
                 const leg = [ev.origin, ev.destination].filter(Boolean).join(' → ');
-                const going = Number(ev.attending || ev.signupCount || 0);
-                return `**${clean(ev.title, 100) || leg || 'Event'}**${leg && ev.title ? ` · ${leg}` : ''}\n${stamp(ev.startsAt) || 'Time to be announced'}${going ? ` · ${going} going` : ''}`;
+                const going = Number(ev.going ?? ev.attending ?? ev.signupCount ?? 0);
+                return `**${clean(ev.title, 100) || leg || 'Event'}**${leg && ev.title ? ` · ${leg}` : ''}\n${stamp(ev.startsAt) || 'Time to be announced'}${going ? ` · ${going} going` : ''}${ev.full ? ' · full (waitlist open)' : ''}`;
             }).join('\n\n').slice(0, 4000)
             : 'Nothing on the calendar right now.');
-        return interaction.editReply({ embeds: [e] });
+        // Anyone can use the menu: it signs up whoever picks, as themselves.
+        const components = events.length ? [new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder().setCustomId(cid('rsvpick')).setPlaceholder('✈️ Sign me up for…')
+                .addOptions(events.map((ev) => ({
+                    label: (clean(ev.title, 100) || [ev.origin, ev.destination].filter(Boolean).join(' → ') || 'Event').slice(0, 100),
+                    value: String(ev.id || ev._id).slice(0, 100),
+                    description: (toTime(ev.startsAt) ? new Date(ev.startsAt).toUTCString().replace(/:\d\d GMT$/, 'Z') : 'Time to be announced').slice(0, 100),
+                }))),
+        )] : [];
+        return interaction.editReply({ embeds: [e], components });
     }
 
     async function showPilot(interaction, ctx) {
@@ -1682,6 +1732,28 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             asBot: true, slug: ctx.va.slug, actor, body: { action: 'accept', createAccount: true },
         });
         if (!r.ok) return { error: r.error };
+        return finishAcceptance({ interaction, ctx, ticket, actor, data: r.data });
+    }
+
+    const LINK_FAILED = {
+        taken: 'that Discord account is already linked to another login at this airline',
+        other_discord: 'their new login is already linked to a different Discord account',
+        no_login: 'no crew center login was made for them yet',
+        not_accepted: 'the crew center does not show the application as accepted',
+    };
+
+    /**
+     * Everything that follows an acceptance, wherever it was pressed: the
+     * pilot role, their Discord linked to the login it made, and the welcome
+     * in the ticket. `data` is the crew center's answer to the accept — or,
+     * when staff accepted from the dashboard, the invitation read back.
+     *
+     * The link is the step that makes the rest work: the inactive role, the
+     * event buttons and /crew me all find a pilot by it. So it is never left
+     * silent — linked, or the pilot is handed the one button that does it and
+     * the staff are told why it could not be done for them.
+     */
+    async function finishAcceptance({ interaction, ctx, ticket, actor, data = {} }) {
         ticket.stage = 'accepted';
         await ticket.save();
 
@@ -1693,6 +1765,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (ctx.settings.pilotRoleId && member) {
             await member.roles.add(ctx.settings.pilotRoleId, `Accepted into ${ctx.va.name}`)
                 .catch(() => { roleNote = ' I could not give them the pilot role — run `/crew-admin check`.'; });
+        }
+        if (member && ctx.settings.welcomeRoleId && ctx.settings.welcomeRoleId !== ctx.settings.pilotRoleId) {
+            // A visitor no longer: the join role was for people who had not joined yet.
+            await member.roles.remove(ctx.settings.welcomeRoleId, 'Now a pilot').catch(() => {});
         }
 
         // Their Discord, linked to the login just made for them. The bot is the
@@ -1710,28 +1786,35 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             },
         });
         const discordLinked = !!(linked.ok && linked.data.linked);
+        const linkWhy = discordLinked ? '' : (LINK_FAILED[linked.data && linked.data.reason] || linked.error || 'the crew center did not answer');
 
-        const account = r.data.account || null;
+        const account = data.account || null;
+        const invite = data.invite || null;
         const thread = await fetchChannel(ticket.threadId);
-        const hasLogin = !!(r.data.invite && r.data.invite.state === 'live') || !!(account && account.password);
+        const hasLogin = !!(invite && invite.state === 'live') || !!(account && account.password);
         const e = vaEmbed(ctx.va).setColor(0x16A34A).setTitle(`🎉 Welcome to ${clean(ctx.va.name, 200)}!`).setDescription([
-            `<@${ticket.userId}>, you’re in${r.data.invite && r.data.invite.username ? ` — your username is \`${clean(r.data.invite.username, 60)}\`` : ''}.`,
+            `<@${ticket.userId}>, you’re in${invite && invite.username ? ` — your username is \`${clean(invite.username, 60)}\`` : ''}.`,
             hasLogin
                 ? 'Press **Show my login** — only you can see it. You’ll choose your own password the first time you sign in.'
-                : (account && account.error) || 'Your crew center login will follow from the staff.',
-            discordLinked ? '🔗 Your Discord is already linked to your crew center account, so next time you can just press **Sign in with Discord**.' : '',
+                : (account && account.error) || (invite && invite.state === 'claimed' ? 'You’ve already signed in to the crew center — you’re all set.' : 'Your crew center login will follow from the staff.'),
+            discordLinked
+                ? '🔗 Your Discord is linked to your crew center account, so next time you can just press **Sign in with Discord**.'
+                : '🔗 **One last step:** press **Link my account** and approve it on Discord. Then you can sign in with Discord, sign up for events right here, and use `/crew me`.',
         ].filter(Boolean).join('\n\n'));
         const buttons = [];
         if (hasLogin) buttons.push(new ButtonBuilder().setCustomId(cid('login', ticket._id)).setLabel('Show my login').setStyle(ButtonStyle.Success).setEmoji('🔑'));
-        buttons.push(new ButtonBuilder().setURL(r.data.signInUrl && isHttpUrl(r.data.signInUrl) ? r.data.signInUrl : crewUrl(ctx.va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link));
+        if (!discordLinked) buttons.push(new ButtonBuilder().setURL(linkUrl(ctx.va.slug)).setLabel('Link my account').setStyle(ButtonStyle.Link).setEmoji('🔗'));
+        const signIn = (data.signInUrl && isHttpUrl(data.signInUrl) && data.signInUrl) || (invite && isHttpUrl(invite.signInUrl) && invite.signInUrl) || crewUrl(ctx.va.slug);
+        buttons.push(new ButtonBuilder().setURL(signIn).setLabel('Crew center').setStyle(ButtonStyle.Link));
         buttons.push(new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close ticket').setStyle(ButtonStyle.Secondary));
         await send(thread, {
             content: `<@${ticket.userId}>`, embeds: [e],
             components: [new ActionRowBuilder().addComponents(buttons)],
             allowedMentions: { users: [ticket.userId] },
         });
-        logToStaff(ctx.settings, `✅ <@${ticket.userId}> accepted by ${actor}.${roleNote}`).catch(() => {});
-        return { ok: true, note: roleNote, loginError: account && account.error };
+        const linkNote = discordLinked ? ' Discord linked ✓' : ` ⚠️ Their Discord could not be linked automatically (${linkWhy}) — they have a **Link my account** button.`;
+        logToStaff(ctx.settings, `✅ <@${ticket.userId}> accepted by ${actor}.${roleNote}${linkNote}`).catch(() => {});
+        return { ok: true, note: roleNote, loginError: account && account.error, linked: discordLinked, linkWhy };
     }
 
     async function acceptButton(interaction, ctx, ticket) {
@@ -1743,7 +1826,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         await interaction.deferReply({ flags: EPHEMERAL });
         const out = await acceptTicket({ interaction, ctx, ticket, actor: actorOf(interaction) });
         if (out.error) return say(interaction, `⚠️ ${out.error}`);
-        return say(interaction, `Accepted.${out.loginError ? ` ${out.loginError}` : ''}${out.note}`);
+        return say(interaction, `Accepted.${out.loginError ? ` ${out.loginError}` : ''}${out.note}${out.linked ? ' Their Discord is linked.' : ` Their Discord could not be linked automatically (${out.linkWhy}); they’ve been given a Link button.`}`);
     }
 
     /* ---- the pilot's login -------------------------------------------- */
@@ -1939,7 +2022,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const e = vaEmbed(va).setColor(passed ? 0x16A34A : 0xD97706)
             .setTitle(passed ? '✅ Entrance test passed' : '📝 Entrance test not passed')
             .setDescription(`<@${ticket.userId}> scored **${score}/${total}** (${percent}%) on **${clean(quizTitle, 120)}**.`
-                + (passed ? (auto ? '\n\nSending the crew center login now…' : '\n\nStaff: accept to send the crew center login.') : '\n\nThe test page says when they can try again and what to read meanwhile.'));
+                + (passed
+                    ? `\n\n🎉 Well done, <@${ticket.userId}>! ${auto ? 'Your crew center login is on its way' : 'The staff will accept you shortly'} — and your Discord will be linked to your new crew center account at the same moment, so there’s nothing else to set up.`
+                        + (auto ? '' : '\n\nStaff: accept to send the crew center login.')
+                    : '\n\nThe test page says when they can try again and what to read meanwhile.'));
         await send(thread, {
             content: !auto && staff ? `<@&${staff}>` : undefined,
             embeds: [e],
@@ -1956,6 +2042,35 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 });
             }
         }
+    }
+
+    /**
+     * Staff accepted from the crew center (Roster → Applications) while the
+     * applicant is waiting in a Discord ticket. The ticket finishes the job:
+     * role, Discord linked to the login, welcome with their login button.
+     */
+    hub.on('applicationAccepted', async ({ vaId, applicationId }) => {
+        if (!vaId || !applicationId) return;
+        const found = await VaBotTicket.find({ vaId, applicationId: String(applicationId), status: 'open' }).limit(5);
+        for (const t of found) {
+            await ticketLocks.run(String(t._id), () => acceptedElsewhere(String(t._id), vaId))
+                .catch((err) => console.error('🤖 vaBot accepted-elsewhere failed:', err && err.message ? err.message : err));
+        }
+    });
+
+    async function acceptedElsewhere(ticketId, vaId) {
+        const ticket = await VaBotTicket.findOne({ _id: ticketId, status: 'open' });
+        // Accepted from Discord a moment ago: the welcome is already there.
+        if (!ticket || ticket.stage === 'accepted') return;
+        const link = await guildLink(ticket.guildId);
+        if (!link || String(link.vaId) !== String(vaId)) return;
+        const va = await vaById(vaId);
+        if (!va) return;
+        const ctx = { link, va, settings: link.settings || {} };
+        const inv = await api('get', crewPath(va.slug, `/applications/${encodeURIComponent(ticket.applicationId)}/invite`), {
+            asBot: true, slug: va.slug, actor: 'Crew center',
+        });
+        await finishAcceptance({ interaction: null, ctx, ticket, actor: 'the staff in the crew center', data: inv.ok ? { invite: inv.data.invite } : {} });
     }
 
     /** An event was published, changed, cancelled or removed. */
@@ -1980,15 +2095,25 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!post) {
             if (action !== 'published' && action !== 'updated') return;
             const ch = await fetchChannel(link.settings.eventsChannelId);
-            const msg = await send(ch, { embeds: [embed], allowedMentions: { parse: [] } });
+            const msg = await send(ch, { embeds: [embed], components: eventButtons(va, eventId, action), allowedMentions: { parse: [] } });
             if (!msg) return;
             const thread = await msg.startThread({ name: (clean(event.title, 90) || 'Event chat'), autoArchiveDuration: THREAD_ARCHIVE_MIN }).catch(() => null);
-            await VaBotEventPost.create({ guildId: link.guildId, vaId: va._id, eventId, channelId: ch.id, messageId: msg.id, threadId: thread ? thread.id : '' }).catch(() => {});
+            await VaBotEventPost.create({
+                guildId: link.guildId, vaId: va._id, eventId, channelId: ch.id, messageId: msg.id, threadId: thread ? thread.id : '',
+                startsAt: toTime(event.startsAt) ? new Date(event.startsAt) : null,
+            }).catch(() => {});
             return;
         }
         const ch = await fetchChannel(post.channelId);
         const msg = ch && ch.messages ? await ch.messages.fetch(post.messageId).catch(() => null) : null;
-        if (msg) await msg.edit({ embeds: [embed] }).catch(() => {});
+        if (msg) await msg.edit({ embeds: [embed], components: eventButtons(va, eventId, action) }).catch(() => {});
+        // A moved start time gets a fresh reminder; a cancelled event none.
+        const startsAt = toTime(event.startsAt) ? new Date(event.startsAt) : null;
+        const moved = toTime(startsAt) !== toTime(post.startsAt);
+        const off = action === 'cancelled' || action === 'removed';
+        if (moved || off) {
+            await VaBotEventPost.updateOne({ _id: post._id }, { $set: { startsAt, ...(off ? { remindedAt: new Date() } : moved ? { remindedAt: null } : {}) } }).catch(() => {});
+        }
         const thread = await fetchChannel(post.threadId);
         if (thread) {
             const note = { updated: '✏️ The event details were updated.', cancelled: '⚠️ This event has been cancelled.', removed: '🗑️ This event was removed.' }[action];
@@ -1998,6 +2123,202 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 await thread.setArchived(true).catch(() => {});
             }
         }
+    }
+
+    /* ===================================================================
+     * ACTING AS THE PILOT WHO PRESSED
+     *
+     * Event sign-ups and the pilot commands go through the crew center's own
+     * pilot endpoints, as whoever's login this Discord account is linked to
+     * (server.js botPilot). Every rule those endpoints apply — rank locks,
+     * waitlists, what counts as a flight — applies here unchanged.
+     * ================================================================ */
+
+    const asPilot = (interaction, ctx) => ({ pilot: interaction.user.id, slug: ctx.va.slug, actor: actorOf(interaction) });
+
+    /** The answer for somebody whose Discord is linked to no login here. */
+    function notLinked(interaction, ctx, what) {
+        const e = vaEmbed(ctx.va).setTitle('🔗 Link your crew center account first').setDescription([
+            `To ${what} from Discord, I need to know which ${clean(ctx.va.name, 100)} pilot you are.`,
+            'Press **Link my account**, sign in if it asks, and approve it on Discord — about ten seconds, and only once.',
+            'Not a pilot yet? Press **Apply** on the recruitment panel.',
+        ].join('\n\n'));
+        return interaction.editReply({
+            embeds: [e],
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setURL(linkUrl(ctx.va.slug)).setLabel('Link my account').setStyle(ButtonStyle.Link).setEmoji('🔗'),
+            )],
+        });
+    }
+
+    const hoursOf = (v) => Math.round((Number(v) || 0) * 10) / 10;
+    const rsvpCooldown = makeCooldown(3000);
+
+    /* ---- events -------------------------------------------------------- */
+
+    async function rsvp(interaction, ctx, eventId, going) {
+        const wait = rsvpCooldown.hit(`${interaction.user.id}:${eventId}:${going ? 1 : 0}`);
+        if (wait) return say(interaction, 'One moment — still working on your last press.');
+        await interaction.deferReply({ flags: EPHEMERAL });
+        const path = crewPath(ctx.va.slug, `/events/${encodeURIComponent(eventId)}/signup`);
+        const r = going
+            ? await api('post', path, { ...asPilot(interaction, ctx), body: {} })
+            : await api('delete', path, asPilot(interaction, ctx));
+        if (r.status === 401) return notLinked(interaction, ctx, going ? 'sign up for events' : 'change your event sign-ups');
+        if (!r.ok) {
+            // Pressing "I'm in" twice is not a failure.
+            if (going && r.status === 409 && (r.data.code === 'already_signed_up' || /already signed up/i.test(r.error))) return say(interaction, '✅ You’re already signed up for this one. See you there!');
+            return say(interaction, `⚠️ ${r.error}`);
+        }
+        const ev = await refreshEventPost(interaction.guildId, ctx.va, eventId);
+        const title = clean(ev && ev.title, 100) || 'the event';
+        if (!going) return say(interaction, `No problem — you’re off the list for **${title}**. Hope to see you at the next one! 👋`);
+        const when = ev && stamp(ev.startsAt) ? ` on ${stamp(ev.startsAt)} (${stamp(ev.startsAt, 'R')})` : '';
+        return say(interaction, r.data.waitlisted
+            ? `📋 **${title}** is full, so you’re on the waitlist. If a place opens up it’s yours automatically — I’ll still remind you an hour before.`
+            : `✈️ You’re in for **${title}**${when}! I’ll ping you in the event thread an hour before. Pick your stand and aircraft any time in the crew center.`,
+        { components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(crewUrl(ctx.va.slug)).setLabel('Crew center').setStyle(ButtonStyle.Link))] });
+    }
+
+    /** Re-read the event and redraw its post with the new head count. */
+    async function refreshEventPost(guildId, va, eventId) {
+        const r = await api('get', crewPath(va.slug, `/events/${encodeURIComponent(eventId)}`));
+        const ev = r.ok ? r.data.event : null;
+        if (!ev) return null;
+        await eventLocks.run(`${guildId}:${eventId}`, async () => {
+            const post = await VaBotEventPost.findOne({ guildId, eventId: String(eventId) });
+            if (!post) return;
+            const ch = await fetchChannel(post.channelId);
+            const msg = ch && ch.messages ? await ch.messages.fetch(post.messageId).catch(() => null) : null;
+            if (msg) await msg.edit({ embeds: [eventEmbed(va, ev, ev.status === 'cancelled' ? 'cancelled' : '')], components: eventButtons(va, eventId, ev.status) }).catch(() => {});
+        }).catch(() => {});
+        return ev;
+    }
+
+    /** An hour before each posted event: ping the people going, in its thread. */
+    async function remindEvents({ now = Date.now() } = {}) {
+        const due = await VaBotEventPost.find({
+            remindedAt: null,
+            startsAt: { $gt: new Date(now), $lte: new Date(now + EVENT_REMIND_BEFORE_MS + EVENT_REMIND_EVERY_MS) },
+        }).limit(50).lean().catch(() => []);
+        for (const post of due) {
+            // Marked first: a reminder sent twice is worse than one that failed.
+            await VaBotEventPost.updateOne({ _id: post._id }, { $set: { remindedAt: new Date(now) } }).catch(() => {});
+            try {
+                const link = await guildLink(post.guildId);
+                if (!link || String(link.vaId) !== String(post.vaId)) continue;
+                const va = await vaById(post.vaId);
+                if (!va) continue;
+                const r = await api('get', crewPath(va.slug, `/discord-bot/events/${encodeURIComponent(post.eventId)}/attendees`), { asBot: true, slug: va.slug, actor: 'Event reminder' });
+                if (!r.ok || !r.data.event || r.data.event.status === 'cancelled') continue;
+                const ids = (Array.isArray(r.data.discordIds) ? r.data.discordIds : []).filter(isSnowflake).slice(0, 200);
+                const where = (await fetchChannel(post.threadId)) || (await fetchChannel(post.channelId));
+                const ev = r.data.event;
+                const head = `⏰ **${clean(ev.title, 100) || 'The event'}** starts ${stamp(ev.startsAt, 'R')}! Time to load up, pick your stand and get ready. See you on frequency ✈️`;
+                if (!ids.length) { await send(where, { content: head, allowedMentions: { parse: [] } }); continue; }
+                for (let i = 0; i < ids.length; i += 50) {
+                    const chunk = ids.slice(i, i + 50);
+                    await send(where, { content: `${i ? '' : `${head}\n\n`}${chunk.map((id) => `<@${id}>`).join(' ')}`, allowedMentions: { users: chunk } });
+                }
+            } catch (err) { console.warn('🤖 vaBot event reminder failed:', err && err.message ? err.message : err); }
+        }
+    }
+
+    /* ---- pilot commands ----------------------------------------------- */
+
+    async function showMe(interaction, ctx) {
+        const share = interaction.options.getBoolean('share') === true;
+        await interaction.deferReply(share ? {} : { flags: EPHEMERAL });
+        const [r, board] = await Promise.all([
+            api('get', crewPath(ctx.va.slug, '/me/flying'), asPilot(interaction, ctx)),
+            api('get', crewPath(ctx.va.slug, '/standings?window=30'), asPilot(interaction, ctx)),
+        ]);
+        if (!r.ok) return say(interaction, r.error);
+        if (!r.data.pilot) return notLinked(interaction, ctx, 'see your flying');
+        const p = r.data.pilot;
+        const rank = r.data.rank || null;
+        const t = r.data.totals || {};
+        const streak = r.data.streak || null;
+        const me = board.ok ? board.data.me : null;
+        const e = vaEmbed(ctx.va).setTitle(`${clean(p.callsign, 20)} ${clean(p.name, 80)}`.trim() || 'Your flying').setURL(crewUrl(ctx.va.slug));
+        e.addFields(
+            { name: 'Rank', value: clean(rank && rank.name, 40) || '—', inline: true },
+            { name: 'Hours', value: String(hoursOf(p.hours)), inline: true },
+            { name: 'Flights', value: String(Number(t.flights) || 0), inline: true },
+            {
+                name: 'Next rank',
+                value: rank && rank.next
+                    ? `${clean(rank.next.name, 40)} — ${hoursOf(rank.next.hoursAway)} h to go${rank.next.requiresCheck ? ' + a check ride' : ''}`
+                    : rank ? 'Top of the ladder 🏆' : '—',
+                inline: false,
+            },
+            { name: 'Last 30 days', value: `${Number(t.flights30d) || 0} flights · ${hoursOf((Number(t.minutes30d) || 0) / 60)} h`, inline: true },
+            { name: 'Last flight', value: t.lastFlightAt && stamp(t.lastFlightAt, 'R') ? stamp(t.lastFlightAt, 'R') : 'None yet — `/crew route` has an idea', inline: true },
+        );
+        if (streak && streak.weeks > 0) e.addFields({ name: 'Streak', value: `🔥 ${streak.weeks} week${streak.weeks === 1 ? '' : 's'} in a row`, inline: true });
+        if (me) e.addFields({ name: 'This month', value: me.rank ? `#${me.rank} of ${me.of} on the board` : 'Not on the board yet — one flight gets you there', inline: true });
+        if (Number(t.pending)) e.setFooter({ text: `${t.pending} flight${t.pending === 1 ? '' : 's'} waiting for staff approval` });
+        if (rank && isHttpsUrl(rank.image)) e.setThumbnail(rank.image);
+        if (p.status === 'inactive') e.setFooter({ text: 'Marked inactive — fly any route to become active again.' });
+        return interaction.editReply({ embeds: [e] });
+    }
+
+    const MEDALS = ['🥇', '🥈', '🥉'];
+    async function showLeaderboard(interaction, ctx) {
+        const win = ['30', '90', '0'].includes(interaction.options.getString('window')) ? interaction.options.getString('window') : '30';
+        await interaction.deferReply();
+        const r = await api('get', crewPath(ctx.va.slug, `/standings?window=${win}`), asPilot(interaction, ctx));
+        if (!r.ok) return say(interaction, r.error);
+        const board = Array.isArray(r.data.board) ? r.data.board.slice(0, 10) : [];
+        const label = { 30: 'the last 30 days', 90: 'the last 90 days', 0: 'all time' }[win];
+        const e = vaEmbed(ctx.va).setTitle(`🏆 Top pilots — ${label}`).setURL(crewUrl(ctx.va.slug));
+        e.setDescription(board.length
+            ? board.map((b, i) => `${MEDALS[i] || `**${i + 1}.**`} ${b.callsign ? `**${clean(b.callsign, 20)}** ` : ''}${clean(b.name, 50)} — ${hoursOf(b.hours)} h · ${Number(b.flights) || 0} flight${Number(b.flights) === 1 ? '' : 's'}`).join('\n')
+            : 'Nobody has flown in this window yet. Be the first! ✈️');
+        const me = r.data.me;
+        if (me) e.addFields({ name: 'You', value: me.rank ? `#${me.rank} of ${me.of} · ${hoursOf(me.hours)} h` : 'Not on the board yet — one flight and you’re on it. Try `/crew route`.' });
+        return interaction.editReply({ embeds: [e] });
+    }
+
+    const cleanIcao = (v) => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    const cleanType = (v) => String(v || '').replace(/[^A-Za-z0-9 .-]/g, '').trim().slice(0, 30);
+
+    async function suggestRoute(interaction, ctx, fromArg, typeArg) {
+        const from = cleanIcao(fromArg);
+        const type = cleanType(typeArg);
+        await interaction.deferReply({ flags: EPHEMERAL });
+        const r = await api('get', crewPath(ctx.va.slug, '/routes'), asPilot(interaction, ctx));
+        if (!r.ok) return say(interaction, r.error);
+        const all = (Array.isArray(r.data.routes) ? r.data.routes : []).filter((x) => x && x.active !== false && !x.locked && x.origin && x.destination);
+        let pool = all;
+        if (from) pool = pool.filter((x) => String(x.origin).toUpperCase() === from);
+        if (type) pool = pool.filter((x) => String(x.aircraft || '').toLowerCase().includes(type.toLowerCase()));
+        if (!pool.length) {
+            return say(interaction, all.length
+                ? `No open route matches${from ? ` from **${from}**` : ''}${type ? ` on **${type}**` : ''}. Try \`/crew route\` with fewer filters.`
+                : 'This airline has no open routes to suggest yet.');
+        }
+        // Featured legs first, half the time: they are the ones the airline is
+        // pointing everyone at this week.
+        const featured = pool.filter((x) => x.featured);
+        const pickFrom = featured.length && Math.random() < 0.5 ? featured : pool;
+        const leg = pickFrom[Math.floor(Math.random() * pickFrom.length)];
+        const e = vaEmbed(ctx.va).setTitle(`${leg.flightNumber ? `${clean(leg.flightNumber, 12)} · ` : ''}${clean(leg.origin, 4)} → ${clean(leg.destination, 4)}`).setURL(crewUrl(ctx.va.slug));
+        e.setDescription(leg.featured ? `⭐ Featured this ${leg.featured === 'day' ? 'day' : 'week'}${Number(leg.featuredBonus) ? ` — bonus ×${Number(leg.featuredBonus)}` : ''}` : 'How about this one? ✈️');
+        e.addFields(
+            { name: 'Aircraft', value: clean(leg.aircraft, 60) || 'Any in the fleet', inline: true },
+            { name: 'Distance', value: Number(leg.distanceNm) ? `${Math.round(Number(leg.distanceNm)).toLocaleString('en-US')} nm` : '—', inline: true },
+            ...(leg.kind === 'codeshare' && leg.partnerName ? [{ name: 'Codeshare', value: clean(leg.partnerName, 60), inline: true }] : []),
+            ...(leg.departureGate ? [{ name: 'Stand', value: clean(leg.departureGate, 12), inline: true }] : []),
+        );
+        if (leg.notes) e.setFooter({ text: clean(leg.notes, 200) });
+        return interaction.editReply({
+            embeds: [e],
+            components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(cid('route', from || '-', type || '-')).setLabel('Another one').setStyle(ButtonStyle.Secondary).setEmoji('🎲'),
+                new ButtonBuilder().setURL(crewUrl(ctx.va.slug)).setLabel('Book it in the crew center').setStyle(ButtonStyle.Link),
+            )],
+        });
     }
 
     /* ===================================================================
@@ -2144,6 +2465,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 
     const stayButtons = (va) => new ActionRowBuilder().addComponents(
         new ButtonBuilder().setURL(crewUrl(va.slug)).setLabel('Open the crew center').setStyle(ButtonStyle.Link),
+        new ButtonBuilder().setCustomId(cid('route', '-', '-')).setLabel('Suggest a route').setStyle(ButtonStyle.Primary).setEmoji('🎲'),
         new ButtonBuilder().setCustomId(cid('open', 'support', 'loa')).setLabel('Request leave').setStyle(ButtonStyle.Secondary).setEmoji('🌴'),
         new ButtonBuilder().setCustomId(cid('open', 'support')).setLabel('I need help').setStyle(ButtonStyle.Secondary).setEmoji('🎫'),
     );
@@ -2281,17 +2603,18 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 
     let sweepTimer = null;
     let firstSweep = null;
+    let remindTimer = null;
     /** Called once the client is ready. Timers are unref'd: they never hold the process open. */
     function startSchedules() {
         if (sweepTimer) return;
         firstSweep = setTimeout(() => { sweepAll().catch(() => {}); }, SWEEP_FIRST_MS);
         sweepTimer = setInterval(() => { sweepAll().catch(() => {}); }, SWEEP_EVERY_MS);
-        if (firstSweep.unref) firstSweep.unref();
-        if (sweepTimer.unref) sweepTimer.unref();
+        remindTimer = setInterval(() => { remindEvents().catch(() => {}); }, EVENT_REMIND_EVERY_MS);
+        for (const t of [firstSweep, sweepTimer, remindTimer]) if (t.unref) t.unref();
     }
     function stopSchedules() {
-        clearTimeout(firstSweep); clearInterval(sweepTimer);
-        firstSweep = null; sweepTimer = null;
+        clearTimeout(firstSweep); clearInterval(sweepTimer); clearInterval(remindTimer);
+        firstSweep = null; sweepTimer = null; remindTimer = null;
     }
 
     /* ===================================================================
@@ -2352,6 +2675,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (sub === 'close') return closeCommand(interaction, ctx);
         if (sub === 'add') return addToTicket(interaction, ctx);
         if (sub === 'link') return linkAccount(interaction, ctx);
+        if (sub === 'me') return showMe(interaction, ctx);
+        if (sub === 'leaderboard') return showLeaderboard(interaction, ctx);
+        if (sub === 'route') return suggestRoute(interaction, ctx, interaction.options.getString('from'), interaction.options.getString('aircraft'));
         if (sub === 'links') return showLinks(interaction, ctx);
         if (sub === 'stats') return showStats(interaction, ctx);
         if (sub === 'events') return showEvents(interaction, ctx);
@@ -2369,6 +2695,12 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         }
         if (action === 'links') return showLinks(interaction, ctx);
         if (action === 'link') return linkAccount(interaction, ctx);
+        if (action === 'rsvp' || action === 'unrsvp') return args[0] ? rsvp(interaction, ctx, args[0], action === 'rsvp') : say(interaction, 'That event is gone.');
+        if (action === 'rsvpick') {
+            const id = interaction.values && interaction.values[0];
+            return id ? rsvp(interaction, ctx, id, true) : say(interaction, 'Pick an event.');
+        }
+        if (action === 'route') return suggestRoute(interaction, ctx, args[0] === '-' ? '' : args[0], args[1] === '-' ? '' : args[1]);
 
         // A change to a ticket claims it first and only then reads it, so two
         // presses cannot both see "not sent yet" and both send.
@@ -2421,11 +2753,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     /** For diagnostics: what this module holds in memory. */
     const stats = () => ({
         guildCache: guildCache.size(), vaCache: vaCache.size(), joinCache: joinCache.size(),
-        cooldowns: ticketCooldown.size() + commandCooldown.size() + setupCooldown.size() + joinBurst.size(),
+        cooldowns: ticketCooldown.size() + commandCooldown.size() + setupCooldown.size() + joinBurst.size() + rsvpCooldown.size(),
         locks: ticketLocks.size() + eventLocks.size() + sweepLocks.size(), api: apiLimiter.stats(),
     });
 
-    return { commands, handleInteraction, onGuildDelete, onMemberJoin, sweepGuild, sweepAll, startSchedules, stopSchedules, stats };
+    return { commands, handleInteraction, onGuildDelete, onMemberJoin, sweepGuild, sweepAll, remindEvents, startSchedules, stopSchedules, stats };
 }
 
 /* ===========================================================================
@@ -2619,6 +2951,33 @@ function registerRoutes(app, { requireCap, resolveCrewVa, resolveCrewStore }) {
         } catch (err) { storeFail(res, err, 'that pilot'); }
     });
 
+    // An hour before an event: the Discord ids of the pilots going, so the
+    // reminder can ping them. Only people whose login is linked appear.
+    app.get('/api/crew/:slug/discord-bot/events/:eventId/attendees', async (req, res) => {
+        if (!botOnly(req, res)) return;
+        try {
+            const { store } = await resolveCrewStore(req.params.slug);
+            const event = await store.getEvent(req.params.eventId);
+            if (!event || event.status === 'draft') return res.status(404).json({ error: 'Event not found.' });
+            const [signups, accounts] = await Promise.all([store.listSignups(event._id), store.listAccounts({ limit: 5000 })]);
+            const byAccount = new Map();
+            const byMember = new Map();
+            for (const a of accounts) {
+                if (!a || a.active === false || !isSnowflake(a.discordId)) continue;
+                byAccount.set(String(a._id), a.discordId);
+                if (a.memberId) byMember.set(String(a.memberId), a.discordId);
+            }
+            const ids = new Set();
+            for (const sgn of signups) {
+                if (!sgn || sgn.status !== 'going') continue;
+                const id = (sgn.accountId && byAccount.get(String(sgn.accountId))) || (sgn.memberId && byMember.get(String(sgn.memberId)));
+                if (id) ids.add(id);
+            }
+            res.set('Cache-Control', 'no-store');
+            res.json({ event: { title: event.title || '', startsAt: event.startsAt || null, status: event.status || '' }, discordIds: [...ids] });
+        } catch (err) { storeFail(res, err, 'that event'); }
+    });
+
     // Right after the bot accepted an application from a ticket: write the
     // applicant's Discord onto the login that acceptance made. Never over a
     // different Discord already on it, and never onto a second login.
@@ -2656,7 +3015,7 @@ function registerRoutes(app, { requireCap, resolveCrewVa, resolveCrewStore }) {
 
 module.exports = {
     configure, createVaBot, registerRoutes, hub, api, callerHeaders, guideState, guildSummary, GUIDE_URL,
-    botCallerFrom, botMay, BOT_CAPS,
+    botCallerFrom, botPilotFrom, botMay, BOT_CAPS,
     // Pure, for the tests.
     makeLinkCode, normalizeCode, hashCode, cid, parseCid, pageCount, pageQuestions,
     matchOption, pickAirline, agreeLabels, describeRequirements, draftProblems, applyBody,

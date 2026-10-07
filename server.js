@@ -4416,7 +4416,11 @@ async function requireCap(req, slug, capability) {
 // reviewing their own network would be nonsense.
 async function crewViewer(req, store) {
     const p = verifyCrewRequest(req);
-    if (!p || p.kind !== 'crew') return null;
+    if (!p) {
+        const viaBot = await botPilot(req, store);
+        return viaBot ? { hours: viaBot.hours, memberId: viaBot.memberId } : null;
+    }
+    if (p.kind !== 'crew') return null;
     try {
         const account = await store.getAccount(p.sub);
         if (!account) return null;
@@ -10789,9 +10793,40 @@ const publicEvent = (e, opts = {}) => {
 // Staff and Inflight oversight come back with `account: null` — they can manage
 // the board but they are not automatically ON it, and a manager who wants to
 // fly the event signs up like anyone else.
+/**
+ * The pilot a Discord bot request is acting for, or null.
+ *
+ * The VA bot (vaBot.js) presses buttons for people: "I'm in" on an event,
+ * "/crew me". Discord has already told it who pressed — that id is not
+ * something a member can forge — so the bot names it in a header, and the
+ * pilot is whoever's login that Discord account is LINKED to. Three things
+ * must hold, the same three the bot's staff calls need: loopback, this
+ * process's key, and this route's own airline (vaBot.botCallerFrom). A
+ * Discord account linked to nobody is nobody, exactly as a missing session
+ * is, so every rule a pilot endpoint applies still applies.
+ */
+async function botPilot(req, store) {
+    const slug = req.params && req.params.slug;
+    if (!vaBot.botCallerFrom(req, slug)) return null;
+    const discordId = vaBot.botPilotFrom(req);
+    if (!discordId || typeof store.getAccountByDiscord !== 'function') return null;
+    try {
+        const account = await store.getAccountByDiscord(discordId);
+        if (!account || account.active === false) return null;
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+        return {
+            accountId: account._id,
+            memberId: member ? member._id : null,
+            name: (member && member.name) || account.displayName || account.username || 'A pilot',
+            callsign: (member && member.callsign) || '',
+            hours: member ? Number(member.hours) || 0 : 0,
+        };
+    } catch { return null; }
+}
+
 async function crewPilot(req, store) {
     const p = verifyCrewRequest(req);
-    if (!p) return null;
+    if (!p) return botPilot(req, store);
     try {
         // A pilot account in the VA's own store. The ordinary case.
         if (p.kind === 'crew') {
@@ -14541,6 +14576,13 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
 
         const cs = applicationCallsign(appDoc, va);
         const accepted = appDoc.status === 'accepted';
+        // Accepted from the dashboard while the applicant waits in a Discord
+        // ticket: the bot finishes the job there — their Discord linked to the
+        // login, the pilot role, the welcome. Not when the bot is the one
+        // accepting; it does all of that itself.
+        if (action === 'accept' && accepted && !(gate.p && gate.p.kind === 'discord-bot')) {
+            vaBot.hub.emit('applicationAccepted', { vaId: va._id, applicationId: String(appDoc._id) });
+        }
         // Post the decision (+ the staff's message) to the VA's Discord.
         const hook = await crewWebhookUrlFor(va._id);
         if (hook) {

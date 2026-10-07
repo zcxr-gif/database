@@ -218,6 +218,10 @@ async function principal() {
     check('a guessed key of the right length is nobody', forged.p === null);
 
     const fakeReq = (ip) => ({ headers: v.callerHeaders('my-va', ''), socket: { remoteAddress: ip } });
+    check('the pilot header rides only with a real Discord id', v.callerHeaders('my-va', '', '123456789')['x-inflight-bot-pilot'] === '123456789'
+        && !('x-inflight-bot-pilot' in v.callerHeaders('my-va', '', 'nope')));
+    check('…and is read back only when it is one', v.botPilotFrom({ headers: { 'x-inflight-bot-pilot': '123456789' } }) === '123456789'
+        && v.botPilotFrom({ headers: { 'x-inflight-bot-pilot': '1 OR 1=1' } }) === '' && v.botPilotFrom({}) === '');
     check('the right key from off the box is nobody', v.botCallerFrom(fakeReq('203.0.113.9'), 'my-va') === null);
     check('…and from IPv6 loopback it is the bot', !!v.botCallerFrom(fakeReq('::1'), 'my-va'));
 
