@@ -339,26 +339,49 @@ asks.
 - **Adding a pilot by invite.** Roster → **Add** → tick *Invite them* (on by
   default). It makes the roster row, their login and a single-use setup link,
   and opens the welcome message to copy — no email needed.
+- **Recruiting is one road** (`crewRecruit.js`): apply → [open a Discord
+  ticket] → [entrance test] → accepted → the pilot chooses their password.
+  Every channel — join page, status page, email, the dashboard's *Copy for
+  IFC*, the Discord bot — reads the applicant's step from the same rules, so
+  they all say the same thing. Recruitment → **Joining** has the choices:
+  - **Who accepts:** *Staff accept each pilot* (`joinMode: application`) or
+    *Accept automatically* (`free`) — on applying, or on passing the test when
+    one is set.
+  - **Entrance test** (`crewEntranceQuizId`): one of the VA's quizzes, or none.
+    It goes out **by itself** when somebody applies — or, when they recruit
+    through Discord, when the applicant's ticket links up. The taker needs **no
+    account**: the link is the key (`/crew/<slug>/test?t=…`). Tests only ever
+    go to an application; somebody met on the IFC is sent the join link.
+  - **Send website applicants to our Discord** (`crewJoinViaDiscord`): applicants
+    are told to join with the VA's invite and open a ticket with their
+    **application code** (`ABCD-1234`, the front of their status token). Only
+    honoured while the bot is linked with a ticket channel and an invite is
+    set; the dashboard says so beside the switch.
+- **Accepting always makes the login.** Roster row, login in the VA's own store
+  and a **one-time link to choose a password** (the v24 setup link). Nobody —
+  staff included — ever sees a password. The old "create a crew center login
+  when accepting" switch is gone; a database too old to keep links (pre-v24, or
+  legacy managed storage) still falls back to a temporary password.
+- **Where the link reaches them:** the applicant's status page, the acceptance
+  email (when the VA has email), the bot's **Set up my login** button in their
+  ticket, and the dashboard's Applications → *Invited* card (Copy for IFC,
+  recorded as sent; *New link*; throw away).
+- **Staff can always step in:** every application card has *Accept now*
+  (skips the test), *Send it now* / *Send an entrance test anyway*, and
+  *Decline*, plus one *Copy their next step for IFC* message for whatever step
+  they are on — the way to reach an applicant who gave no email.
+- **The quiz "door" is retired.** Pilots with a login are never held at a quiz;
+  any stored door is switched off on the next quiz save and read as off until
+  then. The bot's `auto_invite` setting is retired too — whether a pass lets
+  somebody in is the crew center's *Accept automatically*.
 - **The IFC welcome message** opens with the VA's directory banner (or one we
   draw from their name and logo) and ends with a small *Welcome aboard* strip
   in their colours, drawn at `/api/crew/<slug>/invite-banner.png`. There is a
   *Plain text* copy beside it for Discord, where markdown images do not draw.
-- **No login on the screen after signing up.** A free-join VA still accepts
-  somebody the moment they sign up (roster row, callsign), but no password is
-  minted, shown or emailed. They land in Roster → **Logins** as "no login yet",
-  and staff send the sign-in from there — after an entrance test, if the VA
-  runs one. Their status link says the sign-in is on its way.
-- **Entrance tests.** Any quiz (Recruitment → Quizzes) can be sent as an
-  entrance test — from an application card, or to somebody who never applied
-  (Applications → *All tests & send to someone new*). The taker needs **no
-  account**: the link is the key (`/crew/<slug>/test?t=…`), and it only ever
-  opens a test sent to somebody who is not crew yet. The quiz sets the pass
-  mark, the **wait before a retake** (new quizzes default to 24 h) and the
-  **study resources** shown to anybody who does not pass. Staff copy a
-  ready-made welcome message (banner on top, strip at the bottom) to paste on
-  the IFC; passing is reported to staff, who then **accept** the application
-  (or *Add & invite* somebody who never applied) to send the crew center
-  invitation. Needs database v25 — the dashboard's *Update my database* button.
+- **Entrance tests** set the pass mark, the **wait before a retake** (new
+  quizzes default to 24 h) and the **study resources** shown to anybody who
+  does not pass. Needs database v25 — the dashboard's *Update my database*
+  button.
 - **Infinite Flight Live is locked in beta** for every crew center. The tile and
   setup step stay, marked Beta. To open it for testers set
   `IF_LIVE_BETA_SLUGS=slug1,slug2` on the backend, or `*` for everyone. Nothing a
@@ -619,9 +642,11 @@ The bot also runs inside each VA's **own** Discord server, for that VA's
 recruitment — a different job from everything above, which happens in ours.
 A VA owner links their server from **Crew Dashboard → Settings → Alerts →
 Discord bot** (a one-time code) plus `/crew-admin setup` in their server. From
-then on their recruits apply through private ticket threads, staff send the
-entrance test and accept from the ticket, and the pilot reads their login from a
-button only they can see.
+then newcomers are greeted and pointed at **Apply**; a private ticket takes a
+new application or links one made on the website (by its application code); the
+entrance test is posted there by itself; and the pilot opens their
+choose-a-password link from a button only they can see. Staff can accept,
+resend the test or decline from the ticket at any point.
 
 What this means for us:
 - **Our server's commands stay ours.** The Inflight commands in this chapter are

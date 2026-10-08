@@ -1541,7 +1541,7 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
             const can = (c) => caps.includes(c);
             const body = req.body || {};
             const touchesBranding = ['layout', 'accent', 'loginLook', 'loginBackdrop', 'topicMode', 'ranks', 'roles', 'fleet', 'social', 'hero', 'ui'].some(f => body[f] !== undefined);
-            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'acceptCreatesLogin', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
+            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'callsignReservedMax', 'discordInvite', 'entranceQuizId', 'joinViaDiscord', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             // Openings ride with the team, not with recruitment. A job advert
             // for a staff role points AT a staff role and hands out its
             // permissions when it is accepted, so the person who may write one
@@ -1760,9 +1760,23 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                 }
                 ad.crewDiscordInvite = inv;
             }
-            // The default for "Create a crew center login" on every accept card.
-            if (typeof req.body?.acceptCreatesLogin === 'boolean') {
-                ad.crewAcceptCreatesLogin = req.body.acceptCreatesLogin;
+            // The entrance test every applicant sits (crewRecruit.js) — one of
+            // this airline's quizzes with questions in it, or '' for none. A
+            // quiz deleted later simply stops being a test; see rulesFor.
+            if (req.body?.entranceQuizId !== undefined) {
+                const id = String(req.body.entranceQuizId || '').trim().slice(0, 40);
+                if (id) {
+                    const quiz = (crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || []).find((q) => q.id === id);
+                    if (!quiz) return res.status(400).json({ error: 'That quiz doesn’t exist any more. Pick another, or build one under Quizzes.' });
+                    if (!crewQuizzes.isReady(quiz)) return res.status(400).json({ error: `“${quiz.title}” has no questions in it yet.` });
+                }
+                ad.crewEntranceQuizId = id;
+            }
+            // Send web applicants on to the Discord to open a ticket. Saved as
+            // asked; only honoured while a bot is linked and an invite is set,
+            // which the dashboard says beside the switch.
+            if (typeof req.body?.joinViaDiscord === 'boolean') {
+                ad.crewJoinViaDiscord = req.body.joinViaDiscord;
             }
             if (req.body?.applicationForm !== undefined) {
                 const f = sanitizeForm(req.body.applicationForm);
@@ -1810,7 +1824,8 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 callsignReservedMax: crewCallsign.reservedMaxOf(ad),
                 discordInvite: ad.crewDiscordInvite || '',
-                acceptCreatesLogin: ad.crewAcceptCreatesLogin !== false,
+                entranceQuizId: ad.crewEntranceQuizId || '',
+                joinViaDiscord: !!ad.crewJoinViaDiscord,
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
                 staffOpenings: ad.staffOpenings || [],
@@ -2747,20 +2762,9 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
            off the first and the Discord controls off the second. */
         let pilotSide = { applies: p.kind === 'va', ready: p.kind === 'crew', memberId: null };
         let terms = crewTermsState('', false);
-        /* THE DOOR. v22.
-           A VA can hold its crew centre shut until a pilot has passed the quiz
-           its staff sent them. /me is where that is answered, because /me is
-           what every page asks before it draws anything — and because the
-           answer has to be the DATABASE's rather than the session's, exactly
-           like the password nag above: a gate a pilot could clear by reloading
-           is not a gate.
-
-           IT FAILS OPEN. No gate, a deleted quiz, a store that will not answer
-           — all of them come back unlocked. A crew centre locked because a
-           database was slow is an outage the airline did not ask for and cannot
-           explain; see the head of crewQuizzes.js. Staff are never held at it
-           either: the person who would unlock it must not be behind it. */
-        let quizGate = crewQuizzes.gateState({});
+        /* THE DOOR (v22) is retired — see crewRecruit.js. quizGate is still
+           answered, always open, so a page that reads it draws nothing. */
+        const quizGate = crewQuizzes.gateState({});
         if ((p.kind === 'crew' || p.kind === 'va') && va) {
             discord.available = crewDiscord.configured();
             try {
@@ -2780,27 +2784,10 @@ function registerCrewAuthRoutes(app, { postAnnouncement, vetStaffCallsign } = {}
                         discord.avatar = crewDiscord.avatarUrl({ id: account.discordId, avatar: account.discordAvatar });
                     }
                 }
-                // Only ever asked when the airline has actually shut the door,
-                // so a VA that has never touched this pays nothing for it.
-                const quizzes = crewQuizzes.sanitizeQuizzes(va.crewQuizzes || []) || [];
-                const gateCfg = crewQuizzes.sanitizeGate(va.crewQuizGate || {}, quizzes);
-                if (gateCfg.enabled) {
-                    const memberId = p.kind === 'crew'
-                        ? (account && account.memberId) || null
-                        : (pilotSide.memberId || null);
-                    let attempts = [];
-                    if (memberId) {
-                        attempts = await store.listQuizAttempts({ memberId: String(memberId), limit: 50 })
-                            .then(rows => rows.map(crewQuizzes.myAttemptView))
-                            .catch(() => []);
-                    }
-                    quizGate = crewQuizzes.gateState({
-                        gate: gateCfg, quizzes, attempts,
-                        // A staff login is never gated, and neither is a pilot
-                        // whose account we could not resolve — see above.
-                        isStaff: p.kind !== 'crew' || isOwner || caps.length > 0 || !memberId,
-                    });
-                }
+                // The quiz "door" is retired (crewRecruit.js): the one test is
+                // the entrance test before acceptance, so a pilot with a login
+                // is never held at a second one. quizGate stays in the answer,
+                // always open, for pages that still read it.
             } catch { /* unreachable store — don't block "who am I" on it */ }
         }
         res.set('Cache-Control', 'no-store');

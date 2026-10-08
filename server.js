@@ -73,6 +73,7 @@ const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordIn
 // gated on team.manage rather than on a capability of its own.
 const crewStaffApps = require('./crewStaffApps');
 const crewQuizzes = require('./crewQuizzes');
+const crewRecruit = require('./crewRecruit');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -1239,12 +1240,18 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     crewDiscordInvite: { type: String, trim: true, default: '' },
     // Temporary multipliers on one event or one route — crewMultipliers.js.
     crewMultipliers: { type: mongoose.Schema.Types.Mixed, default: [] },
-    // Whether accepting an application makes the pilot a crew center login.
-    // The default each accept card starts from — staff can still flip it on
-    // one card. On unless a VA turns it off: some airlines live in Discord and
-    // hand out logins later, and unticking it on every single card was the
-    // only way to say so.
-    crewAcceptCreatesLogin: { type: Boolean, default: true },
+    // RECRUITING (crewRecruit.js). Accepting a pilot always makes their login
+    // now — the old "create a login when accepting" switch is gone — so what
+    // is left to choose is the road there:
+    //
+    //   the entrance test every applicant sits ('' = none). Sent the moment
+    //   they apply (or the moment their Discord ticket links up), never by
+    //   hand to somebody who has not applied.
+    crewEntranceQuizId: { type: String, trim: true, default: '' },
+    //   whether web applicants are sent on to the VA's Discord to open a
+    //   ticket, where the bot runs the test and hands over the login. Only
+    //   honoured while a bot is linked and there is an invite to send.
+    crewJoinViaDiscord: { type: Boolean, default: false },
 
     // --- Bring-your-own email provider (applicant notifications) ---
     // When set, applicant emails go through the VA's OWN provider/account so
@@ -13950,6 +13957,416 @@ app.delete('/api/crew/:slug/pireps/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'pirep delete error', message: 'Could not remove the flight.' }); }
 });
 
+/* ===========================================================================
+ * RECRUITING — one road in (crewRecruit.js holds the rules)
+ *
+ *   apply → [open a Discord ticket] → [entrance test] → accepted → they choose
+ *   their password
+ *
+ * Everything in this block is the glue between those rules and the VA's own
+ * store: where an application stands, sending its test, accepting it, and the
+ * one invitation an acceptance produces. The join form, the applicant's status
+ * page, the dashboard and the Discord bot all go through these rather than
+ * each doing a piece of it, which is how the old flows drifted into five.
+ * ======================================================================== */
+
+/** A Discord server is linked to this VA, with somewhere to open tickets. */
+async function botTicketsLinked(vaId) {
+    if (!vaId) return false;
+    try {
+        const g = await vaBot.models.VaBotGuild.findOne({ vaId, 'settings.ticketChannelId': { $ne: '' } }).select('_id').lean();
+        return !!g;
+    } catch { return false; }
+}
+
+/**
+ * The recruiting rules a VA runs. `ad` may already carry the fields (the
+ * by-slug route selects them); the store-backed `va` does not, so they are
+ * read here when missing.
+ */
+async function recruitRulesFor(ad) {
+    let rec = ad || {};
+    if (rec.crewQuizzes === undefined || rec.crewEntranceQuizId === undefined || rec.joinMode === undefined) {
+        const more = await VirtualAirlineAd.findById(rec._id)
+            .select('joinMode crewEntranceQuizId crewJoinViaDiscord crewDiscordInvite crewQuizzes').lean().catch(() => null);
+        rec = { ...rec, ...(more || {}) };
+    }
+    const quizzes = crewQuizzes.sanitizeQuizzes(rec.crewQuizzes || []) || [];
+    const botLinked = rec.crewJoinViaDiscord ? await botTicketsLinked(rec._id) : false;
+    return crewRecruit.rulesFor(rec, { quizzes, botLinked });
+}
+
+/** Application ids with a Discord ticket tied to them. */
+async function ticketedApplications(vaId, ids) {
+    const out = new Set();
+    const list = (ids || []).map(String).filter(Boolean);
+    if (!vaId || !list.length) return out;
+    try {
+        const rows = await vaBot.models.VaBotTicket.find({ vaId, applicationId: { $in: list } }).select('applicationId').lean();
+        for (const r of rows || []) out.add(String(r.applicationId));
+    } catch { /* no bot storage reachable — nobody is in a ticket */ }
+    return out;
+}
+
+const applicationStatusUrl = (va, slug, token) =>
+    `${SITE_ORIGIN}/crew/${encodeURIComponent((va && va.slug) || slug)}/status?id=${encodeURIComponent(token || '')}`;
+
+/**
+ * The roster row an accepted application became. Not stored on the
+ * application, so it is found the way acceptance named it: by IFC name.
+ */
+async function memberForApplication(store, appDoc) {
+    const want = candidateKey(appDoc && appDoc.ifcName);
+    if (!want) return null;
+    const members = await store.listMembers({ limit: 5000 }).catch(() => []);
+    return (members || []).find((m) => candidateKey(m.ifcName) === want)
+        || (members || []).find((m) => candidateKey(m.name) === want)
+        || null;
+}
+
+/**
+ * Send an applicant their entrance test.
+ *
+ * One test per application per quiz: asked again while one is out (or after a
+ * pass), the one there is comes back with `existing: true` rather than a second
+ * link. Emailed when the applicant gave an address and the VA can send.
+ */
+async function issueEntranceTest({ va, store, quiz, appDoc, by = '', note = '', slug, email = true }) {
+    const quizzes = [quiz];
+    const mine = await store.listQuizAttempts({ candidates: true, quizId: quiz.id, limit: 300 });
+    const theirs = (mine || []).filter((a) => String(a.applicationId || '') === String(appDoc._id));
+    const passed = theirs.find((a) => a.status === 'passed');
+    if (passed) return { test: staffEntrance(va, quizzes, passed, slug), existing: true, passed: true, emailed: false };
+    const live = theirs.find((a) => entranceLive(quiz, a));
+    if (live) return { test: staffEntrance(va, quizzes, live, slug), existing: true, emailed: false };
+
+    const saved = await store.createQuizAttempt({
+        quizId: quiz.id,
+        quizTitle: quiz.title,
+        token: crewQuizzes.attemptToken(),
+        memberId: null,
+        applicationId: appDoc._id,
+        ifcName: appDoc.ifcName || '',
+        pilotName: appDoc.ifcName || '',
+        callsign: applicationCallsign(appDoc, va),
+        status: 'issued',
+        gate: false,
+        passMark: quiz.passMark,
+        maxAttempts: quiz.maxAttempts,
+        note: String(note || '').trim().slice(0, 500),
+        issuedBy: String(by || '').slice(0, 80),
+    });
+    const test = staffEntrance(va, quizzes, saved, slug);
+
+    let emailed = false;
+    if (email && appDoc.email && test.link) {
+        try {
+            const emailCfg = await crewEmailConfigFor(va._id);
+            if (emailCfg) {
+                emailed = true;
+                const statusUrl = applicationStatusUrl(va, slug, appDoc.statusToken);
+                sendCrewEmail(emailCfg, {
+                    to: appDoc.email, subject: `${quiz.title} — ${va.name || 'Crew Center'}`,
+                    html: crewEmailHtml({
+                        vaName: va.name, accent: va.crewAccent, heading: `Welcome to ${va.name || 'the crew'}!`,
+                        bodyHtml: escHtml(test.plainMessage.split('\nHere is your link:')[0]).replace(/\n/g, '<br>')
+                            + (appDoc.statusToken ? `<br><br><a href="${escHtml(statusUrl)}">Track your application</a>` : ''),
+                        button: { label: 'Take the test', url: test.link },
+                    }),
+                }).catch(() => {});
+            }
+        } catch { emailed = false; }
+    }
+    return { test, existing: false, emailed };
+}
+
+/**
+ * A pilot's login and the one invitation that hands it over.
+ *
+ * Every new pilot gets a SETUP LINK — one-time, to choose their own password —
+ * so nobody, staff included, ever holds a password of theirs. Only a database
+ * too old to keep a link falls back to the temporary password crew centers
+ * used to hand out.
+ *
+ * Never re-issues anything for a login somebody has already signed in with, or
+ * for a staff member's own pilot side (it has no password by design).
+ *
+ * @returns {{account, created, username, kind: 'link'|'password'|'existing',
+ *            link?: string, expiresAt?: Date, password?: string}}
+ */
+async function issueLogin({ va, store, displayName, memberId = null, email = '', by = '', slug }) {
+    const r = await crewAccounts.provisionPilotAccount(store, {
+        displayName, memberId, email, createdByName: by || 'Crew Center', vaName: va.name || '',
+    });
+    const account = r.account;
+    const base = { account, created: r.created, username: r.username || account.username };
+    if (account.portalAccountId || account.lastLoginAt) return { ...base, kind: 'existing' };
+    const support = await setupSupport(store);
+    if (support.links && support.keep) {
+        const { token, hash } = crewPasswordReset.mintToken();
+        const patch = crewPasswordReset.setupPatch({ hash, token, keep: true });
+        await store.updateAccount(account._id, patch);
+        Object.assign(account, patch);
+        return {
+            ...base, kind: 'link',
+            link: crewPasswordReset.resetUrl(crewSignInUrl(va, slug), token),
+            expiresAt: patch.resetTokenExpiresAt,
+        };
+    }
+    const password = r.password || ((await crewAccounts.resetPassword(store, account._id)) || {}).password || null;
+    return { ...base, kind: 'password', password };
+}
+
+/**
+ * The invitation on an accepted application, in one shape whichever kind it
+ * is — a setup link (every acceptance now) or a temporary password (an older
+ * database, or an acceptance from before links):
+ *
+ *   { state: 'none'|'live'|'expired'|'claimed'|'revoked', kind: 'link'|'password'|'',
+ *     username, link, password, expiresAt, issuedAt, claimedAt, sentAt, sentBy,
+ *     signInUrl, message, plainMessage, accountId }
+ *
+ * The secret and the messages are only ever present while it is live.
+ * `accounts` (id -> account) saves a lookup per row on a long list.
+ */
+async function applicationInvite(va, store, appDoc, slug, accounts = null) {
+    const ctx = inviteContext(va, appDoc, slug);
+    const out = {
+        state: 'none', kind: '', username: (appDoc && appDoc.inviteUsername) || '', link: '', password: '',
+        expiresAt: null, issuedAt: (appDoc && appDoc.inviteIssuedAt) || null, claimedAt: null, sentAt: null, sentBy: '',
+        signInUrl: ctx.signInUrl, message: '', plainMessage: '', accountId: (appDoc && appDoc.inviteAccountId) || null,
+    };
+    if (!appDoc || appDoc.status !== 'accepted') return out;
+    let account = null;
+    if (accounts) {
+        account = (appDoc.inviteAccountId && accounts.byId.get(String(appDoc.inviteAccountId)))
+            || (appDoc.inviteUsername && accounts.byUsername.get(String(appDoc.inviteUsername).toLowerCase())) || null;
+    } else {
+        account = await inviteAccountFor(store, appDoc).catch(() => null);
+    }
+    if (account) {
+        out.username = account.username || out.username;
+        out.accountId = account._id;
+        if (account.lastLoginAt) return { ...out, state: 'claimed', claimedAt: account.lastLoginAt };
+        const si = crewPasswordReset.setupInvite(account);
+        if (si.state === 'live' || si.state === 'expired') {
+            const live = si.state === 'live';
+            const link = live ? crewPasswordReset.resetUrl(ctx.signInUrl, si.token) : '';
+            const words = { ...ctx, username: account.username, link, expiresAt: si.expiresAt };
+            return {
+                ...out, state: si.state, kind: 'link', link,
+                expiresAt: si.expiresAt || null, sentAt: si.sentAt || null, sentBy: si.sentBy || '',
+                message: live ? crewInvite.buildInviteMessage({ ...words, format: 'ifc' }) : '',
+                plainMessage: live ? crewInvite.buildInviteMessage(words) : '',
+            };
+        }
+    }
+    const legacy = crewInvite.staffInvite(appDoc, ctx);
+    if (legacy.state === 'none') return out;
+    return {
+        ...out, state: legacy.state, kind: 'password', username: legacy.username || out.username,
+        password: legacy.password, expiresAt: legacy.expiresAt, claimedAt: legacy.claimedAt,
+        message: legacy.message, plainMessage: legacy.plainMessage,
+    };
+}
+
+/** What the applicant themselves may see of their invitation: only a live one. */
+const applicantLogin = (inv) => (inv && inv.state === 'live' ? {
+    kind: inv.kind, username: inv.username, link: inv.link || '', password: inv.password || '',
+    signInUrl: inv.signInUrl, expiresAt: inv.expiresAt, mustChange: inv.kind === 'password',
+    message: inv.plainMessage || '',
+} : null);
+
+/** Every login, by id and by username, for a list that resolves many invitations. */
+async function accountsIndex(store) {
+    const all = await store.listAccounts({ limit: 5000 }).catch(() => []);
+    const byId = new Map(), byUsername = new Map();
+    for (const a of all || []) {
+        byId.set(String(a._id), a);
+        if (a.username) byUsername.set(String(a.username).toLowerCase(), a);
+    }
+    return { byId, byUsername };
+}
+
+/** An applicant's latest entrance test, staff-shaped, or null. */
+async function latestEntrance(va, store, appDoc, slug, quizzes = null) {
+    try {
+        const [a] = await store.listQuizAttempts({ candidates: true, applicationId: String(appDoc._id), limit: 1 });
+        if (!a || a.status === 'revoked') return null;
+        const list = quizzes || crewQuizzes.sanitizeQuizzes(((await crewQuizDoc(slug)) || {}).crewQuizzes || []) || [];
+        return staffEntrance(va, list, a, slug);
+    } catch { return null; }
+}
+
+/**
+ * Where an application stands and what to tell its applicant, for every
+ * screen at once: the stage, the next step in the applicant's words, and the
+ * message staff paste to them for that step.
+ */
+function applicantView(va, appDoc, slug, { rules, test = null, invite = null, inTicket = false, emailed = false }) {
+    const stage = crewRecruit.stageOf({ app: appDoc, test, invite, rules, inTicket });
+    const code = crewRecruit.applicationCode(appDoc.statusToken);
+    const statusUrl = appDoc.statusToken ? applicationStatusUrl(va, slug, appDoc.statusToken) : '';
+    const testInfo = test ? { title: test.quizTitle || '', passMark: test.passMark, status: test.status, link: test.link || '' } : null;
+    const next = crewRecruit.nextStep({
+        stage, vaName: va.name, code, discordInvite: rules.discordInvite, inTicket, test: testInfo,
+        invite: applicantLogin(invite), signInUrl: crewSignInUrl(va, slug), emailed, staffMessage: appDoc.staffMessage,
+    });
+    // The message for this step. Accepted: the welcome with their login, which
+    // lives with the invitation. Taking a test: the test's own message.
+    let message = '', plainMessage = '';
+    if (stage === 'invited' || stage === 'joined') {
+        message = (invite && invite.message) || '';
+        plainMessage = (invite && invite.plainMessage) || '';
+    } else if (stage === 'test' && test && test.message) {
+        message = test.message;
+        plainMessage = test.plainMessage || '';
+    } else {
+        const words = {
+            stage, vaName: va.name, ifcName: appDoc.ifcName, statusUrl, code, discordInvite: rules.discordInvite,
+            passed: !!(test && test.status === 'passed'), staffMessage: appDoc.staffMessage,
+        };
+        message = crewRecruit.applicantMessage({ ...words, format: 'ifc', ...inviteArt(va, slug) });
+        plainMessage = crewRecruit.applicantMessage(words);
+    }
+    return { stage, code, statusUrl, inTicket, next, message, plainMessage };
+}
+
+/**
+ * Accept an application. The one way anybody is let in — the dashboard, the
+ * bot, open joining and a pass that accepts itself all call this.
+ *
+ * ALWAYS makes the login: the roster row, a crew center login next to it in the
+ * VA's own store, and the setup link that hands it over. Best-effort past the
+ * roster row — a pilot who is on the roster without a login is a fixable
+ * annoyance ("New link" on their card), whereas failing the acceptance after
+ * adding them would leave a pending application for somebody already crew.
+ *
+ * Throws {status: 409, code: 'callsign_taken'} when the callsign went to
+ * somebody else since they applied.
+ *
+ * @returns {{appDoc, member, login, loginError: string, invite, discordInvite: string, emailed: boolean}}
+ */
+async function acceptApplication({
+    va, store, appDoc, by = 'Crew Center', senderName = '', message = '', discordInvite = '', email = '',
+    slug, notifyBot = true, notice = true,
+}) {
+    const patch = { reviewedAt: new Date(), status: 'accepted' };
+    // Only ever FILLS a gap: an address the applicant gave themselves is never
+    // replaced from the review screen — that would let staff redirect
+    // somebody else's login to an inbox of their choosing.
+    if (!appDoc.email && email) { patch.email = email; appDoc = { ...appDoc, email }; }
+
+    let invite = discordInvite;
+    if (!invite) {
+        const withInvite = await VirtualAirlineAd.findById(va._id).select('crewDiscordInvite').lean().catch(() => null);
+        invite = (withInvite && withInvite.crewDiscordInvite) || '';
+    }
+    if (invite) patch.discordInvite = invite;
+
+    let member = null;
+    if (appDoc.status !== 'accepted') {
+        // The callsign was free when they applied; staff may have issued it
+        // since, so it is checked again at the moment it becomes theirs.
+        const wanted = applicationCallsign(appDoc, va);
+        const clash = await callsignHolder(va, store, wanted, { exceptApplicationId: appDoc._id });
+        if (clash) {
+            const err = new Error(`${callsignTakenMessage(clash, wanted)} Change this applicant’s number before accepting them.`);
+            err.status = 409; err.code = 'callsign_taken';
+            throw err;
+        }
+        member = await store.createMember({
+            name: appDoc.ifcName, callsign: wanted,
+            hours: 0, role: '', aircraft: [], status: 'active',
+            ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
+        });
+        vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
+        postAnnouncement(va, {
+            kind: 'join',
+            title: `${member.name || 'A new pilot'} joined the crew`,
+            body: member.callsign ? `Flying as ${member.callsign}.` : '',
+            refId: member._id,
+        });
+        notifyPilot(va, member, {
+            kind: 'application',
+            title: `Welcome to ${va.name || 'the airline'}`,
+            body: member.callsign
+                ? `Your application was accepted. You’re flying as ${member.callsign}.`
+                : 'Your application was accepted.',
+            refId: member._id,
+            senderName,
+        });
+    } else {
+        member = await memberForApplication(store, appDoc);
+    }
+
+    let login = null, loginError = '';
+    try {
+        login = await issueLogin({
+            va, store, displayName: appDoc.ifcName || '', memberId: member ? member._id : null,
+            email: appDoc.email || '', by, slug,
+        });
+        // The application remembers which login it produced (the bot links
+        // Discord to it, the card finds its invitation by it). The password is
+        // only kept on the old path; a link lives on the account.
+        Object.assign(patch, crewInvite.issuePatch({
+            username: login.username,
+            password: login.kind === 'password' ? (login.password || '') : '',
+            accountId: login.account && login.account._id,
+        }));
+    } catch (err) {
+        console.error('pilot account provision error:', err?.message || err);
+        loginError = err && err.code === 'store_accounts_missing'
+            ? 'The pilot was accepted, but your project needs the updated setup SQL before it can hold pilot logins (Settings → Data store).'
+            : 'The pilot was accepted, but their crew center login could not be made. Press “New link” on their card to try again.';
+    }
+    if (message) patch.staffMessage = message;
+    appDoc = (await store.updateApplication(appDoc._id, patch)) || { ...appDoc, ...patch };
+
+    // Waiting in a Discord ticket: the bot finishes there — Discord linked to
+    // the login, the pilot role, the welcome with their login button.
+    if (notifyBot) vaBot.hub.emit('applicationAccepted', { vaId: va._id, applicationId: String(appDoc._id) });
+
+    const cs = applicationCallsign(appDoc, va);
+    // `notice: false` where the caller already posts its own line about this
+    // pilot (open joining's "joined", a pass's "accepted automatically").
+    const hook = notice ? await crewWebhookUrlFor(va._id) : '';
+    if (hook) {
+        postCrewNotice(hook, {
+            title: `✅ Accepted — ${appDoc.ifcName}`,
+            description: [message, by && by !== 'Crew Center' ? `By ${by}.` : ''].filter(Boolean).join('\n') || undefined,
+            color: CREW_COLORS.accepted,
+            fields: cs ? [{ name: 'Callsign', value: cs, inline: true }] : [],
+        }).catch(() => {});
+    }
+
+    const inv = await applicationInvite(va, store, appDoc, slug);
+    let emailed = false;
+    if (appDoc.email) {
+        const emailCfg = await crewEmailConfigFor(va._id);
+        const centerUrl = crewSignInUrl(va, slug);
+        let body = `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
+            + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
+        let button = { label: 'Open the crew center', url: centerUrl };
+        if (inv.state === 'live' && inv.kind === 'link') {
+            body += `<br><br><b>Your crew center login</b><br>Username: <b>${escHtml(inv.username)}</b>`
+                + '<br><span style="color:#6b7280">Press the button to choose your password. The link works once'
+                + (inv.expiresAt ? `, until ${escHtml(new Date(inv.expiresAt).toISOString().slice(0, 10))}` : '') + '.</span>';
+            button = { label: 'Choose my password', url: inv.link };
+        } else if (inv.state === 'live' && inv.kind === 'password') {
+            body += crewCredentialsHtml({ username: inv.username, password: inv.password, signInUrl: centerUrl });
+            button = { label: 'Sign in to the crew center', url: centerUrl };
+        }
+        if (invite) body += `<br><br><b>Join the crew on Discord</b><br><a href="${escHtml(invite)}">${escHtml(invite)}</a>`;
+        if (emailCfg) emailed = true;
+        sendCrewEmail(emailCfg, {
+            to: appDoc.email, subject: `You’re in — ${va.name || 'Crew Center'}`,
+            html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: 'You’re in! 🎉', bodyHtml: body, button }),
+        }).catch(() => {});
+    }
+    return { appDoc, member, login, loginError, invite: inv, discordInvite: invite, emailed };
+}
+
 // ---- Recruitment: applications ----
 // Submit a join application (public). Free mode creates the pilot instantly;
 // application mode leaves it pending for staff. A min-grade gate blocks
@@ -14046,47 +14463,62 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
 
         const statusToken = crypto.randomBytes(16).toString('hex');
-        const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
-        const appDoc = await store.createApplication({
+        let appDoc = await store.createApplication({
             ifcName, email, callsignPrefix: prefix, callsignNumber: number, grade,
-            ifVerified, ifUserId, answers, statusToken,
-            status, reviewedAt: status === 'accepted' ? new Date() : null,
+            ifVerified, ifUserId, answers, statusToken, status: 'pending', reviewedAt: null,
         });
         vaStats.recordEngagement(ad._id, 'application', 1, ad.name);
-        // A free-join VA accepts on the spot, so this is the moment that pilot
-        // becomes crew — on the roster, with their callsign.
-        //
-        // NOT WITH A LOGIN. This used to mint one here and put the password on
-        // the join page (and in the welcome email) the second the form was
-        // sent, which took the one decision a VA still had — when somebody gets
-        // into the crew center — away from it. Sign-ins come from staff now:
-        // the pilot lands in Roster → Logins as "no login yet", where one press
-        // makes their login and a welcome message to send on the IFC. A VA that
-        // runs an entrance test sends that first, and the invite after a pass.
-        if (status === 'accepted') {
-            await store.createMember({
-                name: ifcName, callsign: cs,
-                hours: 0, role: '', aircraft: [], status: 'active',
-                ifUserId: ifUserId || '', ifcName,
-            });
-            vaStats.recordEngagement(ad._id, 'crewJoin', 1, ad.name);
+
+        /* WHAT HAPPENS NEXT — the same road for everybody (crewRecruit.js).
+         *
+         *   Open joining, no test     accepted now: roster, login, and the
+         *                             link to choose a password, on this reply.
+         *   An entrance test          sent now, unless this airline recruits in
+         *                             its Discord — then the ticket sends it.
+         *                             Open joining accepts on the pass.
+         *   Discord                   told to open a ticket, with the code that
+         *                             ties the ticket to this application.
+         *   Otherwise                 staff review it.
+         *
+         * Applying FROM a Discord ticket (the bot calling this) is already in
+         * the ticket, so the test goes out straight away there too. */
+        const slug = ad.slug || raw;
+        const fromBot = !!vaBot.botCallerFrom(req, raw);
+        const rules = await recruitRulesFor(ad);
+        let test = null, accepted = null;
+        if (rules.auto && !rules.test) {
+            try {
+                accepted = await acceptApplication({
+                    va: ad, store, appDoc, by: 'Open joining', slug, notifyBot: false, notice: false,
+                });
+                appDoc = accepted.appDoc;
+            } catch (err) {
+                // The number went in the instant between the check and now.
+                // Left pending for staff, who can give them another.
+                console.warn('open join accept failed:', err?.message || err);
+            }
+        } else if (rules.test && (!rules.viaDiscord || fromBot)) {
+            try {
+                const sent = await issueEntranceTest({ va: ad, store, quiz: rules.test, appDoc, by: 'Automatic', slug });
+                test = sent.test;
+            } catch (err) { console.warn('entrance test on apply failed:', err?.message || err); }
         }
-        // Notify the VA's Discord (fire-and-forget). Free-mode joins and
-        // pending applications both post so staff see activity in real time.
+        const view = applicantView(ad, appDoc, slug, {
+            rules, test, invite: accepted ? accepted.invite : null, inTicket: fromBot, emailed: !!email,
+        });
+        const status = appDoc.status;
+        const stageLine = {
+            discord: 'Sent on to your Discord to open a ticket.',
+            test: test ? 'Entrance test sent.' : 'Waiting for the entrance test.',
+            review: 'Review it in your Crew Center → Roster → Applications.',
+        }[view.stage];
+
+        // Notify the VA's Discord (fire-and-forget).
         if (ad.crewWebhookUrl) {
-            postCrewNotice(ad.crewWebhookUrl, status === 'accepted' ? {
-                title: `🎉 New pilot joined — ${ifcName}`,
-                description: 'Send their crew center sign-in from Roster → Logins.',
-                color: CREW_COLORS.accepted,
-                fields: [
-                    { name: 'Callsign', value: cs || '—', inline: true },
-                    { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
-                    { name: 'Verified', value: ifVerified ? '✓ yes' : 'no', inline: true },
-                ],
-            } : {
-                title: `📝 New application — ${ifcName}`,
-                description: 'Review it in your Crew Center → Roster → Applications.',
-                color: CREW_COLORS.new,
+            postCrewNotice(ad.crewWebhookUrl, {
+                title: status === 'accepted' ? `🎉 New pilot joined — ${ifcName}` : `📝 New application — ${ifcName}`,
+                description: status === 'accepted' ? 'Their login is made — they choose their password from the link they were given.' : stageLine,
+                color: status === 'accepted' ? CREW_COLORS.accepted : CREW_COLORS.new,
                 fields: [
                     { name: 'Callsign', value: cs || '—', inline: true },
                     { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
@@ -14094,33 +14526,29 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                 ],
             }).catch(() => {});
         }
-        // Acknowledge to the applicant by email (if they gave one). Free-mode
-        // joins get a welcome; applications get a "received + your status link".
-        if (email) {
+        // Tell the applicant by email what happens next. An acceptance and a
+        // test send their own (acceptApplication, issueEntranceTest).
+        if (email && status !== 'accepted' && !(view.stage === 'test' && test)) {
             const emailCfg = await crewEmailConfigFor(ad._id);
-            const slug = ad.slug || raw;
-            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${statusToken}`;
-            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
-            if (status === 'accepted') {
-                sendCrewEmail(emailCfg, { to: email, subject: `Welcome to ${ad.name || 'the crew'}!`,
-                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
-                        bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`
-                            + ` The ${escHtml(ad.name || 'VA')} team will send you your crew center sign-in — keep an eye on your IFC messages.`,
-                        button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
-            } else {
-                sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
-                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
-                        bodyHtml: `Thanks, <b>${escHtml(ifcName)}</b>. The ${escHtml(ad.name || 'VA')} team will review your application and we’ll email you here as soon as there’s a decision.`,
-                        button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
-            }
+            const next = view.next;
+            sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
+                html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
+                    bodyHtml: `Thanks, <b>${escHtml(ifcName)}</b>.<br><br><b>${escHtml(next.title)}</b><br>${escHtml(next.body)}`
+                        + (view.code && view.stage === 'discord' ? `<br><br>Your application code: <b style="font-family:monospace;font-size:16px">${escHtml(view.code)}</b>` : '')
+                        + `<br><br><a href="${escHtml(view.statusUrl)}">Track your application</a>`,
+                    button: next.action || { label: 'Check your status', url: view.statusUrl } }) }).catch(() => {});
         }
+        res.set('Cache-Control', 'no-store');
         res.json({
             status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade,
             emailed: !!email,
-            // Never a login: staff hand those out (see above). Kept in the shape
-            // so an older join page reads "no credentials" rather than breaking.
+            stage: view.stage, next: view.next, code: view.code, statusUrl: view.statusUrl,
+            test: test && test.link ? { link: test.link, title: test.quizTitle || rules.test.title, passMark: test.passMark } : null,
+            // Their own login, when open joining let them straight in. The link
+            // is theirs to use; nothing in it is a password.
+            login: accepted ? applicantLogin(accepted.invite) : null,
+            // Kept so an older join page reads "no credentials" rather than breaking.
             account: null,
-            signInFromStaff: status === 'accepted',
         });
     } catch (err) { crewFail(res, err, { log: 'apply error', message: 'Could not submit your application.' }); }
 });
@@ -14258,9 +14686,14 @@ function sweepExpiredInvite(store, appDoc) {
 }
 
 // Public: an applicant checks the state of their application with the opaque
-// token they were handed at submit time. No account or email needed. Includes
-// any message staff left when they reviewed it, and — while the invitation is
-// live — the login they were issued.
+// token they were handed at submit time. No account or email needed.
+//
+// It answers the one question an applicant has — what do I do next? — in
+// `next`, from the same rules every other screen uses (crewRecruit.js): open a
+// Discord ticket, take the test, wait for the team, or choose a password. While
+// their invitation is live, `login` carries it: a link to choose a password, or
+// on an older database the temporary password. The status link stops being a
+// way in the moment it stops needing to be one.
 app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
     try {
         const token = String(req.params.token || '').trim();
@@ -14269,58 +14702,53 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
         const appDoc = await store.getApplicationByToken(token);
         if (!appDoc) return res.status(404).json({ error: 'We could not find that application.' });
         sweepExpiredInvite(store, appDoc);
+        const slug = req.params.slug;
+        const [rules, test, invite, ticketed] = await Promise.all([
+            recruitRulesFor(va),
+            latestEntrance(va, store, appDoc, slug),
+            applicationInvite(va, store, appDoc, slug),
+            ticketedApplications(va._id, [appDoc._id]),
+        ]);
+        const view = applicantView(va, appDoc, slug, {
+            rules, test, invite, inTicket: ticketed.has(String(appDoc._id)), emailed: !!appDoc.email,
+        });
+        const login = applicantLogin(invite);
         // This response can carry a credential, so it must not be stored by a
         // browser cache or by anything between here and the applicant.
         res.set('Cache-Control', 'no-store');
         res.json({
             status: appDoc.status,
+            stage: view.stage,
+            next: view.next,
+            code: view.code,
             message: appDoc.staffMessage || '',
             ifcName: appDoc.ifcName || '',
             callsign: applicationCallsign(appDoc, va),
-            // Only meaningful once accepted, and only ever set by the accept
-            // handler from a validated invite.
-            discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : '',
-            // The login they were issued, for as long as the invitation is live.
-            // null once they have signed in, once staff have thrown it away, and
-            // once it has aged out — the status link stops being a way in the
-            // moment it stops needing to be one.
-            credentials: appDoc.status === 'accepted'
-                ? crewInvite.applicantCredentials(appDoc, inviteContext(va, appDoc, req.params.slug))
+            discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : (view.stage === 'discord' ? rules.discordInvite : ''),
+            login,
+            // The older page's name for a temporary password. Only that kind.
+            credentials: login && login.kind === 'password'
+                ? { username: login.username, password: login.password, signInUrl: login.signInUrl, mustChange: true, expiresAt: login.expiresAt, message: login.message }
                 : null,
-            // Their entrance test, when staff have sent one — the link to sit it
-            // while it can be sat, and how it went once it has been.
-            test: await applicantTest(va, store, appDoc, req.params.slug),
+            test: test ? {
+                title: test.quizTitle || 'Entrance test',
+                status: test.status,
+                percent: test.total ? Math.floor((Number(test.score) || 0) / test.total * 100) : (test.percent || 0),
+                passMark: test.passMark,
+                retryAt: test.retryAt || null,
+                link: test.live ? (test.link || '') : '',
+            } : null,
             reviewedAt: appDoc.reviewedAt || null,
             submittedAt: appDoc.createdAt || null,
         });
     } catch (err) { crewFail(res, err, { log: 'application-status error', message: 'Could not load that application.' }); }
 });
 
-/** The applicant's own view of their latest entrance test, or null. */
-async function applicantTest(va, store, appDoc, slug) {
-    try {
-        const [a] = await store.listQuizAttempts({ candidates: true, applicationId: String(appDoc._id), limit: 1 });
-        if (!a || a.status === 'revoked') return null;
-        const ad = await crewQuizDoc(slug);
-        const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
-        const quiz = quizzes.find((q) => q.id === a.quizId) || null;
-        return {
-            title: a.quizTitle || (quiz && quiz.title) || 'Entrance test',
-            status: a.status,
-            percent: a.total ? Math.floor((Number(a.score) || 0) / a.total * 100) : 0,
-            passMark: a.passMark,
-            retryAt: crewQuizzes.retryAfter(quiz, a),
-            link: entranceLive(quiz, a) ? testLinkFor(va.slug || slug, a.token) : '',
-        };
-    } catch { return null; }
-}
-
 // An application on its way out to staff. The raw row carries the invitation's
 // stored password, and handing that straight to the browser would show one that
-// has quietly aged out — so the invite fields are replaced wholesale by the
-// accessor that knows the difference. There is one shape, so there is one place
-// to get this wrong.
-function staffApplication(appDoc, va, slug) {
+// has quietly aged out — so the invite fields are dropped and `invite` comes
+// from applicationInvite, the accessor that knows the difference.
+function staffApplication(appDoc, va, slug, extra = {}) {
     const {
         inviteUsername, invitePassword, inviteIssuedAt, inviteClaimedAt,
         inviteRevokedAt, inviteAccountId, ...rest
@@ -14328,49 +14756,63 @@ function staffApplication(appDoc, va, slug) {
     return {
         ...rest,
         // The finished callsign, so the review list shows what this pilot will
-        // actually be issued rather than the two halves it is stored as. The
-        // dashboard's fallback (prefix + number, concatenated) renders
-        // "AEROMEXICO1" — the shape this whole area exists to stop.
+        // actually be issued rather than the two halves it is stored as.
         callsign: applicationCallsign(appDoc, va),
-        invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, slug)),
+        ...extra,
     };
 }
 
-// Staff: list applications (default pending).
+/** The rules as the dashboard draws them. */
+const publicRules = (rules) => ({
+    auto: rules.auto,
+    test: rules.test ? { id: rules.test.id, title: rules.test.title || 'Entrance test', passMark: rules.test.passMark } : null,
+    viaDiscord: rules.viaDiscord,
+    viaDiscordWanted: rules.viaDiscordWanted,
+    discordInvite: rules.discordInvite,
+});
+
+// Staff: list applications (default pending), each with where it stands
+// (crewRecruit.stageOf), its test, its invitation once accepted, and the
+// message for its step ready to paste on the IFC.
 app.get('/api/crew/:slug/applications', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
+        const slug = req.params.slug;
         const wanted = String(req.query.status || '');
         const status = ['pending', 'accepted', 'declined'].includes(wanted) ? wanted : 'pending';
-        const rows = await store.listApplications({ status });
-        (rows || []).forEach((a) => sweepExpiredInvite(store, a));
-        // Each applicant's entrance test (v25), newest first, so the card staff
-        // accept from says how they did. Best-effort: a project that cannot
-        // record tests still lists its applications.
-        const { byApp, waiting } = await applicationTests(va, store, req.params.slug, rows || []);
-        // Live passwords may be in here, so keep it out of every cache.
+        const rows = (await store.listApplications({ status })) || [];
+        rows.forEach((a) => sweepExpiredInvite(store, a));
+        const [rules, tests, ticketed, accounts] = await Promise.all([
+            recruitRulesFor(va),
+            applicationTests(va, store, slug, rows),
+            ticketedApplications(va._id, rows.map((a) => a._id)),
+            status === 'accepted' ? accountsIndex(store) : null,
+        ]);
+        const applications = await Promise.all(rows.map(async (a) => {
+            const test = tests.get(String(a._id)) || null;
+            const invite = status === 'accepted' ? await applicationInvite(va, store, a, slug, accounts) : null;
+            const view = applicantView(va, a, slug, { rules, test, invite, inTicket: ticketed.has(String(a._id)), emailed: !!a.email });
+            return staffApplication(a, va, slug, {
+                test, invite, stage: view.stage, code: view.code, statusUrl: view.statusUrl, inTicket: view.inTicket,
+                applicant: { message: view.message, plainMessage: view.plainMessage },
+            });
+        }));
+        // Live links and passwords may be in here, so keep it out of every cache.
         res.set('Cache-Control', 'no-store');
-        res.json({
-            applications: (rows || []).map((a) => ({
-                ...staffApplication(a, va, req.params.slug),
-                test: byApp.get(String(a._id)) || null,
-            })),
-            // Passed an entrance test that was handed out by hand, never
-            // applied, and not on the roster yet: people waiting to be let in
-            // just as much as an application is.
-            waitingTests: status === 'pending' ? waiting : [],
-        });
+        res.json({ applications, rules: publicRules(rules), waitingTests: [] });
     } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
+
 /**
  * Each applicant's latest entrance test, as staff see it (applicationId ->
- * test), and the passed tests nobody has acted on that have no application.
+ * test). A test sent by hand before tests were tied to applications is placed
+ * on the card of the applicant with the same IFC name. Best-effort: a project
+ * that cannot record tests still lists its applications.
  */
 async function applicationTests(va, store, slug, apps) {
     const byApp = new Map();
-    let waiting = [];
     try {
         const ad = await crewQuizDoc(slug);
         const quizzes = crewQuizzes.sanitizeQuizzes((ad && ad.crewQuizzes) || []) || [];
@@ -14379,22 +14821,16 @@ async function applicationTests(va, store, slug, apps) {
         for (const t of tests) {   // newest first, so the first one seen wins
             if (t.applicationId && !byApp.has(String(t.applicationId))) byApp.set(String(t.applicationId), t);
         }
-        waiting = tests.filter(waitingToBeAdded);
     } catch { /* no tests on this project — the cards simply carry none */ }
-    return { byApp, waiting };
+    return byApp;
 }
 
 const candidateKey = (s) => String(s || '').trim().replace(/^@/, '').toLowerCase();
 
 /**
- * Where a test sent BY HAND belongs.
- *
- * A test sent to a name typed in, rather than from an application, carries no
- * application — which is how a VA without email works: copy the message, paste
- * it on the IFC. Staff still need two things from one: whether that person
- * has applied too (then it belongs on their application card), and whether
- * they are on the roster already (then there is nobody left to let in).
- * Matched on the IFC username, which is the one name both sides were given.
+ * Where a test with no application on it belongs — one sent by hand to a typed
+ * name, before every test was tied to an application. Matched on the IFC
+ * username, the one name both sides were given.
  */
 async function placeCandidateTests(store, tests, apps) {
     const byIfc = new Map();
@@ -14402,259 +14838,114 @@ async function placeCandidateTests(store, tests, apps) {
         const k = candidateKey(a.ifcName);
         if (k && !byIfc.has(k)) byIfc.set(k, String(a._id));
     }
-    const crew = new Set();
-    const members = await store.listMembers({ limit: 5000 }).catch(() => []);
-    for (const m of members || []) {
-        if (m.ifcName) crew.add('ifc:' + candidateKey(m.ifcName));
-        if (m.name) crew.add('name:' + candidateKey(m.name));
-    }
     return tests.map((t) => {
         const out = { ...t };
         const k = candidateKey(out.ifcName);
         if (!out.applicationId && k && byIfc.has(k)) out.applicationId = byIfc.get(k);
-        // By IFC username when the test has one: two pilots can share a
-        // first name, and hiding a pass behind somebody else's is worse than
-        // showing one twice. By name only when that is all there is.
-        out.onRoster = !out.applicationId && (k ? crew.has('ifc:' + k)
-            : !!out.pilotName && crew.has('name:' + candidateKey(out.pilotName)));
         return out;
     });
 }
 
-/** A pass from somebody who never applied and is not crew yet. */
-const waitingToBeAdded = (t) => t.status === 'passed' && !t.applicationId && !t.onRoster;
-
-// Staff: accept / decline an application. Accept creates the pilot.
+// Staff: accept / decline an application.
+//
+// Accepting ALWAYS makes the login — there is no "create a login" switch any
+// more (crewRecruit.js). A `createAccount` an older dashboard sends is ignored.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
+        const slug = req.params.slug;
         let appDoc = await store.getApplication(req.params.id);
         if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
         const action = String(req.body?.action || '');
         const message = String(req.body?.message || '').trim().slice(0, 2000);
-        const patch = { reviewedAt: new Date() };
-
-        // An address the reviewer typed in, for an applicant who left the email
-        // field blank. It is the difference between a pilot receiving their
-        // one-time password and a staff member having to read it out, so the
-        // accept dialog asks for one whenever the application has none.
-        //
-        // It only ever FILLS a gap: an address the applicant gave themselves is
-        // never overwritten from the review screen, because that would let staff
-        // redirect someone else's credentials to an inbox of their choosing.
-        if (!appDoc.email && req.body?.email !== undefined) {
-            const typed = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
-            if (typed && !isEmail(typed)) {
-                return res.status(400).json({ error: 'That doesn’t look like an email address.' });
-            }
-            if (typed) { patch.email = typed; appDoc = { ...appDoc, email: typed }; }
-        }
-
-        // What the pilot gets handed along with the decision. `credentials` is
-        // returned to the reviewing staff member exactly once — see below.
-        let credentials = null;
-        let invite = '';
 
         if (action === 'accept') {
-            // The invite the pilot is sent: whatever the reviewer typed, else
-            // the VA's stored default. Rejected outright if it isn't a real
-            // Discord invite — we are about to put it in an email with our name
-            // on it (see isDiscordInviteUrl).
+            // An address the reviewer typed for an applicant who left it blank.
+            let email = '';
+            if (!appDoc.email && req.body?.email !== undefined) {
+                const typed = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+                if (typed && !isEmail(typed)) return res.status(400).json({ error: 'That doesn’t look like an email address.' });
+                email = typed;
+            }
+            // Whatever the reviewer typed, else the VA's default — and rejected
+            // outright if it isn't a real Discord invite (it goes in an email
+            // with our name on it; see isDiscordInviteUrl).
+            let invite = '';
             if (req.body?.discordInvite !== undefined) {
                 invite = cleanDiscordInvite(req.body.discordInvite);
                 if (invite === null) {
                     return res.status(400).json({ error: 'That is not a Discord invite link. Use a discord.gg or discord.com/invite address.' });
                 }
             }
-            if (!invite) {
-                const withInvite = await VirtualAirlineAd.findById(va._id).select('crewDiscordInvite').lean();
-                invite = (withInvite && withInvite.crewDiscordInvite) || '';
+            let out;
+            try {
+                out = await acceptApplication({
+                    va, store, appDoc, slug, message, discordInvite: invite, email,
+                    by: (gate.p && gate.p.name) || 'Crew Center', senderName: (gate.p && gate.p.name) || '',
+                    // The bot accepting does its own welcome in the ticket.
+                    notifyBot: !(gate.p && gate.p.kind === 'discord-bot'),
+                });
+            } catch (err) {
+                if (err && err.status === 409) return res.status(409).json({ error: err.message, code: err.code });
+                throw err;
             }
-            if (invite) patch.discordInvite = invite;
+            const login = out.login;
+            // This response can carry a credential, so it is not cacheable.
+            res.set('Cache-Control', 'no-store');
+            return res.json({
+                status: out.appDoc.status,
+                stage: out.invite && out.invite.state === 'claimed' ? 'joined' : 'invited',
+                message: out.appDoc.staffMessage || '',
+                discordInvite: out.discordInvite || '',
+                emailed: out.emailed,
+                email: out.appDoc.email || '',
+                signInUrl: crewSignInUrl(va, slug),
+                // The login as it was just made. A link lives in `invite`; a
+                // password only ever appears here on a database too old for one.
+                account: login
+                    ? { username: login.username, created: login.created, kind: login.kind, password: login.kind === 'password' ? (login.password || null) : null }
+                    : { error: out.loginError },
+                invite: out.invite,
+            });
+        }
+        if (action !== 'decline') return res.status(400).json({ error: 'Unknown action.' });
 
-            // Only mint the pilot on the transition into 'accepted', so
-            // re-accepting an already-accepted application can't duplicate them.
-            let member = null;
-            if (appDoc.status !== 'accepted') {
-                // The callsign was free when they applied. Between then and now
-                // staff may have issued it to somebody else, or accepted an
-                // applicant who asked for the same number — so it is checked
-                // again at the moment it actually becomes theirs. Refusing here
-                // is the point: the reviewer can edit the pilot's number on the
-                // roster afterwards, but two pilots must not leave this handler
-                // sharing one callsign.
-                const wanted = applicationCallsign(appDoc, va);
-                const clash = await callsignHolder(va, store, wanted, { exceptApplicationId: appDoc._id });
-                if (clash) {
-                    return res.status(409).json({
-                        error: `${callsignTakenMessage(clash, wanted)} Change this applicant’s number before accepting them.`,
-                        code: 'callsign_taken',
-                    });
-                }
-                member = await store.createMember({
-                    name: appDoc.ifcName, callsign: wanted,
-                    hours: 0, role: '', aircraft: [], status: 'active',
-                    ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
-                });
-                vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
-                // Put them on the noticeboard. A new pilot's first visit to the
-                // crew center is the one where they are most likely to be
-                // looking, and "welcome aboard" being there for the crew to see
-                // is worth more than the Discord line that scrolls away.
-                postAnnouncement(va, {
-                    kind: 'join',
-                    title: `${member.name || 'A new pilot'} joined the crew`,
-                    body: member.callsign ? `Flying as ${member.callsign}.` : '',
-                    refId: member._id,
-                });
-                // Waiting for them when they first sign in. The acceptance email
-                // is the thing they are told at the time; this is the copy that is
-                // still there a week later when they have lost the email, and it
-                // is addressed by member id because the login below does not exist
-                // yet (see the store's listNotifications for why that still finds
-                // it).
-                notifyPilot(va, member, {
-                    kind: 'application',
-                    title: `Welcome to ${va.name || 'the airline'}`,
-                    body: member.callsign
-                        ? `Your application was accepted. You’re flying as ${member.callsign}.`
-                        : 'Your application was accepted.',
-                    refId: member._id,
-                    senderName: (gate.p && gate.p.name) || '',
-                });
-            }
-
-            // A crew center login, when the reviewer asked for one. It is
-            // written into the VA's OWN data store next to the roster row it
-            // belongs to — Inflight never holds a pilot's credentials.
-            //
-            // Best-effort: a pilot who is on the roster but could not be given
-            // an account is a fixable annoyance, whereas failing the whole
-            // acceptance over it would leave the application pending after we
-            // already added them.
-            if (req.body?.createAccount) {
-                try {
-                    const r = await crewAccounts.provisionPilotAccount(store, {
-                        displayName: appDoc.ifcName || '',
-                        memberId: member ? member._id : null,
-                        email: appDoc.email || '',
-                        createdByName: gate.p?.name || 'Crew Center',
-                        vaName: va.name || '',
-                    });
-                    // A password comes back only on first creation; re-accepting
-                    // someone who already has a login yields username-only.
-                    credentials = { username: r.username, password: r.password, created: r.created };
-                    // Fold the invitation into the same patch that records the
-                    // decision, so the acceptance and the credential it produced
-                    // are one write. It stays readable — to staff, and to the
-                    // holder of the status link — until the pilot signs in, a
-                    // staff member throws it away, or it ages out.
-                    if (r.created && r.password) {
-                        Object.assign(patch, crewInvite.issuePatch({
-                            username: r.username, password: r.password, accountId: r.account && r.account._id,
-                        }));
-                    }
-                } catch (err) {
-                    console.error('pilot account provision error:', err?.message || err);
-                    // An older schema is the one failure the VA can act on, so
-                    // say that rather than the generic line.
-                    credentials = {
-                        error: err && err.code === 'store_accounts_missing'
-                            ? 'The pilot was accepted, but your project needs the updated setup SQL before it can hold pilot logins (Settings → Data store).'
-                            : 'The pilot was accepted, but their crew center account could not be created.',
-                    };
-                }
-            }
-            patch.status = 'accepted';
-        } else if (action === 'decline') {
-            patch.status = 'declined';
-        } else return res.status(400).json({ error: 'Unknown action.' });
+        const patch = { reviewedAt: new Date(), status: 'declined' };
         if (message) patch.staffMessage = message;
         appDoc = (await store.updateApplication(appDoc._id, patch)) || { ...appDoc, ...patch };
-
-        const cs = applicationCallsign(appDoc, va);
-        const accepted = appDoc.status === 'accepted';
-        // Accepted from the dashboard while the applicant waits in a Discord
-        // ticket: the bot finishes the job there — their Discord linked to the
-        // login, the pilot role, the welcome. Not when the bot is the one
-        // accepting; it does all of that itself.
-        if (action === 'accept' && accepted && !(gate.p && gate.p.kind === 'discord-bot')) {
-            vaBot.hub.emit('applicationAccepted', { vaId: va._id, applicationId: String(appDoc._id) });
-        }
-        // Post the decision (+ the staff's message) to the VA's Discord.
         const hook = await crewWebhookUrlFor(va._id);
         if (hook) {
             postCrewNotice(hook, {
-                title: `${accepted ? '✅ Accepted' : '🚫 Declined'} — ${appDoc.ifcName}`,
+                title: `🚫 Declined — ${appDoc.ifcName}`,
                 description: message || undefined,
-                color: accepted ? CREW_COLORS.accepted : CREW_COLORS.declined,
-                fields: accepted && cs ? [{ name: 'Callsign', value: cs, inline: true }] : [],
+                color: CREW_COLORS.declined,
             }).catch(() => {});
         }
-        // Email the applicant the decision + the staff's message (if they left one).
         if (appDoc.email) {
             const emailCfg = await crewEmailConfigFor(va._id);
-            const slug = va.slug || req.params.slug;
-            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
-            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
-            let body = (accepted
-                ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
-                : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
-                + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
-            // The two things a new pilot needs next: how to sign in, and where
-            // the crew actually talks. The password is printed here because this
-            // is the only copy — nothing stores it, here or in the VA's project
-            // (see crewAccounts.provisionPilotAccount).
-            if (accepted && credentials && credentials.password) {
-                body += crewCredentialsHtml({ ...credentials, signInUrl: centerUrl });
-            }
-            if (accepted && invite) {
-                body += `<br><br><b>Join the crew on Discord</b><br><a href="${escHtml(invite)}">${escHtml(invite)}</a>`;
-            }
-            const signInEmail = accepted && credentials && credentials.password;
+            const statusUrl = applicationStatusUrl(va, slug, appDoc.statusToken);
             sendCrewEmail(emailCfg, { to: appDoc.email,
-                subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
-                html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
-                    bodyHtml: body,
-                    button: accepted
-                        ? { label: signInEmail ? 'Sign in to the crew center' : 'Open the crew center', url: centerUrl }
-                        : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
+                subject: `Update on your application — ${va.name || 'Crew Center'}`,
+                html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: 'Application update',
+                    bodyHtml: `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`
+                        + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : ''),
+                    button: { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
-        // `account` is the credential as it was just minted; `invite` is the
-        // same thing as it will look on every later read, message included, so
-        // the dashboard renders one card here and after a reload. This response
-        // can carry a password, so it is not cacheable.
-        res.set('Cache-Control', 'no-store');
-        res.json({
-            status: appDoc.status,
-            message: appDoc.staffMessage || '',
-            discordInvite: accepted ? (invite || '') : '',
-            emailed: !!(accepted && appDoc.email),
-            email: accepted ? (appDoc.email || '') : '',
-            // Where the pilot signs in, so the reviewer can pass on a working
-            // link with the credentials when there was no email to send them to.
-            signInUrl: accepted ? `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}` : '',
-            account: credentials,
-            invite: accepted
-                ? crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, req.params.slug))
-                : null,
-        });
+        res.json({ status: appDoc.status, stage: 'declined', message: appDoc.staffMessage || '' });
     } catch (err) { crewFail(res, err, { log: 'application review error', message: 'Could not update the application.' }); }
 });
 
 // ---- The invitation on an accepted application ----
 //
-// An acceptance produces a login that somebody still has to deliver, usually by
-// hand and usually later — an IFC message, a Discord DM. These three endpoints
-// are that gap: read the invitation back (with the message ready to paste),
-// mint a fresh one when the first never arrived, or throw it away.
+// An acceptance produces a login somebody may still have to deliver by hand —
+// an IFC message, a Discord DM — when there was no email and no ticket to send
+// it through. These endpoints are that gap: read it back with the message ready
+// to paste, record that it was sent, make a fresh one, or throw it away.
 //
-// All three are gated on applications.review rather than owner-only. Whoever is
-// trusted to accept a pilot is by definition trusted to hand them their login;
-// making this owner-only would mean the person who did the accepting cannot
-// finish the job.
+// Gated on applications.review: whoever is trusted to accept a pilot is by
+// definition trusted to hand them their login.
 
 // Locate the account an invitation belongs to. The id is recorded when the
 // invitation is issued, but an invitation written before that (or one whose
@@ -14670,66 +14961,159 @@ async function inviteAccountFor(store, appDoc) {
     return null;
 }
 
+async function reviewGate(req, res) {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) { res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' }); return null; }
+    const { va, store } = await resolveCrewStore(req.params.slug);
+    const appDoc = await store.getApplication(req.params.id);
+    if (!appDoc) { res.status(404).json({ error: 'Application not found.' }); return null; }
+    return { gate, va, store, appDoc };
+}
+
 // Read one invitation back, message included.
 app.get('/api/crew/:slug/applications/:id/invite', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
-    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { va, store } = await resolveCrewStore(req.params.slug);
-        const appDoc = await store.getApplication(req.params.id);
-        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
-        sweepExpiredInvite(store, appDoc);
+        const ctx = await reviewGate(req, res);
+        if (!ctx) return;
+        sweepExpiredInvite(ctx.store, ctx.appDoc);
         res.set('Cache-Control', 'no-store');
-        res.json({ invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, req.params.slug)) });
+        res.json({ invite: await applicationInvite(ctx.va, ctx.store, ctx.appDoc, req.params.slug) });
     } catch (err) { crewFail(res, err, { log: 'invite read error', message: 'Could not load that invitation.' }); }
 });
 
-// Mint a fresh temporary password for a pilot who never got the first one.
-//
-// This resets the account's real password too — the two cannot be allowed to
-// disagree, or the invitation would show a password that does not work. Which
-// also means it invalidates whatever the pilot may already be holding, so the
-// dashboard asks before calling it.
+// A fresh invitation for a pilot who never got (or lost) the first — and the
+// first one for an applicant accepted before every acceptance made a login.
+// The old link (or password) stops working, so the dashboard asks first.
 app.post('/api/crew/:slug/applications/:id/invite/regenerate', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
-    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { va, store } = await resolveCrewStore(req.params.slug);
-        const appDoc = await store.getApplication(req.params.id);
-        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
-        if (appDoc.status !== 'accepted') {
-            return res.status(400).json({ error: 'Only an accepted application has an invitation.' });
+        const ctx = await reviewGate(req, res);
+        if (!ctx) return;
+        const { gate, va, store, appDoc } = ctx;
+        if (appDoc.status !== 'accepted') return res.status(400).json({ error: 'Only an accepted application has an invitation.' });
+        const existing = await inviteAccountFor(store, appDoc);
+        if (existing && existing.portalAccountId) {
+            return res.status(409).json({ error: 'That login is a staff member’s own pilot account — they sign in with their staff account or Discord.', code: 'staff_owned' });
         }
-        const account = await inviteAccountFor(store, appDoc);
-        if (!account) {
-            return res.status(404).json({ error: 'This pilot has no crew center login to reissue. Create one from the roster.' });
+        if (existing && existing.lastLoginAt) {
+            return res.status(409).json({ error: 'They have already signed in. If they’ve lost their password, they can use “Forgot password” on the sign-in page.', code: 'already_signed_in' });
         }
-        const reset = await crewAccounts.resetPassword(store, account._id);
-        if (!reset) return res.status(404).json({ error: 'This pilot has no crew center login to reissue.' });
+        const member = await memberForApplication(store, appDoc);
+        const login = await issueLogin({
+            va, store, displayName: appDoc.ifcName || (existing && existing.displayName) || '',
+            memberId: (member && member._id) || (existing && existing.memberId) || null,
+            email: appDoc.email || '', by: (gate.p && gate.p.name) || 'Crew Center', slug: req.params.slug,
+        });
         const updated = await store.updateApplication(appDoc._id, crewInvite.issuePatch({
-            username: reset.username, password: reset.password, accountId: account._id,
-        })) || { ...appDoc };
+            username: login.username,
+            password: login.kind === 'password' ? (login.password || '') : '',
+            accountId: login.account && login.account._id,
+        })) || appDoc;
         res.set('Cache-Control', 'no-store');
-        res.json({ invite: crewInvite.staffInvite(updated, inviteContext(va, updated, req.params.slug)) });
-    } catch (err) { crewFail(res, err, { log: 'invite regenerate error', message: 'Could not reissue that invitation.' }); }
+        res.json({ invite: await applicationInvite(va, store, updated, req.params.slug) });
+    } catch (err) { crewFail(res, err, { log: 'invite regenerate error', message: 'Could not make a new invitation.' }); }
 });
 
-// Throw the invitation away.
-//
-// Deliberately does NOT touch the pilot's account: an invitation nobody needs
-// any more is not the same event as a pilot losing their login, and conflating
-// them would make tidying up the applications list a way to lock somebody out.
-// Suspending or deleting the account is its own action on the accounts screen.
+// Record that the invitation was copied to send — or, with sent: false, was
+// not after all — so the next staff member sees "copied by Elijah, 2h ago".
+app.post('/api/crew/:slug/applications/:id/invite/sent', async (req, res) => {
+    try {
+        const ctx = await reviewGate(req, res);
+        if (!ctx) return;
+        const { gate, va, store, appDoc } = ctx;
+        const account = await inviteAccountFor(store, appDoc);
+        const si = crewPasswordReset.setupInvite(account);
+        if (account && (si.state === 'live' || si.state === 'expired')) {
+            await store.updateAccount(account._id, crewPasswordReset.sentPatch({
+                sent: req.body?.sent !== false, by: (gate.p && gate.p.name) || 'Staff',
+            }));
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({ invite: await applicationInvite(va, store, appDoc, req.params.slug) });
+    } catch (err) { crewFail(res, err, { log: 'invite sent error', message: 'Could not update that invitation.' }); }
+});
+
+// Throw the invitation away: the link (or password) stops working. Their login
+// itself is untouched — suspending or deleting it is its own action.
 app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'applications.review');
-    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const ctx = await reviewGate(req, res);
+        if (!ctx) return;
+        const { va, store, appDoc } = ctx;
+        const account = await inviteAccountFor(store, appDoc);
+        const si = crewPasswordReset.setupInvite(account);
+        if (account && (si.state === 'live' || si.state === 'expired')) {
+            await store.updateAccount(account._id, crewPasswordReset.setupPatch({ hash: '', keep: true }));
+        }
+        const updated = await store.updateApplication(appDoc._id, crewInvite.revokePatch()) || { ...appDoc };
+        res.json({ invite: await applicationInvite(va, store, updated, req.params.slug) });
+    } catch (err) { crewFail(res, err, { log: 'invite revoke error', message: 'Could not discard that invitation.' }); }
+});
+
+/* ---- The Discord bot: a ticket and the application it is for ------------
+ *
+ * Answered to the bot only (vaBot.botCallerFrom). A ticket names its
+ * application either directly — the applicant filled the form in the ticket —
+ * or by the code a web applicant was given ("I applied on the website"). Either
+ * way the answer is the same: the application, where it stands, and the
+ * entrance test, which is sent right here when the airline requires one and
+ * none is out yet. That is the Discord half of crewRecruit's road.
+ */
+app.post('/api/crew/:slug/discord-bot/ticket-application', async (req, res) => {
+    if (!vaBot.botCallerFrom(req, req.params.slug)) return res.status(401).json({ error: 'Not authenticated.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const appDoc = await store.getApplication(req.params.id);
-        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
-        const updated = await store.updateApplication(appDoc._id, crewInvite.revokePatch()) || { ...appDoc };
-        res.json({ invite: crewInvite.staffInvite(updated, inviteContext(va, updated, req.params.slug)) });
-    } catch (err) { crewFail(res, err, { log: 'invite revoke error', message: 'Could not discard that invitation.' }); }
+        const slug = req.params.slug;
+        const b = req.body || {};
+        const discordId = String(b.discordId || '');
+        let appDoc = null;
+        if (b.applicationId) {
+            appDoc = await store.getApplication(String(b.applicationId)).catch(() => null);
+        } else {
+            const read = crewRecruit.readCode(b.code);
+            if (!read) return res.status(400).json({ error: 'That isn’t an application code. It looks like ABCD-1234 — it’s in your email and on your status page.', code: 'bad_code' });
+            if (read.token) appDoc = await store.getApplicationByToken(read.token).catch(() => null);
+            else {
+                for (const status of ['pending', 'accepted']) {
+                    const rows = await store.listApplications({ status }).catch(() => []);
+                    appDoc = (rows || []).find((a) => crewRecruit.codeMatches(a, read)) || null;
+                    if (appDoc) break;
+                }
+            }
+        }
+        if (!appDoc || appDoc.status === 'declined') {
+            return res.status(404).json({ error: 'We couldn’t find an application with that code. Check it, or press Start application to apply here.', code: 'not_found' });
+        }
+        // One person per application. A code typed by somebody else's Discord
+        // account is refused rather than handing them that applicant's test
+        // and login.
+        if (discordId) {
+            const other = await vaBot.models.VaBotTicket.findOne({
+                vaId: va._id, applicationId: String(appDoc._id), userId: { $ne: discordId },
+            }).select('_id').lean().catch(() => null);
+            if (other) return res.status(409).json({ error: 'That application is already linked to a different Discord account. Ask the staff here for help.', code: 'other_discord' });
+        }
+        const rules = await recruitRulesFor(va);
+        let test = await latestEntrance(va, store, appDoc, slug);
+        if (appDoc.status === 'pending' && rules.test && !test) {
+            try { test = (await issueEntranceTest({ va, store, quiz: rules.test, appDoc, by: 'Automatic', slug, email: false })).test; }
+            catch (err) { console.warn('entrance test for ticket failed:', err?.message || err); }
+        }
+        const invite = appDoc.status === 'accepted' ? await applicationInvite(va, store, appDoc, slug) : null;
+        const view = applicantView(va, appDoc, slug, { rules, test, invite, inTicket: true });
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            application: {
+                id: String(appDoc._id), ifcName: appDoc.ifcName || '', callsign: applicationCallsign(appDoc, va),
+                status: appDoc.status, grade: appDoc.grade || 0, ifVerified: !!appDoc.ifVerified,
+            },
+            stage: view.stage,
+            test: test ? {
+                quizTitle: test.quizTitle || '', passMark: test.passMark, status: test.status,
+                live: !!test.live, link: test.live ? (test.link || '') : '', percent: test.percent || 0,
+            } : null,
+            rules: { test: !!rules.test, auto: rules.auto },
+        });
+    } catch (err) { crewFail(res, err, { log: 'ticket application error', message: 'Could not find that application.' }); }
 });
 
 /* ===========================================================================
@@ -15154,7 +15538,7 @@ app.patch('/api/crew/:slug/staff-applications/:id', async (req, res) => {
 // settings, none of which the store-backed `va` carries.
 async function crewQuizDoc(slug) {
     const raw = String(slug || '').trim().toLowerCase();
-    const sel = 'slug callsign name crewQuizzes crewQuizGate crewBanners crewStaffReminders';
+    const sel = 'slug callsign name crewQuizzes crewBanners crewStaffReminders crewEntranceQuizId';
     let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return ad;
@@ -15198,7 +15582,7 @@ app.get('/api/crew/:slug/quizzes', async (req, res) => {
         const canReview = !review.error;
 
         const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
-        const gate = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const gate = crewQuizzes.sanitizeGate({}, quizzes);
         const banners = crewQuizzes.sanitizeBanners(ad.crewBanners || {});
 
         // Whether this project can hold a result at all. Asked before anything
@@ -15233,6 +15617,9 @@ app.get('/api/crew/:slug/quizzes', async (req, res) => {
             banners,
             gate: crewQuizzes.gateState({ gate, quizzes, attempts: mine, isStaff }),
             gateConfig: canBuild ? gate : null,
+            // Which quiz is the entrance test (Recruitment settings), so the
+            // builder can say so on it.
+            entranceQuizId: canBuild || canReview ? (ad.crewEntranceQuizId || '') : '',
             reminders: canBuild ? crewQuizzes.sanitizeReminders(ad.crewStaffReminders || {}) : null,
             canBuild,
             canReview,
@@ -15279,14 +15666,12 @@ app.post('/api/crew/:slug/quizzes', async (req, res) => {
                 lastSentAt: before.lastSentAt || null,
             };
         }
-        // The gate is sanitised against the quizzes AS THEY WILL BE after this
-        // save, not as they were — so deleting the quiz the door names in the
-        // same breath turns the door off rather than locking the airline out.
-        if (body.gate !== undefined) {
-            ad.crewQuizGate = crewQuizzes.sanitizeGate(body.gate, ad.crewQuizzes || []);
-        } else if (body.quizzes !== undefined) {
-            ad.crewQuizGate = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, ad.crewQuizzes || []);
-        }
+        // THE DOOR IS GONE. A quiz that locked the crew center after a login had
+        // already been handed out was a second, later test for the same people;
+        // the entrance test before acceptance (crewRecruit.js) is the one test
+        // now. Any door still stored is switched off at the first save, and is
+        // read as off everywhere until then.
+        if (ad.crewQuizGate && ad.crewQuizGate.enabled) ad.crewQuizGate = {};
 
         await ad.save();
         res.set('Cache-Control', 'no-store');
@@ -15294,7 +15679,7 @@ app.post('/api/crew/:slug/quizzes', async (req, res) => {
         res.json({
             quizzes: quizzes.map(q => crewQuizzes.publicQuiz(q, { withAnswers: true })),
             banners: crewQuizzes.sanitizeBanners(ad.crewBanners || {}),
-            gateConfig: crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes),
+            gateConfig: crewQuizzes.sanitizeGate({}, quizzes),
             reminders: crewQuizzes.sanitizeReminders(ad.crewStaffReminders || {}),
         });
     } catch (err) { crewFail(res, err, { log: 'quizzes save error', message: 'Could not save the quizzes.' }); }
@@ -15429,7 +15814,7 @@ app.post('/api/crew/:slug/quiz-attempts', async (req, res) => {
             return res.status(409).json({ error: `${member.name || 'That pilot'} has already passed “${quiz.title}”.` });
         }
 
-        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const gateCfg = crewQuizzes.sanitizeGate({}, quizzes);
         const saved = await store.createQuizAttempt({
             quizId: quiz.id,
             quizTitle: quiz.title,
@@ -15656,7 +16041,7 @@ app.post('/api/crew/:slug/quiz/:token', async (req, res) => {
         // The gate, recomputed from what is now on the record — so the pilot's
         // screen can unlock itself the moment they pass rather than after a
         // reload.
-        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const gateCfg = crewQuizzes.sanitizeGate({}, quizzes);
         const mine = await store.listQuizAttempts({ memberId: String(attempt.memberId), limit: 100 })
             .then(rows => rows.map(crewQuizzes.myAttemptView)).catch(() => []);
 
@@ -15705,7 +16090,7 @@ app.post('/api/crew/:slug/quiz-attempts/self', async (req, res) => {
             return res.status(401).json({ error: 'Sign in as a pilot of this airline.', code: 'not_authenticated' });
         }
         const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
-        const gateCfg = crewQuizzes.sanitizeGate(ad.crewQuizGate || {}, quizzes);
+        const gateCfg = crewQuizzes.sanitizeGate({}, quizzes);
         const wanted = String((req.body || {}).quizId || '');
         const quiz = quizzes.find(q => q.id === wanted);
         if (!quiz || !crewQuizzes.isReady(quiz)) return res.status(404).json({ error: 'That quiz no longer exists.' });
@@ -15807,7 +16192,13 @@ function staffEntrance(va, quizzes, a, slug) {
     return out;
 }
 
-// Staff: send one.  { quizId, applicationId? | name, ifcName?, note? }
+// Staff: send one to an applicant.  { quizId?, applicationId, note? }
+//
+// Normally nobody presses this: an airline that requires a test has it sent
+// the moment somebody applies (or opens their Discord ticket). This is the
+// override — a different quiz, a test for an airline that does not require
+// one, a resend. Always for an APPLICATION: somebody met on the IFC is sent
+// the join link, so there is never a test floating with nobody behind it.
 app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) {
@@ -15820,91 +16211,31 @@ app.post('/api/crew/:slug/entrance-tests', async (req, res) => {
         const ad = await crewQuizDoc(req.params.slug);
         if (!ad) return res.status(404).json({ error: 'Crew centre not found.' });
         const b = req.body || {};
-        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
-        const quiz = quizzes.find((q) => q.id === String(b.quizId || ''));
-        if (!quiz) return res.status(404).json({ error: 'That test no longer exists. Build one under Recruitment → Quizzes.' });
-        if (!crewQuizzes.isReady(quiz)) return res.status(409).json({ error: `“${quiz.title}” has no questions in it yet.` });
-
-        // WHO IT IS FOR: an application on file, or a name typed by staff.
-        let appDoc = null;
-        let name = String(b.name || '').trim().slice(0, 80);
-        let ifcName = String(b.ifcName || '').trim().replace(/^@/, '').slice(0, 60);
-        if (b.applicationId) {
-            appDoc = await store.getApplication(String(b.applicationId));
-            if (!appDoc) return res.status(404).json({ error: 'That application no longer exists.' });
-            if (appDoc.status === 'declined') return res.status(409).json({ error: 'That application was declined.' });
-        } else if (ifcName) {
-            // Typed in by hand for somebody who has, as it happens, applied:
-            // it is their application's test, and belongs on that card.
-            const pending = await store.listApplications({ status: 'pending' }).catch(() => []);
-            appDoc = (pending || []).find((a) => candidateKey(a.ifcName) === candidateKey(ifcName)) || null;
-        }
-        if (appDoc) {
-            ifcName = appDoc.ifcName || ifcName;
-            name = name || appDoc.ifcName || '';
-        }
-        name = name || ifcName;
-        if (!name) return res.status(400).json({ error: 'Who is this test for? Type their name or IFC username.' });
-
-        // One live test per person per quiz — a second link while the first is
-        // still usable is two doors to the same room, and two rows in the queue.
-        const mine = await store.listQuizAttempts({ candidates: true, quizId: quiz.id, limit: 300 });
-        const same = (a) => (appDoc ? String(a.applicationId || '') === String(appDoc._id)
-            : (ifcName && String(a.ifcName || '').toLowerCase() === ifcName.toLowerCase())
-              || String(a.pilotName || '').toLowerCase() === name.toLowerCase());
-        const theirs = mine.filter(same);
-        if (theirs.some((a) => a.status === 'passed')) {
-            return res.status(409).json({ error: `${name} has already passed “${quiz.title}”.`, code: 'already_passed' });
-        }
-        const live = theirs.find((a) => entranceLive(quiz, a));
-        if (live) {
-            return res.status(409).json({
-                error: `${name} already has a link for “${quiz.title}”.`,
-                code: 'already_issued',
-                test: staffEntrance(va, quizzes, live, req.params.slug),
+        if (!b.applicationId) {
+            return res.status(400).json({
+                error: 'Entrance tests go to applicants. Send them your join link — the test follows when they apply.',
+                code: 'needs_application',
             });
         }
+        const appDoc = await store.getApplication(String(b.applicationId));
+        if (!appDoc) return res.status(404).json({ error: 'That application no longer exists.' });
+        if (appDoc.status === 'declined') return res.status(409).json({ error: 'That application was declined.' });
 
-        const saved = await store.createQuizAttempt({
-            quizId: quiz.id,
-            quizTitle: quiz.title,
-            token: crewQuizzes.attemptToken(),
-            memberId: null,
-            applicationId: appDoc ? appDoc._id : null,
-            ifcName,
-            pilotName: name,
-            callsign: appDoc ? applicationCallsign(appDoc, va) : '',
-            status: 'issued',
-            gate: false,
-            passMark: quiz.passMark,
-            maxAttempts: quiz.maxAttempts,
-            note: String(b.note || '').trim().slice(0, 500),
-            issuedBy: (gate.p && (gate.p.name || gate.p.uname)) || '',
+        const quizzes = crewQuizzes.sanitizeQuizzes(ad.crewQuizzes || []) || [];
+        const rules = await recruitRulesFor(va);
+        const quiz = quizzes.find((q) => q.id === String(b.quizId || '')) || rules.test;
+        if (!quiz) return res.status(404).json({ error: 'Pick a test — or choose your entrance test under Recruitment.' });
+        if (!crewQuizzes.isReady(quiz)) return res.status(409).json({ error: `“${quiz.title}” has no questions in it yet.` });
+
+        const out = await issueEntranceTest({
+            va, store, quiz, appDoc, slug: req.params.slug, note: b.note,
+            by: (gate.p && (gate.p.name || gate.p.uname)) || '',
         });
-        const test = staffEntrance(va, quizzes, saved, req.params.slug);
-
-        // By email too, when the applicant gave one and the VA can send. The
-        // copy-for-IFC message is the main road; this is the second one.
-        let emailed = false;
-        if (appDoc && appDoc.email && test.link) {
-            try {
-                const emailCfg = await crewEmailConfigFor(va._id);
-                if (emailCfg) {
-                    emailed = true;
-                    sendCrewEmail(emailCfg, {
-                        to: appDoc.email, subject: `${quiz.title} — ${va.name || 'Crew Center'}`,
-                        html: crewEmailHtml({
-                            vaName: va.name, accent: va.crewAccent, heading: `Welcome to ${va.name || 'the crew'}!`,
-                            bodyHtml: escHtml(test.plainMessage.split('\nHere is your link:')[0]).replace(/\n/g, '<br>'),
-                            button: { label: 'Take the test', url: test.link },
-                        }),
-                    }).catch(() => {});
-                }
-            } catch { emailed = false; }
-        }
-
+        const name = appDoc.ifcName || 'They';
+        if (out.passed) return res.status(409).json({ error: `${name} has already passed “${quiz.title}”.`, code: 'already_passed', test: out.test });
+        if (out.existing) return res.status(409).json({ error: `${name} already has a link for “${quiz.title}”.`, code: 'already_issued', test: out.test });
         res.set('Cache-Control', 'no-store');
-        res.status(201).json(withDrift(store, { test, emailed }));
+        res.status(201).json(withDrift(store, { test: out.test, emailed: out.emailed }));
     } catch (err) { crewFail(res, err, { log: 'entrance test issue error', message: 'Could not send that test.' }); }
 });
 
@@ -16003,11 +16334,32 @@ app.post('/api/crew/:slug/test/:token', async (req, res) => {
             submittedAt: new Date(),
         });
 
-        // The applicant's Discord ticket, when they applied through the bot.
+        // A pass on an airline that accepts by itself (open joining) lets them
+        // straight in: roster, login, the link to choose a password — emailed,
+        // on their status page and in their Discord ticket. Otherwise staff
+        // hear it and accept. Best-effort: a pass is recorded either way.
+        let accepted = null;
+        if (result.passed && attempt.applicationId) {
+            try {
+                const rules = await recruitRulesFor(va);
+                const appDoc = rules.auto ? await store.getApplication(String(attempt.applicationId)) : null;
+                if (appDoc && appDoc.status === 'pending') {
+                    accepted = await acceptApplication({
+                        va, store, appDoc, slug: req.params.slug, by: 'Automatic — passed the entrance test',
+                        // The ticket hears it below, result first, then the
+                        // welcome; the webhook line below says it was automatic.
+                        notifyBot: false, notice: false,
+                    });
+                }
+            } catch (err) { console.warn('auto-accept on pass failed:', err?.message || err); accepted = null; }
+        }
+
+        // The applicant's Discord ticket, when they have one.
         if (attempt.applicationId) {
             vaBot.hub.emit('entranceTest', {
                 vaId: va._id, applicationId: attempt.applicationId, passed: result.passed,
                 score: result.score, total: result.total, percent: result.percent, quizTitle: attempt.quizTitle,
+                accepted: !!accepted,
             });
         }
 
@@ -16016,13 +16368,19 @@ app.post('/api/crew/:slug/test/:token', async (req, res) => {
             .then((url) => postCrewNotice(url, {
                 title: result.passed ? '✅ Entrance test passed' : '📝 Entrance test not passed',
                 description: `**${attempt.ifcName || attempt.pilotName || 'A candidate'}** scored **${result.score}/${result.total}** (${result.percent}%) on **${attempt.quizTitle}**.`
-                    + (result.passed ? '\nSend their crew center invitation from Roster → Applications.' : ''),
+                    + (result.passed ? (accepted ? '\nAccepted automatically — their login is on its way.' : '\nAccept them from Roster → Applications.') : ''),
                 color: result.passed ? 0x16A34A : 0xD97706,
             }))
             .catch(() => {});
 
         res.set('Cache-Control', 'no-store');
-        res.json({ ...takerView(va, ad, quiz, saved), passed: result.passed, score: result.score, total: result.total, percent: result.percent, passMark: bar });
+        res.json({
+            ...takerView(va, ad, quiz, saved), passed: result.passed, score: result.score, total: result.total, percent: result.percent, passMark: bar,
+            // Let in on the pass: the link to choose their password, here as
+            // well as in their email, status page and ticket.
+            accepted: !!accepted,
+            login: accepted ? applicantLogin(accepted.invite) : null,
+        });
     } catch (err) { crewFail(res, err, { log: 'entrance test submit error', message: 'Could not mark that test.' }); }
 });
 
@@ -20195,7 +20553,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewAcceptCreatesLogin crewBanners supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign callsigns tagline country logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook loginBackdrop crewTopicMode crewAccent crewHero crewSocial ranks roles crewFleet crewPartners crewHubs crewArtwork crewArt crewTheme crewUi crewPirepAutoApprove crewSchedule crewShop joinMode minGrade callsignPrefix callsignReservedMax applicationForm joinRequirements crewEmailConfigured crewDiscordInvite crewEntranceQuizId crewJoinViaDiscord crewQuizzes crewBanners supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -20365,9 +20723,18 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 // meant to be shared) and read by the dashboard so the accept
                 // dialog can pre-fill it.
                 discordInvite: ad.crewDiscordInvite || '',
-                // Whether the accept card's "Create a crew center login" starts
-                // ticked. Absent on an old record means the old behaviour: yes.
-                createsLogin: ad.crewAcceptCreatesLogin !== false,
+                // The road an applicant takes (crewRecruit.js), so the join
+                // form can say what happens after they press Apply. The test's
+                // title and pass mark only — never its questions.
+                ...await (async () => {
+                    const rules = await recruitRulesFor(ad);
+                    return {
+                        entranceTest: rules.test ? { id: rules.test.id, title: rules.test.title || 'Entrance test', passMark: rules.test.passMark } : null,
+                        entranceQuizId: rules.test ? rules.test.id : '',
+                        viaDiscord: rules.viaDiscord,
+                        viaDiscordWanted: rules.viaDiscordWanted,
+                    };
+                })(),
             },
             // Public Supabase connection (never the secret service key).
             supabase: {
