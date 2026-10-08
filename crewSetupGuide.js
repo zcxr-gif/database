@@ -69,7 +69,7 @@ function botStep(bot) {
     if (!guilds.length) {
         return {
             ...step, state: 'todo',
-            summary: 'Recruitment inside your Discord: Apply opens a private ticket, staff send the entrance test from it, and the pilot gets their login there.',
+            summary: 'Recruitment inside your Discord: newcomers are greeted and pointed at Apply, the entrance test runs in a private ticket, and the pilot gets their login there.',
         };
     }
     const g = guilds[0];
@@ -85,7 +85,7 @@ function botStep(bot) {
     }
     return {
         ...step, state: 'done',
-        summary: `Running in ${where}${g.autoInvite ? ', sending logins automatically on a pass' : ''}.`,
+        summary: `Running in ${where}.`,
     };
 }
 
@@ -217,8 +217,8 @@ function evaluate({ va = {}, store = {}, counts = null, staffAccounts = 0, ifLoc
         id: 'recruiting', group: 'people', title: 'How new pilots join', required: false,
         state: recruitingSet ? 'done' : 'todo',
         summary: recruitingSet
-            ? `${va.joinMode === 'free' ? 'Anyone can join straight away' : 'New pilots apply and staff accept them'}${has(va.crewDiscordInvite) ? ', and get your Discord invite' : ''}.`
-            : 'Open joining or applications, the questions you ask, and the Discord invite new pilots get.',
+            ? `${va.joinMode === 'free' ? 'Pilots are let in automatically' : 'New pilots apply and staff accept them'}${has(va.crewEntranceQuizId) ? ' after an entrance test' : ''}${has(va.crewDiscordInvite) ? ', and get your Discord invite' : ''}.`
+            : 'Who accepts new pilots, the entrance test, the questions you ask, and whether applicants go through your Discord.',
     });
     const staffRoles = Array.isArray(va.staffRoles) ? va.staffRoles.length : 0;
     steps.push({

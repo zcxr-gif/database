@@ -113,7 +113,8 @@ const SWEEP_FIRST_MS = 10 * 60 * 1000;
 const WELCOME_BURST = 8;
 const WELCOME_WINDOW_MS = 60 * 1000;
 const DEFAULT_WELCOME = 'Welcome aboard, {user}! 👋 We’re really glad you’re here at **{airline}**.\n\n'
-    + 'Want to fly with us? Press **Apply** below. Got a question about anything at all? **Contact staff** opens a private chat with the team.';
+    + 'Want to fly with us? Press **Apply** below — it opens a private ticket. Already applied on our website? Press **Apply** too, then **I applied on the website**.\n\n'
+    + 'Got a question about anything at all? **Contact staff** opens a private chat with the team.';
 
 /* ===========================================================================
  * THE BOT AS A CALLER OF THE CREW CENTER
@@ -214,6 +215,9 @@ const VaBotGuildSchema = new Schema({
         ticketChannelId: { type: String, default: '' },
         logChannelId: { type: String, default: '' },
         eventsChannelId: { type: String, default: '' },
+        // Retired: whether a pass accepts by itself is the crew center's
+        // decision now (Recruitment → open joining), one setting for the web
+        // and Discord alike. Kept so old records still load.
         autoInvite: { type: Boolean, default: false },
         // Welcome. A channel to greet people in, a role everyone gets on
         // joining, the airline's own words, and whether to DM it too.
@@ -802,12 +806,14 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     const ticketCooldown = makeCooldown(TICKET_COOLDOWN_MS);
     const commandCooldown = makeCooldown(3000);
     const setupCooldown = makeCooldown(5000);
+    // An application code is short; one try every few seconds per person.
+    const claimCooldown = makeCooldown(5000);
     // One change at a time per ticket — see makeLocks.
     const ticketLocks = makeLocks();
     const eventLocks = makeLocks();
     const sweepLocks = makeLocks();
     const joinBurst = makeBurst(WELCOME_BURST, WELCOME_WINDOW_MS);
-    const MUTATING = new Set(['formsub', 'submit', 'test', 'testpick', 'accept', 'declinesub', 'close', 'reopen']);
+    const MUTATING = new Set(['formsub', 'submit', 'claimsub', 'test', 'testpick', 'accept', 'declinesub', 'close', 'reopen']);
 
     /* ---- lookups ------------------------------------------------------- */
 
@@ -940,8 +946,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 .addRoleOption((o) => o.setName('pilot_role').setDescription('Given to a pilot when they are accepted'))
                 .addChannelOption((o) => o.setName('ticket_channel').setDescription('Where ticket threads are opened').addChannelTypes(ChannelType.GuildText))
                 .addChannelOption((o) => o.setName('log_channel').setDescription('Where staff hear about tickets').addChannelTypes(ChannelType.GuildText))
-                .addChannelOption((o) => o.setName('events_channel').setDescription('Where events are posted, each with a thread').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-                .addBooleanOption((o) => o.setName('auto_invite').setDescription('Accept and send the crew center login as soon as the entrance test is passed')))
+                .addChannelOption((o) => o.setName('events_channel').setDescription('Where events are posted, each with a thread').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand((s) => s.setName('welcome').setDescription('Greet people who join the server')
                 .addChannelOption((o) => o.setName('channel').setDescription('Where to post the welcome').addChannelTypes(ChannelType.GuildText))
                 .addRoleOption((o) => o.setName('role').setDescription('A role everyone gets on joining'))
@@ -1028,8 +1033,6 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (chan('ticket_channel')) set['settings.ticketChannelId'] = chan('ticket_channel').id;
         if (chan('log_channel')) set['settings.logChannelId'] = chan('log_channel').id;
         if (chan('events_channel')) set['settings.eventsChannelId'] = chan('events_channel').id;
-        const auto = interaction.options.getBoolean('auto_invite');
-        if (auto !== null) set['settings.autoInvite'] = auto;
 
         let s = ctx.settings;
         if (Object.keys(set).length) {
@@ -1038,10 +1041,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             s = (doc && doc.settings) || s;
         }
         const show = (id, kind) => (id ? (kind === 'role' ? `<@&${id}>` : `<#${id}>`) : '_not set_');
+        const join = await joinConfig(ctx.va) || {};
         const e = vaEmbed(ctx.va).setTitle('Crew center bot — settings').addFields(
             { name: 'Staff role', value: show(s.staffRoleId, 'role'), inline: true },
             { name: 'Pilot role', value: show(s.pilotRoleId, 'role'), inline: true },
-            { name: 'Auto-invite on pass', value: s.autoInvite ? 'On' : 'Off — staff press Accept', inline: true },
+            { name: 'Recruiting', value: recruitSummary(join), inline: false },
             { name: 'Ticket channel', value: show(s.ticketChannelId), inline: true },
             { name: 'Log channel', value: show(s.logChannelId), inline: true },
             { name: 'Events channel', value: show(s.eventsChannelId), inline: true },
@@ -1062,9 +1066,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             .setTitle(`Fly with ${clean(ctx.va.name, 200)}`)
             .setDescription([
                 ctx.va.tagline ? clean(ctx.va.tagline, 300) : '',
-                join.mode === 'free'
-                    ? 'Press **Apply** to join. A private ticket opens where you fill in your details, and staff send your crew center login.'
-                    : 'Press **Apply** to open a private ticket with the recruitment team. You fill in the application there, and the team takes it from there — entrance test, decision and your crew center login.',
+                join.mode === 'free' && !join.entranceTest
+                    ? 'Press **Apply** to join. A private ticket opens where you fill in your details, and your crew center login arrives right there.'
+                    : `Press **Apply** to open a private ticket with the recruitment team. Fill in the application there${join.entranceTest ? `, take the entrance test (**${clean(join.entranceTest.title, 80)}**)` : ''} — and your crew center login arrives right there when you’re accepted.`,
+                'Already applied on our website? Press **Apply** too, then **I applied on the website** and enter your application code.',
                 reqs.length ? `**Requirements:** ${reqs.join(' · ')}` : '',
             ].filter(Boolean).join('\n\n'));
         if (isHttpsUrl(join.banner || ctx.va.bannerUrl)) e.setImage(join.banner || ctx.va.bannerUrl);
@@ -1099,6 +1104,13 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!posted) return say(interaction, `I could not post in ${channel}. Give me **View Channel**, **Send Messages** and **Embed Links** there.`);
         return say(interaction, `Help panel posted in ${channel}.`);
     }
+
+    /** How this airline recruits — set in the crew center, shown here. */
+    const recruitSummary = (join) => [
+        join.mode === 'free' ? 'Accepted automatically' + (join.entranceTest ? ' on passing the test' : '') : 'Staff accept each pilot',
+        join.entranceTest ? `entrance test: ${clean(join.entranceTest.title, 60)} (${join.entranceTest.passMark}%)` : 'no entrance test',
+        join.viaDiscord ? 'web applicants are sent here to open a ticket' : '',
+    ].filter(Boolean).join(' · ') + ' — change it in Crew Center → Recruitment.';
 
     const welcomeSummary = (s) => (s.welcomeChannelId || s.welcomeRoleId || s.welcomeDm
         ? [s.welcomeChannelId ? `posts in <#${s.welcomeChannelId}>` : '', s.welcomeRoleId ? `gives <@&${s.welcomeRoleId}>` : '',
@@ -1468,9 +1480,12 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (kind === 'apply') {
             const pages = pageCount(join.form);
             const reqs = describeRequirements(join);
+            const test = join.entranceTest;
             const e = vaEmbed(ctx.va).setTitle(`Application — ${clean(ctx.va.name, 200)}`).setDescription([
                 `Welcome, ${interaction.user}! This thread is private: only you and the ${clean(ctx.va.name, 100)} staff can see it.`,
-                `Press **Start application**. It takes ${pages === 1 ? 'one short form' : `${pages} short forms`}.`,
+                '**Applied on our website already?** Press **I applied on the website** and enter the application code from your email or status page (it looks like `ABCD-1234`).',
+                `**New here?** Press **Start application** — ${pages === 1 ? 'one short form' : `${pages} short forms`}.`,
+                test ? `Then comes the entrance test, **${clean(test.title, 100)}** (${test.passMark}% to pass) — posted right here, no account needed.` : '',
                 reqs.length ? `**Requirements:** ${reqs.join(' · ')}` : '',
                 'Your Infinite Flight Community name is checked against Infinite Flight, so use the exact spelling.',
             ].filter(Boolean).join('\n\n'));
@@ -1479,6 +1494,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 embeds: [e],
                 components: [new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(cid('form', ticket._id, 0)).setLabel('Start application').setStyle(ButtonStyle.Primary).setEmoji('📝'),
+                    new ButtonBuilder().setCustomId(cid('claim', ticket._id)).setLabel('I applied on the website').setStyle(ButtonStyle.Secondary).setEmoji('🌐'),
                     new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close').setStyle(ButtonStyle.Secondary),
                 )],
                 allowedMentions: { users: [interaction.user.id] },
@@ -1627,7 +1643,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const missing = draftProblems(ticket.draft, join);
         if (missing.length) return interaction.followUp({ content: `Still needed: ${missing.join(', ')}.`, flags: EPHEMERAL });
 
-        const r = await api('post', crewPath(ctx.va.slug, '/apply'), { body: applyBody(ticket.draft, join) });
+        // As the bot, so the crew center knows this applicant is already in a
+        // ticket: the entrance test, when there is one, comes straight here.
+        const r = await api('post', crewPath(ctx.va.slug, '/apply'), {
+            body: applyBody(ticket.draft, join), asBot: true, slug: ctx.va.slug, actor: actorOf(interaction),
+        });
         if (!r.ok) {
             const fixPage = /callsign/i.test(r.data.code || r.error) || r.status === 404 ? 0 : null;
             return interaction.followUp({
@@ -1639,43 +1659,135 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             });
         }
 
-        const thread = await fetchChannel(ticket.threadId);
-        ticket.applicationId = String(r.data.applicationId || '');
-        ticket.stage = r.data.status === 'accepted' ? 'joined' : 'submitted';
+        const linked = await api('post', crewPath(ctx.va.slug, '/discord-bot/ticket-application'), {
+            asBot: true, slug: ctx.va.slug, actor: actorOf(interaction),
+            body: { applicationId: String(r.data.applicationId || ''), discordId: ticket.userId },
+        });
+        // The application exists whatever the second call said; draw it from
+        // the first answer when the second did not come.
+        const data = linked.ok ? linked.data : {
+            application: {
+                id: String(r.data.applicationId || ''), ifcName: ticket.draft.ifcName, callsign: r.data.callsign,
+                status: r.data.status, grade: r.data.grade, ifVerified: r.data.ifVerified,
+            },
+            test: r.data.test ? { quizTitle: r.data.test.title, passMark: r.data.test.passMark, link: r.data.test.link, status: 'issued', live: true } : null,
+            rules: {},
+        };
+        await linkApplication({ ctx, ticket, data, source: 'discord' });
+        return interaction.followUp({ content: '✅ Application sent. Everything from here happens in this thread.', flags: EPHEMERAL });
+    }
+
+    /* ---- "I applied on the website" ------------------------------------ */
+
+    async function showClaim(interaction, ctx, ticket) {
+        if (!isOwner(interaction, ticket)) return say(interaction, 'Only the applicant can do this.');
+        if (ticket.stage !== 'form') return say(interaction, 'This ticket already has an application.');
+        const modal = new ModalBuilder().setCustomId(cid('claimsub', ticket._id)).setTitle('I applied on the website').addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('code')
+                .setLabel('Application code (or your status link)').setStyle(TextInputStyle.Short)
+                .setRequired(true).setMaxLength(200).setPlaceholder('ABCD-1234')),
+        );
+        return interaction.showModal(modal);
+    }
+
+    async function claimSubmit(interaction, ctx, ticket) {
+        if (!isOwner(interaction, ticket)) return say(interaction, 'Only the applicant can do this.');
+        if (ticket.stage !== 'form') return say(interaction, 'This ticket already has an application.');
+        const wait = claimCooldown.hit(`${interaction.guildId}:${interaction.user.id}`);
+        if (wait) return say(interaction, `One moment — try again in ${wait}s.`);
+        await interaction.deferReply({ flags: EPHEMERAL });
+        let code = '';
+        try { code = clean(interaction.fields.getTextInputValue('code'), 200); } catch { code = ''; }
+        const r = await api('post', crewPath(ctx.va.slug, '/discord-bot/ticket-application'), {
+            asBot: true, slug: ctx.va.slug, actor: actorOf(interaction),
+            body: { code, discordId: interaction.user.id },
+        });
+        if (!r.ok) {
+            return say(interaction, `⚠️ ${r.error}`, {
+                components: [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(cid('claim', ticket._id)).setLabel('Try again').setStyle(ButtonStyle.Primary),
+                )],
+            });
+        }
+        await linkApplication({ ctx, ticket, data: r.data, source: 'website' });
+        return say(interaction, '✅ Found your application — it’s linked to this ticket.');
+    }
+
+    /**
+     * The ticket has its application now — filled in here, or found by the code
+     * a web applicant was given. Tells the staff, posts the entrance test when
+     * one is out, and finishes the job when the application is already
+     * accepted (open joining). Staff can step in at any point from the row of
+     * buttons: send a test, accept without one, decline.
+     */
+    async function linkApplication({ ctx, ticket, data = {}, source = 'discord' }) {
+        const app = data.application || {};
+        const test = data.test || null;
+        const accepted = app.status === 'accepted';
+        const testing = !accepted && !!(test && test.link && test.status !== 'passed');
+        ticket.applicationId = String(app.id || ticket.applicationId || '');
+        ticket.stage = testing ? 'testing' : 'submitted';
         // The answers are in the airline's own database now; this copy is done.
-        ticket.draft = { ifcName: ticket.draft.ifcName, callsignNumber: '', airline: '', email: '', answers: [] };
+        ticket.draft = { ifcName: clean(app.ifcName || ticket.draft.ifcName, 60), callsignNumber: '', airline: '', email: '', answers: [] };
         await ticket.save();
 
+        const thread = await fetchChannel(ticket.threadId);
         const staff = ctx.settings.staffRoleId;
-        const joined = r.data.status === 'accepted';
+        const name = clean(app.ifcName, 60) || 'the applicant';
+        const rules = data.rules || {};
+        const from = source === 'website' ? 'Applied on the website. ' : '';
+        const testLine = test && test.status === 'passed' ? `✅ passed${test.percent ? ` (${test.percent}%)` : ''}`
+            : test && test.status === 'failed' ? `not passed${test.percent ? ` (${test.percent}%)` : ''}`
+            : test ? 'sent' : (rules.test ? 'not sent yet' : 'none required');
         const e = vaEmbed(ctx.va)
-            .setTitle(joined ? `🎉 ${clean(ticket.draft.ifcName, 60)} joined the roster` : `📝 Application from ${clean(ticket.draft.ifcName, 60)}`)
-            .setDescription(joined
-                ? 'This airline accepts pilots straight away. Staff: press **Accept & send login** to issue the crew center login.'
-                : 'Sent to the crew center. Staff can send the entrance test, accept or decline from here — or from Roster → Applications.')
+            .setTitle(accepted ? `🎉 ${name} joined the roster` : `📝 Application from ${name}`)
+            .setDescription(accepted
+                ? `${from}This airline lets pilots straight in — the login is below.`
+                : testing
+                    ? `${from}The entrance test is below. ${rules.auto ? 'A pass lets them straight in.' : 'Staff: accept once they pass.'} You can step in at any time.`
+                    : `${from}Over to the staff: accept or decline${test ? '' : ', or send an entrance test'}.`)
             .addFields(
-                { name: 'Callsign', value: clean(r.data.callsign, 40) || '—', inline: true },
-                { name: 'Grade', value: r.data.grade ? `Grade ${r.data.grade}` : '—', inline: true },
-                { name: 'IF verified', value: r.data.ifVerified ? '✓ yes' : 'no', inline: true },
+                { name: 'Callsign', value: clean(app.callsign, 40) || '—', inline: true },
+                { name: 'Grade', value: app.grade ? `Grade ${app.grade}` : '—', inline: true },
+                { name: 'IF verified', value: app.ifVerified ? '✓ yes' : 'no', inline: true },
+                { name: 'Entrance test', value: testLine, inline: true },
                 { name: 'Discord', value: `<@${ticket.userId}>`, inline: true },
             );
+        const ping = !accepted && !testing && staff;
         await send(thread, {
-            content: staff ? `<@&${staff}>` : undefined,
+            content: ping ? `<@&${staff}>` : undefined,
             embeds: [e],
-            components: [staffRow(ticket, { test: !joined, decline: !joined })],
-            allowedMentions: { roles: staff ? [staff] : [] },
+            components: accepted ? [] : [staffRow(ticket, { test: true })],
+            allowedMentions: { roles: ping ? [staff] : [] },
         });
-        logToStaff(ctx.settings, `📝 New application from **${clean(ticket.draft.ifcName, 60)}** (<@${ticket.userId}>): ${thread || ''}`).catch(() => {});
-        return interaction.followUp({ content: '✅ Application sent. The staff will reply in this thread.', flags: EPHEMERAL });
+        if (testing) await postTestLink(ctx, ticket, test);
+        logToStaff(ctx.settings, `📝 ${source === 'website' ? 'Website application linked' : 'New application'}: **${name}** (<@${ticket.userId}>) ${thread || ''}`).catch(() => {});
+        if (accepted) await welcomeAccepted(ctx, ticket, 'Open joining');
     }
 
     function staffRow(ticket, { test = true, accept = true, decline = true } = {}) {
         const b = [];
-        if (test) b.push(new ButtonBuilder().setCustomId(cid('test', ticket._id)).setLabel('Send entrance test').setStyle(ButtonStyle.Primary).setEmoji('📝'));
-        if (accept) b.push(new ButtonBuilder().setCustomId(cid('accept', ticket._id)).setLabel('Accept & send login').setStyle(ButtonStyle.Success).setEmoji('✅'));
+        if (test) b.push(new ButtonBuilder().setCustomId(cid('test', ticket._id)).setLabel('Send test').setStyle(ButtonStyle.Secondary).setEmoji('📝'));
+        if (accept) b.push(new ButtonBuilder().setCustomId(cid('accept', ticket._id)).setLabel('Accept').setStyle(ButtonStyle.Success).setEmoji('✅'));
         if (decline) b.push(new ButtonBuilder().setCustomId(cid('decline', ticket._id)).setLabel('Decline').setStyle(ButtonStyle.Danger));
         b.push(new ButtonBuilder().setCustomId(cid('close', ticket._id)).setLabel('Close').setStyle(ButtonStyle.Secondary));
         return new ActionRowBuilder().addComponents(b);
+    }
+
+    /** The test, posted for the applicant. */
+    async function postTestLink(ctx, ticket, test) {
+        const thread = await fetchChannel(ticket.threadId);
+        const e = vaEmbed(ctx.va).setTitle(`📝 Entrance test — ${clean(test.quizTitle || '', 200) || 'your test'}`).setDescription([
+            `<@${ticket.userId}>, here’s your entrance test.`,
+            test.passMark ? `You need **${test.passMark}%** to pass.` : '',
+            'No account needed — just open the link. Your result comes back to this thread as soon as you finish.',
+        ].filter(Boolean).join('\n\n'));
+        return send(thread, {
+            content: `<@${ticket.userId}>`,
+            embeds: [e],
+            components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(test.link).setLabel('Take the test').setStyle(ButtonStyle.Link))],
+            allowedMentions: { users: [ticket.userId] },
+        });
     }
 
     /* ---- staff: entrance test ----------------------------------------- */
@@ -1701,35 +1813,24 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
 
         const r = await api('post', crewPath(ctx.va.slug, '/entrance-tests'), { ...asBot, body: { quizId, applicationId: ticket.applicationId } });
         const test = r.data.test;
+        if (r.data.code === 'already_passed') return say(interaction, `${r.error} Press **Accept** to let them in.`, { components: [] });
         if (!r.ok && !(r.data.code === 'already_issued' && test)) return say(interaction, r.error);
         if (!test || !isHttpUrl(test.link)) return say(interaction, 'The test was created but has no link to send. Open it in the crew center.');
 
         ticket.stage = 'testing';
         await ticket.save();
-        const thread = await fetchChannel(ticket.threadId);
-        const e = vaEmbed(ctx.va).setTitle(`📝 Entrance test — ${clean(test.quizTitle || '', 200) || 'your test'}`).setDescription([
-            `<@${ticket.userId}>, the staff have sent you the entrance test.`,
-            test.passMark ? `You need **${test.passMark}%** to pass.` : '',
-            'Your result comes back to this thread as soon as you finish.',
-        ].filter(Boolean).join('\n\n'));
-        await send(thread, {
-            content: `<@${ticket.userId}>`,
-            embeds: [e],
-            components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setURL(test.link).setLabel('Take the test').setStyle(ButtonStyle.Link))],
-            allowedMentions: { users: [ticket.userId] },
-        });
+        await postTestLink(ctx, ticket, test);
         return say(interaction, r.ok ? 'Test sent.' : 'They already had a link for that test — I posted it again.', { components: [] });
     }
 
     /* ---- staff: accept ------------------------------------------------- */
 
     /**
-     * Accept the application and issue the crew center login. Shared by the
-     * staff button and auto-invite; `interaction` is null for the latter.
+     * Accept the application; the crew center makes the login.
      */
     async function acceptTicket({ interaction, ctx, ticket, actor }) {
         const r = await api('patch', crewPath(ctx.va.slug, `/applications/${encodeURIComponent(ticket.applicationId)}`), {
-            asBot: true, slug: ctx.va.slug, actor, body: { action: 'accept', createAccount: true },
+            asBot: true, slug: ctx.va.slug, actor, body: { action: 'accept' },
         });
         if (!r.ok) return { error: r.error };
         return finishAcceptance({ interaction, ctx, ticket, actor, data: r.data });
@@ -1791,18 +1892,18 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         const account = data.account || null;
         const invite = data.invite || null;
         const thread = await fetchChannel(ticket.threadId);
-        const hasLogin = !!(invite && invite.state === 'live') || !!(account && account.password);
+        const hasLogin = !!(invite && invite.state === 'live');
         const e = vaEmbed(ctx.va).setColor(0x16A34A).setTitle(`🎉 Welcome to ${clean(ctx.va.name, 200)}!`).setDescription([
             `<@${ticket.userId}>, you’re in${invite && invite.username ? ` — your username is \`${clean(invite.username, 60)}\`` : ''}.`,
             hasLogin
-                ? 'Press **Show my login** — only you can see it. You’ll choose your own password the first time you sign in.'
+                ? `Press **Set up my login** — only you can see it${invite.kind === 'link' ? ', and you choose your own password' : '. You’ll choose your own password the first time you sign in'}.`
                 : (account && account.error) || (invite && invite.state === 'claimed' ? 'You’ve already signed in to the crew center — you’re all set.' : 'Your crew center login will follow from the staff.'),
             discordLinked
                 ? '🔗 Your Discord is linked to your crew center account, so next time you can just press **Sign in with Discord**.'
                 : '🔗 **One last step:** press **Link my account** and approve it on Discord. Then you can sign in with Discord, sign up for events right here, and use `/crew me`.',
         ].filter(Boolean).join('\n\n'));
         const buttons = [];
-        if (hasLogin) buttons.push(new ButtonBuilder().setCustomId(cid('login', ticket._id)).setLabel('Show my login').setStyle(ButtonStyle.Success).setEmoji('🔑'));
+        if (hasLogin) buttons.push(new ButtonBuilder().setCustomId(cid('login', ticket._id)).setLabel('Set up my login').setStyle(ButtonStyle.Success).setEmoji('🔑'));
         if (!discordLinked) buttons.push(new ButtonBuilder().setURL(linkUrl(ctx.va.slug)).setLabel('Link my account').setStyle(ButtonStyle.Link).setEmoji('🔗'));
         const signIn = (data.signInUrl && isHttpUrl(data.signInUrl) && data.signInUrl) || (invite && isHttpUrl(invite.signInUrl) && invite.signInUrl) || crewUrl(ctx.va.slug);
         buttons.push(new ButtonBuilder().setURL(signIn).setLabel('Crew center').setStyle(ButtonStyle.Link));
@@ -1820,8 +1921,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     async function acceptButton(interaction, ctx, ticket) {
         if (!isStaff(interaction, ctx.settings)) return say(interaction, 'Only staff can accept an application.');
         if (!ticket.applicationId) return say(interaction, 'There is no application on this ticket yet.');
-        // A second press (or a press after auto-invite) would post a second
-        // welcome. Reissuing a lost login is the crew center's job.
+        // A second press (or a press after an automatic acceptance) would post
+        // a second welcome. Reissuing a lost login is the crew center's job.
         if (ticket.stage === 'accepted') return say(interaction, 'Already accepted. To reissue their login, use Roster → Applications in the crew center.');
         await interaction.deferReply({ flags: EPHEMERAL });
         const out = await acceptTicket({ interaction, ctx, ticket, actor: actorOf(interaction) });
@@ -1840,6 +1941,18 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!r.ok) return say(interaction, r.error);
         const inv = r.data.invite || {};
         const signIn = isHttpUrl(inv.signInUrl) ? inv.signInUrl : crewUrl(ctx.va.slug);
+        if (inv.state === 'live' && inv.kind === 'link' && isHttpUrl(inv.link)) {
+            return say(interaction, [
+                `**Your ${clean(ctx.va.name, 100)} crew center login**`,
+                `Username: \`${inv.username}\``,
+                '',
+                `Press the button to choose your password. The link works once${inv.expiresAt ? ` and expires ${stamp(inv.expiresAt, 'R')}` : ''}.`,
+            ].join('\n'), {
+                components: [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setURL(inv.link).setLabel('Choose my password').setStyle(ButtonStyle.Link).setEmoji('🔑'),
+                )],
+            });
+        }
         if (inv.state === 'live' && inv.password) {
             return say(interaction, [
                 `**Your ${clean(ctx.va.name, 100)} crew center login**`,
@@ -1851,7 +1964,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 inv.expiresAt ? `It expires ${stamp(inv.expiresAt, 'R')} if unused.` : '',
             ].filter((l) => l !== null).join('\n'));
         }
-        if (inv.state === 'claimed') return say(interaction, `You’ve already signed in, so this one-time password is gone. Lost your password? Use **Forgot password** at ${signIn}`);
+        if (inv.state === 'claimed') return say(interaction, `You’ve already signed in, so this one-time login is used up. Lost your password? Use **Forgot password** at ${signIn}`);
         return say(interaction, 'There is no login waiting for you right now — ask the staff in this thread to reissue it.');
     }
 
@@ -1996,52 +2109,55 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
      * ================================================================ */
 
     /** An entrance test was marked. Post the result where the applicant is. */
-    hub.on('entranceTest', async ({ vaId, applicationId, passed, score, total, percent, quizTitle }) => {
+    hub.on('entranceTest', async ({ vaId, applicationId, passed, score, total, percent, quizTitle, accepted }) => {
         if (!vaId || !applicationId) return;
         const found = await VaBotTicket.find({ vaId, applicationId: String(applicationId), status: 'open' }).limit(5);
         for (const t of found) {
             // Behind any staff press on the same ticket, and read again once
-            // it is our turn: a staff Accept that just finished means there is
-            // nothing left for auto-invite to do.
-            await ticketLocks.run(String(t._id), () => postTestResult(String(t._id), { vaId, passed, score, total, percent, quizTitle }))
+            // it is our turn.
+            await ticketLocks.run(String(t._id), () => postTestResult(String(t._id), { vaId, passed, score, total, percent, quizTitle, accepted }))
                 .catch((err) => console.error('🤖 vaBot test result failed:', err && err.message ? err.message : err));
         }
     });
 
-    async function postTestResult(ticketId, { vaId, passed, score, total, percent, quizTitle }) {
+    async function ticketContext(ticketId, vaId) {
         const ticket = await VaBotTicket.findOne({ _id: ticketId, status: 'open' });
-        if (!ticket) return;
+        if (!ticket) return null;
         const link = await guildLink(ticket.guildId);
-        if (!link || String(link.vaId) !== String(vaId)) return;
+        if (!link || String(link.vaId) !== String(vaId)) return null;
         const va = await vaById(vaId);
-        if (!va) return;
-        const ctx = { link, va, settings: link.settings || {} };
+        if (!va) return null;
+        return { ticket, ctx: { link, va, settings: link.settings || {} } };
+    }
+
+    /**
+     * The result, where the applicant is. A pass on an airline that accepts by
+     * itself has already been accepted by the crew center (`accepted`): the
+     * welcome with their login follows straight after. Otherwise staff are
+     * pinged with the buttons to act on it.
+     */
+    async function postTestResult(ticketId, { vaId, passed, score, total, percent, quizTitle, accepted }) {
+        const found = await ticketContext(ticketId, vaId);
+        if (!found) return;
+        const { ticket, ctx } = found;
         const thread = await fetchChannel(ticket.threadId);
         const staff = ctx.settings.staffRoleId;
-        const auto = passed && ctx.settings.autoInvite && ticket.stage !== 'accepted';
-        const e = vaEmbed(va).setColor(passed ? 0x16A34A : 0xD97706)
+        const e = vaEmbed(ctx.va).setColor(passed ? 0x16A34A : 0xD97706)
             .setTitle(passed ? '✅ Entrance test passed' : '📝 Entrance test not passed')
             .setDescription(`<@${ticket.userId}> scored **${score}/${total}** (${percent}%) on **${clean(quizTitle, 120)}**.`
                 + (passed
-                    ? `\n\n🎉 Well done, <@${ticket.userId}>! ${auto ? 'Your crew center login is on its way' : 'The staff will accept you shortly'} — and your Discord will be linked to your new crew center account at the same moment, so there’s nothing else to set up.`
-                        + (auto ? '' : '\n\nStaff: accept to send the crew center login.')
-                    : '\n\nThe test page says when they can try again and what to read meanwhile.'));
+                    ? (accepted
+                        ? `\n\n🎉 Well done, <@${ticket.userId}> — you’re in! Your crew center login is just below.`
+                        : `\n\n🎉 Well done, <@${ticket.userId}>! The staff will accept you shortly — your Discord is linked to your new login at the same moment.\n\nStaff: press **Accept**.`)
+                    : '\n\nThe test page says when you can try again and what to read meanwhile. Staff can still accept or decline.'));
+        const ping = passed && !accepted && staff;
         await send(thread, {
-            content: !auto && staff ? `<@&${staff}>` : undefined,
+            content: ping ? `<@&${staff}>` : undefined,
             embeds: [e],
-            components: auto ? [] : [staffRow(ticket, { test: !passed, accept: passed })],
-            allowedMentions: { roles: !auto && staff ? [staff] : [] },
+            components: accepted ? [] : [staffRow(ticket, { test: !passed })],
+            allowedMentions: { roles: ping ? [staff] : [] },
         });
-        if (auto) {
-            const out = await acceptTicket({ interaction: null, ctx, ticket, actor: 'Auto-invite' });
-            if (out.error) {
-                await send(thread, {
-                    content: `⚠️ Auto-invite could not accept this application: ${out.error}${staff ? ` <@&${staff}>` : ''}`,
-                    components: [staffRow(ticket, { test: false })],
-                    allowedMentions: { roles: staff ? [staff] : [] },
-                });
-            }
-        }
+        if (accepted && ticket.stage !== 'accepted') await welcomeAccepted(ctx, ticket, 'Automatic — passed the entrance test');
     }
 
     /**
@@ -2053,24 +2169,21 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (!vaId || !applicationId) return;
         const found = await VaBotTicket.find({ vaId, applicationId: String(applicationId), status: 'open' }).limit(5);
         for (const t of found) {
-            await ticketLocks.run(String(t._id), () => acceptedElsewhere(String(t._id), vaId))
-                .catch((err) => console.error('🤖 vaBot accepted-elsewhere failed:', err && err.message ? err.message : err));
+            await ticketLocks.run(String(t._id), async () => {
+                const hit = await ticketContext(String(t._id), vaId);
+                // Accepted from Discord a moment ago: the welcome is already there.
+                if (!hit || hit.ticket.stage === 'accepted') return;
+                await welcomeAccepted(hit.ctx, hit.ticket, 'the staff in the crew center');
+            }).catch((err) => console.error('🤖 vaBot accepted-elsewhere failed:', err && err.message ? err.message : err));
         }
     });
 
-    async function acceptedElsewhere(ticketId, vaId) {
-        const ticket = await VaBotTicket.findOne({ _id: ticketId, status: 'open' });
-        // Accepted from Discord a moment ago: the welcome is already there.
-        if (!ticket || ticket.stage === 'accepted') return;
-        const link = await guildLink(ticket.guildId);
-        if (!link || String(link.vaId) !== String(vaId)) return;
-        const va = await vaById(vaId);
-        if (!va) return;
-        const ctx = { link, va, settings: link.settings || {} };
-        const inv = await api('get', crewPath(va.slug, `/applications/${encodeURIComponent(ticket.applicationId)}/invite`), {
-            asBot: true, slug: va.slug, actor: 'Crew center',
+    /** The welcome for an application the crew center has already accepted. */
+    async function welcomeAccepted(ctx, ticket, actor) {
+        const inv = await api('get', crewPath(ctx.va.slug, `/applications/${encodeURIComponent(ticket.applicationId)}/invite`), {
+            asBot: true, slug: ctx.va.slug, actor: 'Crew center',
         });
-        await finishAcceptance({ interaction: null, ctx, ticket, actor: 'the staff in the crew center', data: inv.ok ? { invite: inv.data.invite } : {} });
+        return finishAcceptance({ interaction: null, ctx, ticket, actor, data: inv.ok ? { invite: inv.data.invite } : {} });
     }
 
     /** An event was published, changed, cancelled or removed. */
@@ -2422,9 +2535,15 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             const link = await guildLink(guild.id);
             if (!link) return;
             const s = link.settings || {};
-            if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm && !s.pilotRoleId) return;
+            if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm && !s.pilotRoleId && !s.ticketChannelId) return;
             const va = await vaById(link.vaId);
             if (!va) return;
+            // An airline that sends its applicants here to open a ticket wants
+            // every newcomer greeted and pointed at Apply, whether or not it set
+            // a welcome channel — so without one, the greeting goes where the
+            // tickets open.
+            const join = s.welcomeChannelId ? null : await joinConfig(va).catch(() => null);
+            const greetIn = s.welcomeChannelId || (join && join.viaDiscord ? s.ticketChannelId : '');
             if (s.welcomeRoleId) await member.roles.add(s.welcomeRoleId, 'Welcome role').catch(() => {});
             // A raid, or a mass import: roles yes, a wall of greetings no.
             if (joinBurst.over(guild.id)) return;
@@ -2432,14 +2551,14 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             // Somebody coming back. A pilot who left (or was removed for
             // being quiet) and is still on the roster gets their role again;
             // the sweep is what decides whether they are still flying.
-            const pilot = s.pilotRoleId || s.welcomeChannelId ? await pilotByDiscord(va, member.user.id) : null;
+            const pilot = s.pilotRoleId || greetIn ? await pilotByDiscord(va, member.user.id) : null;
             if (pilot) {
                 await VaBotInactive.deleteOne({ guildId: guild.id, userId: member.user.id }).catch(() => {});
                 if (pilot.status !== 'inactive' && s.pilotRoleId) await member.roles.add(s.pilotRoleId, 'Returning pilot').catch(() => {});
             }
-            if (!s.welcomeChannelId && !s.welcomeDm) return;
+            if (!greetIn && !s.welcomeDm) return;
             const payload = welcomePayload(va, s, { member, guild, pilot });
-            if (s.welcomeChannelId) await send(await fetchChannel(s.welcomeChannelId), payload);
+            if (greetIn) await send(await fetchChannel(greetIn), payload);
             if (s.welcomeDm) {
                 // Guild buttons do nothing in a DM, so the DM gets the links only.
                 await dm(member.user.id, {
@@ -2722,6 +2841,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         case 'form': return showFormPage(interaction, ctx, ticket, args[1]);
         case 'formsub': return saveFormPage(interaction, ctx, ticket, args[1]);
         case 'submit': return submitApplication(interaction, ctx, ticket);
+        case 'claim': return showClaim(interaction, ctx, ticket);
+        case 'claimsub': return claimSubmit(interaction, ctx, ticket);
         case 'test': return sendTest(interaction, ctx, ticket, null);
         case 'testpick': {
             if (!isStaff(interaction, ctx.settings)) return say(interaction, 'Only staff can send the entrance test.');
@@ -2774,7 +2895,7 @@ function guildSummary(g) {
     return {
         staffRole: !!s.staffRoleId, pilotRole: !!s.pilotRoleId,
         ticketChannel: !!s.ticketChannelId, eventsChannel: !!s.eventsChannelId,
-        autoInvite: !!s.autoInvite, panel: !!(g && g.panelAt),
+        panel: !!(g && g.panelAt),
     };
 }
 

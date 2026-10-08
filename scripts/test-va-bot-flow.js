@@ -9,11 +9,12 @@
 // replaced by in-memory statics on the real models, so documents are real
 // mongoose documents and only their persistence is pretend.
 //
-// The path held:
+// The path held (crewRecruit.js):
 //   link the server → settings → open a ticket → two pages of form → submit
-//   → staff send the test (an applicant may not) → the result arrives → auto-
-//   invite accepts → the pilot role is given → only the pilot can read the
-//   login → close.
+//   → the entrance test arrives by itself (staff can resend; an applicant may
+//   not) → a pass the crew center accepts → the pilot role is given → only the
+//   pilot can open their choose-a-password link → close. And the other door
+//   in: "I applied on the website" with the application code.
 //
 // Run:  node scripts/test-va-bot-flow.js
 const http = require('http');
@@ -100,6 +101,9 @@ const VirtualAirlineAd = { findById: () => ({ select: () => q(VA) }) };
 /* ---------------------------------------------------------- fake crew center */
 const calls = [];
 let invite = null;
+// What every acceptance hands over now: a one-time link to choose a password.
+const SETUP_LINK = 'https://inflight.example/crew/test-air?setup=Zm9vYmFyYmF6cXV4c2V0dXBsaW5r';
+const LIVE_INVITE = { state: 'live', kind: 'link', username: 'pilot.one', link: SETUP_LINK, signInUrl: 'https://inflight.example/crew/test-air' };
 let rosterPilots = [];
 let rosterDown = false;
 const eventSignups = new Map();
@@ -126,13 +130,14 @@ function crewCenter() {
     };
     app.get('/api/va-ads/by-slug/:slug', (req, res) => res.json({
         join: {
-            mode: 'application', form: [{ label: 'Why us?', type: 'text', required: true }],
+            mode: 'free', entranceTest: { id: 'q1', title: 'SOP test', passMark: 80 }, viaDiscord: true,
+            form: [{ label: 'Why us?', type: 'text', required: true }],
             requirements: [{ type: 'agree', label: 'I read the SOP' }],
             callsign: { airlines: [{ base: 'TEST', tag: 'T', sample: 'TEST 001T' }] },
         },
     }));
     app.post('/api/crew/:slug/apply', (req, res) => {
-        calls.push({ path: 'apply', body: req.body });
+        calls.push({ path: 'apply', body: req.body, asBot: !!v.botCallerFrom(req, req.params.slug) });
         res.json({ status: 'pending', callsign: 'TEST 123T', applicationId: req.body.ifcName === 'Pilot_One' ? 'app1' : `app-${req.body.ifcName}`, ifVerified: true, grade: 3 });
     });
     app.get('/api/crew/:slug/entrance-tests', staffOnly, (req, res) => res.json({ quizzes: [{ id: 'q1', title: 'SOP test', passMark: 80 }] }));
@@ -140,10 +145,24 @@ function crewCenter() {
         calls.push({ path: 'test', body: req.body, actor: req.actor });
         res.status(201).json({ test: { link: 'https://inflight.example/crew/test-air/test?t=abc', quizTitle: 'SOP test', passMark: 80 } });
     });
+    // A ticket and its application: by id after a form here, or by the code
+    // a web applicant was given. The test comes back with it.
+    app.post('/api/crew/:slug/discord-bot/ticket-application', staffOnly, (req, res) => {
+        calls.push({ path: 'ticket-app', body: req.body });
+        const b = req.body || {};
+        if (b.code !== undefined && String(b.code).toUpperCase() !== 'WEB1-0001') return res.status(404).json({ error: 'We couldn’t find an application with that code.' });
+        const id = b.applicationId || 'app-web';
+        res.json({
+            application: { id, ifcName: id === 'app-web' ? 'Web_Pilot' : 'Pilot_One', callsign: 'TEST 123T', status: 'pending', grade: 3, ifVerified: true },
+            stage: 'test',
+            test: { quizTitle: 'SOP test', passMark: 80, status: 'issued', live: true, link: `https://inflight.example/crew/test-air/test?t=${id}` },
+            rules: { test: true, auto: true },
+        });
+    });
     app.patch('/api/crew/:slug/applications/:id', staffOnly, (req, res) => {
         calls.push({ path: 'review', id: req.params.id, body: req.body, actor: req.actor });
-        invite = { state: 'live', username: 'pilot.one', password: 'Temp-Pass-123', signInUrl: 'https://inflight.example/crew/test-air' };
-        res.json({ status: 'accepted', account: { username: 'pilot.one', password: 'Temp-Pass-123', created: true }, invite, signInUrl: invite.signInUrl });
+        invite = LIVE_INVITE;
+        res.json({ status: 'accepted', account: { username: 'pilot.one', kind: 'link', created: true }, invite, signInUrl: invite.signInUrl });
     });
     app.get('/api/crew/:slug/applications/:id/invite', staffOnly, (req, res) => res.json({ invite }));
     app.get('/api/crew/:slug/discord-bot/pilots', staffOnly, (req, res) => (rosterDown ? res.status(503).json({ error: 'store down' }) : res.json({ pilots: rosterPilots, unlinked: 2 })));
@@ -332,10 +351,13 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     check('…and the code is spent', liveCode === null);
 
     it = interaction('command', { user: STAFF, perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'settings', options: {
-        staff_role: { id: STAFF_ROLE }, pilot_role: { id: PILOT_ROLE }, ticket_channel: ticketChannel, log_channel: logChannel, auto_invite: true,
+        staff_role: { id: STAFF_ROLE }, pilot_role: { id: PILOT_ROLE }, ticket_channel: ticketChannel, log_channel: logChannel,
     } });
     await run(it);
-    check('settings are saved', guilds[0].settings.staffRoleId === STAFF_ROLE && guilds[0].settings.autoInvite === true, guilds[0].settings);
+    check('settings are saved', guilds[0].settings.staffRoleId === STAFF_ROLE && guilds[0].settings.ticketChannelId === ticketChannel.id, guilds[0].settings);
+    check('…and say how the airline recruits, from the crew center', /Accepted automatically on passing the test/.test(JSON.stringify(it.out.replies)) && /SOP test/.test(JSON.stringify(it.out.replies)), it.out.replies);
+    const adminCmd = bot.commands().find((c) => c.name === 'crew-admin');
+    check('there is no separate auto-invite switch in Discord any more', !JSON.stringify(adminCmd).includes('auto_invite'));
 
     it = interaction('command', { user: STAFF, perms: [PermissionsBitField.Flags.ManageGuild], command: 'crew-admin', sub: 'panel', options: {} });
     await run(it);
@@ -350,6 +372,8 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     const thread = ticket && channels.get(ticket.threadId);
     check('a ticket thread opens', !!thread && /ticket is open/.test(lastText(it)), lastText(it));
     check('…with a Start button for the applicant', thread && buttonIds(thread.sent[0]).includes(`vab:form:${ticket._id}:0`));
+    check('…and one for somebody who applied on the website', thread && buttonIds(thread.sent[0]).includes(`vab:claim:${ticket._id}`));
+    check('…telling them the test comes next', thread && /SOP test/.test(JSON.stringify(thread.sent[0].embeds)));
 
     it = interaction('button', { customId: 'vab:open:apply' });
     await run(it);
@@ -379,13 +403,15 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     it = interaction('button', { customId: `vab:submit:${ticket._id}` });
     await run(it);
     const applied = calls.find((c) => c.path === 'apply');
-    check('the application reached /apply', !!applied);
+    check('the application reached /apply, as the bot', !!applied && applied.asBot === true, applied);
     check('…as the body /apply expects', applied && applied.body.ifcName === 'Pilot_One' && applied.body.callsignPrefix === 'TEST'
         && applied.body.callsignNumber === '123' && applied.body.answers[0].a === 'Great airline' && applied.body.agreed[0] === 'I read the SOP', applied && applied.body);
-    check('the ticket now carries the application', ticket.applicationId === 'app1' && ticket.stage === 'submitted');
+    check('the ticket now carries the application', ticket.applicationId === 'app1' && ticket.stage === 'testing', ticket.stage);
     check('…and the draft answers are gone', ticket.draft.answers.length === 0);
-    const staffMsg = thread.sent[thread.sent.length - 1];
-    check('staff are pinged with the controls', staffMsg.content === `<@&${STAFF_ROLE}>` && buttonIds(staffMsg).includes(`vab:test:${ticket._id}`));
+    const autoTest = thread.sent[thread.sent.length - 1];
+    check('the entrance test arrives by itself', buttonIds(autoTest).includes('https://inflight.example/crew/test-air/test?t=app1'), buttonIds(autoTest));
+    const staffMsg = thread.sent[thread.sent.length - 2];
+    check('staff get the controls, without a ping while the test is out', !staffMsg.content && buttonIds(staffMsg).includes(`vab:test:${ticket._id}`) && buttonIds(staffMsg).includes(`vab:accept:${ticket._id}`));
 
     // The applicant cannot send themselves the test or accept themselves.
     it = interaction('button', { customId: `vab:test:${ticket._id}` });
@@ -398,36 +424,63 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:test:${ticket._id}` });
     await run(it);
     const sentTest = calls.find((c) => c.path === 'test');
-    check('staff send the test through the crew center, as the bot', sentTest && sentTest.body.applicationId === 'app1' && sentTest.actor === 'boss (Discord)', sentTest);
+    check('staff can resend the test through the crew center, as the bot', sentTest && sentTest.body.applicationId === 'app1' && sentTest.actor === 'boss (Discord)', sentTest);
     const testMsg = thread.sent[thread.sent.length - 1];
     check('…and the applicant gets a link button', buttonIds(testMsg).includes('https://inflight.example/crew/test-air/test?t=abc'));
 
-    // The result comes back; auto-invite is on.
-    v.hub.emit('entranceTest', { vaId, applicationId: 'app1', passed: true, score: 9, total: 10, percent: 90, quizTitle: 'SOP test' });
+    // The result comes back, and the crew center has already accepted them
+    // (open joining: a pass lets them in).
+    invite = LIVE_INVITE;
+    v.hub.emit('entranceTest', { vaId, applicationId: 'app1', passed: true, score: 9, total: 10, percent: 90, quizTitle: 'SOP test', accepted: true });
     await new Promise((r) => setTimeout(r, 300));
-    const review2 = calls.find((c) => c.path === 'review');
-    check('a pass with auto-invite accepts with a login', review2 && review2.body.action === 'accept' && review2.body.createAccount === true, review2);
-    check('…recorded as auto-invite', review2 && review2.actor === 'Auto-invite (Discord)', review2 && review2.actor);
+    check('an automatic acceptance is not accepted a second time from Discord', !calls.some((c) => c.path === 'review'));
     check('the pilot role is given', roleAdds.some((x) => x.id === APPLICANT.id && x.r === PILOT_ROLE), roleAdds);
     const linkCall = calls.find((c) => c.path === 'link');
     check('…and their Discord is linked to the new login', linkCall && linkCall.body.discordId === APPLICANT.id && linkCall.body.applicationId === 'app1', linkCall);
     const welcome = thread.sent[thread.sent.length - 1];
-    check('the welcome offers Show my login', buttonIds(welcome).includes(`vab:login:${ticket._id}`), buttonIds(welcome));
-    check('…and never prints the password in the thread', !thread.sent.some((m) => JSON.stringify(m).includes('Temp-Pass-123')));
+    check('the welcome offers Set up my login', buttonIds(welcome).includes(`vab:login:${ticket._id}`), buttonIds(welcome));
+    check('…and never puts the link in the thread', !thread.sent.some((m) => JSON.stringify(m).includes(SETUP_LINK)));
     check('…and tells them Discord sign-in already works', /Discord is linked/.test(JSON.stringify(welcome.embeds)));
-    check('passing the test tells them their Discord will be linked too', thread.sent.some((m) => /Discord will be linked/.test(JSON.stringify(m.embeds || []))));
+    check('the result says they are in', thread.sent.some((m) => /you’re in/.test(JSON.stringify(m.embeds || []))));
 
     it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:login:${ticket._id}` });
     await run(it);
-    check('staff cannot open the pilot’s login', /Only the pilot/.test(lastText(it)) && !lastText(it).includes('Temp-Pass'));
+    check('staff cannot open the pilot’s login', /Only the pilot/.test(lastText(it)) && !JSON.stringify(it.out.replies).includes(SETUP_LINK));
     it = interaction('button', { customId: `vab:login:${ticket._id}` });
     await run(it);
-    check('the pilot reads their login', lastText(it).includes('pilot.one') && lastText(it).includes('Temp-Pass-123'), lastText(it));
+    check('the pilot gets their username and a Choose my password button', lastText(it).includes('pilot.one')
+        && buttonIds(it.out.replies[it.out.replies.length - 1]).includes(SETUP_LINK), it.out.replies);
 
-    const reviews = calls.filter((c) => c.path === 'review').length;
     it = interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:accept:${ticket._id}` });
     await run(it);
-    check('a second Accept after auto-invite does nothing', /Already accepted/.test(lastText(it)) && calls.filter((c) => c.path === 'review').length === reviews, lastText(it));
+    check('a second Accept after an automatic one does nothing', /Already accepted/.test(lastText(it)) && !calls.some((c) => c.path === 'review'), lastText(it));
+
+    /* ---- applied on the website ----------------------------------------- */
+    const WEB = { id: '333', username: 'web_pilot', tag: 'web_pilot' };
+    it = interaction('button', { user: WEB, customId: 'vab:open:apply' });
+    await run(it);
+    const webTicket = tickets.find((t) => t.userId === WEB.id);
+    const webThread = channels.get(webTicket.threadId);
+    it = interaction('button', { user: STAFF, customId: `vab:claim:${webTicket._id}` });
+    await run(it);
+    check('only the applicant can enter their code', /Only the applicant/.test(lastText(it)));
+    it = interaction('button', { user: WEB, customId: `vab:claim:${webTicket._id}` });
+    await run(it);
+    check('“I applied on the website” asks for the code', it.out.modal && it.out.modal.custom_id === `vab:claimsub:${webTicket._id}`, it.out.modal);
+    it = interaction('modal', { user: WEB, customId: `vab:claimsub:${webTicket._id}`, fields: { code: 'NOPE-0000' } });
+    await run(it);
+    check('a wrong code is refused, with a way to try again', /couldn’t find/.test(lastText(it)) && buttonIds(it.out.replies[it.out.replies.length - 1]).includes(`vab:claim:${webTicket._id}`) && !webTicket.applicationId, lastText(it));
+    it = interaction('modal', { user: WEB, customId: `vab:claimsub:${webTicket._id}`, fields: { code: 'web1-0001' } });
+    await run(it);
+    check('a second guess straight away waits', /try again in/.test(lastText(it)), lastText(it));
+    const realNow = Date.now;
+    Date.now = () => realNow() + 10000;   // the guess limiter's few seconds pass
+    it = interaction('modal', { user: WEB, customId: `vab:claimsub:${webTicket._id}`, fields: { code: 'web1-0001' } });
+    await run(it);
+    Date.now = realNow;
+    check('the right one links the website application', /Found your application/.test(lastText(it)) && webTicket.applicationId === 'app-web' && webTicket.stage === 'testing', lastText(it));
+    check('…and the test arrives right after', buttonIds(webThread.sent[webThread.sent.length - 1]).includes('https://inflight.example/crew/test-air/test?t=app-web'));
+    check('…with staff told it came from the website', JSON.stringify(webThread.sent[webThread.sent.length - 2].embeds).includes('Applied on the website'));
 
     it = interaction('button', { customId: `vab:close:${ticket._id}` });
     await run(it);
@@ -499,6 +552,13 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     check('Request leave opens a ticket already titled for it', JSON.stringify(it.out.modal || {}).includes('Leave of absence'));
 
     /* ---- welcome ------------------------------------------------------- */
+    // An airline that sends applicants here greets every newcomer and points
+    // them at Apply, even before it has chosen a welcome channel.
+    const inTickets = ticketChannel.sent.length;
+    await bot.onMemberJoin(memberObj('665000000'));
+    const pointed = ticketChannel.sent[ticketChannel.sent.length - 1];
+    check('recruiting through Discord: newcomers are greeted where tickets open', ticketChannel.sent.length === inTickets + 1
+        && buttonIds(pointed).includes('vab:open:apply') && /applied on our website/.test(JSON.stringify(pointed.embeds)), pointed);
     const welcomeChannel = { id: '500000000003', type: 0, sent: [], send: async (m) => { welcomeChannel.sent.push(m); return {}; } };
     channels.set(welcomeChannel.id, welcomeChannel);
     it = interaction('command', { ...ADMIN, sub: 'welcome', options: { channel: welcomeChannel, role: { id: '3003' }, message: 'Hi {user}, welcome to {airline}!' } });
@@ -605,16 +665,16 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     check('ten Submits at once send ONE application', applies === 1, applies);
     check('…none of them throws', results.every((r) => r.status === 'fulfilled'), results.filter((r) => r.status === 'rejected').map((r) => String(r.reason)));
     check('…and every press gets an answer', presses.every(answered), presses.map((x) => x.out.replies.length));
-    check('…one staff card in the thread, not ten', thread2.sent.filter((m) => buttonIds(m).includes(`vab:test:${t2._id}`)).length === 1);
+    check('…one staff card in the thread, not ten', thread2.sent.filter((m) => buttonIds(m).includes(`vab:test:${t2._id}`) && /Application from/.test(JSON.stringify(m.embeds || []))).length === 1);
 
-    // Five staff press Accept while auto-invite fires for the same pass.
+    // Five staff press Accept while the pass arrives for the same applicant.
     const accepts = Array.from({ length: 5 }, () => interaction('button', { user: STAFF, roles: [STAFF_ROLE], customId: `vab:accept:${t2._id}` }));
     const before = calls.filter((c) => c.path === 'review').length;
-    v.hub.emit('entranceTest', { vaId, applicationId: 'app-Pilot_Two', passed: true, score: 9, total: 10, percent: 90, quizTitle: 'SOP test' });
+    v.hub.emit('entranceTest', { vaId, applicationId: 'app-Pilot_Two', passed: true, score: 9, total: 10, percent: 90, quizTitle: 'SOP test', accepted: false });
     results = await settled(accepts);
     await new Promise((r) => setTimeout(r, 1500));
     const accepted = calls.filter((c) => c.path === 'review').length - before;
-    check('five Accepts and an auto-invite accept ONCE', accepted === 1, accepted);
+    check('five Accepts at once accept ONCE', accepted === 1, accepted);
     check('…one welcome in the thread', thread2.sent.filter((m) => buttonIds(m).includes(`vab:login:${t2._id}`)).length === 1,
         thread2.sent.filter((m) => buttonIds(m).includes(`vab:login:${t2._id}`)).length);
     check('…and every staff press gets an answer', accepts.every(answered));

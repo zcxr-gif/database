@@ -1,22 +1,26 @@
 // test-crew-entrance-tests.js
-// Entrance tests and the join form, driven through the REAL server.js — its
+// The recruiting road (crewRecruit.js), driven through the REAL server.js — its
 // routes, its auth, its marking — with only Mongo and the VA's own database
 // replaced by memory.
 //
 // WHAT THIS FILE IS DEFENDING
 //
-//   * Signing up never puts a login on the screen. A free-join VA puts the
-//     pilot on the roster and stops there: no password in the reply, none
-//     minted, none emailed. Staff hand sign-ins out.
-//   * An entrance test is sat WITHOUT a login — the link is the key — and the
-//     paper the taker is handed has no answer key in it.
-//   * Only an entrance test opens that way. A pilot's own quiz link is refused
-//     on the public route, whoever holds it.
-//   * A failed test says when the next go is, hands over the study material,
-//     and refuses a retake before then. A pass is recorded for staff, who send
-//     the invitation themselves.
-//   * Staff see the result on the application card, and the applicant sees
-//     their link on their own status page.
+//   * ONE road: apply → [Discord ticket] → [entrance test] → accepted → the
+//     pilot chooses their password. Every way in ends the same way.
+//   * Accepting ALWAYS makes the login, and hands it over as a one-time link to
+//     choose a password. No password exists anywhere — not in a reply, not on
+//     the status page, not in the message staff paste.
+//   * Open joining lets people straight in — on submit, or on passing the test
+//     when one is required. Application mode waits for staff.
+//   * A required entrance test goes out by itself the moment somebody applies,
+//     is sat WITHOUT a login, and its paper has no answer key in it. A failed
+//     test says when the next go is and hands over the study material.
+//   * An airline that recruits in its Discord sends web applicants there with
+//     an application code; the bot's ticket finds the application by it and
+//     the test is sent there. One Discord account per application.
+//   * Tests only ever go to applicants — nobody is tested who has not applied.
+//   * Only an entrance test opens on the public route. A pilot's own quiz link
+//     is refused, whoever holds it.
 //
 // Run:  node scripts/test-crew-entrance-tests.js
 'use strict';
@@ -42,6 +46,7 @@ const QUIZ = {
 const VA = {
     _id: 'va1', slug: 'am', name: 'Aeroméxico Virtual', callsign: 'AEROMEXICO ###AM', status: 'approved',
     joinMode: 'free', minGrade: 0, crewQuizzes: [QUIZ], crewQuizGate: {}, crewBanners: {},
+    crewEntranceQuizId: '', crewJoinViaDiscord: false, crewDiscordInvite: 'https://discord.gg/aeromexico',
     supabaseUrl: 'https://x.supabase.co', supabaseServiceKey: 'k', bannerUrl: 'https://cdn.example/am.webp',
 };
 
@@ -73,7 +78,8 @@ const DB = { applications: [], attempts: [], members: [], accounts: [] };
 const id = () => `00000000-0000-4000-8000-${String(++SEQ).padStart(12, '0')}`;
 const store = {
     drift: () => [],
-    health: async () => ({ ok: true, provisioned: true, version: 25 }),
+    // v26: keeps setup links as invitations.
+    health: async () => ({ ok: true, provisioned: true, version: 26, invites: true, quizzes: true }),
     createApplication: async (d) => { const a = { _id: id(), createdAt: new Date(), ...d }; DB.applications.push(a); return a; },
     getApplication: async (i) => DB.applications.find((a) => a._id === i) || null,
     getApplicationByToken: async (t) => DB.applications.find((a) => a.statusToken === t) || null,
@@ -84,13 +90,18 @@ const store = {
     getMember: async (i) => DB.members.find((m) => m._id === i) || null,
     createAccount: async (d) => { const a = { _id: id(), ...d }; DB.accounts.push(a); return a; },
     listAccounts: async () => DB.accounts.slice(),
+    getAccount: async (i) => DB.accounts.find((a) => a._id === i) || null,
+    getAccountByUsername: async (u) => DB.accounts.find((a) => a.username === u) || null,
+    getAccountByMember: async (m) => DB.accounts.find((a) => String(a.memberId) === String(m)) || null,
+    getAccountByResetToken: async (h) => DB.accounts.find((a) => a.resetTokenHash === h) || null,
+    updateAccount: async (i, p) => { const a = DB.accounts.find((x) => x._id === i); if (!a) return null; Object.assign(a, p); return a; },
     createQuizAttempt: async (d) => { const a = { _id: id(), attemptsUsed: 0, score: 0, total: 0, answers: [], createdAt: new Date(), ...d }; DB.attempts.unshift(a); return a; },
     getQuizAttempt: async (i) => DB.attempts.find((a) => a._id === i) || null,
     getQuizAttemptByToken: async (t) => DB.attempts.find((a) => a.token === t) || null,
     updateQuizAttempt: async (i, p) => { const a = DB.attempts.find((x) => x._id === i); Object.assign(a, p); return a; },
     listQuizAttempts: async ({ memberId = '', quizId = '', candidates = false, applicationId = '', status = '' } = {}) => DB.attempts.filter((a) => (
         (!memberId || a.memberId === memberId) && (!candidates || memberId || !a.memberId)
-        && (!quizId || a.quizId === quizId) && (!applicationId || a.applicationId === applicationId)
+        && (!quizId || a.quizId === quizId) && (!applicationId || String(a.applicationId) === String(applicationId))
         && (!status || a.status === status))),
 };
 const crewStore = require('../crewStore');
@@ -112,10 +123,18 @@ const check = (what, ok, saw) => {
     else fails.push(what + (saw === undefined ? '' : `  (saw ${JSON.stringify(saw).slice(0, 400)})`));
 };
 
-// What the Discord bot hears when a test is marked (vaBot.js).
+// What the Discord bot hears (vaBot.js), and the bot's own storage, faked:
+// whether a server is linked, and which tickets hold which application.
 const vaBot = require('../vaBot');
 const hubSeen = [];
 vaBot.hub.on('entranceTest', (p) => { hubSeen.push(p); });
+let BOT_LINKED = false;
+const TICKETS = [];
+vaBot.models.VaBotGuild.findOne = () => query(BOT_LINKED ? { _id: 'g1' } : null);
+vaBot.models.VaBotTicket.find = (f) => query(TICKETS.filter((t) => String(t.vaId) === String(f.vaId)
+    && (!f.applicationId || !f.applicationId.$in || f.applicationId.$in.includes(String(t.applicationId)))));
+vaBot.models.VaBotTicket.findOne = (f) => query(TICKETS.find((t) => String(t.applicationId) === String(f.applicationId)
+    && (!f.userId || !f.userId.$ne || t.userId !== f.userId.$ne)) || null);
 
 require('../server.js');
 
@@ -132,6 +151,15 @@ const call = async (method, path, body, token) => {
     try { json = await res.json(); } catch { json = null; }
     return { status: res.status, body: json };
 };
+let NUM = 400;
+const apply = (ifcName, extra = {}) => call('POST', '/api/crew/am/apply', {
+    ifcName, callsignPrefix: 'AEROMEXICO', callsignNumber: String(++NUM), grade: 3, answers: [], ...extra,
+});
+const noPassword = (o) => !/"password":"[^"]+"|Temporary password/i.test(JSON.stringify(o || {}));
+const cardOf = async (appId, status = 'pending') => {
+    const r = await call('GET', `/api/crew/am/applications?status=${status}`, null, owner);
+    return ((r.body && r.body.applications) || []).find((a) => String(a._id) === String(appId)) || null;
+};
 
 async function waitForServer() {
     for (let i = 0; i < 100; i++) {
@@ -143,39 +171,70 @@ async function waitForServer() {
 (async () => {
     await waitForServer();
 
-    /* ---- signing up shows no login -------------------------------------- */
+    /* ---- open joining, no test: straight in, with a link ---------------- */
     {
-        const r = await call('POST', '/api/crew/am/apply', {
-            ifcName: 'Jordan_Lee', callsignPrefix: 'AEROMEXICO', callsignNumber: '412', grade: 3, answers: [],
-        });
-        check('a free-join sign-up is accepted', r.status === 200 && r.body.status === 'accepted', r);
-        check('…with no login anywhere in the reply', r.body && r.body.account === null && !JSON.stringify(r.body).includes('password'), r.body);
-        check('…and none is made behind the scenes', DB.accounts.length === 0, DB.accounts);
-        check('…but they are on the roster, with their callsign', DB.members.some((m) => m.name === 'Jordan_Lee' && /412/.test(m.callsign)), DB.members);
-        check('…and they are told staff send the sign-in', r.body.signInFromStaff === true);
+        const r = await apply('Jordan_Lee');
+        check('open joining accepts on the spot', r.status === 200 && r.body.status === 'accepted' && r.body.stage === 'invited', r.body);
+        check('…puts them on the roster with their callsign', DB.members.some((m) => m.name === 'Jordan_Lee' && /401/.test(m.callsign)), DB.members);
+        const acct = DB.accounts.find((a) => a.displayName === 'Jordan_Lee');
+        check('…ALWAYS makes their login', !!acct && acct.mustChangePassword === true, acct);
+        check('…and hands it over as a link to choose a password', r.body.login && r.body.login.kind === 'link' && /reset=|token=|setup/i.test(r.body.login.link), r.body.login);
+        check('…with no password anywhere in the reply', noPassword(r.body), r.body);
+        check('…and says so as the next step', r.body.next && r.body.next.action && r.body.next.action.label === 'Choose my password', r.body.next);
         const st = await call('GET', `/api/crew/am/application-status/${r.body.statusToken}`);
-        check('their status page has no credentials either', st.status === 200 && st.body.credentials === null, st.body);
+        check('their status page has the same link', st.status === 200 && st.body.login && st.body.login.link === r.body.login.link && st.body.credentials === null, st.body);
     }
 
+    /* ---- application mode, no test: staff accept ------------------------ */
     VA.joinMode = 'application';
-    const applied = await call('POST', '/api/crew/am/apply', {
-        ifcName: 'Rae_Okafor', callsignPrefix: 'AEROMEXICO', callsignNumber: '413', grade: 3, answers: [],
-    });
-    const appId = applied.body.applicationId;
-    check('an application is pending', applied.body.status === 'pending', applied.body);
+    let ana;
+    {
+        const r = await apply('Ana_Ruiz');
+        ana = r.body;
+        check('an application waits for staff', r.body.status === 'pending' && r.body.stage === 'review', r.body);
+        check('…with nothing to sign in with yet', r.body.login === null && !DB.accounts.some((a) => a.displayName === 'Ana_Ruiz'), r.body);
+        const card = await cardOf(r.body.applicationId);
+        check('the card says it is ready for review', card && card.stage === 'review', card);
+        check('…with a message for the IFC that links their status page', card && /Track your application: http/.test(card.applicant.plainMessage), card && card.applicant);
+        const ok = await call('PATCH', `/api/crew/am/applications/${r.body.applicationId}`, { action: 'accept', createAccount: false }, owner);
+        check('accepting makes the login even when an old screen says not to', ok.status === 200 && DB.accounts.some((a) => a.displayName === 'Ana_Ruiz'), ok.body);
+        const inv = ok.body.invite || {};
+        check('…as a live link invitation', inv.state === 'live' && inv.kind === 'link' && !!inv.link, inv);
+        check('…whose welcome carries the link and no password', /choose your password/.test(inv.plainMessage) && inv.plainMessage.includes(inv.link) && noPassword(ok.body), inv.plainMessage);
+        check('…framed for the IFC', /^!\[Aeroméxico Virtual\]/.test(inv.message), inv.message);
+        const st = await call('GET', `/api/crew/am/application-status/${r.body.statusToken}`);
+        check('the applicant sees the link on their status page', st.body.stage === 'invited' && st.body.login && st.body.login.link === inv.link, st.body);
 
-    /* ---- sending a test --------------------------------------------------- */
-    const anon = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', applicationId: appId });
-    check('only staff send tests', anon.status === 401, anon);
-    const sent = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', applicationId: appId }, owner);
-    const t = sent.body && sent.body.test;
-    check('staff send an applicant a test', sent.status === 201 && t && /\/crew\/am\/test\?t=[a-f0-9]{32}$/.test(t.link), sent);
-    check('…with a message to paste, framed for the IFC', t && t.message.startsWith('![Aeroméxico Virtual](https://cdn.example/am.webp)') && /\|600x100\]/.test(t.message), t && t.message);
-    check('…that states the pass mark and the retake wait', t && /80% or higher/.test(t.plainMessage) && /1 day \(24 hours\)/.test(t.plainMessage), t && t.plainMessage);
-    check('…and is tied to the application', !!DB.attempts[0] && DB.attempts[0].applicationId === appId && DB.attempts[0].memberId === null, DB.attempts[0]);
+        const sent = await call('POST', `/api/crew/am/applications/${r.body.applicationId}/invite/sent`, { sent: true }, owner);
+        check('copying it is recorded, with who', sent.status === 200 && !!sent.body.invite.sentAt && sent.body.invite.sentBy === 'Founder', sent.body);
+        const fresh = await call('POST', `/api/crew/am/applications/${r.body.applicationId}/invite/regenerate`, null, owner);
+        check('a new link replaces the old one', fresh.status === 200 && fresh.body.invite.link && fresh.body.invite.link !== inv.link && !fresh.body.invite.sentAt, fresh.body);
+        const gone = await call('DELETE', `/api/crew/am/applications/${r.body.applicationId}/invite`, null, owner);
+        check('throwing it away kills the link', gone.status === 200 && gone.body.invite.state !== 'live' && !gone.body.invite.link, gone.body);
+        // They sign in: the invitation is spent, and cannot be reissued.
+        const acct = DB.accounts.find((a) => a.displayName === 'Ana_Ruiz');
+        acct.lastLoginAt = new Date();
+        const joined = await cardOf(r.body.applicationId, 'accepted');
+        check('once they sign in the card says joined', joined && joined.stage === 'joined' && joined.invite.state === 'claimed', joined);
+        const again = await call('POST', `/api/crew/am/applications/${r.body.applicationId}/invite/regenerate`, null, owner);
+        check('…and no new link is made over a used login', again.status === 409, again);
+    }
+
+    /* ---- a required test goes out by itself ------------------------------ */
+    VA.crewEntranceQuizId = 'entrance';
+    const applied = await apply('Rae_Okafor', { email: '' });
+    const appId = applied.body.applicationId;
+    check('with a required test, applying sends it', applied.body.status === 'pending' && applied.body.stage === 'test' && applied.body.test && /\/crew\/am\/test\?t=[a-f0-9]{32}$/.test(applied.body.test.link), applied.body);
+    check('…tied to the application', !!DB.attempts[0] && String(DB.attempts[0].applicationId) === String(appId) && DB.attempts[0].memberId === null, DB.attempts[0]);
+    const t = (await cardOf(appId)).test;
+    check('the card carries it, with a message to paste', t && t.message.startsWith('![Aeroméxico Virtual](https://cdn.example/am.webp)') && /80% or higher/.test(t.plainMessage), t);
     if (!t) { fails.forEach((f) => console.log('  ✗ ' + f)); process.exit(1); }   // nothing below can run without it
-    const again = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', applicationId: appId }, owner);
+    const again = await call('POST', '/api/crew/am/entrance-tests', { applicationId: appId }, owner);
     check('a second link while the first is live is refused, with the first one back', again.status === 409 && again.body.test && again.body.test.link === t.link, again);
+    const anon = await call('POST', '/api/crew/am/entrance-tests', { applicationId: appId });
+    check('only staff send tests', anon.status === 401, anon);
+    const loose = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', name: 'Sam', ifcName: '@sam_flies' }, owner);
+    check('a test never goes to somebody who has not applied', loose.status === 400 && loose.body.code === 'needs_application', loose);
     const token = t.link.split('t=')[1];
 
     /* ---- sitting it, with no login --------------------------------------- */
@@ -191,74 +250,80 @@ async function waitForServer() {
     check('…and says when the next go is', !!wrong.body.retryAt && /in 2[34] hours/.test(wrong.body.refusal), wrong.body);
     const tooSoon = await call('POST', `/api/crew/am/test/${token}`, { answers: [0, 1] });
     check('a retake before the wait is up is refused', tooSoon.status === 409, tooSoon);
-
-    const list = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
-    const card = list.body && (list.body.applications || []).find((a) => String(a._id) === String(appId));
-    check('staff see the result on the application', card && card.test && card.test.status === 'failed' && card.test.percent === 0, card);
+    const card = await cardOf(appId);
+    check('staff see the result, still at the test step', card && card.test && card.test.status === 'failed' && card.stage === 'test', card);
     const mine = await call('GET', `/api/crew/am/application-status/${applied.body.statusToken}`);
-    check('the applicant sees their test on their status page', mine.body.test && mine.body.test.status === 'failed' && !!mine.body.test.link, mine.body.test);
+    check('the applicant sees their test on their status page', mine.body.test && mine.body.test.status === 'failed' && !!mine.body.test.link && mine.body.stage === 'test', mine.body);
 
     // The wait passes.
-    DB.attempts[0].submittedAt = new Date(Date.now() - 25 * 3600 * 1000);
+    DB.attempts.find((a) => a.token === token).submittedAt = new Date(Date.now() - 25 * 3600 * 1000);
     const right = await call('POST', `/api/crew/am/test/${token}`, { answers: [0, 1] });
     check('after the wait, a passing paper passes', right.status === 200 && right.body.passed === true && right.body.percent === 100, right.body);
-    check('…and keeps the study material to itself', right.body.study === '');
+    check('…keeps the study material to itself', right.body.study === '');
+    check('…and in application mode does not let them in by itself', right.body.accepted === false && right.body.login === null, right.body);
     const done = await call('POST', `/api/crew/am/test/${token}`, { answers: [0, 1] });
     check('a passed test cannot be sat again', done.status === 409, done);
-    const after = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
-    const card2 = (after.body.applications || []).find((a) => String(a._id) === String(appId));
-    check('the card now says they passed — the invite is staff’s to send', card2.test.status === 'passed' && card2.status === 'pending', card2);
+    const card2 = await cardOf(appId);
+    check('the card is ready for review — staff accept', card2.test.status === 'passed' && card2.status === 'pending' && card2.stage === 'review', card2);
+    const heard = hubSeen.find((h) => String(h.applicationId) === String(appId) && h.passed);
+    check('a marked test is told to the bot, with its application', !!heard && heard.percent === 100 && heard.accepted === false, hubSeen);
 
-    /* ---- somebody who never applied ------------------------------------- */
-    const loose = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', name: 'Sam', ifcName: '@sam_flies' }, owner);
-    check('a test can go to somebody who never applied', loose.status === 201 && loose.body.test.ifcName === 'sam_flies', loose);
-    const all = await call('GET', '/api/crew/am/entrance-tests', null, owner);
-    check('staff list every test', all.status === 200 && all.body.tests.length === 2 && all.body.quizzes.length === 1, all.body);
-
-    /* ---- a test handed out by hand shows up under Applications ------------ */
-    // No email, so the link went over the IFC: no application behind it. A
-    // pass from them is somebody waiting to be let in all the same.
-    const samToken = loose.body.test.link.split('t=')[1];
-    await call('POST', `/api/crew/am/test/${samToken}`, { answers: [0, 1] });
-    const withSam = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
-    const samWaiting = (withSam.body.waitingTests || []).find((x) => x.ifcName === 'sam_flies');
-    check('a hand-sent pass is listed with the applications', !!samWaiting && samWaiting.status === 'passed' && samWaiting.onRoster === false, withSam.body.waitingTests);
-    check('…but an applicant’s pass is not listed twice', !(withSam.body.waitingTests || []).some((x) => x.ifcName === 'Rae_Okafor'), withSam.body.waitingTests);
-    DB.members.push({ _id: id(), name: 'Sam', ifcName: 'sam_flies' });
-    const samAdded = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
-    check('…and leaves once they are on the roster', !(samAdded.body.waitingTests || []).some((x) => x.ifcName === 'sam_flies'), samAdded.body.waitingTests);
-    const panel = await call('GET', '/api/crew/am/entrance-tests', null, owner);
-    check('the panel knows they are on the roster too', (panel.body.tests || []).some((x) => x.ifcName === 'sam_flies' && x.onRoster === true), panel.body.tests);
-
-    // Sent by hand to somebody who HAS applied: it is their application's test.
-    const kai = await call('POST', '/api/crew/am/apply', {
-        ifcName: 'Kai_Ross', callsignPrefix: 'AEROMEXICO', callsignNumber: '414', grade: 3, answers: [],
-    });
-    const byHand = await call('POST', '/api/crew/am/entrance-tests', { quizId: 'entrance', name: 'Kai', ifcName: 'kai_ross' }, owner);
-    check('a test typed in for an applicant is tied to their application', byHand.status === 201
-        && DB.attempts[0].applicationId === kai.body.applicationId, DB.attempts[0]);
-    // …and one sent that way before this existed is found by IFC username.
-    DB.attempts[0].applicationId = null;
-    const kaiCards = await call('GET', '/api/crew/am/applications?status=pending', null, owner);
-    const kaiCard = (kaiCards.body.applications || []).find((a) => String(a._id) === String(kai.body.applicationId));
-    check('…and an older one is matched to the card by IFC username', kaiCard && kaiCard.test && /^kai_ross$/i.test(kaiCard.test.ifcName), kaiCard && kaiCard.test);
-
-    /* ---- the Discord bot as a caller (vaBot.botCallerFrom) ---------------- */
-    // Through requireCap for real: the loopback key opens recruitment for the
-    // airline it names, and nothing else.
+    /* ---- open joining with a test: a pass lets them in -------------------- */
+    VA.joinMode = 'free';
     {
-        const heard = hubSeen.find((h) => String(h.applicationId) === String(appId) && h.passed);
-        check('a marked test is told to the bot, with its application', !!heard && heard.percent === 100 && String(heard.vaId) === 'va1', hubSeen);
-        const asBot = { asBot: true, slug: 'am', actor: 'boss' };
+        const r = await apply('Lee_Park');
+        check('open joining with a test waits for the test', r.body.status === 'pending' && r.body.stage === 'test' && !!r.body.test, r.body);
+        const tk = r.body.test.link.split('t=')[1];
+        const passed = await call('POST', `/api/crew/am/test/${tk}`, { answers: [0, 1] });
+        check('…and the pass accepts them', passed.body.passed === true && passed.body.accepted === true, passed.body);
+        check('…with the link to choose their password on the result', passed.body.login && passed.body.login.kind === 'link' && noPassword(passed.body), passed.body);
+        check('…their login made and on the roster', DB.accounts.some((a) => a.displayName === 'Lee_Park') && DB.members.some((m) => m.name === 'Lee_Park'));
+        await new Promise((ok) => setTimeout(ok, 50));   // the hub delivers on the next turn
+        const h = hubSeen.find((x) => String(x.applicationId) === String(r.body.applicationId));
+        check('…and the bot is told it was accepted', !!h && h.accepted === true, h);
+    }
+    VA.joinMode = 'application';
+
+    /* ---- recruiting through Discord -------------------------------------- */
+    VA.crewJoinViaDiscord = true;
+    {
+        const off = await apply('Mo_Tanaka');
+        check('without a linked bot, nobody is sent to Discord', off.body.stage === 'test', off.body);
+        BOT_LINKED = true;
+        const r = await apply('Kai_Ross');
+        check('with the bot linked, web applicants are sent to open a ticket', r.body.stage === 'discord' && /^[0-9A-F]{4}-[0-9A-F]{4}$/.test(r.body.code), r.body);
+        check('…told where, with the code', r.body.next.action && r.body.next.action.url === VA.crewDiscordInvite && r.body.next.body.includes(r.body.code), r.body.next);
+        check('…and the test waits for the ticket', !DB.attempts.some((a) => String(a.applicationId) === String(r.body.applicationId)));
+        const kaiCard = await cardOf(r.body.applicationId);
+        check('the IFC message carries the invite and the code', kaiCard && kaiCard.stage === 'discord' && kaiCard.applicant.plainMessage.includes(VA.crewDiscordInvite) && kaiCard.applicant.plainMessage.includes(r.body.code), kaiCard && kaiCard.applicant);
+
+        const asBot = { asBot: true, slug: 'am', actor: 'Kai' };
+        const bad = await vaBot.api('post', '/api/crew/am/discord-bot/ticket-application', { ...asBot, body: { code: 'FFFF-FFFF', discordId: '111111111111' } });
+        check('a wrong code finds nothing', bad.status === 404, bad);
+        const notBot = await call('POST', '/api/crew/am/discord-bot/ticket-application', { code: r.body.code });
+        check('only the bot may look a code up', notBot.status === 401, notBot);
+        const found = await vaBot.api('post', '/api/crew/am/discord-bot/ticket-application', { ...asBot, body: { code: r.body.code.toLowerCase(), discordId: '111111111111' } });
+        check('the code finds their application', found.status === 200 && found.data.application.id === String(r.body.applicationId), found.data);
+        check('…and sends the test into the ticket', found.data.test && /\/test\?t=/.test(found.data.test.link) && found.data.stage === 'test', found.data);
+        TICKETS.push({ vaId: 'va1', applicationId: String(r.body.applicationId), userId: '111111111111' });
+        const byLink = await vaBot.api('post', '/api/crew/am/discord-bot/ticket-application', { ...asBot, body: { code: `https://x/crew/am/status?id=${r.body.statusToken}`, discordId: '111111111111' } });
+        check('their whole status link works as the code too, with the same test', byLink.status === 200 && byLink.data.test.link === found.data.test.link, byLink.data);
+        const stolen = await vaBot.api('post', '/api/crew/am/discord-bot/ticket-application', { ...asBot, body: { code: r.body.code, discordId: '222222222222' } });
+        check('another Discord account cannot take it', stolen.status === 409 && stolen.data.code === 'other_discord', stolen);
+        const st = await call('GET', `/api/crew/am/application-status/${r.body.statusToken}`);
+        check('their status page now says the test is in the ticket', st.body.stage === 'test' && /Discord ticket/.test(st.body.next.body), st.body.next);
+
+        /* ---- the bot as a caller: recruitment, nothing else --------------- */
         const list = await vaBot.api('get', '/api/crew/am/entrance-tests', asBot);
         check('the bot may list entrance tests', list.status === 200 && Array.isArray(list.data.tests), list);
         const wrongVa = await vaBot.api('get', '/api/crew/am/entrance-tests', { ...asBot, slug: 'other' });
         check('…but not with another airline’s name on it', wrongVa.status === 401, wrongVa.status);
         const roster = await vaBot.api('post', '/api/crew/am/roster', { ...asBot, body: { name: 'Nope', callsign: '999' } });
         check('…and may not touch the roster', roster.status === 403, roster.status);
-        const accept = await vaBot.api('patch', `/api/crew/am/applications/${kai.body.applicationId}`, { ...asBot, body: { action: 'accept' } });
-        check('the bot accepts an application', accept.status === 200 && accept.data.status === 'accepted', accept.data);
-        check('…which puts the pilot on the roster', DB.members.some((m) => m.name === 'Kai_Ross'), DB.members.map((m) => m.name));
+        const accept = await vaBot.api('patch', `/api/crew/am/applications/${r.body.applicationId}`, { ...asBot, body: { action: 'accept' } });
+        check('staff can accept before the test is done (override)', accept.status === 200 && accept.data.status === 'accepted' && accept.data.invite.kind === 'link', accept.data);
+        const inv = await vaBot.api('get', `/api/crew/am/applications/${r.body.applicationId}/invite`, asBot);
+        check('the bot reads the link back for the pilot', inv.status === 200 && inv.data.invite.state === 'live' && !!inv.data.invite.link, inv.data);
     }
 
     /* ---- a pilot's own quiz is not opened by the public route ------------- */

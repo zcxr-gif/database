@@ -136,11 +136,11 @@ const expirePatch = () => ({ invitePassword: '' });
  */
 function buildInviteMessage({
     vaName = '', ifcName = '', callsign = '',
-    username = '', password = '', signInUrl = '',
+    username = '', password = '', link = '', expiresAt = null, signInUrl = '',
     discordInvite = '', staffMessage = '',
     bannerUrl = '', footerUrl = '', format = 'plain',
 } = {}) {
-    const body = plainInviteMessage({ vaName, ifcName, callsign, username, password, signInUrl, discordInvite, staffMessage });
+    const body = plainInviteMessage({ vaName, ifcName, callsign, username, password, link, expiresAt, signInUrl, discordInvite, staffMessage });
     return format === 'ifc' ? forIfc(body, { vaName, bannerUrl, footerUrl }) : body;
 }
 
@@ -171,7 +171,7 @@ function forIfc(body, { vaName = '', bannerUrl = '', footerUrl = '' } = {}) {
 
 function plainInviteMessage({
     vaName = '', ifcName = '', callsign = '',
-    username = '', password = '', signInUrl = '',
+    username = '', password = '', link = '', expiresAt = null, signInUrl = '',
     discordInvite = '', staffMessage = '',
 } = {}) {
     const who = String(ifcName || '').trim();
@@ -185,7 +185,18 @@ function plainInviteMessage({
     // The credentials block is the point of the message; keep it visually
     // separate and keep the two values on their own lines so a copy-paste out of
     // a forum post cannot run them together.
-    if (username && password) {
+    //
+    // A LINK is what every new pilot gets now (crewRecruit.js): they choose
+    // their own password, so nothing in this message is a password at all.
+    // The temporary-password block below is the fallback for a database too
+    // old to keep a setup link.
+    if (username && link) {
+        const until = asDate(expiresAt);
+        lines.push('', 'Your crew center login:');
+        lines.push(`  Username: ${username}`);
+        lines.push('', 'Open this link to choose your password:', `  ${link}`);
+        lines.push('', `It works once${until ? `, until ${until.toISOString().slice(0, 10)}` : ''}.`);
+    } else if (username && password) {
         lines.push('', 'Your crew center login:');
         if (signInUrl) lines.push(`  ${signInUrl}`);
         lines.push(`  Username: ${username}`);

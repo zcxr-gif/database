@@ -61,8 +61,8 @@ console.log('\n the Discord bot');
         [half.state, /staff role and a ticket channel/.test(half.summary), /Test Air/.test(half.summary)], ['attention', true, true]);
     const noPanel = step({ available: true, guilds: [{ name: 'Test Air', staffRole: true, ticketChannel: true, panel: false }] });
     T('set up but no Apply panel still needs a hand', [noPanel.state, /crew-admin panel/.test(noPanel.summary)], ['attention', true]);
-    const done = step({ available: true, guilds: [{ name: 'Test Air', staffRole: true, ticketChannel: true, panel: true, autoInvite: true }, { name: 'Other' }] });
-    T('linked, set up and panel posted is done, and says where', [done.state, /Test Air and 1 other server/.test(done.summary), /automatically/.test(done.summary)], ['done', true, true]);
+    const done = step({ available: true, guilds: [{ name: 'Test Air', staffRole: true, ticketChannel: true, panel: true }, { name: 'Other' }] });
+    T('linked, set up and panel posted is done, and says where', [done.state, /Test Air and 1 other server/.test(done.summary)], ['done', true]);
     T('it never becomes the essential next step', guide.evaluate({ va: {}, store: { connected: false }, discordBot: { available: true, guilds: [] } }).next, 'database');
 }
 
