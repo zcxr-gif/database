@@ -225,6 +225,9 @@ const VaBotGuildSchema = new Schema({
         welcomeRoleId: { type: String, default: '' },
         welcomeMessage: { type: String, default: '' },
         welcomeDm: { type: Boolean, default: false },
+        // Staff said no. Without it, an airline recruiting through Discord
+        // greets newcomers where tickets open; this is what stops that too.
+        welcomeOff: { type: Boolean, default: false },
         // Inactivity. Off while inactiveRoleId is empty. kickDays 0 = never.
         inactiveRoleId: { type: String, default: '' },
         inactiveChannelId: { type: String, default: '' },
@@ -1112,10 +1115,15 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         join.viaDiscord ? 'web applicants are sent here to open a ticket' : '',
     ].filter(Boolean).join(' · ') + ' — change it in Crew Center → Recruitment.';
 
-    const welcomeSummary = (s) => (s.welcomeChannelId || s.welcomeRoleId || s.welcomeDm
-        ? [s.welcomeChannelId ? `posts in <#${s.welcomeChannelId}>` : '', s.welcomeRoleId ? `gives <@&${s.welcomeRoleId}>` : '',
-            s.welcomeDm ? 'sends a DM' : '', s.welcomeMessage ? 'your own message' : 'the default message'].filter(Boolean).join(' · ')
-        : 'Off — `/crew-admin welcome`');
+    const welcomeSummary = (s) => {
+        if (s.welcomeOff) return 'Off — turn it back on with `/crew-admin welcome channel:`';
+        if (s.welcomeChannelId || s.welcomeRoleId || s.welcomeDm) {
+            return [s.welcomeChannelId ? `posts in <#${s.welcomeChannelId}>` : '', s.welcomeRoleId ? `gives <@&${s.welcomeRoleId}>` : '',
+                s.welcomeDm ? 'sends a DM' : '', s.welcomeMessage ? 'your own message' : 'the default message'].filter(Boolean).join(' · ');
+        }
+        if (s.ticketChannelId) return `Not set up — while you recruit through Discord, newcomers are greeted in <#${s.ticketChannelId}>. \`/crew-admin welcome off:true\` stops that.`;
+        return 'Off — `/crew-admin welcome`';
+    };
     const inactivitySummary = (s) => (s.inactiveRoleId
         ? [`<@&${s.inactiveRoleId}> after ${s.inactiveDays || INACTIVE_DAYS_DEFAULT} days without a flight`,
             s.inactiveChannelId ? `told how to stay in <#${s.inactiveChannelId}>` : 'told by DM',
@@ -1132,7 +1140,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     async function adminWelcome(interaction, ctx) {
         const set = {};
         if (interaction.options.getBoolean('off')) {
-            Object.assign(set, { 'settings.welcomeChannelId': '', 'settings.welcomeRoleId': '', 'settings.welcomeDm': false });
+            Object.assign(set, { 'settings.welcomeChannelId': '', 'settings.welcomeRoleId': '', 'settings.welcomeDm': false, 'settings.welcomeOff': true });
         } else {
             const ch = interaction.options.getChannel('channel');
             const role = interaction.options.getRole('role');
@@ -1144,6 +1152,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             if (role) set['settings.welcomeRoleId'] = role.id;
             if (msg !== null) set['settings.welcomeMessage'] = clean(msg, 1500).replace(/\\n/g, '\n');
             if (dm !== null) set['settings.welcomeDm'] = dm;
+            // Choosing anything is choosing to greet again.
+            if (Object.keys(set).length) set['settings.welcomeOff'] = false;
         }
         let s = ctx.settings;
         if (Object.keys(set).length) {
@@ -1283,7 +1293,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         };
         if (s.welcomeChannelId) need(await fetchChannel(s.welcomeChannelId), ['ViewChannel', 'SendMessages', 'EmbedLinks'], 'Welcome channel');
         if (s.welcomeRoleId) lines.push(await giveable(s.welcomeRoleId, 'Welcome role'));
-        if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm) lines.push('⚪ Welcome: off — `/crew-admin welcome`');
+        if (!s.welcomeChannelId && !s.welcomeRoleId && !s.welcomeDm) lines.push(`⚪ Welcome: ${welcomeSummary(s)}`);
         if (s.inactiveRoleId) {
             lines.push(await giveable(s.inactiveRoleId, 'Inactive role'));
             if (s.inactiveChannelId) need(await fetchChannel(s.inactiveChannelId), ['ViewChannel', 'SendMessages', 'EmbedLinks'], 'Inactive channel');
@@ -2542,8 +2552,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             // every newcomer greeted and pointed at Apply, whether or not it set
             // a welcome channel — so without one, the greeting goes where the
             // tickets open.
-            const join = s.welcomeChannelId ? null : await joinConfig(va).catch(() => null);
-            const greetIn = s.welcomeChannelId || (join && join.viaDiscord ? s.ticketChannelId : '');
+            const join = s.welcomeChannelId || s.welcomeOff ? null : await joinConfig(va).catch(() => null);
+            const greetIn = s.welcomeOff ? '' : s.welcomeChannelId || (join && join.viaDiscord ? s.ticketChannelId : '');
             if (s.welcomeRoleId) await member.roles.add(s.welcomeRoleId, 'Welcome role').catch(() => {});
             // A raid, or a mass import: roles yes, a wall of greetings no.
             if (joinBurst.over(guild.id)) return;
@@ -2878,7 +2888,12 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         locks: ticketLocks.size() + eventLocks.size() + sweepLocks.size(), api: apiLimiter.stats(),
     });
 
-    return { commands, handleInteraction, onGuildDelete, onMemberJoin, sweepGuild, sweepAll, remindEvents, startSchedules, stopSchedules, stats };
+    /** A server linked to an airline — not Inflight's own, whatever else is known. */
+    async function isVaGuild(guildId) {
+        return !isHomeGuild(guildId) && !!(await guildLink(guildId));
+    }
+
+    return { commands, handleInteraction, onGuildDelete, onMemberJoin, isVaGuild, sweepGuild, sweepAll, remindEvents, startSchedules, stopSchedules, stats };
 }
 
 /* ===========================================================================
