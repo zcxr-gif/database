@@ -1015,4 +1015,9 @@ const queueRender = (task) => {
 const renderVaEventCard = (e = {}, media = {}, opts) => queueRender(() => renderVaEventCardImpl(e, media, opts));
 const renderVaRouteMapImage = (e = {}, opts) => queueRender(() => renderVaRouteMapImageImpl(e, opts));
 
-module.exports = { renderVaEventCard, renderVaRouteMapImage };
+module.exports = {
+    renderVaEventCard, renderVaRouteMapImage,
+    // Shared with liveFlightMap.js, so the satellite render fetches photos,
+    // rounds corners and queues behind the same single render slot as these.
+    fetchImage, coverRounded, contain, coordsOf, queueRender, brandLogo: () => BRAND_LOGO_BUF,
+};

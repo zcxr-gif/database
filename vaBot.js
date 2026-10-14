@@ -934,7 +934,10 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             .addSubcommand((s) => s.setName('stats').setDescription('Pilots, hours and flights'))
             .addSubcommand((s) => s.setName('events').setDescription('Upcoming events — and sign up for one'))
             .addSubcommand((s) => s.setName('pilot').setDescription('Look a pilot up on the roster')
-                .addStringOption((o) => o.setName('who').setDescription('Callsign or name').setRequired(true).setMaxLength(60)));
+                .addStringOption((o) => o.setName('who').setDescription('Callsign or name').setRequired(true).setMaxLength(60)))
+            .addSubcommand((s) => s.setName('flight').setDescription('A live flight on the satellite map, with a photo of the aircraft')
+                .addStringOption((o) => o.setName('who').setDescription('Callsign, pilot name or IF username (default: you)').setMaxLength(60)))
+            .addSubcommand((s) => s.setName('live').setDescription('Who is flying for the airline right now'));
 
         const admin = new SlashCommandBuilder().setName('crew-admin').setDescription('Set up the crew center bot in this server')
             .setDMPermission(false)
@@ -1392,6 +1395,142 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (pilot.role) e.addFields({ name: 'Role', value: clean(pilot.role, 60), inline: true });
         if (pilot.rank && isHttpsUrl(pilot.rank.image)) e.setThumbnail(pilot.rank.image);
         return interaction.editReply({ embeds: [e] });
+    }
+
+    /* ===================================================================
+     * LIVE FLIGHTS
+     *
+     * The tracker's view of a flight, in Discord: satellite imagery with the
+     * path flown, the plan ahead, the aeroplane where it is now and its photo
+     * (liveFlightMap.js). `/crew live` lists everyone flying for the airline;
+     * `/crew flight` draws one of them (yourself, by default).
+     *
+     * Who is "flying for the airline" is the crew center's answer, which is
+     * the ACARS matcher's answer — the bot does not guess from callsigns.
+     * ================================================================ */
+
+    const squashName = (v) => String(v || '').toLowerCase().replace(/\s+/g, '');
+    const flLabel = (f) => clean(f.callsign, 40) || 'Flight';
+    const flLeg = (f) => (f.origin || f.destination ? `${clean(f.origin, 4) || '????'} → ${clean(f.destination, 4) || '????'}` : '');
+    const flAlt = (f) => (f.onGround ? 'on the ground'
+        : Number(f.altitude) >= 18000 ? `FL${String(Math.round(Number(f.altitude) / 100)).padStart(3, '0')}`
+            : `${Math.round(Number(f.altitude) || 0).toLocaleString('en-US')} ft`);
+    const flWho = (f) => clean((f.pilot && f.pilot.name) || f.username, 60);
+
+    /** The airline's live list, or an error string. */
+    async function liveList(ctx) {
+        const r = await api('get', crewPath(ctx.va.slug, '/live'));
+        if (!r.ok) return { error: r.error };
+        return { flights: Array.isArray(r.data.flights) ? r.data.flights : [] };
+    }
+
+    function findFlight(flights, who) {
+        const q = squashName(who);
+        if (!q) return null;
+        const fields = (f) => [f.callsign, f.username, f.pilot && f.pilot.name, f.pilot && f.pilot.callsign].map(squashName);
+        return flights.find((f) => fields(f).some((v) => v && v === q))
+            || flights.find((f) => fields(f).some((v) => v && v.includes(q)));
+    }
+
+    async function showLive(interaction, ctx) {
+        await interaction.deferReply();
+        const { flights, error } = await liveList(ctx);
+        if (error) return say(interaction, error);
+        const e = vaEmbed(ctx.va).setURL(crewUrl(ctx.va.slug));
+        if (!flights.length) {
+            e.setTitle('📡 Nobody is flying right now').setDescription(`No ${clean(ctx.va.name, 100)} flights are in the air. Fancy one? \`/crew route\` has an idea. ✈️`);
+            return interaction.editReply({ embeds: [e] });
+        }
+        const air = flights.filter((f) => !f.onGround).length;
+        e.setTitle(`📡 ${flights.length} flying now${air !== flights.length ? ` · ${air} airborne` : ''}`);
+        const shown = flights.slice(0, 20);
+        e.setDescription(shown.map((f) => {
+            const bits = [flLeg(f), clean(f.aircraftName, 40), flAlt(f), f.onGround ? '' : `${Math.round(Number(f.speed) || 0)} kt`].filter(Boolean).join(' · ');
+            const name = flWho(f);
+            const link = isHttpsUrl(f.trackUrl) ? `[${flLabel(f)}](${f.trackUrl})` : flLabel(f);
+            return `${f.onGround ? '🅿️' : '✈️'} **${link}**${name ? ` — ${name}` : ''}\n${bits}`;
+        }).join('\n').slice(0, 4000));
+        if (flights.length > shown.length) e.setFooter({ text: `…and ${flights.length - shown.length} more` });
+        // Pick one to see it drawn. Answered to the picker only, so a busy list
+        // does not fill the channel with maps nobody else asked for.
+        const menu = new StringSelectMenuBuilder().setCustomId(cid('livepick')).setPlaceholder('Show a flight on the map…')
+            .addOptions(flights.slice(0, 25).map((f) => ({
+                label: `${flLabel(f)}${flWho(f) ? ` — ${flWho(f)}` : ''}`.slice(0, 100),
+                description: [flLeg(f), clean(f.aircraftName, 40), flAlt(f)].filter(Boolean).join(' · ').slice(0, 100) || undefined,
+                value: String(f.flightId).slice(0, 100),
+            })));
+        return interaction.editReply({ embeds: [e], components: [new ActionRowBuilder().addComponents(menu)] });
+    }
+
+    /**
+     * One flight, drawn. `who` names it (callsign, roster name, IF username);
+     * `flightId` comes from the picker or the refresh button; neither means
+     * the person asking, through their linked login.
+     */
+    async function showFlight(interaction, ctx, who, flightId = '', { refresh = false } = {}) {
+        const picked = !!flightId;
+        // From the picker: only the person who picked sees it. From the command:
+        // the channel does, which is the point of asking in a channel.
+        if (refresh) await interaction.deferUpdate();
+        else await interaction.deferReply(picked ? { flags: EPHEMERAL } : {});
+        let id = String(flightId || '');
+        let mine = false;
+        if (!id) {
+            if (clean(who, 60)) {
+                const { flights, error } = await liveList(ctx);
+                if (error) return say(interaction, error);
+                const f = findFlight(flights, who);
+                if (!f) {
+                    const names = flights.slice(0, 8).map((x) => `\`${flLabel(x)}\``).join(', ');
+                    return say(interaction, `Nobody flying for ${clean(ctx.va.name, 100)} matches “${clean(who, 60)}”.`
+                        + (names ? ` In the air now: ${names}.` : ' Nobody is in the air right now.'));
+                }
+                id = f.flightId;
+            } else {
+                mine = true;
+                const r = await api('get', crewPath(ctx.va.slug, '/me/live'), asPilot(interaction, ctx));
+                if (!r.ok) return say(interaction, r.error);
+                if (!r.data.linked && r.data.reason !== 'no_if_account') return notLinked(interaction, ctx, 'see your live flight');
+                if (r.data.reason === 'no_if_account') {
+                    return say(interaction, 'Your crew center profile has no Infinite Flight account linked, so I can’t find your flight. Link it on your crew center profile, then try again.');
+                }
+                if (!r.data.flying) {
+                    return say(interaction, `You’re not flying for ${clean(ctx.va.name, 100)} right now. Spawn in with the airline’s callsign and try again — or \`/crew live\` to see who is.`);
+                }
+                id = r.data.flying.flightId;
+            }
+        }
+        if (!id) return say(interaction, 'That flight has no id I can look up.');
+
+        const r = await api('get', crewPath(ctx.va.slug, `/live/${encodeURIComponent(id)}/card`), { asBot: true, slug: ctx.va.slug, actor: actorOf(interaction) });
+        if (!r.ok) return say(interaction, r.status === 404 ? 'That flight has landed or left the server — it isn’t in the air any more.' : r.error);
+        const f = r.data.flight || {};
+        const leg = flLeg(f);
+        const e = vaEmbed(ctx.va)
+            .setTitle(`${f.onGround ? '🅿️' : '📡'} ${flLabel(f)}${leg ? ` · ${leg}` : ''}`.slice(0, 256))
+            .setDescription([
+                `**${flWho(f) || 'A pilot'}**${mine ? ' (you)' : ''} ${f.onGround ? 'is on the ground' : 'is in the air'}${f.server ? ` on **${clean(f.server, 40)}**` : ''}.`,
+                isHttpsUrl(f.trackUrl) ? `[🔭 Follow this flight live on Inflight](${f.trackUrl})` : '',
+            ].filter(Boolean).join('\n'))
+            .addFields(
+                { name: 'Aircraft', value: clean([f.aircraftName, f.liveryName].filter(Boolean).join(' · '), 100) || '—', inline: true },
+                { name: 'Altitude', value: flAlt(f), inline: true },
+                { name: 'Speed', value: `${Math.round(Number(f.speed) || 0)} kt`, inline: true },
+                { name: 'Heading', value: `${String(Math.round(Number(f.heading) || 0) % 360).padStart(3, '0')}°`, inline: true },
+                { name: 'Vertical', value: `${Number(f.verticalSpeed) > 0 ? '+' : ''}${Math.round(Number(f.verticalSpeed) || 0).toLocaleString('en-US')} fpm`, inline: true },
+            )
+            .setTimestamp(new Date());
+        // The satellite map, with the aircraft's photo in its corner. Should it
+        // fail to draw, the photo on its own is still better than nothing.
+        const files = [];
+        const map = r.data.map ? Buffer.from(String(r.data.map), 'base64') : null;
+        if (map) { files.push({ attachment: map, name: 'flight.png' }); e.setImage('attachment://flight.png'); }
+        else if (isHttpsUrl(r.data.photoUrl)) e.setImage(r.data.photoUrl);
+        const again = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(cid('liveagain', id)).setLabel('Refresh').setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
+            ...(isHttpsUrl(f.trackUrl) ? [new ButtonBuilder().setURL(f.trackUrl).setLabel('Track live').setStyle(ButtonStyle.Link).setEmoji('🔭')] : []),
+        );
+        return interaction.editReply({ embeds: [e], files, attachments: [], components: [again] });
     }
 
     /* ===================================================================
@@ -2801,6 +2940,8 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
         if (sub === 'stats') return showStats(interaction, ctx);
         if (sub === 'events') return showEvents(interaction, ctx);
         if (sub === 'pilot') return showPilot(interaction, ctx);
+        if (sub === 'flight') return showFlight(interaction, ctx, interaction.options.getString('who'));
+        if (sub === 'live') return showLive(interaction, ctx);
         return say(interaction, 'Unknown command.');
     }
 
@@ -2819,6 +2960,11 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             const id = interaction.values && interaction.values[0];
             return id ? rsvp(interaction, ctx, id, true) : say(interaction, 'Pick an event.');
         }
+        if (action === 'livepick') {
+            const id = interaction.values && interaction.values[0];
+            return id ? showFlight(interaction, ctx, '', id) : say(interaction, 'Pick a flight.');
+        }
+        if (action === 'liveagain') return args[0] ? showFlight(interaction, ctx, '', args[0], { refresh: true }) : say(interaction, 'That flight is gone.');
         if (action === 'route') return suggestRoute(interaction, ctx, args[0] === '-' ? '' : args[0], args[1] === '-' ? '' : args[1]);
 
         // A change to a ticket claims it first and only then reads it, so two
