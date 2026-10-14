@@ -304,7 +304,49 @@ function memberRank(ranks, hours, checksPassed) {
     };
 }
 
+/**
+ * Which routes a bulk "lock to rank" lands on.
+ *
+ * `airline` is how a VA thinks about its network: '' / 'all' for everything,
+ * 'own' for its own metal, or a codeshare partner's name for the legs flown on
+ * that partner's aeroplanes. `ids`, when given, narrows to an explicit pick (the
+ * routes ticked in the list) and wins over `airline`. `onlyOpen` leaves routes
+ * that already carry a gate alone, so "lock everything else to First Officer"
+ * does not undo the three long-hauls the VA set to Captain by hand.
+ */
+function bulkGateTargets(routes, { airline = 'all', ids = null, onlyOpen = false } = {}) {
+    const list = Array.isArray(routes) ? routes : [];
+    const want = clampStr(airline, 60).toLowerCase();
+    const picked = Array.isArray(ids) && ids.length ? new Set(ids.map(String)) : null;
+    return list.filter((r) => {
+        if (!r) return false;
+        const id = String(r._id ?? r.id ?? '');
+        if (!id) return false;
+        if (picked) { if (!picked.has(id)) return false; } else if (want && want !== 'all') {
+            const cs = r.kind === 'codeshare';
+            if (want === 'own') { if (cs) return false; } else if (!cs || String(r.partnerName || '').trim().toLowerCase() !== want) return false;
+        }
+        if (onlyOpen && clampStr(r.minRank, 40)) return false;
+        return true;
+    });
+}
+
+/**
+ * The ladder's own spelling of a rank a request named, '' for "open to
+ * everyone", or null when the name is not on the ladder at all — which a bulk
+ * action refuses rather than writing, because a gate naming no rung lapses
+ * (see meetsRank) and the VA would have locked nothing while being told they had.
+ */
+function ladderRankName(ranks, name) {
+    const wanted = clampStr(name, 40);
+    if (!wanted) return '';
+    const idx = rankIndex(ranks, wanted);
+    return idx < 0 ? null : normalizeLadder(ranks)[idx].name;
+}
+
 module.exports = {
+    bulkGateTargets,
+    ladderRankName,
     normalizeLadder,
     rankForHours,
     rankIndex,

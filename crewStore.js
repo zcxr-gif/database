@@ -1892,6 +1892,23 @@ class SupabaseStore {
         return row ? routeFromRow(row) : null;
     }
     async deleteRoute(id) { await this.db.remove('crew_routes', this.ident(id)); return true; }
+    /**
+     * Gate many routes on one rank in as few writes as possible — the bulk
+     * "lock this airline's network to Captain" action. Chunked because the ids
+     * travel in the query string, and a thousand uuids in one URL is longer
+     * than some proxies will carry. Returns how many rows actually changed.
+     */
+    async setRoutesRank(ids, minRank) {
+        const list = [...new Set((ids || []).map(String).filter(Boolean))];
+        let changed = 0;
+        for (let i = 0; i < list.length; i += 80) {
+            const chunk = list.slice(i, i + 80);
+            const rows = await this.db.update('crew_routes',
+                { ...this.scope, id: `in.(${chunk.join(',')})` }, routeToRow({ minRank }));
+            changed += Array.isArray(rows) ? rows.length : 0;
+        }
+        return changed;
+    }
 
     // --- Flight reports ---
     async listPireps({ status = '', limit = 500 } = {}) {
@@ -3433,6 +3450,12 @@ class LegacyStore {
         return this.lean(r);
     }
     async deleteRoute(id) { await models.CrewRoute.deleteOne({ ...this.q, _id: id }); return true; }
+    async setRoutesRank(ids, minRank) {
+        const list = [...new Set((ids || []).map(String).filter(Boolean))];
+        if (!list.length) return 0;
+        const r = await models.CrewRoute.updateMany({ ...this.q, _id: { $in: list } }, { $set: { minRank } });
+        return r.modifiedCount ?? r.nModified ?? list.length;
+    }
 
     listPireps({ status = '', limit = 500 } = {}) {
         const q = status ? { ...this.q, status } : this.q;

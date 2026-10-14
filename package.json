@@ -12,6 +12,7 @@
     "test:sites:browser": "node scripts/test-va-site-motion.js",
     "test:schema": "node scripts/test-schema-typekey.js",
     "test:crew": "node scripts/test-crew-shop-awards.js",
+    "test:routes-rank": "node scripts/test-crew-bulk-rank.js",
     "test:discord": "node scripts/test-crew-discord.js && node scripts/test-crew-discord-routes.js",
     "test:staff-pilot": "node scripts/test-crew-staff-pilot.js",
     "test:staff-apps": "node scripts/test-crew-staff-apps.js",

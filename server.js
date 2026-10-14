@@ -2382,6 +2382,27 @@ function postRouteImportNotice(va, summary, actor) {
         .catch(() => {});
 }
 
+// One notice for a bulk rank change, for the reason the import posts one: a VA
+// locking three hundred legs must not post three hundred announcements.
+function postRouteRankNotice(va, summary, actor) {
+    if (!va || !summary || !summary.updated) return;
+    const who = (actor && actor.name) || '';
+    const slice = summary.airline === 'selected' ? 'Selected routes'
+        : (!summary.airline || summary.airline === 'all') ? 'Whole network'
+            : summary.airline === 'own' ? 'Own metal' : `${summary.airline} codeshares`;
+    crewWebhookUrlFor(va._id, 'routes')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title: summary.minRank ? `🔒 Routes locked to ${summary.minRank}` : '🔓 Routes opened to everyone',
+            description: who ? `By ${who}.` : undefined,
+            color: ROUTE_COLORS.updated,
+            fields: [
+                { name: 'Routes', value: slice, inline: true },
+                { name: 'Changed', value: String(summary.updated), inline: true },
+            ],
+        }))
+        .catch(() => {});
+}
+
 // ---- Event notices ----
 //
 // What this feed is for: an event only works if people know it is happening,
@@ -7404,6 +7425,47 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
 });
 
 /**
+ * Lock (or open) a whole slice of the network to one rank at once.
+ *
+ * Gating a route used to mean opening every leg and picking the rank on each —
+ * fine for five routes, hopeless for an airline that imported four hundred. This
+ * takes the slice the way staff think about it: everything, the airline's own
+ * metal, one codeshare partner's legs, or the routes ticked in the list.
+ *
+ * `minRank` must be a rung on the ladder (or '' to open the slice back up). A
+ * name that is not on it is refused rather than written: such a gate lapses by
+ * design (crewRanks.meetsRank), so writing it would tell the VA they had locked
+ * three hundred routes while locking none.
+ *
+ * `dryRun: true` answers how many routes it would touch without touching them,
+ * so the dialog can say "Lock 212 routes to Captain" before the click.
+ */
+app.post('/api/crew/:slug/routes/bulk-rank', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const minRank = crewRanks.ladderRankName(va.ranks, b.minRank);
+        if (minRank === null) return res.status(400).json({ error: 'That rank is not on your ladder. Pick one from Settings → Ranks.' });
+        const ids = Array.isArray(b.ids) ? b.ids.slice(0, 5000).map((x) => String(x).slice(0, 64)) : null;
+        const airline = String(b.airline || 'all').slice(0, 60);
+        const routes = await store.listRoutes({ limit: 5000 }) || [];
+        const targets = crewRanks.bulkGateTargets(routes, { airline, ids, onlyOpen: b.onlyOpen === true })
+            // Already where it is being put: not a change, and not counted as one.
+            .filter((r) => String(r.minRank || '') !== minRank);
+        const summary = { minRank, airline: ids && ids.length ? 'selected' : airline, matched: targets.length };
+        if (b.dryRun === true) return res.json({ dryRun: true, ...summary });
+        if (!targets.length) return res.json({ ...summary, updated: 0 });
+
+        const updated = await store.setRoutesRank(targets.map((r) => r._id ?? r.id), minRank);
+        postRouteRankNotice(va, { ...summary, updated }, gate.p);
+        codeshareRoutesChanged(va);
+        res.json(withDrift(store, { ...summary, updated }));
+    } catch (err) { crewFail(res, err, { log: 'route bulk rank error', message: 'Could not update those routes.' }); }
+});
+
+/**
  * The stands at an airport, for the two gate boxes on the route form. v21.
  *
  * The same source the event gate board already uses — OpenStreetMap, cached for
@@ -11054,20 +11116,42 @@ const looksIcao = (v) => /^[A-Z]{3,4}$/.test(String(v || '').trim().toUpperCase(
  * flight is the thing worth reporting.
  */
 async function livePlanRoute(flightId) {
-    if (!flightId) return { origin: '', destination: '' };
+    const pts = await livePlanPoints(flightId);
+    const named = pts.map((w) => String((w && w.name) || '').trim().toUpperCase()).filter(looksIcao);
+    return {
+        origin: named.length ? named[0] : '',
+        destination: named.length > 1 ? named[named.length - 1] : '',
+    };
+}
+
+/**
+ * The filed plan's waypoints, as the ACARS backend has them, cached for two
+ * minutes per flight. A plan is fixed once filed, and a busy airline's
+ * `/crew live` asks for every flight at once — so the second server to ask, or
+ * the map drawn a moment later, is answered without going upstream again.
+ * Never throws: no plan is an empty list.
+ */
+const _livePlanCache = new Map();   // flightId -> { at, pts }
+const LIVE_PLAN_TTL_MS = 2 * 60 * 1000;
+async function livePlanPoints(flightId) {
+    const id = String(flightId || '');
+    if (!id) return [];
+    const hit = _livePlanCache.get(id);
+    if (hit && Date.now() - hit.at < LIVE_PLAN_TTL_MS) return hit.pts;
+    let pts = [];
     try {
         const resp = await axios.get(
-            `${ACARS_BACKEND_URL}/api/flights/${encodeURIComponent(flightId)}/plan`,
+            `${ACARS_BACKEND_URL}/api/flights/${encodeURIComponent(id)}/plan`,
             { timeout: 6000 });
-        const pts = (resp.data && Array.isArray(resp.data.waypoints)) ? resp.data.waypoints : [];
-        const named = pts.map((w) => String((w && w.name) || '').trim().toUpperCase()).filter(looksIcao);
-        return {
-            origin: named.length ? named[0] : '',
-            destination: named.length > 1 ? named[named.length - 1] : '',
-        };
-    } catch (err) {
-        return { origin: '', destination: '' };
+        pts = (resp.data && Array.isArray(resp.data.waypoints)) ? resp.data.waypoints.slice(0, 400) : [];
+    } catch { pts = []; }
+    // Bounded: one entry per flight in the air, swept of the stale ones first.
+    if (_livePlanCache.size > 2000) {
+        for (const [k, v] of _livePlanCache) if (Date.now() - v.at >= LIVE_PLAN_TTL_MS) _livePlanCache.delete(k);
+        if (_livePlanCache.size > 2000) _livePlanCache.clear();
     }
+    _livePlanCache.set(id, { at: Date.now(), pts });
+    return pts;
 }
 
 app.get('/api/crew/:slug/me/live', async (req, res) => {
@@ -11126,6 +11210,171 @@ app.get('/api/crew/:slug/me/live', async (req, res) => {
             },
         });
     } catch (err) { crewFail(res, err, { log: 'me/live error', message: 'Could not read your live flight.' }); }
+});
+
+/* ===========================================================================
+ * WHO IS FLYING FOR THE AIRLINE RIGHT NOW
+ *
+ * `/me/live` answers one pilot about themselves. This answers anybody about the
+ * whole airline — the list behind the crew bot's `/crew live` and `/crew flight
+ * who:…`, so a VA's Discord can see its own pilots in the air the way the
+ * webhook shows them taking off and landing.
+ *
+ * PUBLIC, for the reason the live map is: every flight on it is already on
+ * Infinite Flight's own public map under the same callsign. What this adds is
+ * the roster name beside it, and the roster is public too.
+ *
+ * The same roster as `/me/live` (vaLiveRoster, the ACARS matcher's answer), so
+ * the bot, the map and the pilot's own card cannot disagree about who is
+ * flying for whom. The roster name is joined on the Infinite Flight user id,
+ * never on a callsign, for the reason given above vaLiveRoster.
+ *
+ * Cached twenty seconds per airline, like the roster underneath it: five
+ * servers asking at once cost one read of the roster, members and plans.
+ * ========================================================================= */
+const _liveListCache = new Map();   // slug -> { at, flights }
+const LIVE_LIST_MAX = 50;
+
+async function crewLiveFlights(va, store) {
+    const key = String(va.slug || va._id);
+    const hit = _liveListCache.get(key);
+    if (hit && Date.now() - hit.at < LIVE_ROSTER_TTL_MS) return hit.flights;
+
+    const roster = (await vaLiveRoster(va)).filter(Boolean).slice(0, LIVE_LIST_MAX);
+    let byIfUser = new Map();
+    if (roster.length) {
+        try {
+            const members = await store.listMembers({ limit: 5000 }) || [];
+            byIfUser = new Map(members.filter((m) => m && m.ifUserId)
+                .map((m) => [String(m.ifUserId), { name: m.name || '', callsign: m.callsign || '' }]));
+        } catch { byIfUser = new Map(); }
+    }
+    let meta;
+    try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+
+    const flights = roster.map((f) => {
+        const names = resolveFlightNames(f, meta);
+        const altitude = Math.round(Number(f.altitude) || 0);
+        const speed = Math.round(Number(f.speed) || 0);
+        return {
+            flightId: String(f.flightId || ''),
+            callsign: f.callsign || '',
+            username: f.username || '',
+            pilot: byIfUser.get(String(f.userId || '')) || null,
+            server: f.server || '',
+            aircraftName: names.aircraftName || '',
+            liveryName: names.liveryName || '',
+            altitude, speed,
+            heading: Math.round(Number(f.heading) || 0),
+            verticalSpeed: Math.round(Number(f.verticalSpeed) || 0),
+            latitude: Number(f.latitude) || 0,
+            longitude: Number(f.longitude) || 0,
+            // Slow and low is parked or taxiing — the same test the tracker's
+            // own /track command uses.
+            onGround: speed < 40 && altitude < 1000,
+            origin: '', destination: '',
+            trackUrl: trackUrl({ flightId: f.flightId }),
+            lastReport: f.lastReport || null,
+        };
+    });
+    // The route off each filed plan, four at a time; cached per flight, so this
+    // is only slow the first time a flight is seen.
+    await eachLimited(flights, 4, async (fl) => {
+        const r = await livePlanRoute(fl.flightId);
+        fl.origin = r.origin; fl.destination = r.destination;
+    });
+    // Airborne first, then by callsign, so a list read top-down starts with the
+    // flights that are actually going somewhere.
+    flights.sort((a, b) => (a.onGround - b.onGround) || String(a.callsign).localeCompare(String(b.callsign)));
+
+    if (_liveListCache.size > 500) _liveListCache.clear();
+    _liveListCache.set(key, { at: Date.now(), flights });
+    return flights;
+}
+
+app.get('/api/crew/:slug/live', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const flights = await crewLiveFlights(va, store);
+        res.set('Cache-Control', 'no-store');
+        res.json({ flights, at: new Date().toISOString() });
+    } catch (err) { crewFail(res, err, { log: 'crew live error', message: 'Could not read who is flying.' }); }
+});
+
+/**
+ * One live flight as a picture: the same card (with the aircraft's photo) and
+ * the same route map the takeoff/landing webhook posts, drawn for a flight that
+ * is somewhere in between — the map with the aeroplane on it where it is now.
+ *
+ * BOT-ONLY. A render costs real CPU, and a public URL that draws a fresh PNG on
+ * every hit is an invitation; the public route map (/api/route-map) is the
+ * shareable version. The bot asks over loopback with this process's key
+ * (vaBot.botCallerFrom), and only for the airline it is acting for.
+ *
+ * The flight must be on the airline's live list: the bot cannot be used to draw
+ * somebody else's flight under this airline's colours.
+ *
+ * The images ride back as base64 in JSON so the bot reads them through the same
+ * client, limiter and timeout as every other call it makes. Cached thirty
+ * seconds per flight: ten people pressing the same flight in the list is one render.
+ */
+const _liveCardCache = new Map();   // slug|flightId -> { at, body }
+const LIVE_CARD_TTL_MS = 30 * 1000;
+
+app.get('/api/crew/:slug/live/:flightId/card', async (req, res) => {
+    const slug = String(req.params.slug || '').toLowerCase();
+    if (!vaBot.botCallerFrom(req, slug)) return res.status(403).json({ error: 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(slug);
+        const id = String(req.params.flightId || '').slice(0, 64);
+        const key = `${slug}|${id}`;
+        const hit = _liveCardCache.get(key);
+        if (hit && Date.now() - hit.at < LIVE_CARD_TTL_MS) return res.json(hit.body);
+
+        const flight = (await crewLiveFlights(va, store)).find((f) => f.flightId === id);
+        if (!flight) return res.status(404).json({ error: 'That flight is not in the air for this airline any more.' });
+
+        // The same validation the webhook's map runs on a plan (range checks, the
+        // (0,0) of an unresolved fix, the length cap).
+        const plan = extractFlightPlan({ flightPlan: { waypoints: await livePlanPoints(id) } });
+        const e = {
+            event: 'live',
+            onGround: flight.onGround,
+            flightId: id,
+            va: { code: va.callsign || '', name: va.name || va.callsign || 'Virtual Airline' },
+            callsign: flight.callsign,
+            username: (flight.pilot && flight.pilot.name) || flight.username,
+            server: flight.server,
+            aircraft: { aircraftName: flight.aircraftName, liveryName: flight.liveryName },
+            position: { lat: flight.latitude, lon: flight.longitude, alt_ft: flight.altitude, gs_kt: flight.speed },
+            departure: flight.origin || undefined,
+            arrival: flight.destination || undefined,
+            flightPlan: plan.length >= 2 ? { waypoints: plan } : undefined,
+            timestamp: Date.now(),
+        };
+        const media = await enrichEventMedia(e);
+        if (isHttpImageUrl(va.logoUrl)) media.vaLogoUrl = va.logoUrl;
+        // The airline's own card design, as its webhook posts it. Read here rather
+        // than added to resolveCrewVa's selection, which every crew request pays for.
+        const look = await VirtualAirlineAd.findById(va._id).select('flightEventsCard').lean().catch(() => null);
+        const opts = resolveCardOpts(look || va);
+        const [card, map] = await Promise.all([
+            renderVaEventCard(e, media, opts).catch(() => null),
+            // A route map needs two ends; a flight with no plan filed has the
+            // card and the photo, and no map rather than a wrong one.
+            (flight.origin && flight.destination) || plan.length >= 2
+                ? renderVaRouteMapImage(e, { ...opts, showMap: true }).catch(() => null) : null,
+        ]);
+        const body = {
+            flight,
+            photoUrl: isHttpImageUrl(media.aircraftImageUrl) ? media.aircraftImageUrl : '',
+            card: card ? card.toString('base64') : '',
+            map: map ? map.toString('base64') : '',
+        };
+        if (_liveCardCache.size > 200) _liveCardCache.clear();
+        _liveCardCache.set(key, { at: Date.now(), body });
+        res.json(body);
+    } catch (err) { crewFail(res, err, { log: 'crew live card error', message: 'Could not draw that flight.' }); }
 });
 
 /* ===========================================================================
