@@ -115,8 +115,10 @@ axios.post = async (url, body) => {
     }
     return { status: 204, data: {} };
 };
+const asked = [];
 axios.get = async (url) => {
     const u = String(url);
+    asked.push(u);
     if (u.endsWith('/api/va/roster')) {
         return { data: { flights: [
             { flightId: 'fl-1', userId: 'if-user-1', username: 'rae_if', callsign: 'Aeromexico 101AM', server: 'Expert',
@@ -124,6 +126,9 @@ axios.get = async (url) => {
             { flightId: 'fl-2', userId: 'if-user-9', username: 'stranger', callsign: 'Aeromexico 202AM', server: 'Expert',
                 altitude: 0, speed: 0, heading: 0, latitude: 19.43, longitude: -99.07 },
         ] } };
+    }
+    if (u.includes('/api/flights/fl-1/history')) {
+        return { data: { ok: true, path: [{ lat: 19.436, lon: -99.072 }, { lat: 22, lon: -97 }, { lat: 25, lon: -95 }] } };
     }
     if (u.includes('/api/flights/fl-1/plan')) {
         return { data: { waypoints: [{ name: 'MMMX', lat: 19.436, lon: -99.072 }, { name: 'KJFK', lat: 40.64, lon: -73.78 }] } };
@@ -211,8 +216,9 @@ async function waitForServer() {
     check('the drawn card is not public', pub.status === 403, pub);
     const botHeaders = vaBot.callerHeaders('am', 'Tester');
     const card = await call('GET', '/api/crew/am/live/fl-1/card', null, null, botHeaders);
-    check('the bot gets the card and the map', card.status === 200 && card.body.card.length > 1000 && card.body.map.length > 1000,
-        card.body && { ...card.body, card: (card.body.card || '').length, map: (card.body.map || '').length });
+    check('the bot gets the satellite map', card.status === 200 && card.body.map.length > 1000 && card.body.card === undefined,
+        card.body && { ...card.body, map: (card.body.map || '').length });
+    check('…drawn with the flown track asked for', asked.some((u) => u.includes('/api/flights/fl-1/history')), asked);
     const elsewhere = await call('GET', '/api/crew/am/live/not-ours/card', null, null, botHeaders);
     check('a flight not flying for the airline is not drawn', elsewhere.status === 404, elsewhere.body);
     const otherVa = await call('GET', '/api/crew/am/live/fl-1/card', null, null, vaBot.callerHeaders('zz', 'Tester'));

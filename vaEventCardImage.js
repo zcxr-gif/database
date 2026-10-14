@@ -584,19 +584,14 @@ const cardLayout = (o) => {
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
 // we draw placeholders only where an image is missing. `opts` is a (normalized)
 // VA card customization — accent colour, which fields to show, photo on/off.
-// The word in the corner badge. A takeoff and a landing are the two moments the
-// webhooks post; 'live' is a flight looked up mid-air (the crew bot's
-// `/crew flight`), which is neither, and saying ARRIVAL on it would be wrong.
-const cardBadge = (e = {}) => (e.event === 'takeoff' ? 'DEPARTURE'
-    : e.event === 'live' ? (e.onGround ? 'ON GROUND' : 'IN FLIGHT') : 'ARRIVAL');
-
 const buildBaseSvg = (e, route, has, opts, plan = []) => {
     const o = normalizeCardOptions(opts || {});
     const { photoX, cx, cxR } = cardLayout(o);
+    const isTakeoff = e.event === 'takeoff';
     const accent = resolveAccent(e, o).hex;
     const ac = e.aircraft || {};
     const pos = e.position || {};
-    const eventWord = cardBadge(e);
+    const eventWord = isTakeoff ? 'DEPARTURE' : 'ARRIVAL';
     // Real ICAOs are 4 chars; clip malformed longer input so it can't spill
     // across the route line into the photo column.
     const depTxt = clipText(route.dep || '????', 5);
@@ -768,6 +763,7 @@ const slickChip = (x, y, label, value, pal) => {
 // background it would only mud the card up.
 const buildSlickSvg = (e, route, has, opts, plan) => {
     const o = normalizeCardOptions(opts || {});
+    const isTakeoff = e.event === 'takeoff';
     const accent = resolveAccent(e, o).hex;
     const ac = e.aircraft || {};
     const pos = e.position || {};
@@ -874,7 +870,7 @@ const buildSlickSvg = (e, route, has, opts, plan) => {
         <!-- header: brand mark, event pill, UTC stamp -->
         ${logoText}
         <rect x="${WIDTH - SLICK.pad - 196}" y="46" width="196" height="44" rx="22" fill="${accent}"/>
-        <text x="${WIDTH - SLICK.pad - 98}" y="75" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#080d14">${cardBadge(e)}</text>
+        <text x="${WIDTH - SLICK.pad - 98}" y="75" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#080d14">${isTakeoff ? 'DEPARTURE' : 'ARRIVAL'}</text>
         <text x="${WIDTH - SLICK.pad}" y="118" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="16" font-weight="bold" letter-spacing="1.2" fill="${pal.dim}">${esc(utcStamp(e.timestamp))}</text>
 
         <!-- the callsign leads; the VA and pilot sit under it -->
@@ -1019,4 +1015,9 @@ const queueRender = (task) => {
 const renderVaEventCard = (e = {}, media = {}, opts) => queueRender(() => renderVaEventCardImpl(e, media, opts));
 const renderVaRouteMapImage = (e = {}, opts) => queueRender(() => renderVaRouteMapImageImpl(e, opts));
 
-module.exports = { renderVaEventCard, renderVaRouteMapImage };
+module.exports = {
+    renderVaEventCard, renderVaRouteMapImage,
+    // Shared with liveFlightMap.js, so the satellite render fetches photos,
+    // rounds corners and queues behind the same single render slot as these.
+    fetchImage, coverRounded, contain, coordsOf, queueRender, brandLogo: () => BRAND_LOGO_BUF,
+};

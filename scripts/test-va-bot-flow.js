@@ -233,7 +233,7 @@ function crewCenter() {
         if (!req.headers['x-inflight-bot-key']) return res.status(403).json({ error: 'Not allowed.' });
         const f = LIVE.find((x) => x.flightId === req.params.id);
         if (!f) return res.status(404).json({ error: 'gone' });
-        res.json({ flight: f, photoUrl: '', card: Buffer.from('card-png').toString('base64'), map: f.origin ? Buffer.from('map-png').toString('base64') : '' });
+        res.json({ flight: f, photoUrl: f.origin ? '' : 'https://cdn.example/b777.jpg', map: f.origin ? Buffer.from('map-png').toString('base64') : '' });
     });
     app.get('/api/crew/:slug/routes', (req, res) => res.json({ routes: [
         { origin: 'EGLL', destination: 'KJFK', aircraft: 'B777-300ER', distanceNm: 2999, flightNumber: 'TS1' },
@@ -825,14 +825,15 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     await run(it);
     let flightMsg = it.out.replies[it.out.replies.length - 1];
     check('/crew flight with nobody named draws your own flight', /TEST 901T · EGLL → LFPG/.test(lastText(it)) && /\(you\)/.test(lastText(it)), lastText(it));
-    check('…with the card and the map attached, like the webhook', (flightMsg.files || []).map((f) => f.name).join() === 'card.png,map.png'
-        && flightMsg.embeds.length === 2, flightMsg.files);
+    check('…with the satellite map as its one image', (flightMsg.files || []).map((f) => f.name).join() === 'flight.png'
+        && flightMsg.embeds.length === 1 && /attachment:\/\/flight\.png/.test(JSON.stringify(flightMsg.embeds)), flightMsg.files);
     check('…and Refresh / Track live', buttonIds(flightMsg).includes('vab:liveagain:fl-1') && buttonIds(flightMsg).includes('https://inflight.example/share/fl-1'), buttonIds(flightMsg));
     it = interaction('command', { user: STAFF, command: 'crew', sub: 'flight', options: { who: 'ace' } });
     await run(it);
     flightMsg = it.out.replies[it.out.replies.length - 1];
     check('/crew flight who: finds a pilot by name', /TEST 002T/.test(lastText(it)) && /on the ground/.test(lastText(it)), lastText(it));
-    check('…and leaves the map off a flight with no route', (flightMsg.files || []).map((f) => f.name).join() === 'card.png', flightMsg.files);
+    check('…and falls back to the aircraft photo when no map could be drawn', !(flightMsg.files || []).length
+        && /cdn\.example\/b777\.jpg/.test(JSON.stringify(flightMsg.embeds)), flightMsg.embeds);
     it = interaction('command', { user: APPLICANT, command: 'crew', sub: 'flight', options: { who: 'nobody' } });
     await run(it);
     check('…and says who is up when nobody matches', /matches “nobody”/.test(lastText(it)) && /TEST 901T/.test(lastText(it)), lastText(it));

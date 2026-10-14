@@ -11302,24 +11302,42 @@ app.get('/api/crew/:slug/live', async (req, res) => {
 });
 
 /**
- * One live flight as a picture: the same card (with the aircraft's photo) and
- * the same route map the takeoff/landing webhook posts, drawn for a flight that
- * is somewhere in between — the map with the aeroplane on it where it is now.
+ * One live flight as a picture: satellite imagery with the path flown so far,
+ * the plan still to fly, the aeroplane where it is now, the aircraft's photo
+ * in the corner and the numbers along the bottom (liveFlightMap.js). Not the
+ * webhook's card — that is for the moment of takeoff or landing; this is the
+ * tracker's own view of a flight in progress.
  *
- * BOT-ONLY. A render costs real CPU, and a public URL that draws a fresh PNG on
- * every hit is an invitation; the public route map (/api/route-map) is the
- * shareable version. The bot asks over loopback with this process's key
- * (vaBot.botCallerFrom), and only for the airline it is acting for.
+ * BOT-ONLY. A render costs real CPU and an imagery fetch, and a public URL that
+ * draws a fresh PNG on every hit is an invitation; the public route map
+ * (/api/route-map) is the shareable version. The bot asks over loopback with
+ * this process's key (vaBot.botCallerFrom), and only for the airline it is
+ * acting for.
  *
  * The flight must be on the airline's live list: the bot cannot be used to draw
  * somebody else's flight under this airline's colours.
  *
- * The images ride back as base64 in JSON so the bot reads them through the same
+ * The image rides back as base64 in JSON so the bot reads it through the same
  * client, limiter and timeout as every other call it makes. Cached thirty
  * seconds per flight: ten people pressing the same flight in the list is one render.
  */
 const _liveCardCache = new Map();   // slug|flightId -> { at, body }
 const LIVE_CARD_TTL_MS = 30 * 1000;
+
+/** The track flown so far, as the tracker draws it. Never throws: none is []. */
+async function liveFlownPath(flightId) {
+    try {
+        const resp = await axios.get(
+            `${ACARS_BACKEND_URL}/api/flights/${encodeURIComponent(flightId)}/history`,
+            { timeout: 6000 });
+        const d = resp.data || {};
+        const pts = Array.isArray(d.path) ? d.path : (Array.isArray(d.route) ? d.route : []);
+        // Thinned to ~600 points: a long-haul trail has thousands, and the
+        // line on a 1200-pixel image looks the same with a fraction of them.
+        const step = Math.max(1, Math.ceil(pts.length / 600));
+        return pts.filter((_, i) => i % step === 0 || i === pts.length - 1);
+    } catch { return []; }
+}
 
 app.get('/api/crew/:slug/live/:flightId/card', async (req, res) => {
     const slug = String(req.params.slug || '').toLowerCase();
@@ -11334,41 +11352,19 @@ app.get('/api/crew/:slug/live/:flightId/card', async (req, res) => {
         const flight = (await crewLiveFlights(va, store)).find((f) => f.flightId === id);
         if (!flight) return res.status(404).json({ error: 'That flight is not in the air for this airline any more.' });
 
-        // The same validation the webhook's map runs on a plan (range checks, the
-        // (0,0) of an unresolved fix, the length cap).
-        const plan = extractFlightPlan({ flightPlan: { waypoints: await livePlanPoints(id) } });
-        const e = {
-            event: 'live',
-            onGround: flight.onGround,
-            flightId: id,
-            va: { code: va.callsign || '', name: va.name || va.callsign || 'Virtual Airline' },
-            callsign: flight.callsign,
-            username: (flight.pilot && flight.pilot.name) || flight.username,
-            server: flight.server,
-            aircraft: { aircraftName: flight.aircraftName, liveryName: flight.liveryName },
-            position: { lat: flight.latitude, lon: flight.longitude, alt_ft: flight.altitude, gs_kt: flight.speed },
-            departure: flight.origin || undefined,
-            arrival: flight.destination || undefined,
-            flightPlan: plan.length >= 2 ? { waypoints: plan } : undefined,
-            timestamp: Date.now(),
-        };
-        const media = await enrichEventMedia(e);
-        if (isHttpImageUrl(va.logoUrl)) media.vaLogoUrl = va.logoUrl;
-        // The airline's own card design, as its webhook posts it. Read here rather
-        // than added to resolveCrewVa's selection, which every crew request pays for.
-        const look = await VirtualAirlineAd.findById(va._id).select('flightEventsCard').lean().catch(() => null);
-        const opts = resolveCardOpts(look || va);
-        const [card, map] = await Promise.all([
-            renderVaEventCard(e, media, opts).catch(() => null),
-            // A route map needs two ends; a flight with no plan filed has the
-            // card and the photo, and no map rather than a wrong one.
-            (flight.origin && flight.destination) || plan.length >= 2
-                ? renderVaRouteMapImage(e, { ...opts, showMap: true }).catch(() => null) : null,
+        const [plan, history, photoUrl] = await Promise.all([
+            livePlanPoints(id),
+            liveFlownPath(id),
+            lookupAircraftPhoto(flight.aircraftName, flight.liveryName).catch(() => null),
         ]);
+        const map = await renderLiveFlightMap(flight, {
+            plan, history,
+            photoUrl: isHttpImageUrl(photoUrl) ? photoUrl : '',
+            accent: va.crewAccent,
+        });
         const body = {
             flight,
-            photoUrl: isHttpImageUrl(media.aircraftImageUrl) ? media.aircraftImageUrl : '',
-            card: card ? card.toString('base64') : '',
+            photoUrl: isHttpImageUrl(photoUrl) ? photoUrl : '',
             map: map ? map.toString('base64') : '',
         };
         if (_liveCardCache.size > 200) _liveCardCache.clear();
@@ -22124,6 +22120,8 @@ const {
     routeDistanceNm, MAX_PLAN_WAYPOINTS,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
+// The crew bot's /crew flight: a live flight on satellite imagery.
+const { renderLiveFlightMap } = require('./liveFlightMap');
 const { RouteMapCache } = require('./routeMapCache');
 
 /* --- Public route map image ---------------------------------------------------

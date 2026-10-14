@@ -935,7 +935,7 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
             .addSubcommand((s) => s.setName('events').setDescription('Upcoming events — and sign up for one'))
             .addSubcommand((s) => s.setName('pilot').setDescription('Look a pilot up on the roster')
                 .addStringOption((o) => o.setName('who').setDescription('Callsign or name').setRequired(true).setMaxLength(60)))
-            .addSubcommand((s) => s.setName('flight').setDescription('A live flight — map, aircraft photo, altitude and speed')
+            .addSubcommand((s) => s.setName('flight').setDescription('A live flight on the satellite map, with a photo of the aircraft')
                 .addStringOption((o) => o.setName('who').setDescription('Callsign, pilot name or IF username (default: you)').setMaxLength(60)))
             .addSubcommand((s) => s.setName('live').setDescription('Who is flying for the airline right now'));
 
@@ -1400,9 +1400,9 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
     /* ===================================================================
      * LIVE FLIGHTS
      *
-     * What the takeoff and landing webhook posts, on demand: the same card,
-     * with the aircraft's photo, and the same map, with the aeroplane drawn
-     * where it is now. `/crew live` lists everyone flying for the airline;
+     * The tracker's view of a flight, in Discord: satellite imagery with the
+     * path flown, the plan ahead, the aeroplane where it is now and its photo
+     * (liveFlightMap.js). `/crew live` lists everyone flying for the airline;
      * `/crew flight` draws one of them (yourself, by default).
      *
      * Who is "flying for the airline" is the crew center's answer, which is
@@ -1520,21 +1520,17 @@ function createVaBot({ client, VirtualAirlineAd, isHomeGuild = () => false }) {
                 { name: 'Vertical', value: `${Number(f.verticalSpeed) > 0 ? '+' : ''}${Math.round(Number(f.verticalSpeed) || 0).toLocaleString('en-US')} fpm`, inline: true },
             )
             .setTimestamp(new Date());
+        // The satellite map, with the aircraft's photo in its corner. Should it
+        // fail to draw, the photo on its own is still better than nothing.
         const files = [];
-        const embeds = [e];
-        const card = r.data.card ? Buffer.from(String(r.data.card), 'base64') : null;
         const map = r.data.map ? Buffer.from(String(r.data.map), 'base64') : null;
-        if (card) { files.push({ attachment: card, name: 'card.png' }); e.setImage('attachment://card.png'); }
+        if (map) { files.push({ attachment: map, name: 'flight.png' }); e.setImage('attachment://flight.png'); }
         else if (isHttpsUrl(r.data.photoUrl)) e.setImage(r.data.photoUrl);
-        if (map) {
-            files.push({ attachment: map, name: 'map.png' });
-            embeds.push(new EmbedBuilder().setColor(accentOf(ctx.va)).setImage('attachment://map.png'));
-        }
         const again = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(cid('liveagain', id)).setLabel('Refresh').setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
             ...(isHttpsUrl(f.trackUrl) ? [new ButtonBuilder().setURL(f.trackUrl).setLabel('Track live').setStyle(ButtonStyle.Link).setEmoji('🔭')] : []),
         );
-        return interaction.editReply({ embeds, files, attachments: [], components: [again] });
+        return interaction.editReply({ embeds: [e], files, attachments: [], components: [again] });
     }
 
     /* ===================================================================
