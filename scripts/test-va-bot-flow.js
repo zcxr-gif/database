@@ -580,11 +580,20 @@ const buttonIds = (msg) => (msg.components || []).flatMap((row) => (row.toJSON ?
     const pointed = ticketChannel.sent[ticketChannel.sent.length - 1];
     check('recruiting through Discord: newcomers are greeted where tickets open', ticketChannel.sent.length === inTickets + 1
         && buttonIds(pointed).includes('vab:open:apply') && /applied on our website/.test(JSON.stringify(pointed.embeds)), pointed);
+    // Staff can say no — and no means the ticket channel too.
+    it = interaction('command', { ...ADMIN, sub: 'welcome', options: { off: true } });
+    await run(it);
+    check('welcome off is saved', guilds[0].settings.welcomeOff === true, guilds[0].settings);
+    const beforeOff = ticketChannel.sent.length;
+    await bot.onMemberJoin(memberObj('665100000'));
+    check('…and nobody is greeted, not even where tickets open', ticketChannel.sent.length === beforeOff, ticketChannel.sent.slice(beforeOff));
+    check('…and /crew-admin welcome says it is off', /\*\*Welcome:\*\* Off/.test(lastText(it)), lastText(it));
     const welcomeChannel = { id: '500000000003', type: 0, sent: [], send: async (m) => { welcomeChannel.sent.push(m); return {}; } };
     channels.set(welcomeChannel.id, welcomeChannel);
     it = interaction('command', { ...ADMIN, sub: 'welcome', options: { channel: welcomeChannel, role: { id: '3003' }, message: 'Hi {user}, welcome to {airline}!' } });
     await run(it);
     check('welcome settings are saved', guilds[0].settings.welcomeChannelId === welcomeChannel.id && guilds[0].settings.welcomeRoleId === '3003', guilds[0].settings);
+    check('…and choosing a channel turns the welcome back on', guilds[0].settings.welcomeOff === false, guilds[0].settings);
     await bot.onMemberJoin(memberObj('666000000'));
     const greeting = welcomeChannel.sent[welcomeChannel.sent.length - 1];
     check('a newcomer is greeted in their words', greeting && JSON.stringify(greeting.embeds).includes('Hi <@666000000>, welcome to Test Air!'), greeting);

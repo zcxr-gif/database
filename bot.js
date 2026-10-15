@@ -576,6 +576,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     let homeGuildId = String(process.env.DISCORD_HOME_GUILD_ID || '').trim();
     const isHomeGuild = (id) => !!homeGuildId && id === homeGuildId;
     const vaBotInstance = vaBot.createVaBot({ client, VirtualAirlineAd, isHomeGuild });
+    // Somebody else's server. With the home server still unknown, a server
+    // linked to an airline is the only one that is certainly not ours.
+    const isVaServer = async (id) => (homeGuildId ? id !== homeGuildId : vaBotInstance.isVaGuild(id));
     client.on('guildDelete', (guild) => { vaBotInstance.onGuildDelete(guild).catch(() => {}); });
 
     // Discord client error surface — without these, transport errors bubble up
@@ -2738,9 +2741,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
     client.on('guildMemberAdd', async (member) => {
         // A VA's server is not ours to welcome people into — that airline's
-        // own welcome lives in vaBot.js. With the home server unknown, behave
-        // as before rather than welcome nobody.
-        if (homeGuildId && member.guild.id !== homeGuildId) {
+        // own welcome lives in vaBot.js.
+        if (await isVaServer(member.guild.id).catch(() => false)) {
             vaBotInstance.onMemberJoin(member).catch(() => {});
             return;
         }
@@ -2903,6 +2905,16 @@ client.on('interactionCreate', async (interaction) => {
       try {
         // /crew, /crew-admin and every `vab:` component belong to vaBot.js.
         if (await vaBotInstance.handleInteraction(interaction)) return;
+
+        // Everything below is Inflight's, built on Inflight's channels and
+        // roles. Registered globally (home server unknown at startup), it
+        // would show in VA servers too, where a server admin passes every
+        // "Administrator" check below — /va_remove included.
+        if ((interaction.isChatInputCommand() || interaction.isAutocomplete()) && interaction.guildId
+            && await isVaServer(interaction.guildId).catch(() => false)) {
+            if (interaction.isAutocomplete()) return interaction.respond([]).catch(() => {});
+            return interaction.reply({ content: 'That command belongs to Inflight’s own server. Here, use `/crew` (and `/crew-admin` for staff).', ephemeral: true }).catch(() => {});
+        }
 
         // --- 1. AUTOCOMPLETE HANDLERS ---
         if (interaction.isAutocomplete()) {
