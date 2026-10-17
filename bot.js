@@ -480,20 +480,24 @@ async function submitWebAircraftReview(payload) {
 // Post a message/embed to a Discord channel by ID using the running bot client.
 // Fire-and-forget: a no-op (logged) if the client isn't ready or the channel
 // can't be reached, so callers never have to guard against startup races.
+// Resolves true once Discord has the message, false otherwise, for callers
+// that only mark something delivered when it was (pilotContentFeed.js).
 async function postToChannel(channelId, payload) {
     try {
         if (!botClient || typeof botClient.isReady === 'function' && !botClient.isReady()) {
             console.warn('[discord] bot not ready — dropping channel post to', channelId);
-            return;
+            return false;
         }
         const channel = await botClient.channels.fetch(channelId).catch(() => null);
         if (!channel || typeof channel.send !== 'function') {
             console.warn('[discord] channel not found or not sendable:', channelId);
-            return;
+            return false;
         }
         await channel.send(typeof payload === 'string' ? { content: payload } : payload);
+        return true;
     } catch (err) {
         console.error('[discord] postToChannel failed:', err.message);
+        return false;
     }
 }
 

@@ -85,6 +85,7 @@
 
             <div class="flex items-center gap-1 mb-6 border-b border-zinc-200 dark:border-zinc-800">
                 <button data-tab="uploads" onclick="showTab('uploads')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
+                <button data-tab="comments" onclick="showTab('comments')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
                 <button data-tab="restrictions" onclick="showTab('restrictions')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
                 <button data-tab="record" onclick="showTab('record')" class="tab px-4 py-2.5 text-sm font-semibold border-b-2 transition"></button>
             </div>
@@ -114,11 +115,37 @@
                 <div id="uploadsEmpty" class="hidden py-20 text-center text-sm text-zinc-500 dark:text-zinc-400"></div>
             </section>
 
+            <!-- ============ COMMENTS ============ -->
+            <section id="tab-comments" class="hidden">
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-5 leading-relaxed max-w-2xl">
+                    Every RateMyATC comment and kudos note still up, newest first. Anonymous ones show their
+                    author here — anonymity is for other pilots and the controller, not for moderation.
+                    Removing the words keeps the stars counting; tick <span class="font-medium text-zinc-700 dark:text-zinc-200">remove the whole rating</span> for one that exists only to carry abuse.
+                </p>
+                <div class="flex flex-wrap items-center gap-2 mb-5">
+                    <div class="relative flex-1 min-w-[220px]">
+                        <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                        <input id="cq" oninput="renderComments()" placeholder="Search words, pilot or controller"
+                               class="w-full pl-9 pr-3 h-10 rounded-xl surface text-sm outline-none focus:ring-2 focus:ring-zinc-900/10 dark:focus:ring-white/10">
+                    </div>
+                    <select id="cFilter" onchange="renderComments()" class="h-10 px-3 rounded-xl surface text-sm outline-none">
+                        <option value="">All words</option>
+                        <option value="rating_comment">RateMyATC comments</option>
+                        <option value="private">Private (1–3★) only</option>
+                        <option value="anonymous">Anonymous only</option>
+                        <option value="kudos_note">Kudos notes</option>
+                    </select>
+                </div>
+                <p id="commentsMeta" class="text-xs text-zinc-500 dark:text-zinc-400 mb-4"></p>
+                <div id="commentsList" class="space-y-2"></div>
+                <div id="commentsEmpty" class="hidden py-20 text-center text-sm text-zinc-500 dark:text-zinc-400"></div>
+            </section>
+
             <!-- ============ RESTRICTIONS ============ -->
             <section id="tab-restrictions" class="hidden">
                 <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-5 leading-relaxed max-w-2xl">
-                    Pilots who cannot add pictures right now. A restriction rides on a warning, so rescinding
-                    the warning lifts it — and so does <span class="font-medium text-zinc-700 dark:text-zinc-200">Allow pictures again</span>,
+                    Pilots who cannot add pictures or comments right now. A restriction rides on a warning, so rescinding
+                    the warning lifts it — and so does <span class="font-medium text-zinc-700 dark:text-zinc-200">Allow posting again</span>,
                     which leaves the warning itself standing on the record.
                 </p>
                 <div id="restrictionsList" class="space-y-3"></div>
@@ -143,7 +170,7 @@
         <div class="max-w-lg mx-auto my-8 surface rounded-2xl overflow-hidden">
             <div class="p-5 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-3">
                 <div class="min-w-0">
-                    <p class="font-semibold">Take this picture down</p>
+                    <p class="font-semibold" id="panelTitle">Take this picture down</p>
                     <p id="panelSub" class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate"></p>
                 </div>
                 <button onclick="closePanel()" class="w-8 h-8 shrink-0 grid place-items-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="x" class="w-4 h-4"></i></button>
@@ -151,6 +178,11 @@
 
             <div class="p-5 space-y-5">
                 <div id="panelPreview"></div>
+
+                <label id="pRemoveAllRow" class="hidden flex items-center gap-2.5 cursor-pointer select-none">
+                    <input id="pRemoveAll" type="checkbox" onchange="syncPanel()" class="accent-rose-600">
+                    <span class="text-sm font-medium" id="pRemoveAllLabel">Remove the whole rating, stars too</span>
+                </label>
 
                 <div>
                     <label class="block text-xs font-semibold uppercase tracking-wide text-zinc-500 mb-2">Why is it coming down</label>
@@ -183,7 +215,7 @@
 
                         <label class="flex items-center gap-2.5 cursor-pointer select-none">
                             <input id="pBlock" type="checkbox" onchange="syncPanel()" class="accent-rose-600">
-                            <span class="text-sm font-medium">Stop them adding any more pictures</span>
+                            <span class="text-sm font-medium">Stop them adding any more pictures or comments</span>
                         </label>
                         <div id="pBlockBody" class="hidden pl-7 space-y-2">
                             <select id="pBlockDays" onchange="syncPanel()" class="h-9 px-3 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-sm outline-none">
@@ -223,6 +255,7 @@ let CATEGORIES = [];
 let LEVELS = [];
 let RESTRICTIONS = [];
 let RECORD = [];
+let COMMENTS = [];
 let TARGET = null;
 let REVEALED = false;
 let TAB = 'uploads';
@@ -288,18 +321,20 @@ const exact = (d) => d ? new Date(d).toLocaleString('en-GB', { day: 'numeric', m
 async function load() {
     try {
         const flagged = !!($('onlyFlagged') && $('onlyFlagged').checked);
-        const [feed, restrictions, record] = await Promise.all([
+        const [feed, restrictions, record, comments] = await Promise.all([
             // Enough rows that a pilot's pictures arrive together (they share
             // a changed-at, so they sort side by side).
             api('/api/pilot-moderation/uploads?limit=900' + (flagged ? '&flagged=1' : '')),
             api('/api/pilot-moderation/restrictions'),
             api('/api/pilot-moderation/log'),
+            api('/api/pilot-moderation/comments?limit=500' + (flagged ? '&flagged=1' : '')),
         ]);
         ITEMS = feed.items || [];
         CATEGORIES = feed.categories || [];
         LEVELS = feed.levels || [];
         RESTRICTIONS = restrictions.restrictions || [];
         RECORD = record.actions || [];
+        COMMENTS = comments.items || [];
     } catch (err) {
         $('loading').classList.add('hidden');
         if (err.unconfigured) { $('unconfigured').classList.remove('hidden'); icons(); return; }
@@ -319,15 +354,19 @@ async function load() {
     applyReveal();
     renderTabs();
     renderUploads();
+    renderComments();
     renderRestrictions();
     renderRecord();
+    // The Discord feed links straight to a tab (/pilot-content#comments).
+    const fromHash = location.hash.slice(1);
+    if (TABS.includes(fromHash) && fromHash !== TAB) showTab(fromHash);
     icons();
 }
 
 /* ---- Tabs ------------------------------------------------------------- */
 function renderTabs() {
-    const counts = { uploads: ITEMS.length, restrictions: RESTRICTIONS.length, record: RECORD.length };
-    const labels = { uploads: 'Pictures', restrictions: 'Restricted', record: 'Record' };
+    const counts = { uploads: ITEMS.length, comments: COMMENTS.length, restrictions: RESTRICTIONS.length, record: RECORD.length };
+    const labels = { uploads: 'Pictures', comments: 'Comments', restrictions: 'Restricted', record: 'Record' };
     document.querySelectorAll('.tab').forEach(b => {
         const k = b.dataset.tab;
         const on = k === TAB;
@@ -337,9 +376,10 @@ function renderTabs() {
         b.innerHTML = `${labels[k]}<span class="ml-2 text-xs font-medium text-zinc-400">${counts[k]}</span>`;
     });
 }
+const TABS = ['uploads', 'comments', 'restrictions', 'record'];
 function showTab(t) {
     TAB = t;
-    ['uploads', 'restrictions', 'record'].forEach(k => $('tab-' + k).classList.toggle('hidden', k !== t));
+    TABS.forEach(k => $('tab-' + k).classList.toggle('hidden', k !== t));
     renderTabs();
     icons();
 }
@@ -355,7 +395,8 @@ function toggleReveal() { REVEALED = !REVEALED; applyReveal(); }
 /* ---- Pictures --------------------------------------------------------- */
 // Window photos are the Pro picture behind the flight window everyone sees
 // for that pilot's flight: tall, like the window itself.
-const KIND_LABEL = { avatar: 'Avatar', banner: 'Banner', window: 'Window photo' };
+const KIND_LABEL = { avatar: 'Avatar', banner: 'Banner', window: 'Window photo',
+    rating_comment: 'RateMyATC comment', rating: 'RateMyATC rating', kudos_note: 'Kudos note', kudos: 'Kudos' };
 const KIND_ASPECT = { avatar: 'aspect-square', banner: 'aspect-[16/7]', window: 'aspect-[9/16]' };
 function visibleUploads() {
     const q = $('q').value.trim().toLowerCase();
@@ -482,10 +523,74 @@ async function showHistory(userId, handle) {
 }
 function clearHistory() { RECORD_USER = null; renderRecord(); }
 
+/* ---- Comments --------------------------------------------------------- */
+function visibleComments() {
+    const q = $('cq').value.trim().toLowerCase();
+    const f = $('cFilter').value;
+    return COMMENTS.filter(c => {
+        if (f === 'private' && !(c.kind === 'rating_comment' && c.isPrivate)) return false;
+        if (f === 'anonymous' && !c.anonymous) return false;
+        if ((f === 'rating_comment' || f === 'kudos_note') && c.kind !== f) return false;
+        if (!q) return true;
+        return [c.body, c.handle, c.displayName, c.controllerUsername, c.airport]
+            .some(v => String(v || '').toLowerCase().includes(q));
+    });
+}
+
+function renderComments() {
+    const list = visibleComments();
+    $('commentsMeta').textContent = list.length === COMMENTS.length
+        ? `${COMMENTS.length} comment${COMMENTS.length === 1 ? '' : 's'} and notes, newest first.`
+        : `${list.length} of ${COMMENTS.length} shown.`;
+    $('commentsEmpty').classList.toggle('hidden', list.length > 0);
+    if (!list.length) $('commentsEmpty').textContent = COMMENTS.length ? 'Nothing matches that.' : 'Nobody has written anything yet.';
+
+    const rows = [];
+    $('commentsList').innerHTML = list.map(c => {
+        const n = rows.push(c) - 1;
+        const tags = [];
+        if (c.kind === 'rating_comment') {
+            tags.push(`<span class="text-amber-500 tracking-tight" title="${c.stars} stars">${'★'.repeat(c.stars || 0)}<span class="text-zinc-300 dark:text-zinc-600">${'★'.repeat(5 - (c.stars || 0))}</span></span>`);
+            tags.push(c.isPrivate
+                ? '<span class="px-1.5 py-0.5 rounded-md bg-violet-600 text-white text-[10px] font-bold" title="Only the controller sees this">PRIVATE</span>'
+                : '<span class="px-1.5 py-0.5 rounded-md bg-emerald-600 text-white text-[10px] font-bold">PUBLIC</span>');
+        } else {
+            tags.push('<span class="px-1.5 py-0.5 rounded-md bg-emerald-600 text-white text-[10px] font-bold">KUDOS NOTE</span>');
+        }
+        if (c.anonymous) tags.push('<span class="px-1.5 py-0.5 rounded-md bg-zinc-700 text-white text-[10px] font-bold" title="Other pilots and the controller do not see the name">ANONYMOUS</span>');
+        if (c.restricted) tags.push(`<span class="px-1.5 py-0.5 rounded-md bg-rose-600 text-white text-[10px] font-bold" title="${c.restrictedUntil ? 'Until ' + esc(exact(c.restrictedUntil)) : 'Until lifted by hand'}">PAUSED</span>`);
+        if (c.priorTakedowns) tags.push(`<span class="px-1.5 py-0.5 rounded-md bg-amber-500 text-white text-[10px] font-bold">${c.priorTakedowns} PRIOR</span>`);
+        const where = c.airport;
+        return `
+        <div class="surface rounded-xl px-4 py-3 flex items-start gap-3">
+            <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-1.5 text-sm">${tags.join('')}</div>
+                <p class="text-sm text-zinc-800 dark:text-zinc-100 mt-2 leading-relaxed whitespace-pre-wrap break-words">${esc(c.body)}</p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2">
+                    by <span class="font-medium text-zinc-700 dark:text-zinc-200">@${esc(c.handle || 'no profile')}</span>${c.displayName ? ` ${esc(c.displayName)}` : ''}
+                    · to <span class="font-medium">${esc(c.controllerUsername || 'a controller')}</span>${where ? ` at ${esc(where)}` : ''}
+                    · <span title="${esc(exact(c.writtenAt))}">${esc(when(c.writtenAt))}</span>
+                </p>
+            </div>
+            <div class="shrink-0 flex flex-col items-end gap-1.5">
+                <button onclick="openCommentPanel(${n})"
+                        class="h-8 px-3 rounded-lg text-xs font-semibold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/70 transition inline-flex items-center gap-1.5">
+                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Take down</button>
+                ${c.priorTakedowns ? `<button onclick="showHistory('${esc(c.userId)}', '${esc(c.handle)}')"
+                    class="h-8 px-3 rounded-lg text-xs font-semibold border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5">
+                    <i data-lucide="history" class="w-3.5 h-3.5"></i> History</button>` : ''}
+            </div>
+        </div>`;
+    }).join('');
+    renderComments._rows = rows;
+    renderTabs();
+    icons();
+}
+
 /* ---- Restrictions ----------------------------------------------------- */
 function renderRestrictions() {
     $('restrictionsEmpty').classList.toggle('hidden', RESTRICTIONS.length > 0);
-    if (!RESTRICTIONS.length) $('restrictionsEmpty').textContent = 'Nobody is stopped from adding pictures.';
+    if (!RESTRICTIONS.length) $('restrictionsEmpty').textContent = 'Nobody is stopped from adding pictures or comments.';
 
     $('restrictionsList').innerHTML = RESTRICTIONS.map(r => `
         <div class="surface rounded-2xl p-4 border-l-4 border-l-rose-500">
@@ -501,7 +606,7 @@ function renderRestrictions() {
                 </div>
                 <button onclick="lift('${esc(r.warningId)}', '${esc(r.handle)}')"
                         class="shrink-0 h-9 px-3 rounded-xl text-xs font-semibold border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">
-                    Allow pictures again
+                    Allow posting again
                 </button>
             </div>
         </div>`).join('');
@@ -510,10 +615,10 @@ function renderRestrictions() {
 }
 
 async function lift(warningId, handle) {
-    if (!confirm(`Let @${handle || 'this pilot'} add pictures again?\n\nThe warning itself stays on their record.`)) return;
+    if (!confirm(`Let @${handle || 'this pilot'} add pictures and comments again?\n\nThe warning itself stays on their record.`)) return;
     try {
         await api(`/api/pilot-moderation/restrictions/${encodeURIComponent(warningId)}/lift`, { method: 'POST' });
-        toast('Pictures switched back on.');
+        toast('Pictures and comments switched back on.');
         await load();
         showTab('restrictions');
     } catch (err) { toast(err.message); }
@@ -543,6 +648,7 @@ function renderRecord() {
                     ${esc(a.categoryLabel)} · removed by ${esc(a.removedBy)} · ${esc(when(a.createdAt))}
                     ${a.warningLevel ? ' · <span class="text-amber-600 dark:text-amber-400 font-medium">warned</span>' : ''}
                 </p>
+                ${a.contentText ? `<p class="text-xs text-zinc-700 dark:text-zinc-200 mt-1.5 leading-relaxed whitespace-pre-wrap border-l-2 border-zinc-300 dark:border-zinc-700 pl-2">“${esc(a.contentText)}”</p>` : ''}
                 ${a.note ? `<p class="text-xs text-zinc-600 dark:text-zinc-300 mt-1.5 leading-relaxed whitespace-pre-wrap">${esc(a.note)}</p>` : ''}
             </div>
         </div>`).join('');
@@ -554,6 +660,10 @@ function renderRecord() {
 function openPanel(n) {
     TARGET = (renderUploads._rows || [])[n];
     if (!TARGET) return;
+    TARGET.isComment = false;
+    $('panelTitle').textContent = 'Take this picture down';
+    $('pRemoveAllRow').classList.add('hidden');
+    $('pRemoveAll').checked = false;
     $('panelSub').textContent = `${KIND_LABEL[TARGET.kind] || TARGET.kind} on @${TARGET.handle}`;
     $('panelPreview').innerHTML = `
         <div class="rounded-xl overflow-hidden checker ${TARGET.kind === 'window' ? 'aspect-[9/16] max-h-[340px] mx-auto' : 'aspect-[16/9]'} cursor-zoom-in"
@@ -577,6 +687,31 @@ function openPanel(n) {
     syncPanel();
     icons();
 }
+function openCommentPanel(n) {
+    const c = (renderComments._rows || [])[n];
+    if (!c) return;
+    TARGET = Object.assign({}, c, { isComment: true });
+    const rating = c.kind === 'rating_comment';
+    $('panelTitle').textContent = rating ? 'Take this comment down' : 'Take this note down';
+    $('panelSub').textContent = `${KIND_LABEL[c.kind]} by @${c.handle || 'no profile'} to ${c.controllerUsername || 'a controller'}`;
+    $('panelPreview').innerHTML = `
+        <div class="rounded-xl bg-zinc-100 dark:bg-zinc-800 p-3.5 text-sm leading-relaxed whitespace-pre-wrap break-words">${esc(c.body)}</div>
+        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2">
+            ${rating ? `${c.stars}★ · ${c.isPrivate ? 'private to the controller' : 'public'} · ` : ''}${c.anonymous ? 'posted anonymously' : 'posted with name'}
+            ${c.priorTakedowns ? ` · <span class="text-amber-600 dark:text-amber-400 font-semibold">${c.priorTakedowns} previous takedown${c.priorTakedowns === 1 ? '' : 's'}</span>` : ''}
+        </p>`;
+    $('pRemoveAllRow').classList.remove('hidden');
+    $('pRemoveAllLabel').textContent = rating ? 'Remove the whole rating, stars too' : 'Remove the kudos too';
+    $('pRemoveAll').checked = false;
+    $('pNote').value = '';
+    $('pReason').value = '';
+    $('pWarn').checked = !!c.priorTakedowns;
+    $('pBlock').checked = false;
+    $('pBlockDays').value = '';
+    $('panel').classList.remove('hidden');
+    syncPanel();
+    icons();
+}
 function closePanel() { $('panel').classList.add('hidden'); TARGET = null; }
 
 function syncPanel() {
@@ -591,8 +726,8 @@ function syncPanel() {
     if (block) {
         const days = $('pBlockDays').value;
         $('pBlockNote').textContent = days
-            ? `They cannot add a picture for ${days} days. It lifts on its own, and nothing already on their profile is touched.`
-            : 'They cannot add a picture until somebody switches it back on. Nothing already on their profile is touched.';
+            ? `They cannot add a picture or a comment for ${days} days. It lifts on its own, and nothing already on their profile is touched. Stars and kudos still go through.`
+            : 'They cannot add a picture or a comment until somebody switches it back on. Nothing already on their profile is touched. Stars and kudos still go through.';
     }
 
     $('pConfirm').innerHTML = warn
@@ -606,7 +741,14 @@ async function takedown() {
     const warn = $('pWarn').checked;
     const block = $('pBlock').checked;
 
-    const body = {
+    const isComment = !!TARGET.isComment;
+    const body = isComment ? {
+        kind: TARGET.kind === 'rating_comment' ? 'rating' : 'kudos',
+        id: TARGET.id,
+        removeAll: $('pRemoveAll').checked,
+        category: $('pCategory').value,
+        note: $('pNote').value,
+    } : {
         userId: TARGET.userId,
         kind: TARGET.kind,
         category: $('pCategory').value,
@@ -626,10 +768,11 @@ async function takedown() {
     btn.disabled = true;
     btn.innerHTML = 'Working…';
     try {
-        const out = await api('/api/pilot-moderation/takedown', { method: 'POST', body: JSON.stringify(body) });
+        const out = await api(isComment ? '/api/pilot-moderation/comments/takedown' : '/api/pilot-moderation/takedown',
+            { method: 'POST', body: JSON.stringify(body) });
         closePanel();
         toast(
-            (out.uploadsBlocked ? 'Removed, warned, and pictures switched off.'
+            (out.uploadsBlocked ? 'Removed, warned, and posting switched off.'
              : out.warningIssued ? 'Removed and the pilot was warned.'
              : 'Removed.')
             // The row is gone either way, which is what took the picture down.

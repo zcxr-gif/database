@@ -327,6 +327,90 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
         }
     });
 
+    // --- Words -------------------------------------------------------------
+    // Every RateMyATC comment and kudos note still standing — public and
+    // private, anonymous or named — with who wrote it. Anonymity is a promise
+    // to other pilots and the controller, not to staff: moderating abuse
+    // starts with knowing whose it is.
+    app.get('/api/pilot-moderation/comments', requireAuth, needsKey, async (req, res) => {
+        try {
+            const rows = await rpc('admin_pilot_comments', {
+                p_limit: Math.min(Math.max(parseInt(req.query.limit, 10) || 300, 1), 1000),
+                p_offset: Math.max(parseInt(req.query.offset, 10) || 0, 0),
+                p_only_flagged: req.query.flagged === '1',
+            });
+            res.json({
+                items: (rows || []).map((r) => ({
+                    kind: r.kind,
+                    id: r.id,
+                    userId: r.user_id,
+                    handle: r.handle || '',
+                    displayName: r.display_name || '',
+                    body: r.body || '',
+                    stars: r.stars == null ? null : Number(r.stars),
+                    anonymous: !!r.anonymous,
+                    isPrivate: !!r.is_private,
+                    controllerUsername: r.controller_username || '',
+                    controllerId: r.controller_if_id || '',
+                    airport: r.airport_icao || '',
+                    writtenAt: r.written_at || null,
+                    priorTakedowns: r.prior_takedowns || 0,
+                    restricted: !!r.restricted,
+                    restrictedUntil: r.restricted_until || null,
+                })),
+            });
+        } catch (err) {
+            console.error('[pilot-moderation] comments:', err.message);
+            res.status(statusFor(err)).json({ error: err.message });
+        }
+    });
+
+    /* Take a comment or note down. By default only the words go and the stars
+     * or kudos keep counting; `removeAll` hides the whole rating or kudos.
+     * Same one-decision shape as a picture takedown: removal, record, warning
+     * and pause in one transaction.
+     */
+    app.post('/api/pilot-moderation/comments/takedown', requireAuth, needsKey, async (req, res) => {
+        try {
+            const { kind, id, removeAll, category, note, warn } = req.body || {};
+            if (!['rating', 'kudos'].includes(kind)) {
+                return res.status(400).json({ error: 'kind must be rating or kudos.' });
+            }
+            if (!id) return res.status(400).json({ error: 'Which comment is required.' });
+            if (category && !CATEGORY_KEYS.includes(category)) {
+                return res.status(400).json({ error: 'Unknown reason.' });
+            }
+            if (warn && warn.level && !LEVEL_KEYS.includes(warn.level)) {
+                return res.status(400).json({ error: 'Unknown warning level.' });
+            }
+            const blockDays = warn && warn.blockUploads && warn.blockDays
+                ? Math.min(Math.max(parseInt(warn.blockDays, 10) || 0, 1), 365)
+                : null;
+
+            const rows = await rpc('admin_pilot_comment_takedown', {
+                p_kind: kind,
+                p_id: id,
+                p_remove_all: !!removeAll,
+                p_category: category || 'other',
+                p_note: (note && String(note).trim()) || null,
+                p_removed_by: staffName(req),
+                p_warn_level: (warn && warn.level) || null,
+                p_warn_reason: (warn && warn.reason && String(warn.reason).trim()) || null,
+                p_block_uploads: !!(warn && warn.blockUploads),
+                p_block_days: blockDays,
+            });
+            const result = Array.isArray(rows) ? rows[0] : rows;
+            res.status(201).json({
+                ok: true,
+                warningIssued: !!(result && result.warning_id),
+                uploadsBlocked: !!(warn && warn.blockUploads),
+            });
+        } catch (err) {
+            console.error('[pilot-moderation] comment takedown:', err.message);
+            res.status(statusFor(err)).json({ error: err.message });
+        }
+    });
+
     // --- Who cannot upload --------------------------------------------------
     app.get('/api/pilot-moderation/restrictions', requireAuth, needsKey, async (req, res) => {
         try {
@@ -391,6 +475,8 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
                     removedBy: r.removed_by || 'Inflight',
                     warningLevel: r.warning_level || null,
                     createdAt: r.created_at,
+                    // The words that came down, for comment takedowns.
+                    contentText: r.content_text || '',
                 })),
             });
         } catch (err) {
@@ -408,6 +494,7 @@ function registerPilotModerationRoutes(app, { requireAuth }) {
 
 module.exports = {
     registerPilotModerationRoutes,
+    rpc,
     CATEGORIES,
     LEVELS,
     KINDS,

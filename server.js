@@ -4080,6 +4080,10 @@ vaSites.registerVaSiteRoutes(app, {
 // the rest of the hub's tools; the service key that reaches the tracker project
 // never leaves this process.
 pilotModeration.registerPilotModerationRoutes(app, { requireAuth });
+// …and everything pilots post, announced to the staff Discord channel as it
+// arrives (pilotContentFeed.js), so moderation does not wait for somebody to
+// open the console.
+require('./pilotContentFeed').start();
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 // postAnnouncement is handed over rather than imported: crewAuth cannot require
